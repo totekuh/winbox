@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 from rich.table import Table
 
+from winbox.utils import human_size
+
 if TYPE_CHECKING:
     from winbox.config import Config
 
@@ -50,7 +52,7 @@ def list_tools(cfg: Config) -> None:
     table.add_column("Size", justify="right")
 
     for f in files:
-        size = _human_size(f.stat().st_size)
+        size = human_size(f.stat().st_size)
         table.add_row(f.name, size)
 
     console.print(table)
@@ -64,11 +66,3 @@ def remove(cfg: Config, name: str) -> None:
         console.print(f"[green][+][/] Removed: {name}")
     else:
         console.print(f"[yellow][!][/] Not found: {name}")
-
-
-def _human_size(nbytes: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if nbytes < 1024:
-            return f"{nbytes:.1f} {unit}"
-        nbytes /= 1024  # type: ignore[assignment]
-    return f"{nbytes:.1f} TB"

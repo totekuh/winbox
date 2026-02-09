@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import subprocess
 import time
@@ -130,7 +131,9 @@ class GuestAgent:
         timeout: int = 600,
     ) -> ExecResult:
         """Execute a PowerShell command/script in the guest."""
-        cmd = f'powershell -ExecutionPolicy Bypass -Command "{script}"'
+        # Use -EncodedCommand to avoid shell quoting issues
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        cmd = f"powershell -ExecutionPolicy Bypass -EncodedCommand {encoded}"
         return self.exec(cmd, timeout=timeout)
 
     def exec_powershell_file(
@@ -140,7 +143,7 @@ class GuestAgent:
         timeout: int = 600,
     ) -> ExecResult:
         """Execute a PowerShell script file in the guest."""
-        cmd = f"powershell -ExecutionPolicy Bypass -File {path}"
+        cmd = f'powershell -ExecutionPolicy Bypass -File "{path}"'
         return self.exec(cmd, timeout=timeout)
 
     def shutdown(self) -> None:
@@ -157,5 +160,5 @@ def _decode_b64(data: str) -> str:
         return ""
     try:
         return base64.b64decode(data).decode("utf-8", errors="replace")
-    except Exception:
+    except (binascii.Error, ValueError):
         return ""

@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-import sys
+import os
 import time
+from pathlib import Path
 
 import click
 from rich.console import Console
 
+from winbox import installer
+from winbox import tools as tools_mod
 from winbox.config import Config
+from winbox.executor import run_command
 from winbox.guest import GuestAgent, GuestAgentError
+from winbox.iso import ISO_FILENAME, download_iso
+from winbox.utils import human_size
 from winbox.vm import VM, VMState
 
 console = Console()
@@ -72,8 +78,6 @@ def cli(ctx: click.Context) -> None:
 @click.pass_context
 def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
     """Build the Windows VM (one-time setup)."""
-    from winbox import installer
-
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
 
@@ -99,14 +103,23 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
 
     # Windows ISO
     if windows_iso is None:
-        console.print("[bold]Windows Server 2022 Evaluation ISO required.[/]")
-        console.print(
-            "Download from: https://www.microsoft.com/en-us/evalcenter/"
-            "evaluate-windows-server-2022\n"
-        )
-        windows_iso = click.prompt("Path to Windows ISO")
-
-    from pathlib import Path
+        # Check if already downloaded
+        cached = cfg.iso_dir / ISO_FILENAME
+        if cached.exists() and cached.stat().st_size > 1_000_000_000:
+            console.print(f"[green][+][/] Using cached ISO: {cached}")
+            windows_iso = str(cached)
+        else:
+            console.print("[bold]Windows Server 2022 Evaluation ISO required.[/]")
+            console.print(
+                "    Run [bold]winbox iso download[/] to fetch it automatically,\n"
+                "    or provide a path.\n"
+            )
+            windows_iso = click.prompt(
+                "Path to Windows ISO (or 'download' to fetch now)",
+            )
+            if windows_iso.strip().lower() == "download":
+                iso_path = download_iso(cfg)
+                windows_iso = str(iso_path)
 
     if not Path(windows_iso).exists():
         console.print(f"[red][-][/] ISO not found: {windows_iso}")
@@ -298,8 +311,6 @@ def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int) -> None
     Bare .exe names are resolved from Z:\\tools\\. Output files land in
     ~/.winbox/shared/loot/ instantly via virtiofs.
     """
-    from winbox.executor import run_command
-
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
@@ -326,8 +337,6 @@ def tools() -> None:
 @click.pass_context
 def tools_add(ctx: click.Context, files: tuple[str, ...]) -> None:
     """Copy files into the shared tools directory."""
-    from winbox import tools as tools_mod
-
     cfg: Config = ctx.obj["cfg"]
     tools_mod.add(cfg, files)
 
@@ -336,8 +345,6 @@ def tools_add(ctx: click.Context, files: tuple[str, ...]) -> None:
 @click.pass_context
 def tools_list(ctx: click.Context) -> None:
     """List tools in the shared directory."""
-    from winbox import tools as tools_mod
-
     cfg: Config = ctx.obj["cfg"]
     tools_mod.list_tools(cfg)
 
@@ -347,10 +354,40 @@ def tools_list(ctx: click.Context) -> None:
 @click.pass_context
 def tools_remove(ctx: click.Context, name: str) -> None:
     """Remove a tool from the shared directory."""
-    from winbox import tools as tools_mod
-
     cfg: Config = ctx.obj["cfg"]
     tools_mod.remove(cfg, name)
+
+
+# ─── iso ─────────────────────────────────────────────────────────────────────
+
+
+@cli.group()
+def iso() -> None:
+    """Manage the Windows ISO."""
+    pass
+
+
+@iso.command("download")
+@click.option("--force", "-f", is_flag=True, help="Re-download even if ISO exists.")
+@click.pass_context
+def iso_download(ctx: click.Context, force: bool) -> None:
+    """Download the Windows Server 2022 Evaluation ISO (~5GB)."""
+    cfg: Config = ctx.obj["cfg"]
+    download_iso(cfg, force=force)
+
+
+@iso.command("status")
+@click.pass_context
+def iso_status(ctx: click.Context) -> None:
+    """Check if the Windows ISO is downloaded."""
+    cfg: Config = ctx.obj["cfg"]
+    path = cfg.iso_dir / ISO_FILENAME
+    if path.exists():
+        size = path.stat().st_size
+        console.print(f"[green][+][/] ISO found: {path} ({human_size(size)})")
+    else:
+        console.print("[yellow][!][/] ISO not downloaded")
+        console.print("    Run: [bold]winbox iso download[/]")
 
 
 # ─── snapshot ────────────────────────────────────────────────────────────────
@@ -401,8 +438,6 @@ def restore(ctx: click.Context, name: str) -> None:
 @click.pass_context
 def provision(ctx: click.Context) -> None:
     """Re-run the provisioning script inside the VM."""
-    from winbox import installer
-
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
@@ -423,8 +458,6 @@ def provision(ctx: click.Context) -> None:
 @click.pass_context
 def ssh(ctx: click.Context) -> None:
     """Open an interactive SSH session to the VM (fallback)."""
-    import os
-
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)

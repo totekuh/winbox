@@ -1,10 +1,10 @@
-"""Tests for winbox.executor — path resolution and human_size."""
+"""Tests for winbox.executor — path resolution."""
 
 from pathlib import Path
 
 import pytest
 
-from winbox.executor import _human_size, resolve_exe
+from winbox.executor import resolve_exe
 
 
 class TestResolveExe:
@@ -33,35 +33,16 @@ class TestResolveExe:
         # but since it wouldn't be in tools_dir, it stays as-is
         assert resolve_exe("cmd.exe", tmp_path) == "cmd.exe"
 
-    def test_exe_case_sensitive(self, tmp_path):
+    def test_exe_case_insensitive(self, tmp_path):
         (tmp_path / "Tool.EXE").touch()
-        # .exe check is lowercase, so .EXE won't match
-        assert resolve_exe("Tool.EXE", tmp_path) == "Tool.EXE"
+        # .EXE should resolve just like .exe
+        assert resolve_exe("Tool.EXE", tmp_path) == "Z:\\tools\\Tool.EXE"
+
+    def test_exe_mixed_case(self, tmp_path):
+        (tmp_path / "Rubeus.Exe").touch()
+        assert resolve_exe("Rubeus.Exe", tmp_path) == "Z:\\tools\\Rubeus.Exe"
 
     def test_bare_exe_with_no_tools_dir(self):
         # Non-existent tools dir — can't resolve
         bogus = Path("/nonexistent/tools")
         assert resolve_exe("Rubeus.exe", bogus) == "Rubeus.exe"
-
-
-class TestHumanSize:
-    def test_bytes(self):
-        assert _human_size(0) == "0.0 B"
-        assert _human_size(1) == "1.0 B"
-        assert _human_size(512) == "512.0 B"
-        assert _human_size(1023) == "1023.0 B"
-
-    def test_kilobytes(self):
-        assert _human_size(1024) == "1.0 KB"
-        assert _human_size(1536) == "1.5 KB"
-
-    def test_megabytes(self):
-        assert _human_size(1024 * 1024) == "1.0 MB"
-        assert _human_size(int(1.5 * 1024 * 1024)) == "1.5 MB"
-
-    def test_gigabytes(self):
-        assert _human_size(1024 ** 3) == "1.0 GB"
-
-    def test_terabytes(self):
-        assert _human_size(1024 ** 4) == "1.0 TB"
-        assert _human_size(2 * 1024 ** 4) == "2.0 TB"

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 
 from winbox.guest import ExecResult, GuestAgent
+from winbox.utils import human_size
 
 if TYPE_CHECKING:
     from winbox.config import Config
@@ -18,7 +19,7 @@ console = Console()
 
 def resolve_exe(exe: str, tools_dir: Path) -> str:
     """Resolve a bare .exe name to Z:\\tools\\ path if it exists locally."""
-    if exe.endswith(".exe") and "\\" not in exe and "/" not in exe:
+    if exe.lower().endswith(".exe") and "\\" not in exe and "/" not in exe:
         if (tools_dir / exe).exists():
             return f"Z:\\tools\\{exe}"
     return exe
@@ -49,6 +50,7 @@ def run_command(
 
     # Touch marker for detecting new output files
     marker = cfg.shared_dir / ".exec_marker"
+    marker.parent.mkdir(parents=True, exist_ok=True)
     marker.touch()
     marker_time = time.time()
 
@@ -81,13 +83,5 @@ def _show_new_files(loot_dir: Path, since: float) -> None:
         console.print()
         console.print("[green][+][/] Output files:")
         for f in new_files:
-            size = _human_size(f.stat().st_size)
+            size = human_size(f.stat().st_size)
             console.print(f"    {f} ({size})")
-
-
-def _human_size(nbytes: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if nbytes < 1024:
-            return f"{nbytes:.1f} {unit}"
-        nbytes /= 1024  # type: ignore[assignment]
-    return f"{nbytes:.1f} TB"

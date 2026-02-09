@@ -121,9 +121,5 @@ class VM:
     def disk_usage(self) -> str | None:
         if not self.cfg.disk_path.exists():
             return None
-        size = self.cfg.disk_path.stat().st_size
-        for unit in ("B", "KB", "MB", "GB"):
-            if size < 1024:
-                return f"{size:.1f} {unit}"
-            size /= 1024
-        return f"{size:.1f} TB"
+        from winbox.utils import human_size
+        return human_size(self.cfg.disk_path.stat().st_size)

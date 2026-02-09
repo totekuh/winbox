@@ -98,7 +98,10 @@ class Config:
             if attr is None:
                 continue
             if attr in int_fields:
-                setattr(cfg, attr, int(value))
+                try:
+                    setattr(cfg, attr, int(value))
+                except ValueError:
+                    continue
             elif attr in path_fields:
                 setattr(cfg, attr, Path(value))
             else:

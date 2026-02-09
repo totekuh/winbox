@@ -6,6 +6,7 @@ import importlib.resources
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -173,8 +174,6 @@ def wait_for_install(cfg: Config, timeout: int = 1200) -> bool:
     console.print()
 
     ga = GuestAgent(cfg)
-    import time
-
     elapsed = 0
     while not ga.ping():
         time.sleep(10)
