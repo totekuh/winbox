@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import importlib.resources
+import os
 import shutil
 import subprocess
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from winbox.guest import GuestAgent
 from winbox.vm import VM
 
 if TYPE_CHECKING:
@@ -26,11 +27,18 @@ def _data_file(name: str) -> Path:
     return importlib.resources.files("winbox.data").joinpath(name)  # type: ignore[return-value]
 
 
+def run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.CompletedProcess[str]:
+    """Run a shell command with text output."""
+    return subprocess.run(cmd, text=True, check=check, **kwargs)
+
+
 REQUIRED_TOOLS = [
     "qemu-system-x86_64",
     "virsh",
     "virt-install",
+    "virt-customize",
     "jq",
+    "impacket-smbserver",
 ]
 
 
@@ -45,12 +53,101 @@ def check_prereqs() -> list[str]:
     return missing
 
 
+def ensure_default_network() -> None:
+    """Ensure the libvirt 'default' network exists and is active."""
+    # Check if network is active
+    result = subprocess.run(
+        ["virsh", "-c", "qemu:///system", "net-info", "default"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode == 0 and "Active:         yes" in result.stdout:
+        return
+
+    # Try to start it (might be defined but inactive)
+    start = subprocess.run(
+        ["virsh", "-c", "qemu:///system", "net-start", "default"],
+        capture_output=True, text=True, check=False,
+    )
+    if start.returncode == 0:
+        subprocess.run(
+            ["virsh", "-c", "qemu:///system", "net-autostart", "default"],
+            capture_output=True, text=True, check=False,
+        )
+        console.print("[green][+][/] Started libvirt default network")
+        return
+
+    # Not defined — try to define from system default XML
+    default_xml = Path("/usr/share/libvirt/networks/default.xml")
+    if not default_xml.exists():
+        raise RuntimeError(
+            "Libvirt 'default' network not found and no default.xml to create it.\n"
+            "    Fix with: sudo virsh net-define /usr/share/libvirt/networks/default.xml "
+            "&& sudo virsh net-start default && sudo virsh net-autostart default"
+        )
+
+    define = subprocess.run(
+        ["virsh", "-c", "qemu:///system", "net-define", str(default_xml)],
+        capture_output=True, text=True, check=False,
+    )
+    if define.returncode != 0:
+        raise RuntimeError(
+            f"Failed to define default network: {define.stderr.strip()}\n"
+            "    Fix with: sudo virsh net-define /usr/share/libvirt/networks/default.xml "
+            "&& sudo virsh net-start default && sudo virsh net-autostart default"
+        )
+
+    subprocess.run(
+        ["virsh", "-c", "qemu:///system", "net-start", "default"],
+        capture_output=True, text=True, check=True,
+    )
+    subprocess.run(
+        ["virsh", "-c", "qemu:///system", "net-autostart", "default"],
+        capture_output=True, text=True, check=False,
+    )
+    console.print("[green][+][/] Created and started libvirt default network")
+
+
 def _find_mkisofs() -> str | None:
     """Find mkisofs or genisoimage."""
     for cmd in ("mkisofs", "genisoimage"):
         if shutil.which(cmd):
             return cmd
     return None
+
+
+def grant_libvirt_access(cfg: Config) -> None:
+    """Grant libvirt-qemu traverse/read access to winbox directories via ACL."""
+    if not shutil.which("setfacl"):
+        raise RuntimeError(
+            "setfacl not found. Install with: apt install acl\n"
+            "    Or manually: setfacl -m u:libvirt-qemu:x ~/.winbox"
+        )
+
+    # Grant traverse (x) on each parent dir up to and including ~/.winbox
+    # so libvirt-qemu can reach the files inside
+    dirs = []
+    path = cfg.winbox_dir
+    while path != Path.home().parent:
+        dirs.append(path)
+        path = path.parent
+    # Include home dir itself
+    dirs.append(Path.home())
+
+    for d in dirs:
+        subprocess.run(
+            ["setfacl", "-m", "u:libvirt-qemu:x", str(d)],
+            capture_output=True, check=False,
+        )
+
+    # Grant read+traverse on subdirs that contain VM files
+    for d in [cfg.winbox_dir, cfg.iso_dir, cfg.shared_dir, cfg.tools_dir, cfg.loot_dir]:
+        if d.exists():
+            subprocess.run(
+                ["setfacl", "-m", "u:libvirt-qemu:rx", str(d)],
+                capture_output=True, check=False,
+            )
+
+    console.print("[green][+][/] Granted libvirt-qemu access to ~/.winbox")
 
 
 def create_directories(cfg: Config) -> None:
@@ -86,16 +183,16 @@ def generate_ssh_keypair(cfg: Config) -> None:
     )
     console.print("[green][+][/] SSH keypair created")
 
-    # Copy pubkey to shared tools for provisioning
-    shutil.copy2(cfg.ssh_pubkey, cfg.tools_dir / ".ssh_pubkey")
-
 
 def copy_setup_files(cfg: Config) -> None:
-    """Copy provisioning files to shared tools directory."""
+    """Copy provisioning files to shared tools directory (for re-provisioning)."""
     for name in ("provision.ps1", "tools.txt"):
         src = _data_file(name)
         dst = cfg.tools_dir / name
         dst.write_bytes(Path(src).read_bytes())
+    # Copy SSH pubkey so provision.ps1 can find it at Z:\tools\.ssh_pubkey
+    if cfg.ssh_pubkey.exists():
+        shutil.copy2(cfg.ssh_pubkey, cfg.tools_dir / ".ssh_pubkey")
 
 
 def build_unattend_image(cfg: Config) -> None:
@@ -106,6 +203,13 @@ def build_unattend_image(cfg: Config) -> None:
             "Neither mkisofs nor genisoimage found. "
             "Install with: apt install genisoimage"
         )
+
+    # Remove stale image (may be owned by libvirt-qemu from previous run)
+    if cfg.unattend_img.exists():
+        try:
+            cfg.unattend_img.unlink()
+        except PermissionError:
+            subprocess.run(["rm", "-f", str(cfg.unattend_img)], check=False)
 
     console.print("[blue][*][/] Building unattend image...")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -133,29 +237,26 @@ def create_disk(cfg: Config) -> None:
 
 
 def run_virt_install(cfg: Config, windows_iso: str) -> None:
-    """Run virt-install to create and boot the VM."""
+    """Run virt-install to create and boot the VM for Phase 1 (ISO install)."""
+    ensure_default_network()
     console.print("[blue][*][/] Installing Windows VM (this takes ~10-15 minutes)...")
     console.print(f"    Monitor with: virsh console {cfg.vm_name}")
     console.print()
 
     cmd = [
         "virt-install",
+        "--connect", "qemu:///system",
         "--name", cfg.vm_name,
         "--ram", str(cfg.vm_ram),
         "--vcpus", str(cfg.vm_cpus),
-        "--disk", f"path={cfg.disk_path},bus=virtio",
+        "--disk", f"path={cfg.disk_path},bus=sata",
         "--cdrom", windows_iso,
-        "--disk", f"{cfg.virtio_iso},device=cdrom",
         "--disk", f"{cfg.unattend_img},device=cdrom",
-        "--network", f"bridge={cfg.vm_bridge},model=virtio",
+        "--disk", f"{cfg.virtio_iso},device=cdrom",
+        "--network", "network=default,model=e1000",
         "--channel", "unix,target.type=virtio,target.name=org.qemu.guest_agent.0",
-        "--memorybacking", "source.type=memfd,access.mode=shared",
-        "--filesystem", (
-            f"type=mount,driver.type=virtiofs,"
-            f"source.dir={cfg.shared_dir},target.dir=winbox_share"
-        ),
         "--os-variant", "win2k22",
-        "--graphics", "none",
+        "--graphics", "vnc,listen=127.0.0.1",
         "--noautoconsole",
         "--boot", "uefi",
     ]
@@ -163,48 +264,75 @@ def run_virt_install(cfg: Config, windows_iso: str) -> None:
     subprocess.run(cmd, check=True)
     console.print("[green][+][/] VM installation started")
 
+    # UEFI shows "Press any key to boot from CD or DVD..." — send keypresses
+    console.print("[blue][*][/] Sending boot keystroke...")
+    for _ in range(5):
+        time.sleep(3)
+        result = subprocess.run(
+            ["virsh", "-c", "qemu:///system", "send-key", cfg.vm_name, "KEY_ENTER"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            break
 
-def wait_for_install(cfg: Config, timeout: int = 1200) -> bool:
-    """Wait for Windows installation to complete (guest agent becomes available).
 
-    Returns True if the guest agent responded within timeout.
+def provision_vm_disk(cfg: Config) -> None:
+    """Phase 2: Inject provision files into disk image via virt-customize."""
+    console.print("[blue][*][/] Preparing provision payload...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+
+        # Build provision.zip containing provision.ps1, tools.txt, .ssh_pubkey
+        zip_path = tmpdir_path / "provision.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name in ("provision.ps1", "tools.txt"):
+                src = _data_file(name)
+                zf.write(src, name)
+            if cfg.ssh_pubkey.exists():
+                zf.write(cfg.ssh_pubkey, ".ssh_pubkey")
+
+        # Copy bootstrap.ps1 to temp dir
+        bootstrap_src = _data_file("bootstrap.ps1")
+        bootstrap_tmp = tmpdir_path / "bootstrap.ps1"
+        bootstrap_tmp.write_bytes(Path(bootstrap_src).read_bytes())
+
+        console.print("[blue][*][/] Injecting provision files into disk image...")
+        env = {**os.environ, "LIBGUESTFS_BACKEND": "direct"}
+        run([
+            "virt-customize",
+            "-a", str(cfg.disk_path),
+            "--upload", f"{zip_path}:/provision.zip",
+            "--upload", f"{bootstrap_tmp}:/bootstrap.ps1",
+            "--firstboot-command",
+            'cmd.exe /c "powershell.exe -ExecutionPolicy Bypass -NoProfile -File C:\\bootstrap.ps1"',
+        ], env=env)
+
+    console.print("[green][+][/] Provision files injected")
+
+
+def boot_for_firstboot(cfg: Config) -> None:
+    """Phase 3: Start VM for firstboot provisioning.
+
+    Starts SMB server (so guest can map Z:), boots VM, waits for shutdown.
     """
-    console.print("[blue][*][/] Waiting for Windows installation to complete...")
-    console.print("    This will take 10-15 minutes.")
-    console.print()
+    from winbox import smb
 
-    ga = GuestAgent(cfg)
-    elapsed = 0
-    while not ga.ping():
-        time.sleep(10)
-        elapsed += 10
-        if elapsed >= timeout:
-            return False
-        print(f"\r    {elapsed}/{timeout}s elapsed...", end="", flush=True)
+    smb.start(cfg)
 
-    print()
-    console.print("[green][+][/] Windows installed — guest agent responding")
-    return True
+    console.print("[blue][*][/] Booting VM for firstboot provisioning...")
+    vm = VM(cfg)
+    vm.start()
 
+    console.print("[blue][*][/] Waiting for provisioning to complete (VM will shut down)...")
+    console.print("    This may take 5-10 minutes.")
+    if not vm.wait_shutdown(timeout=600):
+        console.print("[yellow][!][/] Provisioning timed out (VM did not shut down in 600s)")
+        console.print(f"    Check with: virsh console {cfg.vm_name}")
+        raise RuntimeError("Firstboot provisioning timed out")
 
-def provision(cfg: Config) -> int:
-    """Run the provisioning script inside the VM. Returns exit code."""
-    ga = GuestAgent(cfg)
-
-    console.print("[blue][*][/] Running provisioning script...")
-    result = ga.exec_powershell_file("Z:\\tools\\provision.ps1", timeout=600)
-
-    if result.stdout:
-        console.print(result.stdout, end="", highlight=False)
-    if result.stderr:
-        console.print(result.stderr, end="", style="red", highlight=False)
-
-    if result.exitcode == 0:
-        console.print("[green][+][/] Provisioning complete")
-    else:
-        console.print(f"[yellow][!][/] Provisioning exited with code {result.exitcode}")
-
-    return result.exitcode
+    smb.stop(cfg)
+    console.print("[green][+][/] Firstboot provisioning complete")
 
 
 def create_clean_snapshot(cfg: Config) -> None:

@@ -1,9 +1,18 @@
 # winbox post-install provisioning script
-# Runs inside Windows VM after first boot via guest-agent
+# Runs inside Windows VM via:
+#   - bootstrap.ps1 (firstboot) — files in C:\Provision\
+#   - winbox provision (re-run) — files in Z:\tools\
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "[*] winbox provisioning started"
+
+# Determine where our files are (firstboot vs re-provision)
+if (Test-Path "C:\Provision\provision.ps1") {
+    $provDir = "C:\Provision"
+} else {
+    $provDir = "Z:\tools"
+}
 
 # --- Disable Defender (tools get flagged) ---
 Write-Host "[*] Disabling Windows Defender..."
@@ -37,19 +46,28 @@ Write-Host "[+] OpenSSH Server running"
 
 # --- SSH key auth ---
 Write-Host "[*] Configuring SSH key auth..."
-if (Test-Path "Z:\tools\.ssh_pubkey") {
-    $pubkey = Get-Content "Z:\tools\.ssh_pubkey" -Raw
+$pubkeyPath = "$provDir\.ssh_pubkey"
+if (Test-Path $pubkeyPath) {
+    $pubkey = Get-Content $pubkeyPath -Raw
     $authKeys = "C:\ProgramData\ssh\administrators_authorized_keys"
     Set-Content -Path $authKeys -Value $pubkey.Trim()
     icacls $authKeys /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" | Out-Null
     Write-Host "[+] SSH key configured"
 } else {
-    Write-Host "[!] No SSH pubkey found at Z:\tools\.ssh_pubkey — skipping key auth"
+    Write-Host "[!] No SSH pubkey found at $pubkeyPath - skipping key auth"
 }
+
+# --- Map SMB share (host on virbr0) ---
+Write-Host "[*] Mapping SMB share..."
+net use Z: \\192.168.122.1\winbox /persistent:yes 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[*] Z: already mapped or mapping failed, continuing..."
+}
+Write-Host "[+] Z: drive mapped"
 
 # --- Download tools ---
 Write-Host "[*] Downloading tools..."
-$toolsFile = "Z:\tools\tools.txt"
+$toolsFile = "$provDir\tools.txt"
 if (Test-Path $toolsFile) {
     $urls = Get-Content $toolsFile | Where-Object { $_ -match "^https?://" }
     foreach ($url in $urls) {
@@ -72,7 +90,7 @@ if (Test-Path $toolsFile) {
         }
     }
 } else {
-    Write-Host "[!] No tools.txt found — skipping tool downloads"
+    Write-Host "[!] No tools.txt found - skipping tool downloads"
 }
 
 # --- Create loot directory ---

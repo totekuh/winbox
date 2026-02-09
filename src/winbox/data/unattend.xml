@@ -21,12 +21,7 @@
                language="neutral" versionScope="nonSxS"
                xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
 
-      <!-- Use evaluation key for Server Standard Core -->
       <UserData>
-        <ProductKey>
-          <Key>VDYBN-27WPP-V4HQT-9VMD4-VMK7H</Key>
-          <WillShowUI>Never</WillShowUI>
-        </ProductKey>
         <AcceptEula>true</AcceptEula>
       </UserData>
 
@@ -80,20 +75,10 @@
         </Disk>
       </DiskConfiguration>
 
-      <!-- Load VirtIO storage driver from CD -->
-      <DriverPaths>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="1">
-          <Path>E:\viostor\w11\amd64</Path>
-        </PathAndCredentials>
-        <PathAndCredentials wcm:action="add" wcm:keyValue="2">
-          <Path>E:\NetKVM\w11\amd64</Path>
-        </PathAndCredentials>
-      </DriverPaths>
-
     </component>
   </settings>
 
-  <!-- Specialize: computer name, drivers -->
+  <!-- Specialize: computer name -->
   <settings pass="specialize">
     <component name="Microsoft-Windows-Shell-Setup"
                processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
@@ -122,16 +107,16 @@
 
       <UserAccounts>
         <AdministratorPassword>
-          <Value>V2luYm94UEBzczEyMw==</Value>
-          <PlainText>false</PlainText>
+          <Value>WinboxP@ss123</Value>
+          <PlainText>true</PlainText>
         </AdministratorPassword>
         <LocalAccounts>
           <LocalAccount wcm:action="add">
             <Name>winbox</Name>
             <Group>Administrators</Group>
             <Password>
-              <Value>V2luYm94UEBzczEyMw==</Value>
-              <PlainText>false</PlainText>
+              <Value>WinboxP@ss123</Value>
+              <PlainText>true</PlainText>
             </Password>
           </LocalAccount>
         </LocalAccounts>
@@ -141,65 +126,25 @@
         <Enabled>true</Enabled>
         <Username>winbox</Username>
         <Password>
-          <Value>V2luYm94UEBzczEyMw==</Value>
-          <PlainText>false</PlainText>
+          <Value>WinboxP@ss123</Value>
+          <PlainText>true</PlainText>
         </Password>
         <LogonCount>3</LogonCount>
       </AutoLogon>
 
       <FirstLogonCommands>
-        <!-- Install QEMU Guest Agent from VirtIO CD -->
+        <!-- Install QEMU Guest Agent from VirtIO CD (try D: E: F:) -->
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>msiexec /i E:\guest-agent\qemu-ga-x86_64.msi /qn</CommandLine>
+          <CommandLine>cmd /c for %d in (D E F) do if exist %d:\guest-agent\qemu-ga-x86_64.msi msiexec /i %d:\guest-agent\qemu-ga-x86_64.msi /qn</CommandLine>
           <Description>Install QEMU Guest Agent</Description>
         </SynchronousCommand>
 
-        <!-- Install VirtIO FS driver -->
+        <!-- Shut down after install so we can provision offline -->
         <SynchronousCommand wcm:action="add">
           <Order>2</Order>
-          <CommandLine>cmd /c pnputil /add-driver E:\viofs\w11\amd64\viofs.inf /install</CommandLine>
-          <Description>Install VirtIO FS driver</Description>
-        </SynchronousCommand>
-
-        <!-- Start VirtIO FS service to mount shared folder as Z: -->
-        <SynchronousCommand wcm:action="add">
-          <Order>3</Order>
-          <CommandLine>cmd /c sc create VirtioFsSvc binPath="C:\Program Files\Virtio-Win\VioFS\virtiofs.exe" start=auto depend=VirtioFsDrv</CommandLine>
-          <Description>Create VirtioFS service</Description>
-        </SynchronousCommand>
-        <SynchronousCommand wcm:action="add">
-          <Order>4</Order>
-          <CommandLine>cmd /c net start VirtioFsSvc</CommandLine>
-          <Description>Start VirtioFS service</Description>
-        </SynchronousCommand>
-
-        <!-- Map virtiofs share to Z: drive -->
-        <SynchronousCommand wcm:action="add">
-          <Order>5</Order>
-          <CommandLine>cmd /c "net use Z: \\?\UNC\winbox_share\ /persistent:yes || subst Z: C:\winbox_share"</CommandLine>
-          <Description>Map shared folder to Z:</Description>
-        </SynchronousCommand>
-
-        <!-- Disable Windows Defender -->
-        <SynchronousCommand wcm:action="add">
-          <Order>6</Order>
-          <CommandLine>powershell -Command "Set-MpPreference -DisableRealtimeMonitoring $true; Set-MpPreference -DisableIOAVProtection $true"</CommandLine>
-          <Description>Disable Windows Defender</Description>
-        </SynchronousCommand>
-
-        <!-- Disable Firewall -->
-        <SynchronousCommand wcm:action="add">
-          <Order>7</Order>
-          <CommandLine>powershell -Command "Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False"</CommandLine>
-          <Description>Disable Firewall</Description>
-        </SynchronousCommand>
-
-        <!-- Install .NET Framework 4.7.2 (usually already present on Server 2022) -->
-        <SynchronousCommand wcm:action="add">
-          <Order>8</Order>
-          <CommandLine>powershell -Command "Install-WindowsFeature Net-Framework-45-Core -ErrorAction SilentlyContinue"</CommandLine>
-          <Description>Ensure .NET Framework</Description>
+          <CommandLine>shutdown /s /t 30</CommandLine>
+          <Description>Shutdown after install</Description>
         </SynchronousCommand>
       </FirstLogonCommands>
 

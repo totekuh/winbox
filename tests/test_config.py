@@ -14,7 +14,7 @@ class TestConfigDefaults:
         assert cfg.vm_ram == 4096
         assert cfg.vm_cpus == 4
         assert cfg.vm_disk == 30
-        assert cfg.vm_bridge == "virbr0"
+        assert cfg.smb_host_ip == "192.168.122.1"
 
     def test_winbox_dir_default(self):
         cfg = Config()
@@ -76,10 +76,9 @@ class TestConfigProperties:
 class TestConfigOverrides:
     def test_override_string_fields(self, tmp_path):
         config_file = tmp_path / "config"
-        config_file.write_text("VM_NAME=myvm\nVM_BRIDGE=br0\n")
+        config_file.write_text("VM_NAME=myvm\n")
         cfg = Config._apply_overrides(Config(), config_file)
         assert cfg.vm_name == "myvm"
-        assert cfg.vm_bridge == "br0"
 
     def test_override_int_fields(self, tmp_path):
         config_file = tmp_path / "config"
@@ -94,6 +93,12 @@ class TestConfigOverrides:
         config_file.write_text("WINBOX_DIR=/opt/winbox\n")
         cfg = Config._apply_overrides(Config(), config_file)
         assert cfg.winbox_dir == Path("/opt/winbox")
+
+    def test_override_smb_host_ip(self, tmp_path):
+        config_file = tmp_path / "config"
+        config_file.write_text("SMB_HOST_IP=10.0.0.1\n")
+        cfg = Config._apply_overrides(Config(), config_file)
+        assert cfg.smb_host_ip == "10.0.0.1"
 
     def test_override_url_field(self, tmp_path):
         config_file = tmp_path / "config"
@@ -178,7 +183,7 @@ class TestConfigOverrides:
             setattr(self, "vm_ram", 4096),
             setattr(self, "vm_cpus", 4),
             setattr(self, "vm_disk", 30),
-            setattr(self, "vm_bridge", "virbr0"),
+            setattr(self, "smb_host_ip", "192.168.122.1"),
             setattr(self, "winbox_dir", tmp_path / ".winbox"),
             setattr(self, "virtio_iso_url", "https://example.com"),
         )[-1])

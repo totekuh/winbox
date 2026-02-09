@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -22,7 +23,7 @@ class VMState(Enum):
 def _virsh(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     """Run a virsh command and return the result."""
     return subprocess.run(
-        ["virsh", *args],
+        ["virsh", "-c", "qemu:///system", *args],
         capture_output=True,
         text=True,
         check=check,
@@ -72,22 +73,22 @@ class VM:
         _virsh("managedsave", self.name)
 
     def destroy(self) -> None:
-        """Completely remove the VM, storage, snapshots, NVRAM."""
+        """Completely remove the VM, snapshots, NVRAM, and disk (but not ISOs)."""
         # Stop if running
         if self.state() in (VMState.RUNNING, VMState.PAUSED):
             self.force_stop()
 
-        # Try progressively less aggressive undefine
+        # Undefine without --remove-all-storage (that deletes attached ISOs too)
         for flags in [
-            ["--remove-all-storage", "--managed-save", "--snapshots-metadata", "--nvram"],
-            ["--remove-all-storage", "--managed-save", "--snapshots-metadata"],
-            ["--remove-all-storage"],
+            ["--managed-save", "--snapshots-metadata", "--nvram"],
+            ["--managed-save", "--snapshots-metadata"],
+            [],
         ]:
             result = _virsh("undefine", self.name, *flags, check=False)
             if result.returncode == 0:
                 break
 
-        # Clean up leftover disk
+        # Clean up disk only
         if self.cfg.disk_path.exists():
             self.cfg.disk_path.unlink()
 
@@ -117,6 +118,16 @@ class VM:
         if result.returncode != 0:
             return []
         return [s.strip() for s in result.stdout.splitlines() if s.strip()]
+
+    def wait_shutdown(self, timeout: int = 600, poll: int = 5) -> bool:
+        """Wait for the VM to reach SHUTOFF state. Returns True if shut down within timeout."""
+        elapsed = 0
+        while self.state() != VMState.SHUTOFF:
+            time.sleep(poll)
+            elapsed += poll
+            if elapsed >= timeout:
+                return False
+        return True
 
     def disk_usage(self) -> str | None:
         if not self.cfg.disk_path.exists():

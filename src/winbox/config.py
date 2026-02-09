@@ -15,7 +15,7 @@ class Config:
     vm_ram: int = 4096
     vm_cpus: int = 4
     vm_disk: int = 30
-    vm_bridge: str = "virbr0"
+    smb_host_ip: str = "192.168.122.1"
     winbox_dir: Path = field(default_factory=lambda: Path.home() / ".winbox")
     virtio_iso_url: str = (
         "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/"
@@ -75,7 +75,7 @@ class Config:
             "VM_RAM": "vm_ram",
             "VM_CPUS": "vm_cpus",
             "VM_DISK": "vm_disk",
-            "VM_BRIDGE": "vm_bridge",
+            "SMB_HOST_IP": "smb_host_ip",
             "WINBOX_DIR": "winbox_dir",
             "VIRTIO_ISO_URL": "virtio_iso_url",
         }

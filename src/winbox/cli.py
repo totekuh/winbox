@@ -10,10 +10,11 @@ import click
 from rich.console import Console
 
 from winbox import installer
+from winbox import smb
 from winbox import tools as tools_mod
 from winbox.config import Config
 from winbox.executor import run_command
-from winbox.guest import GuestAgent, GuestAgentError
+from winbox.guest import GuestAgent
 from winbox.iso import ISO_FILENAME, download_iso
 from winbox.utils import human_size
 from winbox.vm import VM, VMState
@@ -21,13 +22,16 @@ from winbox.vm import VM, VMState
 console = Console()
 
 
-def ensure_running(vm: VM, ga: GuestAgent) -> None:
-    """Make sure the VM is running and the guest agent is responding."""
+def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
+    """Make sure the VM and SMB server are running, guest agent responding."""
     state = vm.state()
 
     if state == VMState.NOT_FOUND:
         console.print("[red][-][/] VM not found. Run [bold]winbox setup[/] first.")
         raise SystemExit(1)
+
+    # Ensure SMB server is up
+    smb.start(cfg)
 
     if state == VMState.RUNNING:
         if not ga.ping():
@@ -89,7 +93,8 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
         console.print(f"[red][-][/] Missing: {', '.join(missing)}")
         console.print(
             "    Install with: [bold]apt install "
-            "qemu-system-x86 libvirt-daemon-system virtinst jq genisoimage[/]"
+            "qemu-system-x86 libvirt-daemon-system virtinst guestfs-tools jq "
+            "genisoimage python3-impacket impacket-scripts[/]"
         )
         raise SystemExit(1)
 
@@ -125,24 +130,32 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
         console.print(f"[red][-][/] ISO not found: {windows_iso}")
         raise SystemExit(1)
 
-    # Run setup steps
+    # Phase 1: ISO install
     installer.create_directories(cfg)
+    installer.grant_libvirt_access(cfg)
     installer.download_virtio_iso(cfg)
     installer.generate_ssh_keypair(cfg)
-    installer.copy_setup_files(cfg)
     installer.build_unattend_image(cfg)
     installer.create_disk(cfg)
     installer.run_virt_install(cfg, windows_iso)
 
-    # Wait for install
-    if not installer.wait_for_install(cfg):
-        console.print("[yellow][!][/] Installation timed out.")
+    console.print("[blue][*][/] Waiting for Windows installation to complete...")
+    console.print("    The VM will shut down automatically when done.")
+    if not vm.wait_shutdown(timeout=1200):
+        console.print("[yellow][!][/] Installation timed out (VM did not shut down).")
         console.print(f"    Check with: virsh console {cfg.vm_name}")
-        console.print("    Re-run provisioning later with: [bold]winbox provision[/]")
         raise SystemExit(1)
+    console.print("[green][+][/] Phase 1 complete — Windows installed")
 
-    # Provision
-    installer.provision(cfg)
+    # Phase 2: Offline provisioning via virt-customize
+    installer.provision_vm_disk(cfg)
+    console.print("[green][+][/] Phase 2 complete — provision files injected")
+
+    # Phase 3: Firstboot provisioning
+    installer.boot_for_firstboot(cfg)
+    console.print("[green][+][/] Phase 3 complete — VM provisioned")
+
+    # Phase 4: Snapshot
     installer.create_clean_snapshot(cfg)
 
     console.print("\n[green][+][/] [bold]winbox setup complete![/]\n")
@@ -163,7 +176,7 @@ def up(ctx: click.Context) -> None:
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
-    ensure_running(vm, ga)
+    ensure_running(vm, ga, cfg)
 
     ip = vm.ip()
     if ip:
@@ -204,6 +217,7 @@ def down(ctx: click.Context) -> None:
     else:
         vm.shutdown()
 
+    smb.stop(cfg)
     console.print("[green][+][/] VM stopped")
 
 
@@ -223,6 +237,7 @@ def suspend(ctx: click.Context) -> None:
 
     console.print("[blue][*][/] Saving VM state...")
     vm.suspend()
+    smb.stop(cfg)
     console.print("[green][+][/] VM state saved — resume with [bold]winbox up[/]")
 
 
@@ -246,6 +261,7 @@ def destroy(ctx: click.Context, yes: bool) -> None:
         return
 
     console.print("[blue][*][/] Destroying VM and all storage...")
+    smb.stop(cfg)
     vm.destroy()
     console.print("[green][+][/] VM destroyed")
 
@@ -309,13 +325,13 @@ def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int) -> None
     """Execute a command in the Windows VM.
 
     Bare .exe names are resolved from Z:\\tools\\. Output files land in
-    ~/.winbox/shared/loot/ instantly via virtiofs.
+    ~/.winbox/shared/loot/ via SMB share.
     """
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
-    ensure_running(vm, ga)
+    ensure_running(vm, ga, cfg)
 
     exe = command[0]
     args = command[1:]
@@ -442,13 +458,25 @@ def provision(ctx: click.Context) -> None:
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
-    ensure_running(vm, ga)
+    ensure_running(vm, ga, cfg)
 
-    # Make sure latest provision script is copied
+    # Copy latest provision files to shared dir for guest access
     installer.copy_setup_files(cfg)
 
-    exitcode = installer.provision(cfg)
-    raise SystemExit(exitcode)
+    console.print("[blue][*][/] Running provisioning script...")
+    result = ga.exec_powershell_file("Z:\\tools\\provision.ps1", timeout=600)
+
+    if result.stdout:
+        console.print(result.stdout, end="", highlight=False)
+    if result.stderr:
+        console.print(result.stderr, end="", style="red", highlight=False)
+
+    if result.exitcode == 0:
+        console.print("[green][+][/] Provisioning complete")
+    else:
+        console.print(f"[yellow][!][/] Provisioning exited with code {result.exitcode}")
+
+    raise SystemExit(result.exitcode)
 
 
 # ─── ssh ─────────────────────────────────────────────────────────────────────
@@ -462,7 +490,7 @@ def ssh(ctx: click.Context) -> None:
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
-    ensure_running(vm, ga)
+    ensure_running(vm, ga, cfg)
 
     ip = vm.ip()
     if not ip:

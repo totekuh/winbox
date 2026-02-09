@@ -37,7 +37,8 @@ class GuestAgent:
         """Send a raw command to the guest agent and return parsed JSON."""
         result = subprocess.run(
             [
-                "virsh", "qemu-agent-command", self.vm_name,
+                "virsh", "-c", "qemu:///system",
+                "qemu-agent-command", self.vm_name,
                 json.dumps(payload),
                 "--timeout", str(timeout),
             ],
