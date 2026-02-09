@@ -1,0 +1,5 @@
+# Tool download URLs (one per line)
+# Format: URL
+# Archives (.zip) are auto-extracted to Z:\tools\
+
+https://github.com/SpecterOps/SharpHound/releases/download/v2.9.0/SharpHound-v2.9.0.zip
