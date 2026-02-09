@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -98,13 +99,25 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
         )
         raise SystemExit(1)
 
-    # Handle existing VM
+    # Clean up previous resources
+    smb.stop(cfg)
+
     if vm.exists():
         console.print(f"[yellow][!][/] VM '{cfg.vm_name}' already exists.")
         if not yes and not click.confirm("Destroy and recreate?", default=False):
             console.print("Aborted.")
             return
         vm.destroy()
+        console.print("[green][+][/] Previous VM destroyed")
+
+    # Remove orphaned files from failed/partial previous setup
+    for stale in [cfg.disk_path, cfg.unattend_img]:
+        if stale.exists():
+            console.print(f"[yellow][!][/] Removing stale {stale.name}")
+            try:
+                stale.unlink()
+            except PermissionError:
+                subprocess.run(["rm", "-f", str(stale)], check=False)
 
     # Windows ISO
     if windows_iso is None:
