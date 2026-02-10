@@ -4,4 +4,3 @@
 
 https://github.com/SpecterOps/SharpHound/releases/download/v2.9.0/SharpHound-v2.9.0.zip
 https://live.sysinternals.com/PsExec64.exe
-https://raw.githubusercontent.com/antonioCoco/ConPtyShell/master/Invoke-ConPtyShell.ps1

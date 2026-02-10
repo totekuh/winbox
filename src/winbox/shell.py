@@ -5,11 +5,12 @@ from __future__ import annotations
 import base64
 import os
 import select
+import shutil
 import socket
 import sys
 import termios
 import tty
-import urllib.request
+from importlib import resources
 from typing import TYPE_CHECKING
 
 from rich.console import Console
@@ -22,21 +23,28 @@ if TYPE_CHECKING:
 console = Console()
 
 CONPTY_SCRIPT = "Invoke-ConPtyShell.ps1"
-CONPTY_URL = (
-    "https://raw.githubusercontent.com/antonioCoco/ConPtyShell/master/"
-    "Invoke-ConPtyShell.ps1"
-)
+CONPTY_VM_PATH = f"C:\\{CONPTY_SCRIPT}"
 DEFAULT_PORT = 4444
 
 
-def _ensure_conpty_script(cfg: Config) -> None:
-    """Download Invoke-ConPtyShell.ps1 to tools dir if not present."""
-    script_path = cfg.tools_dir / CONPTY_SCRIPT
-    if script_path.exists():
+def _ensure_conpty_on_vm(cfg: Config, ga: GuestAgent) -> None:
+    """Push Invoke-ConPtyShell.ps1 from package data to C:\\ on the VM."""
+    # Check if already on the VM
+    result = ga.exec(f'if exist "{CONPTY_VM_PATH}" echo YES', timeout=10)
+    if "YES" in result.stdout:
         return
-    console.print(f"[blue][*][/] Downloading {CONPTY_SCRIPT}...")
-    urllib.request.urlretrieve(CONPTY_URL, script_path)
-    console.print("[green][+][/] Saved to tools dir")
+
+    console.print(f"[blue][*][/] Pushing {CONPTY_SCRIPT} to VM...")
+
+    # Copy from package data to share (temp), then into the VM
+    src = resources.files("winbox.data").joinpath(CONPTY_SCRIPT)
+    tmp = cfg.shared_dir / CONPTY_SCRIPT
+    with resources.as_file(src) as src_path:
+        shutil.copy2(src_path, tmp)
+
+    ga.exec(f'copy "Z:\\{CONPTY_SCRIPT}" "{CONPTY_VM_PATH}"', timeout=10)
+    tmp.unlink(missing_ok=True)
+    console.print(f"[green][+][/] {CONPTY_SCRIPT} installed on VM")
 
 
 def open_shell(
@@ -46,7 +54,7 @@ def open_shell(
     port: int = DEFAULT_PORT,
 ) -> None:
     """Open an interactive SYSTEM shell via ConPTY reverse connection."""
-    _ensure_conpty_script(cfg)
+    _ensure_conpty_on_vm(cfg, ga)
 
     # Get terminal size
     try:
@@ -68,7 +76,7 @@ def open_shell(
 
     # Build PowerShell command — use EncodedCommand to avoid quoting hell
     ps_cmd = (
-        f"IEX(Get-Content Z:\\tools\\{CONPTY_SCRIPT} -Raw); "
+        f"IEX(Get-Content '{CONPTY_VM_PATH}' -Raw); "
         f"Invoke-ConPtyShell -RemoteIp {cfg.smb_host_ip} -RemotePort {port} "
         f"-Rows {rows} -Cols {cols}"
     )
