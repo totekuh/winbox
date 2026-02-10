@@ -40,9 +40,9 @@ def run_command(
     # Resolve tool path
     resolved = resolve_exe(exe, cfg.tools_dir)
 
-    # Build the full command: cd to loot dir, then run
+    # Build the full command: cd to tools dir, then run
     args_str = " ".join(args)
-    full_cmd = f"cd /d Z:\\loot && {resolved}"
+    full_cmd = f"cd /d Z:\\tools && {resolved}"
     if args_str:
         full_cmd += f" {args_str}"
 
