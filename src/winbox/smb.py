@@ -41,6 +41,7 @@ def start(cfg: Config) -> None:
         [
             "impacket-smbserver",
             "-smb2support",
+            "-ip", cfg.smb_host_ip,
             "-port", str(SMB_PORT),
             "winbox",
             str(cfg.shared_dir),
