@@ -10,7 +10,7 @@ import click
 
 from winbox.cli import console, ensure_running, _ensure_smb_mapped
 from winbox.config import Config
-from winbox.guest import GuestAgent
+from winbox.vm import GuestAgent
 from winbox.vm import VM, VMState
 
 
@@ -21,6 +21,49 @@ from winbox.vm import VM, VMState
 def dns() -> None:
     """Manage VM DNS settings."""
     pass
+
+
+@dns.command("set")
+@click.argument("ip")
+@click.pass_context
+def dns_set(ctx: click.Context, ip: str) -> None:
+    """Set a DNS nameserver on the VM and reboot.
+
+    Example: winbox dns set 192.168.56.11
+    """
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    ensure_running(vm, ga, cfg)
+
+    console.print(f"[blue][*][/] Setting DNS to {ip}...")
+    dns_script = (
+        "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
+        "| Select-Object -First 1\n"
+        f"Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex "
+        f"-ServerAddresses {ip}\n"
+        "Clear-DnsClientCache"
+    )
+    result = ga.exec_powershell(dns_script, timeout=30)
+    if result.exitcode != 0:
+        console.print(f"[red][-][/] Failed: {result.stderr.strip()}")
+        raise SystemExit(1)
+
+    console.print(f"[green][+][/] DNS set to {ip}")
+
+    # Reboot for clean slate
+    console.print("[blue][*][/] Rebooting...")
+    try:
+        ga.exec("shutdown /r /t 0", timeout=10)
+    except Exception:
+        pass  # Expected — VM reboots before we get a response
+
+    time.sleep(10)
+    console.print("[blue][*][/] Waiting for VM to come back...")
+    ga.wait(timeout=120)
+    _ensure_smb_mapped(ga, cfg)
+    console.print(f"[green][+][/] VM ready — DNS pointing at {ip}")
 
 
 @dns.command("sync")
