@@ -573,15 +573,20 @@ def ssh(ctx: click.Context) -> None:
 # ─── dns ────────────────────────────────────────────────────────────────────
 
 
-@cli.command("dns")
+@cli.group()
+def dns() -> None:
+    """Manage VM DNS settings."""
+    pass
+
+
+@dns.command("sync")
 @click.pass_context
 def dns_sync(ctx: click.Context) -> None:
-    """Sync VM DNS settings from Kali's /etc/resolv.conf."""
+    """Push Kali's /etc/resolv.conf nameservers to the VM."""
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
-    # Parse nameservers from resolv.conf
     resolv = Path("/etc/resolv.conf")
     if not resolv.exists():
         console.print("[red][-][/] /etc/resolv.conf not found")
@@ -617,6 +622,43 @@ def dns_sync(ctx: click.Context) -> None:
     for ns in nameservers:
         console.print(f"[green][+][/] {ns}")
     console.print("[green][+][/] VM DNS synced")
+
+
+@dns.command("view")
+@click.pass_context
+def dns_view(ctx: click.Context) -> None:
+    """Show current DNS settings on both Kali and the VM."""
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    # Kali side
+    console.print("[bold]Kali (/etc/resolv.conf):[/]")
+    resolv = Path("/etc/resolv.conf")
+    if resolv.exists():
+        for line in resolv.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "nameserver":
+                console.print(f"  {parts[1]}")
+    else:
+        console.print("  [red]not found[/]")
+
+    # VM side
+    console.print("[bold]VM:[/]")
+    if vm.state() != VMState.RUNNING or not ga.ping():
+        console.print("  [yellow]VM not running[/]")
+        return
+
+    result = ga.exec_powershell(
+        "(Get-DnsClientServerAddress -AddressFamily IPv4"
+        " | Where-Object { $_.ServerAddresses }).ServerAddresses",
+        timeout=15,
+    )
+    if result.exitcode == 0 and result.stdout.strip():
+        for ns in result.stdout.strip().splitlines():
+            console.print(f"  {ns.strip()}")
+    else:
+        console.print("  [yellow]no DNS configured[/]")
 
 
 # ─── domain ─────────────────────────────────────────────────────────────────
