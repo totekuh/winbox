@@ -570,6 +570,53 @@ def ssh(ctx: click.Context) -> None:
         os.execvp("ssh", ssh_args)
 
 
+# ─── dns ────────────────────────────────────────────────────────────────────
+
+
+@cli.command("dns")
+@click.pass_context
+def dns_sync(ctx: click.Context) -> None:
+    """Sync VM DNS settings from Kali's /etc/resolv.conf."""
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    # Parse nameservers from resolv.conf
+    resolv = Path("/etc/resolv.conf")
+    if not resolv.exists():
+        console.print("[red][-][/] /etc/resolv.conf not found")
+        raise SystemExit(1)
+
+    nameservers = [
+        line.split()[1]
+        for line in resolv.read_text().splitlines()
+        if line.strip().startswith("nameserver")
+    ]
+    if not nameservers:
+        console.print("[red][-][/] No nameservers found in /etc/resolv.conf")
+        raise SystemExit(1)
+
+    ensure_running(vm, ga, cfg)
+
+    ns_list = ",".join(f"'{ns}'" for ns in nameservers)
+    console.print(f"[blue][*][/] Setting DNS to {', '.join(nameservers)}...")
+    dns_script = (
+        "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
+        "| Select-Object -First 1\n"
+        f"Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex "
+        f"-ServerAddresses @({ns_list})\n"
+        "Clear-DnsClientCache"
+    )
+    result = ga.exec_powershell(dns_script, timeout=30)
+    if result.exitcode != 0:
+        console.print(f"[red][-][/] Failed: {result.stderr.strip()}")
+        raise SystemExit(1)
+
+    for ns in nameservers:
+        console.print(f"[green][+][/] {ns}")
+    console.print("[green][+][/] VM DNS synced")
+
+
 # ─── domain ─────────────────────────────────────────────────────────────────
 
 
