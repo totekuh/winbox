@@ -582,6 +582,7 @@ def domain() -> None:
 @domain.command("join")
 @click.argument("name")
 @click.option("--dc", required=True, help="Domain controller IP address.")
+@click.option("--dns", "dns_ip", default=None, help="DNS server IP (defaults to --dc).")
 @click.option("--user", required=True, help="Domain user (e.g. Administrator).")
 @click.option(
     "--password", prompt=True, hide_input=True,
@@ -592,6 +593,7 @@ def domain_join(
     ctx: click.Context,
     name: str,
     dc: str,
+    dns_ip: str | None,
     user: str,
     password: str,
 ) -> None:
@@ -599,34 +601,37 @@ def domain_join(
 
     Undo with: winbox domain leave
     """
+    if dns_ip is None:
+        dns_ip = dc
+
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
     ensure_running(vm, ga, cfg)
 
-    # Set DNS to domain controller
-    console.print(f"[blue][*][/] Setting DNS to {dc}...")
+    # Set DNS
+    console.print(f"[blue][*][/] Setting DNS to {dns_ip}...")
     dns_script = (
         "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
         "| Select-Object -First 1\n"
         f"Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex "
-        f"-ServerAddresses {dc}\n"
+        f"-ServerAddresses {dns_ip}\n"
         "Clear-DnsClientCache"
     )
     result = ga.exec_powershell(dns_script, timeout=30)
     if result.exitcode != 0:
         console.print(f"[red][-][/] Failed to set DNS: {result.stderr}")
         raise SystemExit(1)
-    console.print(f"[green][+][/] DNS set to {dc}")
+    console.print(f"[green][+][/] DNS set to {dns_ip}")
 
     # Verify DNS resolves the domain before attempting join
     verify = ga.exec_powershell(
         f"Resolve-DnsName {name} -DnsOnly -ErrorAction Stop", timeout=15,
     )
     if verify.exitcode != 0:
-        console.print(f"[red][-][/] Cannot resolve {name} via {dc}")
-        console.print(f"    Is the DC reachable? Is {dc} the right IP?")
+        console.print(f"[red][-][/] Cannot resolve {name} via {dns_ip}")
+        console.print(f"    Check --dns / --dc values")
         raise SystemExit(1)
 
     # Join domain — base64-encode password to avoid quoting issues
