@@ -611,13 +611,23 @@ def domain_join(
         "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
         "| Select-Object -First 1\n"
         f"Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex "
-        f"-ServerAddresses {dc}"
+        f"-ServerAddresses {dc}\n"
+        "Clear-DnsClientCache"
     )
     result = ga.exec_powershell(dns_script, timeout=30)
     if result.exitcode != 0:
         console.print(f"[red][-][/] Failed to set DNS: {result.stderr}")
         raise SystemExit(1)
     console.print(f"[green][+][/] DNS set to {dc}")
+
+    # Verify DNS resolves the domain before attempting join
+    verify = ga.exec_powershell(
+        f"Resolve-DnsName {name} -DnsOnly -ErrorAction Stop", timeout=15,
+    )
+    if verify.exitcode != 0:
+        console.print(f"[red][-][/] Cannot resolve {name} via {dc}")
+        console.print(f"    Is the DC reachable? Is {dc} the right IP?")
+        raise SystemExit(1)
 
     # Join domain — base64-encode password to avoid quoting issues
     console.print(f"[blue][*][/] Joining {name}...")
