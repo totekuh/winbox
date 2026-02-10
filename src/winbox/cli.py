@@ -666,23 +666,43 @@ def domain_join(
 @domain.command("leave")
 @click.pass_context
 def domain_leave(ctx: click.Context) -> None:
-    """Leave the domain by reverting to the pre-domain snapshot."""
+    """Leave the domain and return to workgroup (preserves all files)."""
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
-    if "pre-domain" not in vm.snapshot_list():
-        console.print("[red][-][/] No pre-domain snapshot found")
-        console.print("    Was the VM joined with [bold]winbox domain join[/]?")
+    ensure_running(vm, ga, cfg)
+
+    # Remove from domain
+    console.print("[blue][*][/] Leaving domain...")
+    leave_script = "Remove-Computer -WorkgroupName WORKGROUP -Force"
+    result = ga.exec_powershell(leave_script, timeout=30)
+    if result.stdout:
+        console.print(result.stdout, end="", markup=False, highlight=False)
+    if result.stderr:
+        console.print(result.stderr, end="", markup=False, style="red", highlight=False)
+    if result.exitcode != 0:
+        console.print("[red][-][/] Failed to leave domain")
         raise SystemExit(1)
 
-    console.print("[blue][*][/] Reverting to pre-domain snapshot...")
-    vm.snapshot_revert("pre-domain")
+    # Reset DNS back to DHCP
+    console.print("[blue][*][/] Resetting DNS to DHCP...")
+    dns_script = (
+        "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
+        "| Select-Object -First 1\n"
+        "Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses"
+    )
+    ga.exec_powershell(dns_script, timeout=15)
 
-    if vm.state() == VMState.RUNNING:
-        console.print("[blue][*][/] Waiting for guest agent...")
-        ga.wait(timeout=60)
-        smb.start(cfg)
-        _ensure_smb_mapped(ga, cfg)
+    # Reboot
+    console.print("[blue][*][/] Rebooting...")
+    try:
+        ga.exec("shutdown /r /t 0", timeout=10)
+    except Exception:
+        pass
 
-    console.print("[green][+][/] Domain left — VM restored to pre-join state")
+    time.sleep(10)
+    console.print("[blue][*][/] Waiting for VM to come back...")
+    ga.wait(timeout=120)
+    _ensure_smb_mapped(ga, cfg)
+    console.print("[green][+][/] Domain left — back to workgroup, all files intact")
