@@ -581,8 +581,7 @@ def domain() -> None:
 
 @domain.command("join")
 @click.argument("name")
-@click.option("--dc", required=True, help="Domain controller IP address.")
-@click.option("--dns", "dns_ip", default=None, help="DNS server IP (defaults to --dc).")
+@click.option("--ns", "ns_ip", required=True, help="DNS server IP for domain resolution.")
 @click.option("--user", required=True, help="Domain user (e.g. Administrator).")
 @click.option(
     "--password", prompt=True, hide_input=True,
@@ -592,8 +591,7 @@ def domain() -> None:
 def domain_join(
     ctx: click.Context,
     name: str,
-    dc: str,
-    dns_ip: str | None,
+    ns_ip: str,
     user: str,
     password: str,
 ) -> None:
@@ -601,42 +599,56 @@ def domain_join(
 
     Undo with: winbox domain leave
     """
-    if dns_ip is None:
-        dns_ip = dc
-
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
     ensure_running(vm, ga, cfg)
 
-    # Set DNS
-    console.print(f"[blue][*][/] Setting DNS to {dns_ip}...")
+    # Set DNS to domain name server
+    console.print(f"[blue][*][/] Setting DNS to {ns_ip}...")
     dns_script = (
         "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
         "| Select-Object -First 1\n"
         f"Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex "
-        f"-ServerAddresses {dns_ip}\n"
+        f"-ServerAddresses {ns_ip}\n"
         "Clear-DnsClientCache"
     )
     result = ga.exec_powershell(dns_script, timeout=30)
     if result.exitcode != 0:
         console.print(f"[red][-][/] Failed to set DNS: {result.stderr}")
         raise SystemExit(1)
-    console.print(f"[green][+][/] DNS set to {dns_ip}")
+    console.print(f"[green][+][/] DNS set to {ns_ip}")
 
-    # Verify DNS resolves the domain before attempting join
+    # Verify DNS resolves the domain
     verify = ga.exec_powershell(
         f"Resolve-DnsName {name} -DnsOnly -ErrorAction Stop", timeout=15,
     )
     if verify.exitcode != 0:
-        console.print(f"[red][-][/] Cannot resolve {name} via {dns_ip}")
-        console.print(f"    Check --dns / --dc values")
+        console.print(f"[red][-][/] Cannot resolve {name} via {ns_ip}")
         raise SystemExit(1)
 
-    # Join domain — base64-encode password to avoid quoting issues
-    console.print(f"[blue][*][/] Joining {name}...")
+    # Check machine account quota — if 0, user can't join machines
     pass_b64 = base64.b64encode(password.encode()).decode()
+    quota_script = (
+        f"$b = [Convert]::FromBase64String('{pass_b64}')\n"
+        f"$p = [Text.Encoding]::UTF8.GetString($b)\n"
+        f"$e = New-Object System.DirectoryServices.DirectoryEntry("
+        f"'LDAP://{name}', '{name}\\{user}', $p)\n"
+        "$q = $e.Properties['ms-DS-MachineAccountQuota']\n"
+        "if ($q -ne $null) { $q[0] } else { 'null' }"
+    )
+    result = ga.exec_powershell(quota_script, timeout=15)
+    quota = result.stdout.strip()
+    if quota == "0":
+        console.print("[red][-][/] Machine account quota is 0 — this user cannot join machines")
+        console.print("    Use a Domain Admin or ask for delegation")
+        raise SystemExit(1)
+    if quota != "null":
+        console.print(f"[green][+][/] Machine account quota: {quota}")
+
+    # Join domain
+    console.print(f"[blue][*][/] Joining {name}...")
     join_script = (
         f"$b = [Convert]::FromBase64String('{pass_b64}')\n"
         f"$p = [Text.Encoding]::UTF8.GetString($b)\n"
