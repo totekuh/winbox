@@ -12,6 +12,8 @@ class Config:
     """winbox configuration with defaults and user overrides."""
 
     vm_name: str = "winbox"
+    vm_user: str = "Administrator"
+    vm_password: str = "WinboxP@ss123"
     vm_ram: int = 4096
     vm_cpus: int = 4
     vm_disk: int = 30

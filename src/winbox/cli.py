@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -537,6 +538,11 @@ def ssh(ctx: click.Context) -> None:
     if cfg.ssh_key.exists():
         ssh_args += ["-i", str(cfg.ssh_key)]
 
-    ssh_args.append(f"winbox@{ip}")
+    ssh_args += [f"{cfg.vm_user}@{ip}", "powershell.exe"]
 
-    os.execvp("ssh", ssh_args)
+    # Use sshpass for automatic password auth if available
+    if shutil.which("sshpass"):
+        ssh_args = ["sshpass", "-p", cfg.vm_password] + ssh_args
+        os.execvp("sshpass", ssh_args)
+    else:
+        os.execvp("ssh", ssh_args)
