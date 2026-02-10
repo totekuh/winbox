@@ -54,8 +54,14 @@ def run_command(
     marker.touch()
     marker_time = time.time()
 
-    # Execute via guest agent
-    result: ExecResult = ga.exec(full_cmd, timeout=timeout)
+    # Execute via guest agent (retry on "handle is invalid" — GA pipe race)
+    max_retries = 3
+    for attempt in range(max_retries):
+        result: ExecResult = ga.exec(full_cmd, timeout=timeout)
+        if "handle is invalid" not in result.stdout.lower() + result.stderr.lower():
+            break
+        if attempt < max_retries - 1:
+            time.sleep(0.5)
 
     # Print stdout/stderr
     if result.stdout:

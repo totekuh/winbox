@@ -16,6 +16,7 @@ from winbox import smb
 from winbox import tools as tools_mod
 from winbox.config import Config
 from winbox.executor import run_command
+from winbox.shell import open_shell
 from winbox.guest import GuestAgent
 from winbox.iso import ISO_FILENAME, download_iso
 from winbox.utils import human_size
@@ -368,6 +369,22 @@ def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int) -> None
     args = command[1:]
     exitcode = run_command(cfg, ga, exe, args, timeout=timeout)
     raise SystemExit(exitcode)
+
+
+# ─── shell ──────────────────────────────────────────────────────────────
+
+
+@cli.command()
+@click.option("--port", default=4444, help="Listener port for reverse shell.")
+@click.pass_context
+def shell(ctx: click.Context, port: int) -> None:
+    """Open an interactive SYSTEM shell in the VM (ConPTY reverse shell)."""
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    ensure_running(vm, ga, cfg)
+    open_shell(cfg, ga, port=port)
 
 
 # ─── tools ───────────────────────────────────────────────────────────────────

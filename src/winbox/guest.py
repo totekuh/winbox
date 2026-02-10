@@ -74,6 +74,26 @@ class GuestAgent:
                     f"Guest agent not responding after {timeout}s"
                 )
 
+    def exec_detached(self, command: str) -> int:
+        """Fire a command in the guest and return immediately.
+
+        Returns the guest PID. No output capture, no polling — the process
+        runs in the background until it exits on its own.
+        """
+        payload = {
+            "execute": "guest-exec",
+            "arguments": {
+                "path": "cmd.exe",
+                "arg": ["/c", command],
+                "capture-output": False,
+            },
+        }
+        response = self._raw_command(payload)
+        pid = response.get("return", {}).get("pid")
+        if pid is None:
+            raise GuestAgentError("Failed to start process — no PID returned")
+        return pid
+
     def exec(
         self,
         command: str,
