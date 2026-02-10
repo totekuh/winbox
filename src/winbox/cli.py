@@ -38,6 +38,7 @@ def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
         if not ga.ping():
             console.print("[blue][*][/] Waiting for guest agent...")
             ga.wait(timeout=60)
+        _ensure_smb_mapped(ga, cfg)
         return
 
     if state == VMState.SHUTOFF:
@@ -55,7 +56,20 @@ def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
 
     console.print("[blue][*][/] Waiting for guest agent...")
     ga.wait(timeout=120)
+    _ensure_smb_mapped(ga, cfg)
     console.print("[green][+][/] VM ready")
+
+
+def _ensure_smb_mapped(ga: GuestAgent, cfg: Config) -> None:
+    """Ensure Z: drive is mapped to the host SMB share."""
+    try:
+        result = ga.exec(f"net use Z: \\\\{cfg.smb_host_ip}\\winbox", timeout=10)
+        if result.exitcode != 0 and "already" not in result.stderr.lower():
+            # Already mapped or different error — try remapping
+            ga.exec("net use Z: /delete /y", timeout=10)
+            ga.exec(f"net use Z: \\\\{cfg.smb_host_ip}\\winbox", timeout=10)
+    except Exception:
+        pass  # Best effort — exec will fail with a clear error if Z: is missing
 
 
 # ─── CLI Group ───────────────────────────────────────────────────────────────
@@ -164,8 +178,8 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
     installer.provision_vm_disk(cfg)
     console.print("[green][+][/] Phase 2 complete — provision files injected")
 
-    # Phase 3: Firstboot provisioning
-    installer.boot_for_firstboot(cfg)
+    # Phase 3: Provisioning via guest agent
+    installer.boot_for_provisioning(cfg)
     console.print("[green][+][/] Phase 3 complete — VM provisioned")
 
     # Phase 4: Snapshot
@@ -330,9 +344,12 @@ def status(ctx: click.Context) -> None:
 # ─── exec ────────────────────────────────────────────────────────────────────
 
 
-@cli.command("exec")
-@click.argument("command", nargs=-1, required=True)
-@click.option("--timeout", "-t", default=300, help="Execution timeout in seconds.")
+@cli.command("exec", context_settings=dict(
+    ignore_unknown_options=True,
+    allow_interspersed_args=False,
+))
+@click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
+@click.option("--timeout", default=300, help="Execution timeout in seconds.")
 @click.pass_context
 def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int) -> None:
     """Execute a command in the Windows VM.

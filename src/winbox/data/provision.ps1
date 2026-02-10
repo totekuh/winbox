@@ -3,7 +3,7 @@
 #   - bootstrap.ps1 (firstboot) — files in C:\Provision\
 #   - winbox provision (re-run) — files in Z:\tools\
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 Write-Host "[*] winbox provisioning started"
 
@@ -34,25 +34,37 @@ try {
 
 # --- Disable Firewall ---
 Write-Host "[*] Disabling firewall..."
-Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
-Write-Host "[+] Firewall disabled"
+try {
+    Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+    Write-Host "[+] Firewall disabled"
+} catch {
+    Write-Host "[!] Could not disable firewall: $_"
+}
 
 # --- OpenSSH Server (fallback access) ---
 Write-Host "[*] Installing OpenSSH Server..."
-Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
-Start-Service sshd
-Set-Service -Name sshd -StartupType Automatic
-Write-Host "[+] OpenSSH Server running"
+try {
+    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+    Start-Service sshd
+    Set-Service -Name sshd -StartupType Automatic
+    Write-Host "[+] OpenSSH Server running"
+} catch {
+    Write-Host "[!] Could not install/start OpenSSH: $_"
+}
 
 # --- SSH key auth ---
 Write-Host "[*] Configuring SSH key auth..."
 $pubkeyPath = "$provDir\.ssh_pubkey"
 if (Test-Path $pubkeyPath) {
-    $pubkey = Get-Content $pubkeyPath -Raw
-    $authKeys = "C:\ProgramData\ssh\administrators_authorized_keys"
-    Set-Content -Path $authKeys -Value $pubkey.Trim()
-    icacls $authKeys /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" | Out-Null
-    Write-Host "[+] SSH key configured"
+    try {
+        $pubkey = Get-Content $pubkeyPath -Raw
+        $authKeys = "C:\ProgramData\ssh\administrators_authorized_keys"
+        Set-Content -Path $authKeys -Value $pubkey.Trim()
+        icacls $authKeys /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" | Out-Null
+        Write-Host "[+] SSH key configured"
+    } catch {
+        Write-Host "[!] Could not configure SSH key: $_"
+    }
 } else {
     Write-Host "[!] No SSH pubkey found at $pubkeyPath - skipping key auth"
 }
@@ -61,7 +73,7 @@ if (Test-Path $pubkeyPath) {
 Write-Host "[*] Mapping SMB share..."
 net use Z: \\192.168.122.1\winbox /persistent:yes 2>$null
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[*] Z: already mapped or mapping failed, continuing..."
+    Write-Host "[!] Z: mapping failed or already mapped, continuing..."
 }
 Write-Host "[+] Z: drive mapped"
 

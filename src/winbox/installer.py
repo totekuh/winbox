@@ -304,35 +304,51 @@ def provision_vm_disk(cfg: Config) -> None:
             "-a", str(cfg.disk_path),
             "--upload", f"{zip_path}:/provision.zip",
             "--upload", f"{bootstrap_tmp}:/bootstrap.ps1",
-            "--firstboot-command",
-            'cmd.exe /c "powershell.exe -ExecutionPolicy Bypass -NoProfile -File C:\\bootstrap.ps1"',
         ], env=env)
 
     console.print("[green][+][/] Provision files injected")
 
 
-def boot_for_firstboot(cfg: Config) -> None:
-    """Phase 3: Start VM for firstboot provisioning.
+def boot_for_provisioning(cfg: Config) -> None:
+    """Phase 3: Boot VM, run bootstrap.ps1 via guest agent, wait for shutdown.
 
-    Starts SMB server (so guest can map Z:), boots VM, waits for shutdown.
+    Starts SMB server (so guest can map Z:), boots VM, waits for guest agent,
+    then triggers bootstrap.ps1 which runs provisioning and shuts down.
     """
     from winbox import smb
+    from winbox.guest import GuestAgent
 
     smb.start(cfg)
 
-    console.print("[blue][*][/] Booting VM for firstboot provisioning...")
+    console.print("[blue][*][/] Booting VM for provisioning...")
     vm = VM(cfg)
     vm.start()
 
-    console.print("[blue][*][/] Waiting for provisioning to complete (VM will shut down)...")
+    console.print("[blue][*][/] Waiting for guest agent...")
+    ga = GuestAgent(cfg)
+    ga.wait(timeout=180)
+    console.print("[green][+][/] Guest agent responding")
+
+    console.print("[blue][*][/] Running bootstrap.ps1 via guest agent...")
     console.print("    This may take 5-10 minutes.")
+    try:
+        ga.exec(
+            'powershell.exe -ExecutionPolicy Bypass -NoProfile -File C:\\bootstrap.ps1',
+            timeout=600,
+        )
+    except Exception:
+        # bootstrap.ps1 calls Stop-Computer, so the VM shuts down mid-exec
+        # and the guest agent connection drops — that's expected
+        pass
+
+    console.print("[blue][*][/] Waiting for VM to shut down...")
     if not vm.wait_shutdown(timeout=600):
         console.print("[yellow][!][/] Provisioning timed out (VM did not shut down in 600s)")
         console.print(f"    Check with: virsh console {cfg.vm_name}")
-        raise RuntimeError("Firstboot provisioning timed out")
+        raise RuntimeError("Provisioning timed out")
 
     smb.stop(cfg)
-    console.print("[green][+][/] Firstboot provisioning complete")
+    console.print("[green][+][/] Provisioning complete")
 
 
 def create_clean_snapshot(cfg: Config) -> None:

@@ -124,7 +124,7 @@
 
       <AutoLogon>
         <Enabled>true</Enabled>
-        <Username>winbox</Username>
+        <Username>Administrator</Username>
         <Password>
           <Value>WinboxP@ss123</Value>
           <PlainText>true</PlainText>
@@ -133,16 +133,37 @@
       </AutoLogon>
 
       <FirstLogonCommands>
-        <!-- Install QEMU Guest Agent from VirtIO CD (try D: E: F:) -->
+        <!-- 1. Install VirtIO serial driver (required for guest agent channel) -->
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>cmd /c for %d in (D E F) do if exist %d:\guest-agent\qemu-ga-x86_64.msi msiexec /i %d:\guest-agent\qemu-ga-x86_64.msi /qn</CommandLine>
+          <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\vioserial\2k22\amd64\vioser.inf pnputil /add-driver %d:\vioserial\2k22\amd64\vioser.inf /install</CommandLine>
+          <Description>Install VirtIO serial driver</Description>
+        </SynchronousCommand>
+
+        <!-- 2. Disable MSI install restriction policy -->
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <CommandLine>reg add "HKLM\Software\Policies\Microsoft\Windows\Installer" /v DisableMSI /t REG_DWORD /d 0 /f</CommandLine>
+          <Description>Allow MSI installations</Description>
+        </SynchronousCommand>
+
+        <!-- 3. Install QEMU Guest Agent from VirtIO CD -->
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\guest-agent\qemu-ga-x86_64.msi msiexec /i %d:\guest-agent\qemu-ga-x86_64.msi /qn /norestart</CommandLine>
           <Description>Install QEMU Guest Agent</Description>
         </SynchronousCommand>
 
-        <!-- Shut down after install so we can provision offline -->
+        <!-- 4. Start guest agent service -->
         <SynchronousCommand wcm:action="add">
-          <Order>2</Order>
+          <Order>4</Order>
+          <CommandLine>net start QEMU-GA</CommandLine>
+          <Description>Start QEMU Guest Agent</Description>
+        </SynchronousCommand>
+
+        <!-- 5. Shut down so host can proceed with provisioning -->
+        <SynchronousCommand wcm:action="add">
+          <Order>5</Order>
           <CommandLine>shutdown /s /t 30</CommandLine>
           <Description>Shutdown after install</Description>
         </SynchronousCommand>
