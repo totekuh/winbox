@@ -502,6 +502,10 @@ def provision(ctx: click.Context) -> None:
     if result.stderr:
         console.print(result.stderr, end="", style="red", highlight=False)
 
+    # Clean up provisioning files from shared tools dir
+    for name in ("provision.ps1", "tools.txt", ".ssh_pubkey"):
+        (cfg.tools_dir / name).unlink(missing_ok=True)
+
     if result.exitcode == 0:
         console.print("[green][+][/] Provisioning complete")
     else:
