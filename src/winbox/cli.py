@@ -351,13 +351,9 @@ def status(ctx: click.Context) -> None:
 ))
 @click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
 @click.option("--timeout", default=300, help="Execution timeout in seconds.")
-@click.option("--agent", is_flag=True, help="Use guest agent instead of SSH.")
 @click.pass_context
-def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int, agent: bool) -> None:
+def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int) -> None:
     """Execute a command in the Windows VM.
-
-    Uses SSH for streaming output by default. Use --agent to force
-    guest agent (virtio-serial) execution instead.
 
     Bare .exe names are resolved from Z:\\tools\\. Output files land in
     ~/.winbox/shared/loot/ via SMB share.
@@ -368,16 +364,9 @@ def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int, agent: 
 
     ensure_running(vm, ga, cfg)
 
-    use_ssh = not agent
-    vm_ip = vm.ip() if use_ssh else None
-
-    if use_ssh and not vm_ip:
-        console.print("[yellow][!][/] Cannot determine VM IP, falling back to guest agent")
-        use_ssh = False
-
     exe = command[0]
     args = command[1:]
-    exitcode = run_command(cfg, ga, exe, args, timeout=timeout, use_ssh=use_ssh, vm_ip=vm_ip)
+    exitcode = run_command(cfg, ga, exe, args, timeout=timeout)
     raise SystemExit(exitcode)
 
 
