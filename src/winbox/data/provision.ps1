@@ -41,6 +41,25 @@ try {
     Write-Host "[!] Could not disable firewall: $_"
 }
 
+# --- Disable DNS reverse lookups (kills performance over NAT/VPN) ---
+Write-Host "[*] Disabling DNS reverse lookups..."
+try {
+    # Disable netbios over TCP/IP on all adapters (stops NBNS broadcast spam)
+    Get-WmiObject Win32_NetworkAdapterConfiguration -Filter "IPEnabled=true" | ForEach-Object {
+        $_.SetTcpipNetbios(2) | Out-Null  # 2 = disable
+    }
+    # Disable DNS registration and reverse lookup via registry
+    New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" `
+        -Name DisableReverseAddressRegistrations -Value 1 -PropertyType DWORD -Force | Out-Null
+    # Disable LLMNR (Link-Local Multicast Name Resolution)
+    New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" -Force | Out-Null
+    New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" `
+        -Name EnableMulticast -Value 0 -PropertyType DWORD -Force | Out-Null
+    Write-Host "[+] Reverse lookups and LLMNR disabled"
+} catch {
+    Write-Host "[!] Could not disable reverse lookups: $_"
+}
+
 # --- OpenSSH Server (fallback access) ---
 Write-Host "[*] Installing OpenSSH Server..."
 try {
