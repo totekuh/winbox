@@ -7,12 +7,12 @@ from pathlib import Path
 
 import click
 
-from winbox import installer
-from winbox import smb
+from winbox.setup import installer
+from winbox.vm import smb
 from winbox.cli import console, ensure_running
 from winbox.config import Config
-from winbox.guest import GuestAgent
-from winbox.iso import ISO_FILENAME, download_iso
+from winbox.vm import GuestAgent
+from winbox.setup.iso import ISO_FILENAME, download_iso
 from winbox.vm import VM
 
 

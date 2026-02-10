@@ -8,8 +8,8 @@ import click
 
 from winbox.cli import console, ensure_running
 from winbox.config import Config
-from winbox import smb
-from winbox.guest import GuestAgent
+from winbox.vm import smb
+from winbox.vm import GuestAgent
 from winbox.vm import VM, VMState
 
 

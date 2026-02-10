@@ -22,17 +22,29 @@ pyproject.toml              # hatchling build, click+rich deps, entry point: win
 src/winbox/
   __init__.py               # version
   __main__.py               # python -m winbox
-  cli.py                    # Click CLI — all subcommands, all imports at top level
   config.py                 # Config dataclass, ~/.winbox/config shell-style overrides
-  vm.py                     # VM lifecycle via virsh (start/stop/suspend/destroy/snapshot/wait_shutdown)
-  guest.py                  # QEMU Guest Agent over virtio-serial (exec, ping, wait)
-  executor.py               # winbox exec logic — tool path resolution, output file detection
-  installer.py              # winbox setup pipeline — virt-install, virt-customize, guest agent provision
-  smb.py                    # impacket-smbserver lifecycle (start/stop/is_running), bound to virbr0
-  iso.py                    # Windows ISO downloader — Microsoft CDN, resume, progress bar
   tools.py                  # Shared tools dir management (add/list/remove)
-  shell.py                  # Interactive SYSTEM shell via ConPTY reverse connection
   utils.py                  # human_size() — single shared utility
+  cli/                      # CLI commands (Click)
+    __init__.py             #   entry point, ensure_running, SMB mapping
+    vm.py                   #   up, down, suspend, destroy, status, snapshot, restore
+    setup.py                #   setup, provision
+    exec.py                 #   exec, shell, ssh
+    network.py              #   dns (sync, view), domain (join, leave)
+    files.py                #   tools (add, list, remove), iso (download, status)
+  vm/                       # VM infrastructure
+    __init__.py             #   re-exports: VM, VMState, GuestAgent, ExecResult, smb
+    lifecycle.py            #   VM class, VMState enum (virsh lifecycle)
+    guest.py                #   GuestAgent, ExecResult (virtio-serial)
+    smb.py                  #   impacket-smbserver (start/stop/is_running)
+  setup/                    # Setup pipeline
+    __init__.py             #   re-exports: check_prereqs, ..., download_iso, ISO_FILENAME
+    installer.py            #   4-phase setup (virt-install, virt-customize, GA provision)
+    iso.py                  #   Windows ISO downloader (Microsoft CDN, resume)
+  exec/                     # Execution
+    __init__.py             #   re-exports: run_command, resolve_exe, open_shell
+    executor.py             #   run_command, resolve_exe (tool path resolution)
+    shell.py                #   open_shell (ConPTY reverse connection)
   data/                     # Bundled files for VM setup
     unattend.xml            # Windows unattended install (disk, OOBE, vioserial, guest agent, shutdown)
     bootstrap.ps1           # Provision wrapper: unpack provision.zip, run provision.ps1, shutdown

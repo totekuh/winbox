@@ -315,8 +315,8 @@ def boot_for_provisioning(cfg: Config) -> None:
     Starts SMB server (so guest can map Z:), boots VM, waits for guest agent,
     then triggers bootstrap.ps1 which runs provisioning and shuts down.
     """
-    from winbox import smb
-    from winbox.guest import GuestAgent
+    from winbox.vm import smb
+    from winbox.vm import GuestAgent
 
     smb.start(cfg)
 

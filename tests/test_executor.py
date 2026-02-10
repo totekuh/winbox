@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from winbox.executor import resolve_exe
+from winbox.exec.executor import resolve_exe
 
 
 class TestResolveExe:

@@ -7,7 +7,7 @@ import click
 from winbox import tools as tools_mod
 from winbox.cli import console
 from winbox.config import Config
-from winbox.iso import ISO_FILENAME, download_iso
+from winbox.setup.iso import ISO_FILENAME, download_iso
 from winbox.utils import human_size
 
 

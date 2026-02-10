@@ -9,9 +9,9 @@ import click
 
 from winbox.cli import console, ensure_running
 from winbox.config import Config
-from winbox.executor import run_command
-from winbox.guest import GuestAgent
-from winbox.shell import open_shell
+from winbox.exec import run_command
+from winbox.vm import GuestAgent
+from winbox.exec import open_shell
 from winbox.vm import VM
 
 

@@ -4,7 +4,7 @@ import base64
 
 import pytest
 
-from winbox.guest import ExecResult, _decode_b64
+from winbox.vm.guest import ExecResult, _decode_b64
 
 
 class TestDecodeB64:

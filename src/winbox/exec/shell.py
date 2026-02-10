@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from winbox.guest import GuestAgent
+from winbox.vm.guest import GuestAgent
 
 if TYPE_CHECKING:
     from winbox.config import Config

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from winbox.guest import ExecResult, GuestAgent
+from winbox.vm.guest import ExecResult, GuestAgent
 from winbox.utils import human_size
 
 if TYPE_CHECKING:

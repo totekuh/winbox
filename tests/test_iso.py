@@ -2,7 +2,7 @@
 
 import pytest
 
-from winbox.iso import (
+from winbox.setup.iso import (
     EVAL_REDIRECT_URL,
     ISO_FILENAME,
     resolve_download_url,

@@ -7,9 +7,9 @@ import time
 import click
 from rich.console import Console
 
-from winbox import smb
+from winbox.vm import smb
 from winbox.config import Config
-from winbox.guest import GuestAgent
+from winbox.vm import GuestAgent
 from winbox.vm import VM, VMState
 
 console = Console()
