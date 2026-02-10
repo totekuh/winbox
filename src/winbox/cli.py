@@ -587,24 +587,26 @@ def dns_sync(ctx: click.Context) -> None:
         console.print("[red][-][/] /etc/resolv.conf not found")
         raise SystemExit(1)
 
-    nameservers = [
-        line.split()[1]
-        for line in resolv.read_text().splitlines()
-        if line.strip().startswith("nameserver")
-    ]
+    nameservers = []
+    for line in resolv.read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "nameserver":
+            nameservers.append(parts[1])
+
     if not nameservers:
         console.print("[red][-][/] No nameservers found in /etc/resolv.conf")
         raise SystemExit(1)
 
     ensure_running(vm, ga, cfg)
 
-    ns_list = ",".join(f"'{ns}'" for ns in nameservers)
-    console.print(f"[blue][*][/] Setting DNS to {', '.join(nameservers)}...")
+    ns_joined = ", ".join(nameservers)
+    console.print(f"[blue][*][/] Setting DNS to {ns_joined}...")
+    ns_ps_array = ", ".join(f"'{ns}'" for ns in nameservers)
     dns_script = (
         "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
         "| Select-Object -First 1\n"
         f"Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex "
-        f"-ServerAddresses @({ns_list})\n"
+        f"-ServerAddresses @({ns_ps_array})\n"
         "Clear-DnsClientCache"
     )
     result = ga.exec_powershell(dns_script, timeout=30)
