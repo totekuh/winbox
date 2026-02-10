@@ -660,4 +660,29 @@ def domain_join(
     ga.wait(timeout=120)
     _ensure_smb_mapped(ga, cfg)
     console.print(f"[green][+][/] VM back up — domain-joined to {name}")
-    console.print("    Revert with: [bold]winbox restore pre-domain[/]")
+    console.print("    Undo with: [bold]winbox domain leave[/]")
+
+
+@domain.command("leave")
+@click.pass_context
+def domain_leave(ctx: click.Context) -> None:
+    """Leave the domain by reverting to the pre-domain snapshot."""
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    if "pre-domain" not in vm.snapshot_list():
+        console.print("[red][-][/] No pre-domain snapshot found")
+        console.print("    Was the VM joined with [bold]winbox domain join[/]?")
+        raise SystemExit(1)
+
+    console.print("[blue][*][/] Reverting to pre-domain snapshot...")
+    vm.snapshot_revert("pre-domain")
+
+    if vm.state() == VMState.RUNNING:
+        console.print("[blue][*][/] Waiting for guest agent...")
+        ga.wait(timeout=60)
+        smb.start(cfg)
+        _ensure_smb_mapped(ga, cfg)
+
+    console.print("[green][+][/] Domain left — VM restored to pre-join state")
