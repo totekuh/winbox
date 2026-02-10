@@ -23,28 +23,17 @@ if TYPE_CHECKING:
 console = Console()
 
 CONPTY_SCRIPT = "Invoke-ConPtyShell.ps1"
-CONPTY_VM_PATH = f"C:\\{CONPTY_SCRIPT}"
 DEFAULT_PORT = 4444
 
 
-def _ensure_conpty_on_vm(cfg: Config, ga: GuestAgent) -> None:
-    """Push Invoke-ConPtyShell.ps1 from package data to C:\\ on the VM."""
-    # Check if already on the VM
-    result = ga.exec(f'if exist "{CONPTY_VM_PATH}" echo YES', timeout=10)
-    if "YES" in result.stdout:
+def _ensure_conpty_on_share(cfg: Config) -> None:
+    """Copy Invoke-ConPtyShell.ps1 from package data to share root if missing."""
+    dest = cfg.shared_dir / CONPTY_SCRIPT
+    if dest.exists():
         return
-
-    console.print(f"[blue][*][/] Pushing {CONPTY_SCRIPT} to VM...")
-
-    # Copy from package data to share (temp), then into the VM
     src = resources.files("winbox.data").joinpath(CONPTY_SCRIPT)
-    tmp = cfg.shared_dir / CONPTY_SCRIPT
     with resources.as_file(src) as src_path:
-        shutil.copy2(src_path, tmp)
-
-    ga.exec(f'copy "Z:\\{CONPTY_SCRIPT}" "{CONPTY_VM_PATH}"', timeout=10)
-    tmp.unlink(missing_ok=True)
-    console.print(f"[green][+][/] {CONPTY_SCRIPT} installed on VM")
+        shutil.copy2(src_path, dest)
 
 
 def open_shell(
@@ -54,7 +43,7 @@ def open_shell(
     port: int = DEFAULT_PORT,
 ) -> None:
     """Open an interactive SYSTEM shell via ConPTY reverse connection."""
-    _ensure_conpty_on_vm(cfg, ga)
+    _ensure_conpty_on_share(cfg)
 
     # Get terminal size
     try:
@@ -74,9 +63,9 @@ def open_shell(
     server.listen(1)
     console.print(f"[blue][*][/] Listening on {cfg.smb_host_ip}:{port}")
 
-    # Build PowerShell command — use EncodedCommand to avoid quoting hell
+    # Build PowerShell command — read script from Z:\ (SMB share root)
     ps_cmd = (
-        f"IEX(Get-Content '{CONPTY_VM_PATH}' -Raw); "
+        f"IEX(Get-Content 'Z:\\{CONPTY_SCRIPT}' -Raw); "
         f"Invoke-ConPtyShell -RemoteIp {cfg.smb_host_ip} -RemotePort {port} "
         f"-Rows {rows} -Cols {cols}"
     )
