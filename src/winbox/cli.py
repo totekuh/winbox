@@ -597,21 +597,13 @@ def domain_join(
 ) -> None:
     """Join the VM to an Active Directory domain.
 
-    Auto-creates a 'pre-domain' snapshot before joining so you can
-    revert with: winbox restore pre-domain
+    Undo with: winbox domain leave
     """
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
     ensure_running(vm, ga, cfg)
-
-    # Auto-snapshot before joining (skip if already exists)
-    if "pre-domain" not in vm.snapshot_list():
-        console.print("[blue][*][/] Creating pre-domain snapshot...")
-        vm.snapshot_create("pre-domain")
-    else:
-        console.print("[yellow][!][/] pre-domain snapshot already exists, skipping")
 
     # Set DNS to domain controller
     console.print(f"[blue][*][/] Setting DNS to {dc}...")
