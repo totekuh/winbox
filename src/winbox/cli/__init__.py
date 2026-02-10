@@ -31,6 +31,7 @@ def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
             console.print("[blue][*][/] Waiting for guest agent...")
             ga.wait(timeout=60)
         _ensure_smb_mapped(ga, cfg)
+        _ensure_sshd_running(ga)
         return
 
     if state == VMState.SHUTOFF:
@@ -49,6 +50,7 @@ def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
     console.print("[blue][*][/] Waiting for guest agent...")
     ga.wait(timeout=120)
     _ensure_smb_mapped(ga, cfg)
+    _ensure_sshd_running(ga)
     console.print("[green][+][/] VM ready")
 
 
@@ -62,6 +64,14 @@ def _ensure_smb_mapped(ga: GuestAgent, cfg: Config) -> None:
             ga.exec(f"net use Z: \\\\{cfg.smb_host_ip}\\winbox", timeout=10)
     except Exception:
         pass  # Best effort — exec will fail with a clear error if Z: is missing
+
+
+def _ensure_sshd_running(ga: GuestAgent) -> None:
+    """Start sshd if it's not running."""
+    try:
+        ga.exec("net start sshd", timeout=10)
+    except Exception:
+        pass  # Best effort — ssh will fail with a clear error if sshd is down
 
 
 # ─── CLI Group ───────────────────────────────────────────────────────────────

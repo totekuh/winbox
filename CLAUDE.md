@@ -13,7 +13,7 @@ Type `winbox exec SharpHound.exe -c All -d corp.local` on Kali and it Just Works
 - **Windows ISO:** downloaded at `~/.winbox/iso/SERVER_EVAL_x64FRE_en-us.iso` (4.7GB)
 - **VM:** created, setup works end-to-end (`winbox setup -y`)
 - **Tests:** 78 passing, no mocking needed
-- **Git:** `master` branch, 14 commits
+- **Git:** `master` branch, 31 commits
 
 ## Package Structure
 
@@ -31,6 +31,7 @@ src/winbox/
   smb.py                    # impacket-smbserver lifecycle (start/stop/is_running), bound to virbr0
   iso.py                    # Windows ISO downloader — Microsoft CDN, resume, progress bar
   tools.py                  # Shared tools dir management (add/list/remove)
+  shell.py                  # Interactive SYSTEM shell via ConPTY reverse connection
   utils.py                  # human_size() — single shared utility
   data/                     # Bundled files for VM setup
     unattend.xml            # Windows unattended install (disk, OOBE, vioserial, guest agent, shutdown)
@@ -38,6 +39,7 @@ src/winbox/
     provision.ps1           # Post-install script (disable Defender, SSH, SMB, download tools)
     tools.txt               # Tool download URLs
     config.default          # Default VM config values
+    Invoke-ConPtyShell.ps1  # ConPTY reverse shell module (bundled from antonioCoco/ConPtyShell)
 tests/
   test_config.py            # 29 tests — defaults, properties, config file parsing
   test_executor.py          # 9 tests — resolve_exe path resolution
@@ -59,6 +61,7 @@ winbox destroy [-y]                  # Delete VM + storage
 winbox status                        # VM state, IP, disk, tool/loot counts
 winbox exec <cmd> [args]             # Execute in VM (streaming via SSH, auto-starts)
   [--timeout SEC]                    #   timeout flag must come BEFORE the command
+winbox shell [--port PORT]           # Interactive SYSTEM shell via ConPTY (default 4444)
 winbox tools add <file>...           # Copy to shared tools dir
 winbox tools list                    # List tools
 winbox tools remove <name>           # Remove tool
@@ -68,6 +71,10 @@ winbox snapshot <name>               # Create named snapshot
 winbox restore <name>                # Revert to snapshot
 winbox provision                     # Re-run provisioning script (cleans up after)
 winbox ssh                           # Interactive PowerShell via SSH (auto-auth)
+winbox dns sync                      # Push Kali's resolv.conf nameservers to VM
+winbox dns view                      # Show DNS settings on both Kali and VM
+winbox domain join <name>            # Join VM to AD domain (--ns, --user, --password)
+winbox domain leave                  # Leave domain, reset DNS, return to workgroup
 ```
 
 ## Setup Flow (4-phase)
@@ -111,20 +118,23 @@ Kali Linux
 ├── winbox CLI (Python/Click)
 │   ├── SSH ────────────────> sshd in Windows VM (exec, streaming output)
 │   ├── virtio-serial ──────> QEMU Guest Agent (VM management, Z: mapping)
-│   └── SMB (virbr0 only) ─> ~/.winbox/shared/ <=> Z:\ in Windows VM
+│   ├── SMB (virbr0 only) ─> ~/.winbox/shared/ <=> Z:\ in Windows VM
+│   └── TCP listener ───────< ConPTY reverse shell (SYSTEM, interactive)
 │
 └── Windows Server Core 2022 (headless QEMU/KVM)
     ├── OpenSSH Server (command execution, PowerShell)
     ├── QEMU Guest Agent (VM management channel)
+    ├── ConPTY reverse shell (Invoke-ConPtyShell.ps1 from Z:\)
     ├── VirtIO viostor (disk) + vioserial (agent channel)
     ├── e1000 NIC (libvirt default NAT, 192.168.122.x)
     └── Defender/Firewall disabled
 ```
 
-Three channels:
+Four channels:
 - **SSH** — command execution with streaming output (primary for `winbox exec`)
 - **Guest agent** — VM management (ping, wait, map Z:, provisioning, shutdown)
 - **SMB** — shared filesystem (impacket-smbserver on virbr0, `net use Z:` in guest)
+- **ConPTY** — interactive SYSTEM shell via TCP reverse connection (guest agent fires, Kali listens)
 
 Network: libvirt default NAT. VM traffic is masqueraded through host IP —
 tools in the VM can reach any target the Kali host can reach.
@@ -152,6 +162,12 @@ tools in the VM can reach any target the Kali host can reach.
 - Config silently skips invalid int values (`VM_RAM=abc` keeps default)
 - TYPE_CHECKING guarded imports for Config across modules (avoids circular imports)
 - ISO download supports resume via HTTP Range headers
+- `winbox shell` uses ConPTY reverse shell — GA fires detached PowerShell, Kali listens on virbr0
+- ConPTY script bundled in package data, copied to SMB share root on first use (read from Z:\)
+- `exec_detached` used for bootstrap provisioning and shell launch — prevents GA timeout on long ops
+- `winbox dns sync` reads /etc/resolv.conf nameservers and pushes them to VM via guest agent
+- `winbox domain join` validates credentials via LDAP bind + checks ms-DS-MachineAccountQuota before join
+- `winbox domain leave` unjoins cleanly (Remove-Computer), resets DNS to DHCP, reboots
 
 ## Filesystem Layout (runtime)
 
