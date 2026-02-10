@@ -331,15 +331,9 @@ def boot_for_provisioning(cfg: Config) -> None:
 
     console.print("[blue][*][/] Running bootstrap.ps1 via guest agent...")
     console.print("    This may take 5-10 minutes.")
-    try:
-        ga.exec(
-            'powershell.exe -ExecutionPolicy Bypass -NoProfile -File C:\\bootstrap.ps1',
-            timeout=600,
-        )
-    except Exception:
-        # bootstrap.ps1 calls Stop-Computer, so the VM shuts down mid-exec
-        # and the guest agent connection drops — that's expected
-        pass
+    ga.exec_detached(
+        'powershell.exe -ExecutionPolicy Bypass -NoProfile -File C:\\bootstrap.ps1',
+    )
 
     console.print("[blue][*][/] Waiting for VM to shut down...")
     if not vm.wait_shutdown(timeout=600):
