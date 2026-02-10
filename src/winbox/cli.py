@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import subprocess
@@ -567,3 +568,96 @@ def ssh(ctx: click.Context) -> None:
         os.execvp("sshpass", ssh_args)
     else:
         os.execvp("ssh", ssh_args)
+
+
+# ─── domain ─────────────────────────────────────────────────────────────────
+
+
+@cli.group()
+def domain() -> None:
+    """Manage VM domain membership."""
+    pass
+
+
+@domain.command("join")
+@click.argument("name")
+@click.option("--dc", required=True, help="Domain controller IP address.")
+@click.option("--user", required=True, help="Domain user (e.g. Administrator).")
+@click.option(
+    "--password", prompt=True, hide_input=True,
+    help="Domain user password (prompted if not given).",
+)
+@click.pass_context
+def domain_join(
+    ctx: click.Context,
+    name: str,
+    dc: str,
+    user: str,
+    password: str,
+) -> None:
+    """Join the VM to an Active Directory domain.
+
+    Auto-creates a 'pre-domain' snapshot before joining so you can
+    revert with: winbox restore pre-domain
+    """
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    ensure_running(vm, ga, cfg)
+
+    # Auto-snapshot before joining (skip if already exists)
+    if "pre-domain" not in vm.snapshot_list():
+        console.print("[blue][*][/] Creating pre-domain snapshot...")
+        vm.snapshot_create("pre-domain")
+    else:
+        console.print("[yellow][!][/] pre-domain snapshot already exists, skipping")
+
+    # Set DNS to domain controller
+    console.print(f"[blue][*][/] Setting DNS to {dc}...")
+    dns_script = (
+        "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
+        "| Select-Object -First 1\n"
+        f"Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex "
+        f"-ServerAddresses {dc}"
+    )
+    result = ga.exec_powershell(dns_script, timeout=30)
+    if result.exitcode != 0:
+        console.print(f"[red][-][/] Failed to set DNS: {result.stderr}")
+        raise SystemExit(1)
+    console.print(f"[green][+][/] DNS set to {dc}")
+
+    # Join domain — base64-encode password to avoid quoting issues
+    console.print(f"[blue][*][/] Joining {name}...")
+    pass_b64 = base64.b64encode(password.encode()).decode()
+    join_script = (
+        f"$b = [Convert]::FromBase64String('{pass_b64}')\n"
+        f"$p = [Text.Encoding]::UTF8.GetString($b)\n"
+        f"$s = ConvertTo-SecureString $p -AsPlainText -Force\n"
+        f"$c = New-Object System.Management.Automation.PSCredential("
+        f"'{name}\\{user}', $s)\n"
+        f"Add-Computer -DomainName {name} -Credential $c -Force"
+    )
+    result = ga.exec_powershell(join_script, timeout=60)
+    if result.stdout:
+        console.print(result.stdout, end="", markup=False, highlight=False)
+    if result.stderr:
+        console.print(result.stderr, end="", markup=False, style="red", highlight=False)
+    if result.exitcode != 0:
+        console.print("[red][-][/] Domain join failed")
+        raise SystemExit(1)
+    console.print(f"[green][+][/] Joined {name}")
+
+    # Reboot to apply
+    console.print("[blue][*][/] Rebooting...")
+    try:
+        ga.exec("shutdown /r /t 0", timeout=10)
+    except Exception:
+        pass  # Expected — VM reboots before we get a response
+
+    time.sleep(10)
+    console.print("[blue][*][/] Waiting for VM to come back...")
+    ga.wait(timeout=120)
+    _ensure_smb_mapped(ga, cfg)
+    console.print(f"[green][+][/] VM back up — domain-joined to {name}")
+    console.print("    Revert with: [bold]winbox restore pre-domain[/]")
