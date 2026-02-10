@@ -630,22 +630,32 @@ def domain_join(
 
     # Check machine account quota — if 0, user can't join machines
     pass_b64 = base64.b64encode(password.encode()).decode()
+    console.print("[blue][*][/] Checking machine account quota...")
     quota_script = (
         f"$b = [Convert]::FromBase64String('{pass_b64}')\n"
         f"$p = [Text.Encoding]::UTF8.GetString($b)\n"
         f"$e = New-Object System.DirectoryServices.DirectoryEntry("
         f"'LDAP://{name}', '{name}\\{user}', $p)\n"
-        "$q = $e.Properties['ms-DS-MachineAccountQuota']\n"
-        "if ($q -ne $null) { $q[0] } else { 'null' }"
+        "try {\n"
+        "  $null = $e.distinguishedName\n"
+        "  $q = $e.Properties['ms-DS-MachineAccountQuota']\n"
+        "  if ($q.Count -gt 0) { Write-Output $q[0] } else { Write-Output 'unknown' }\n"
+        "} catch {\n"
+        "  Write-Error $_.Exception.Message\n"
+        "  exit 1\n"
+        "}"
     )
     result = ga.exec_powershell(quota_script, timeout=15)
+    if result.exitcode != 0:
+        console.print(f"[yellow][!][/] Could not check quota: {result.stderr.strip()}")
+        console.print("    Credentials may be wrong or LDAP unreachable")
+        raise SystemExit(1)
     quota = result.stdout.strip()
     if quota == "0":
         console.print("[red][-][/] Machine account quota is 0 — this user cannot join machines")
         console.print("    Use a Domain Admin or ask for delegation")
         raise SystemExit(1)
-    if quota != "null":
-        console.print(f"[green][+][/] Machine account quota: {quota}")
+    console.print(f"[green][+][/] Machine account quota: {quota}")
 
     # Join domain
     console.print(f"[blue][*][/] Joining {name}...")
