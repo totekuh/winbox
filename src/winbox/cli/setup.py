@@ -92,6 +92,8 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
     installer.create_directories(cfg)
     installer.grant_libvirt_access(cfg)
     installer.download_virtio_iso(cfg)
+    installer.download_openssh(cfg)
+    installer.download_tools(cfg)
     installer.generate_ssh_keypair(cfg)
     installer.build_unattend_image(cfg)
     installer.create_disk(cfg)

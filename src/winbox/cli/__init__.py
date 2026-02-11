@@ -91,7 +91,7 @@ def cli(ctx: click.Context) -> None:
 from winbox.cli.vm import up, down, suspend, destroy, status, snapshot, restore  # noqa: E402
 from winbox.cli.setup import setup, provision  # noqa: E402
 from winbox.cli.exec import exec_cmd, shell, ssh  # noqa: E402
-from winbox.cli.network import dns, domain  # noqa: E402
+from winbox.cli.network import dns, domain, hosts  # noqa: E402
 from winbox.cli.files import tools, iso  # noqa: E402
 
 cli.add_command(up)
@@ -108,5 +108,6 @@ cli.add_command(shell)
 cli.add_command(ssh)
 cli.add_command(dns)
 cli.add_command(domain)
+cli.add_command(hosts)
 cli.add_command(tools)
 cli.add_command(iso)

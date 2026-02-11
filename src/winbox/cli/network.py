@@ -135,6 +135,126 @@ def dns_view(ctx: click.Context) -> None:
         console.print("  [yellow]no DNS configured[/]")
 
 
+# ─── hosts ────────────────────────────────────────────────────────────────────
+
+
+HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
+
+
+@click.group()
+def hosts() -> None:
+    """Manage VM hosts file entries."""
+    pass
+
+
+@hosts.command("view")
+@click.pass_context
+def hosts_view(ctx: click.Context) -> None:
+    """Show the VM hosts file."""
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    ensure_running(vm, ga, cfg)
+
+    result = ga.exec_powershell(f"Get-Content '{HOSTS_PATH}'", timeout=15)
+    if result.exitcode != 0:
+        console.print(f"[red][-][/] {result.stderr.strip()}")
+        raise SystemExit(1)
+
+    entries = [
+        line.strip() for line in result.stdout.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not entries:
+        console.print("[yellow]No entries[/]")
+        return
+    for entry in entries:
+        console.print(f"  {entry}")
+
+
+@hosts.command("add")
+@click.argument("ip")
+@click.argument("hostname")
+@click.pass_context
+def hosts_add(ctx: click.Context, ip: str, hostname: str) -> None:
+    """Append an entry to the VM hosts file.
+
+    Example: winbox hosts add 10.0.0.5 dc01.corp.local
+    """
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    ensure_running(vm, ga, cfg)
+
+    script = f"Add-Content -Path '{HOSTS_PATH}' -Value \"{ip}`t{hostname}\""
+    result = ga.exec_powershell(script, timeout=15)
+    if result.exitcode != 0:
+        console.print(f"[red][-][/] {result.stderr.strip()}")
+        raise SystemExit(1)
+
+    console.print(f"[green][+][/] {ip}\t{hostname}")
+
+
+@hosts.command("set")
+@click.argument("ip")
+@click.argument("hostname")
+@click.pass_context
+def hosts_set(ctx: click.Context, ip: str, hostname: str) -> None:
+    """Set a hosts entry (replaces existing entry for hostname, or adds new).
+
+    Example: winbox hosts set 10.0.0.5 dc01.corp.local
+    """
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    ensure_running(vm, ga, cfg)
+
+    script = (
+        f"$f = '{HOSTS_PATH}'\n"
+        f"$lines = Get-Content $f\n"
+        f"$lines = @($lines | Where-Object {{ $_ -notmatch '\\s+{hostname}\\s*$' }})\n"
+        f"$lines += \"{ip}`t{hostname}\"\n"
+        f"Set-Content -Path $f -Value $lines"
+    )
+    result = ga.exec_powershell(script, timeout=15)
+    if result.exitcode != 0:
+        console.print(f"[red][-][/] {result.stderr.strip()}")
+        raise SystemExit(1)
+
+    console.print(f"[green][+][/] {ip}\t{hostname}")
+
+
+@hosts.command("delete")
+@click.argument("hostname")
+@click.pass_context
+def hosts_delete(ctx: click.Context, hostname: str) -> None:
+    """Remove all entries for a hostname from the VM hosts file.
+
+    Example: winbox hosts delete dc01.corp.local
+    """
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    ensure_running(vm, ga, cfg)
+
+    script = (
+        f"$f = '{HOSTS_PATH}'\n"
+        f"$lines = Get-Content $f\n"
+        f"$lines = @($lines | Where-Object {{ $_ -notmatch '\\s+{hostname}\\s*$' }})\n"
+        f"Set-Content -Path $f -Value $lines"
+    )
+    result = ga.exec_powershell(script, timeout=15)
+    if result.exitcode != 0:
+        console.print(f"[red][-][/] {result.stderr.strip()}")
+        raise SystemExit(1)
+
+    console.print(f"[green][+][/] Removed {hostname}")
+
+
 # ─── domain ──────────────────────────────────────────────────────────────────
 
 

@@ -60,10 +60,25 @@ try {
     Write-Host "[!] Could not disable reverse lookups: $_"
 }
 
-# --- OpenSSH Server (fallback access) ---
+# --- OpenSSH Server (from bundled zip, no Windows Update dependency) ---
 Write-Host "[*] Installing OpenSSH Server..."
+$opensshZip = "$provDir\OpenSSH-Win64.zip"
 try {
-    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+    if (Test-Path $opensshZip) {
+        $installDir = "$env:ProgramFiles\OpenSSH"
+        Expand-Archive -Path $opensshZip -DestinationPath $env:ProgramFiles -Force
+        # The zip extracts to OpenSSH-Win64/, rename to OpenSSH
+        if (Test-Path "$env:ProgramFiles\OpenSSH-Win64") {
+            if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
+            Rename-Item "$env:ProgramFiles\OpenSSH-Win64" $installDir
+        }
+        & "$installDir\install-sshd.ps1" | Out-Null
+        $env:Path += ";$installDir"
+        [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Machine)
+    } else {
+        # Fallback: install from Windows Update (re-provision without bundled zip)
+        Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+    }
     Start-Service sshd
     Set-Service -Name sshd -StartupType Automatic
     Write-Host "[+] OpenSSH Server running"
@@ -95,38 +110,5 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "[!] Z: mapping failed or already mapped, continuing..."
 }
 Write-Host "[+] Z: drive mapped"
-
-# --- Download tools ---
-Write-Host "[*] Downloading tools..."
-$toolsFile = "$provDir\tools.txt"
-if (Test-Path $toolsFile) {
-    $urls = Get-Content $toolsFile | Where-Object { $_ -match "^https?://" }
-    foreach ($url in $urls) {
-        $filename = [System.IO.Path]::GetFileName(([URI]$url).AbsolutePath)
-        Write-Host "    Downloading $filename..."
-        $tmp = "$env:TEMP\$filename"
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
-            if ($filename -match '\.zip$') {
-                Expand-Archive -Path $tmp -DestinationPath "Z:\tools\" -Force
-                Remove-Item $tmp -Force
-                Write-Host "    [+] Extracted $filename"
-            } else {
-                Move-Item $tmp "Z:\tools\$filename" -Force
-                Write-Host "    [+] Saved $filename"
-            }
-        } catch {
-            Write-Host "    [!] Failed to download $filename : $_"
-        }
-    }
-} else {
-    Write-Host "[!] No tools.txt found - skipping tool downloads"
-}
-
-# --- Create loot directory ---
-if (-not (Test-Path "Z:\loot")) {
-    New-Item -Path "Z:\loot" -ItemType Directory -Force | Out-Null
-}
 
 Write-Host "[+] winbox provisioning complete"

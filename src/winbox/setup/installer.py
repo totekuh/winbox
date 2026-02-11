@@ -170,6 +170,59 @@ def download_virtio_iso(cfg: Config) -> None:
     console.print("[green][+][/] VirtIO ISO downloaded")
 
 
+OPENSSH_URL = (
+    "https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip"
+)
+OPENSSH_ZIP = "OpenSSH-Win64.zip"
+
+
+def download_openssh(cfg: Config) -> Path:
+    """Download Win32-OpenSSH zip if not cached. Returns path to zip."""
+    dest = cfg.iso_dir / OPENSSH_ZIP
+    if dest.exists():
+        console.print("[green][+][/] OpenSSH zip cached")
+        return dest
+
+    console.print("[blue][*][/] Downloading OpenSSH for Windows...")
+    subprocess.run(
+        ["wget", "-q", "--show-progress", "-O", str(dest), OPENSSH_URL],
+        check=True,
+    )
+    console.print("[green][+][/] OpenSSH zip downloaded")
+    return dest
+
+
+def download_tools(cfg: Config) -> None:
+    """Download tools listed in tools.txt to shared tools directory."""
+    tools_txt = _data_file("tools.txt")
+    urls = []
+    for line in Path(tools_txt).read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and line.startswith("http"):
+            urls.append(line)
+
+    if not urls:
+        return
+
+    console.print(f"[blue][*][/] Downloading {len(urls)} tools...")
+    for url in urls:
+        filename = url.rsplit("/", 1)[-1]
+        dest = cfg.tools_dir / filename
+        console.print(f"    {filename}...")
+        try:
+            subprocess.run(
+                ["wget", "-q", "--show-progress", "-O", str(dest), url],
+                check=True,
+            )
+            if filename.endswith(".zip"):
+                with zipfile.ZipFile(dest) as zf:
+                    zf.extractall(cfg.tools_dir)
+                dest.unlink()
+            console.print(f"    [green][+][/] {filename}")
+        except subprocess.CalledProcessError:
+            console.print(f"    [yellow][!][/] Failed: {filename}")
+
+
 def generate_ssh_keypair(cfg: Config) -> None:
     """Generate an ED25519 SSH keypair for fallback access."""
     if cfg.ssh_key.exists():
@@ -283,7 +336,8 @@ def provision_vm_disk(cfg: Config) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
 
-        # Build provision.zip containing provision.ps1, tools.txt, .ssh_pubkey
+        # Build provision.zip containing provision.ps1, tools.txt, .ssh_pubkey, OpenSSH
+        openssh_zip = cfg.iso_dir / OPENSSH_ZIP
         zip_path = tmpdir_path / "provision.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for name in ("provision.ps1", "tools.txt"):
@@ -291,6 +345,8 @@ def provision_vm_disk(cfg: Config) -> None:
                 zf.write(src, name)
             if cfg.ssh_pubkey.exists():
                 zf.write(cfg.ssh_pubkey, ".ssh_pubkey")
+            if openssh_zip.exists():
+                zf.write(openssh_zip, OPENSSH_ZIP)
 
         # Copy bootstrap.ps1 to temp dir
         bootstrap_src = _data_file("bootstrap.ps1")
