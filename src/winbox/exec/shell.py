@@ -169,12 +169,20 @@ def _relay_pipe(sock: socket.socket) -> None:
     history: list[bytes] = []
     hist_idx = -1           # -1 = not browsing history
     saved = bytearray()     # line saved when entering history browse
+    _inbuf = bytearray()    # input buffer for batching reads
 
     try:
         term_cols = os.get_terminal_size().columns
     except OSError:
         term_cols = 80
     start_col = 0           # cursor column where user input starts (after prompt)
+
+    # SIGWINCH handling — keep term_cols accurate after terminal resize
+    sig_r, sig_w = os.pipe()
+    os.set_blocking(sig_r, False)
+    os.set_blocking(sig_w, False)
+    old_wakeup = signal.set_wakeup_fd(sig_w)
+    old_sighandler = signal.signal(signal.SIGWINCH, lambda *_: None)
 
     def out(data: bytes) -> None:
         os.write(stdout_fd, data)
@@ -242,101 +250,152 @@ def _relay_pipe(sock: socket.socket) -> None:
             else:
                 i += 1
 
+    def _fill(n=1, timeout=0.02):
+        """Ensure at least n bytes in _inbuf, reading from stdin if needed."""
+        while len(_inbuf) < n:
+            r, _, _ = select.select([sys.stdin], [], [], timeout)
+            if r:
+                data = os.read(stdin_fd, 1024)
+                if data:
+                    _inbuf.extend(data)
+                else:
+                    return False
+            else:
+                return False
+        return True
+
     try:
         while True:
-            readable, _, _ = select.select([sys.stdin, sock], [], [])
+            # Only block in select when input buffer is empty
+            if not _inbuf:
+                readable, _, _ = select.select([sys.stdin, sock, sig_r], [], [])
 
-            if sock in readable:
-                data = sock.recv(4096)
-                if not data:
-                    break
-                # Erase user's partial input, print output, then redraw
-                if buf:
-                    _move(pos, 0)
-                    out(b'\x1b[J')
-                out(data)
-                _track_col(data)
-                if buf:
-                    out(bytes(buf))
-                    if pos < len(buf):
-                        _move(len(buf), pos)
+                if sig_r in readable:
+                    try:
+                        os.read(sig_r, 4096)  # drain wakeup bytes
+                    except OSError:
+                        pass
+                    try:
+                        term_cols = os.get_terminal_size().columns
+                    except OSError:
+                        pass
+                    if buf:
+                        _redraw(pos)
 
-            if sys.stdin in readable:
-                ch = os.read(stdin_fd, 1)
-                if not ch:
-                    break
-                b = ch[0]
+                if sock in readable:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    # Erase user's partial input, print output, then redraw
+                    if buf:
+                        _move(pos, 0)
+                        out(b'\x1b[J')
+                    out(data)
+                    _track_col(data)
+                    if buf:
+                        out(bytes(buf))
+                        if pos < len(buf):
+                            _move(len(buf), pos)
 
-                if b == 0x0d:  # Enter
-                    if pos < len(buf):
-                        _move(pos, len(buf))
-                    out(b'\r\n')
-                    line = bytes(buf)
-                    sock.sendall(line + b'\n')
-                    if line.strip():
-                        history.append(line)
-                    buf.clear()
-                    pos = 0
-                    hist_idx = -1
-                    start_col = 0
+                if sys.stdin in readable:
+                    raw = os.read(stdin_fd, 1024)
+                    if not raw:
+                        break
+                    _inbuf.extend(raw)
 
-                elif b in (0x7f, 0x08):  # Backspace
-                    if pos > 0:
+            if not _inbuf:
+                continue
+
+            b = _inbuf[0]
+
+            # Batch-insert printable characters (fast paste support)
+            if b >= 0x20 and b != 0x7f:
+                end = 1
+                while end < len(_inbuf) and _inbuf[end] >= 0x20 and _inbuf[end] != 0x7f:
+                    end += 1
+                run = bytes(_inbuf[:end])
+                del _inbuf[:end]
+                old = pos
+                buf[pos:pos] = run
+                pos += len(run)
+                if pos == len(buf):
+                    out(run)
+                else:
+                    _redraw(old)
+                continue
+
+            del _inbuf[0]
+
+            if b == 0x0d:  # Enter
+                if pos < len(buf):
+                    _move(pos, len(buf))
+                out(b'\r\n')
+                line = bytes(buf)
+                sock.sendall(line + b'\n')
+                if line.strip():
+                    history.append(line)
+                buf.clear()
+                pos = 0
+                hist_idx = -1
+                start_col = 0
+
+            elif b in (0x7f, 0x08):  # Backspace
+                if pos > 0:
+                    old = pos
+                    del buf[pos - 1]
+                    pos -= 1
+                    _redraw(old)
+
+            elif b == 0x1b:  # Escape sequence start
+                if not _fill(1):
+                    continue
+                if _inbuf[0] != 0x5b:  # expect [
+                    continue
+                del _inbuf[0]
+                if not _fill(1):
+                    continue
+                c = _inbuf[0]
+                del _inbuf[0]
+
+                if c == 0x41:  # Up — previous history
+                    if history and hist_idx < len(history) - 1:
                         old = pos
-                        del buf[pos - 1]
-                        pos -= 1
+                        if hist_idx == -1:
+                            saved[:] = buf[:]
+                        hist_idx += 1
+                        buf[:] = bytearray(history[-(hist_idx + 1)])
+                        pos = len(buf)
                         _redraw(old)
 
-                elif b == 0x1b:  # Escape sequence start
-                    # Wait briefly for rest of sequence (bare Esc = ignore)
-                    r, _, _ = select.select([sys.stdin], [], [], 0.02)
-                    if not r:
-                        continue
-                    s1 = os.read(stdin_fd, 1)
-                    if not s1 or s1[0] != 0x5b:  # expect [
-                        continue
-                    s2 = os.read(stdin_fd, 1)
-                    if not s2:
-                        break
-                    c = s2[0]
-
-                    if c == 0x41:  # Up — previous history
-                        if history and hist_idx < len(history) - 1:
-                            old = pos
-                            if hist_idx == -1:
-                                saved[:] = buf[:]
-                            hist_idx += 1
-                            buf[:] = bytearray(history[-(hist_idx + 1)])
-                            pos = len(buf)
-                            _redraw(old)
-
-                    elif c == 0x42:  # Down — next history
-                        if hist_idx > 0:
-                            old = pos
-                            hist_idx -= 1
-                            buf[:] = bytearray(history[-(hist_idx + 1)])
-                            pos = len(buf)
-                            _redraw(old)
-                        elif hist_idx == 0:
-                            old = pos
-                            hist_idx = -1
-                            buf[:] = saved[:]
-                            pos = len(buf)
-                            _redraw(old)
-
-                    elif c == 0x43 and pos < len(buf):  # Right
+                elif c == 0x42:  # Down — next history
+                    if hist_idx > 0:
                         old = pos
-                        pos += 1
-                        _move(old, pos)
-
-                    elif c == 0x44 and pos > 0:  # Left
+                        hist_idx -= 1
+                        buf[:] = bytearray(history[-(hist_idx + 1)])
+                        pos = len(buf)
+                        _redraw(old)
+                    elif hist_idx == 0:
                         old = pos
-                        pos -= 1
-                        _move(old, pos)
+                        hist_idx = -1
+                        buf[:] = saved[:]
+                        pos = len(buf)
+                        _redraw(old)
 
-                    elif c == 0x31:  # ESC[1;5C / ESC[1;5D — Ctrl+Right/Left
-                        rest = os.read(stdin_fd, 3)  # ";5C" or ";5D"
-                        if len(rest) == 3 and rest[0:2] == b';5':
+                elif c == 0x43 and pos < len(buf):  # Right
+                    old = pos
+                    pos += 1
+                    _move(old, pos)
+
+                elif c == 0x44 and pos > 0:  # Left
+                    old = pos
+                    pos -= 1
+                    _move(old, pos)
+
+                elif c == 0x31:  # ESC[1;5C / ESC[1;5D — Ctrl+Right/Left
+                    if _fill(3):
+                        rest = bytes(_inbuf[:3])
+                        del _inbuf[:3]
+                        if rest[0:2] == b';5':
                             old = pos
                             if rest[2:3] == b'C':  # Ctrl+Right
                                 while pos < len(buf) and buf[pos:pos+1] == b' ':
@@ -351,90 +410,93 @@ def _relay_pipe(sock: socket.socket) -> None:
                             if pos != old:
                                 _move(old, pos)
 
-                    elif c == 0x48:  # Home
-                        if pos > 0:
-                            old = pos
-                            pos = 0
-                            _move(old, pos)
-
-                    elif c == 0x46:  # End
-                        if pos < len(buf):
-                            old = pos
-                            pos = len(buf)
-                            _move(old, pos)
-
-                    elif c == 0x33:  # Delete key (ESC[3~)
-                        os.read(stdin_fd, 1)  # consume ~
-                        if pos < len(buf):
-                            del buf[pos]
-                            _redraw(pos)
-
-                elif b == 0x03:  # Ctrl+C
-                    if pos < len(buf):
-                        _move(pos, len(buf))
-                    out(b'^C\r\n')
-                    buf.clear()
-                    pos = 0
-                    hist_idx = -1
-                    start_col = 0
-                    sock.sendall(b'\n')  # trigger fresh prompt
-
-                elif b == 0x04:  # Ctrl+D
-                    break
-
-                elif b == 0x01:  # Ctrl+A — Home
+                elif c == 0x48:  # Home
                     if pos > 0:
                         old = pos
                         pos = 0
                         _move(old, pos)
 
-                elif b == 0x05:  # Ctrl+E — End
+                elif c == 0x46:  # End
                     if pos < len(buf):
                         old = pos
                         pos = len(buf)
                         _move(old, pos)
 
-                elif b == 0x0b:  # Ctrl+K — kill to end of line
+                elif c == 0x33:  # Delete key (ESC[3~)
+                    if _fill(1):
+                        del _inbuf[0]  # consume ~
                     if pos < len(buf):
-                        del buf[pos:]
+                        del buf[pos]
                         _redraw(pos)
 
-                elif b == 0x15:  # Ctrl+U — kill to start of line
-                    if pos > 0:
-                        old = pos
-                        del buf[:pos]
-                        pos = 0
-                        _redraw(old)
+            elif b == 0x03:  # Ctrl+C
+                if pos < len(buf):
+                    _move(pos, len(buf))
+                out(b'^C\r\n')
+                buf.clear()
+                pos = 0
+                hist_idx = -1
+                start_col = 0
+                sock.sendall(b'\n')  # trigger fresh prompt
 
-                elif b == 0x17:  # Ctrl+W — delete word backward
-                    if pos > 0:
-                        old = pos
-                        while pos > 0 and buf[pos-1:pos] == b' ':
-                            pos -= 1
-                        while pos > 0 and buf[pos-1:pos] != b' ':
-                            pos -= 1
-                        del buf[pos:old]
-                        _redraw(old)
+            elif b == 0x04:  # Ctrl+D
+                break
 
-                elif b == 0x0c:  # Ctrl+L — clear screen
-                    out(b'\x1b[2J\x1b[H')  # clear + cursor home
-                    start_col = 0
-                    if buf:
-                        out(bytes(buf))
-                        if pos < len(buf):
-                            _move(len(buf), pos)
+            elif b == 0x09:  # Tab — no completion in pipe mode
+                out(b'\x07')  # bell
 
-                elif b >= 0x20:  # Printable character
-                    buf.insert(pos, b)
-                    pos += 1
-                    if pos == len(buf):
-                        out(bytes([b]))
-                    else:
-                        _redraw(pos - 1)
+            elif b == 0x1a:  # Ctrl+Z — pass through to remote
+                sock.sendall(b'\x1a')
+
+            elif b == 0x01:  # Ctrl+A — Home
+                if pos > 0:
+                    old = pos
+                    pos = 0
+                    _move(old, pos)
+
+            elif b == 0x05:  # Ctrl+E — End
+                if pos < len(buf):
+                    old = pos
+                    pos = len(buf)
+                    _move(old, pos)
+
+            elif b == 0x0b:  # Ctrl+K — kill to end of line
+                if pos < len(buf):
+                    del buf[pos:]
+                    _redraw(pos)
+
+            elif b == 0x15:  # Ctrl+U — kill to start of line
+                if pos > 0:
+                    old = pos
+                    del buf[:pos]
+                    pos = 0
+                    _redraw(old)
+
+            elif b == 0x17:  # Ctrl+W — delete word backward
+                if pos > 0:
+                    old = pos
+                    while pos > 0 and buf[pos-1:pos] == b' ':
+                        pos -= 1
+                    while pos > 0 and buf[pos-1:pos] != b' ':
+                        pos -= 1
+                    del buf[pos:old]
+                    _redraw(old)
+
+            elif b == 0x0c:  # Ctrl+L — clear screen
+                out(b'\x1b[2J\x1b[H')  # clear + cursor home
+                start_col = 0
+                if buf:
+                    out(bytes(buf))
+                    if pos < len(buf):
+                        _move(len(buf), pos)
 
     except (ConnectionResetError, BrokenPipeError, OSError):
         pass
     finally:
+        signal.signal(signal.SIGWINCH, old_sighandler)
+        signal.set_wakeup_fd(old_wakeup)
+        os.close(sig_r)
+        os.close(sig_w)
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         sock.close()
         console.print("\n[blue][*][/] Shell closed")
