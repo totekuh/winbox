@@ -1,44 +1,11 @@
 """Tests for winbox.cli.network — dns and hosts commands."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
-from click.testing import CliRunner
+from unittest.mock import patch
 
 from winbox.cli import cli
-from winbox.config import Config
+from winbox.vm import VMState
 from winbox.vm.guest import ExecResult
-
-
-@pytest.fixture
-def runner():
-    return CliRunner()
-
-
-@pytest.fixture
-def cfg(tmp_path):
-    c = Config(winbox_dir=tmp_path / ".winbox")
-    c.winbox_dir.mkdir(parents=True)
-    c.shared_dir.mkdir(parents=True)
-    c.tools_dir.mkdir(parents=True)
-    c.loot_dir.mkdir(parents=True)
-    return c
-
-
-@pytest.fixture
-def mock_env(cfg):
-    """Patch ensure_running + GuestAgent so CLI commands run without a real VM."""
-    ga = MagicMock()
-    ga.ping.return_value = True
-
-    with (
-        patch("winbox.cli.network.ensure_running"),
-        patch("winbox.cli.network.GuestAgent", return_value=ga),
-        patch("winbox.cli.network.VM"),
-        patch("winbox.cli.Config.load", return_value=cfg),
-    ):
-        yield ga
 
 
 # ─── dns set ──────────────────────────────────────────────────────────────────
@@ -53,7 +20,6 @@ class TestDnsSet:
         assert result.exit_code == 0
         assert "10.0.0.1" in result.output
 
-        # Verify the PowerShell script sets the right IP
         script = mock_env.exec_powershell.call_args[0][0]
         assert "10.0.0.1" in script
         assert "Set-DnsClientServerAddress" in script
@@ -80,14 +46,9 @@ class TestDnsSync:
             exitcode=0, stdout="", stderr=""
         )
         with patch("winbox.cli.network.Path") as mock_path:
-            # Only patch the /etc/resolv.conf path, not other Path uses
             mock_path.side_effect = lambda p: resolv if p == "/etc/resolv.conf" else Path(p)
             mock_path.return_value.exists.return_value = True
-            # Direct approach: patch the resolv path inline
             result = runner.invoke(cli, ["dns", "sync"])
-
-        # dns sync reads /etc/resolv.conf directly via Path — hard to mock
-        # without refactoring. Skip this approach and test the script content instead.
 
     def test_sync_no_resolv(self, runner, mock_env):
         with patch("winbox.cli.network.Path") as mock_path:
@@ -106,85 +67,36 @@ class TestDnsSync:
             mock_path.__call__ = lambda self, p: resolv if p == "/etc/resolv.conf" else Path(p)
             result = runner.invoke(cli, ["dns", "sync"])
 
-        # Since patching Path is tricky, let's verify it at least ran
-        # The real test is that the powershell script contains both IPs
-
 
 # ─── dns view ─────────────────────────────────────────────────────────────────
 
 
 class TestDnsView:
-    def test_view_with_dns(self, runner, cfg):
-        ga = MagicMock()
-        ga.ping.return_value = True
-        ga.exec_powershell.return_value = ExecResult(
+    def test_view_with_dns(self, runner, mock_env):
+        mock_env.exec_powershell.return_value = ExecResult(
             exitcode=0, stdout="192.168.122.1\n", stderr=""
         )
-
-        with (
-            patch("winbox.cli.network.VM") as mock_vm_cls,
-            patch("winbox.cli.network.GuestAgent", return_value=ga),
-            patch("winbox.cli.Config.load", return_value=cfg),
-            patch("winbox.cli.network.VMState") as mock_state,
-        ):
-            vm = mock_vm_cls.return_value
-            vm.state.return_value = mock_state.RUNNING
-            result = runner.invoke(cli, ["dns", "view"])
-
+        result = runner.invoke(cli, ["dns", "view"])
         assert "192.168.122.1" in result.output
 
-    def test_view_no_dns(self, runner, cfg):
-        ga = MagicMock()
-        ga.ping.return_value = True
-        ga.exec_powershell.return_value = ExecResult(
+    def test_view_no_dns(self, runner, mock_env):
+        mock_env.exec_powershell.return_value = ExecResult(
             exitcode=0, stdout="", stderr=""
         )
-
-        with (
-            patch("winbox.cli.network.VM") as mock_vm_cls,
-            patch("winbox.cli.network.GuestAgent", return_value=ga),
-            patch("winbox.cli.Config.load", return_value=cfg),
-            patch("winbox.cli.network.VMState") as mock_state,
-        ):
-            vm = mock_vm_cls.return_value
-            vm.state.return_value = mock_state.RUNNING
-            result = runner.invoke(cli, ["dns", "view"])
-
+        result = runner.invoke(cli, ["dns", "view"])
         assert "no DNS" in result.output
 
-    def test_view_vm_not_running(self, runner, cfg):
-        ga = MagicMock()
-        ga.ping.return_value = False
-
-        with (
-            patch("winbox.cli.network.VM") as mock_vm_cls,
-            patch("winbox.cli.network.GuestAgent", return_value=ga),
-            patch("winbox.cli.Config.load", return_value=cfg),
-            patch("winbox.cli.network.VMState") as mock_state,
-        ):
-            vm = mock_vm_cls.return_value
-            vm.state.return_value = mock_state.SHUTOFF
-            result = runner.invoke(cli, ["dns", "view"])
-
+    def test_view_vm_not_running(self, runner, mock_env):
+        mock_env.ping.return_value = False
+        mock_env._vm.state.return_value = VMState.SHUTOFF
+        result = runner.invoke(cli, ["dns", "view"])
         assert "not running" in result.output
 
-    def test_view_multiple_servers(self, runner, cfg):
-        ga = MagicMock()
-        ga.ping.return_value = True
-        ga.exec_powershell.return_value = ExecResult(
+    def test_view_multiple_servers(self, runner, mock_env):
+        mock_env.exec_powershell.return_value = ExecResult(
             exitcode=0, stdout="10.0.0.1\n10.0.0.2\n", stderr=""
         )
-
-        with (
-            patch("winbox.cli.network.VM") as mock_vm_cls,
-            patch("winbox.cli.network.GuestAgent", return_value=ga),
-            patch("winbox.cli.Config.load", return_value=cfg),
-            patch("winbox.cli.network.VMState") as mock_state,
-        ):
-            vm = mock_vm_cls.return_value
-            vm.state.return_value = mock_state.RUNNING
-            result = runner.invoke(cli, ["dns", "view"])
-
+        result = runner.invoke(cli, ["dns", "view"])
         assert "10.0.0.1" in result.output
         assert "10.0.0.2" in result.output
 
@@ -223,7 +135,6 @@ class TestHostsView:
         assert "dc01.corp.local" in result.output
         assert "fs01.corp.local" in result.output
         assert "10.0.0.5" in result.output
-        # Comments should be filtered out
         assert "Copyright" not in result.output
         assert "localhost" not in result.output
 
@@ -286,7 +197,6 @@ class TestHostsSet:
         assert "10.0.0.5" in result.output
         assert "dc01.corp.local" in result.output
 
-        # Verify script removes old entries and adds new one
         script = mock_env.exec_powershell.call_args[0][0]
         assert "notmatch" in script
         assert "dc01.corp.local" in script

@@ -42,15 +42,16 @@ def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int) -> None
 
 @click.command()
 @click.option("--port", default=4444, help="Listener port for reverse shell.")
+@click.option("--pipe", is_flag=True, help="Pipe mode (no PTY). Use when tools need real pipe handles (e.g. RunasCs -P).")
 @click.pass_context
-def shell(ctx: click.Context, port: int) -> None:
+def shell(ctx: click.Context, port: int, pipe: bool) -> None:
     """Open an interactive SYSTEM shell in the VM (ConPTY reverse shell)."""
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
     ensure_running(vm, ga, cfg)
-    open_shell(cfg, ga, port=port)
+    open_shell(cfg, ga, port=port, pipe_mode=pipe)
 
 
 @click.command()

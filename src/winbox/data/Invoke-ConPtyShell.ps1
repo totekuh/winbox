@@ -92,24 +92,29 @@ function Invoke-ConPtyShell
         
         [Parameter()]
         [Switch]
-        $Upgrade
+        $Upgrade,
+
+        [Parameter()]
+        [Switch]
+        $NoPty
     )
-    
+
     if( $PSBoundParameters.ContainsKey('Upgrade') ) {
         $RemoteIp = "upgrade"
         $RemotePort = "shell"
     }
     else{
-  
+
         if(-Not($PSBoundParameters.ContainsKey('RemoteIp'))) {
             throw "RemoteIp missing parameter"
         }
-        
+
         if(-Not($PSBoundParameters.ContainsKey('RemotePort'))) {
             throw "RemotePort missing parameter"
         }
     }
-    $parametersConPtyShell = @($RemoteIp, $RemotePort, $Rows, $Cols, $CommandLine)
+    $noPtyStr = if ($NoPty) { "nopty" } else { "" }
+    $parametersConPtyShell = @($RemoteIp, $RemotePort, $Rows, $Cols, $CommandLine, $noPtyStr)
     Add-Type -TypeDefinition $Source -Language CSharp;
     $output = [ConPtyShellMainClass]::ConPtyShellMain($parametersConPtyShell)
     Write-Output $output
@@ -1488,7 +1493,7 @@ public static class ConPtyShell
         return thReadSocketWritePipe;
     }
 
-    public static string SpawnConPtyShell(string remoteIp, int remotePort, uint rows, uint cols, string commandLine, bool upgradeShell)
+    public static string SpawnConPtyShell(string remoteIp, int remotePort, uint rows, uint cols, string commandLine, bool upgradeShell, bool noPty)
     {
         IntPtr shellSocket = IntPtr.Zero;
         IntPtr InputPipeRead = IntPtr.Zero;
@@ -1508,7 +1513,7 @@ public static class ConPtyShell
         Process currentProcess = null;
         Process parentProcess = null;
         Process grandParentProcess = null;
-        if (GetProcAddress(GetModuleHandle("kernel32"), "CreatePseudoConsole") != IntPtr.Zero)
+        if (!noPty && GetProcAddress(GetModuleHandle("kernel32"), "CreatePseudoConsole") != IntPtr.Zero)
             conptyCompatible = true;
         PROCESS_INFORMATION childProcessInfo = new PROCESS_INFORMATION();
         CreatePipes(ref InputPipeRead, ref InputPipeWrite, ref OutputPipeRead, ref OutputPipeWrite);
@@ -1737,7 +1742,8 @@ public static class ConPtyShellMainClass
                 uint rows = ParseRows(args);
                 uint cols = ParseCols(args);
                 string commandLine = ParseCommandLine(args);
-                output = ConPtyShell.SpawnConPtyShell(remoteIp, remotePort, rows, cols, commandLine, upgradeShell);
+                bool noPty = (args.Length > 5 && args[5] == "nopty");
+                output = ConPtyShell.SpawnConPtyShell(remoteIp, remotePort, rows, cols, commandLine, upgradeShell, noPty);
             }
             catch (Exception e)
             {

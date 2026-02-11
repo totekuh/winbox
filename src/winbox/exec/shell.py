@@ -42,6 +42,7 @@ def open_shell(
     ga: GuestAgent,
     *,
     port: int = DEFAULT_PORT,
+    pipe_mode: bool = False,
 ) -> None:
     """Open an interactive SYSTEM shell via ConPTY reverse connection."""
     _ensure_conpty_on_share(cfg)
@@ -65,16 +66,18 @@ def open_shell(
     console.print(f"[blue][*][/] Listening on {cfg.smb_host_ip}:{port}")
 
     # Build PowerShell command — read script from Z:\ (SMB share root)
+    nopty_flag = " -NoPty" if pipe_mode else ""
     ps_cmd = (
         f"IEX(Get-Content 'Z:\\{CONPTY_SCRIPT}' -Raw); "
         f"Invoke-ConPtyShell -RemoteIp {cfg.smb_host_ip} -RemotePort {port} "
-        f"-Rows {rows} -Cols {cols}"
+        f"-Rows {rows} -Cols {cols}{nopty_flag}"
     )
     encoded = base64.b64encode(ps_cmd.encode("utf-16-le")).decode("ascii")
     cmd = f"powershell -ExecutionPolicy Bypass -EncodedCommand {encoded}"
 
     # Fire via guest agent — detached, the shell runs until we disconnect
-    console.print("[blue][*][/] Launching reverse shell as SYSTEM...")
+    mode = "pipe" if pipe_mode else "ConPTY"
+    console.print(f"[blue][*][/] Launching reverse shell as SYSTEM ({mode})...")
     ga.exec_detached(cmd)
 
     # Wait for incoming connection
@@ -91,25 +94,32 @@ def open_shell(
     console.print("[green][+][/] SYSTEM shell ready — type 'exit' to close\n")
 
     # Enter raw terminal mode and relay I/O
-    _relay(client)
+    _relay(client, resize=not pipe_mode)
 
 
-def _relay(sock: socket.socket) -> None:
+def _relay(sock: socket.socket, *, resize: bool = True) -> None:
     """Raw terminal I/O relay between stdin/stdout and the socket."""
     old_settings = termios.tcgetattr(sys.stdin)
     tty.setraw(sys.stdin)
 
-    # Self-pipe so SIGWINCH wakes up select()
-    sig_r, sig_w = os.pipe()
-    os.set_blocking(sig_r, False)
-    os.set_blocking(sig_w, False)
-    old_wakeup = signal.set_wakeup_fd(sig_w)
-    old_handler = signal.signal(signal.SIGWINCH, lambda *_: None)
+    # Self-pipe so SIGWINCH wakes up select() (only needed for resize)
+    sig_r = sig_w = -1
+    old_wakeup = -1
+    old_handler = None
+    if resize:
+        sig_r, sig_w = os.pipe()
+        os.set_blocking(sig_r, False)
+        os.set_blocking(sig_w, False)
+        old_wakeup = signal.set_wakeup_fd(sig_w)
+        old_handler = signal.signal(signal.SIGWINCH, lambda *_: None)
 
     try:
         while True:
-            readable, _, _ = select.select([sys.stdin, sock, sig_r], [], [])
-            if sig_r in readable:
+            select_fds = [sys.stdin, sock]
+            if resize:
+                select_fds.append(sig_r)
+            readable, _, _ = select.select(select_fds, [], [])
+            if resize and sig_r in readable:
                 try:
                     os.read(sig_r, 4096)  # drain wakeup bytes
                 except OSError:
@@ -133,10 +143,11 @@ def _relay(sock: socket.socket) -> None:
     except (ConnectionResetError, BrokenPipeError, OSError):
         pass
     finally:
-        signal.signal(signal.SIGWINCH, old_handler)
-        signal.set_wakeup_fd(old_wakeup)
-        os.close(sig_r)
-        os.close(sig_w)
+        if resize:
+            signal.signal(signal.SIGWINCH, old_handler)
+            signal.set_wakeup_fd(old_wakeup)
+            os.close(sig_r)
+            os.close(sig_w)
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         sock.close()
         console.print("\n[blue][*][/] Shell closed")
