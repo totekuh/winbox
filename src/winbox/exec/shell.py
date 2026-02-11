@@ -192,7 +192,16 @@ def _relay_pipe(sock: socket.socket) -> None:
                 data = sock.recv(4096)
                 if not data:
                     break
+                # Erase user's partial input, print output, then redraw
+                if buf:
+                    if pos > 0:
+                        out(b'\x1b[%dD' % pos)
+                    out(b'\x1b[K')
                 out(data)
+                if buf:
+                    out(bytes(buf))
+                    if pos < len(buf):
+                        out(b'\x1b[%dD' % (len(buf) - pos))
 
             if sys.stdin in readable:
                 ch = os.read(stdin_fd, 1)
@@ -254,6 +263,25 @@ def _relay_pipe(sock: socket.socket) -> None:
                         out(b'\x1b[D')
                         pos -= 1
 
+                    elif c == 0x31:  # ESC[1;5C / ESC[1;5D — Ctrl+Right/Left
+                        rest = os.read(stdin_fd, 3)  # ";5C" or ";5D"
+                        if len(rest) == 3 and rest[0:2] == b';5':
+                            old_pos = pos
+                            if rest[2:3] == b'C':  # Ctrl+Right
+                                while pos < len(buf) and buf[pos:pos+1] == b' ':
+                                    pos += 1
+                                while pos < len(buf) and buf[pos:pos+1] != b' ':
+                                    pos += 1
+                                if pos > old_pos:
+                                    out(b'\x1b[%dC' % (pos - old_pos))
+                            elif rest[2:3] == b'D':  # Ctrl+Left
+                                while pos > 0 and buf[pos-1:pos] == b' ':
+                                    pos -= 1
+                                while pos > 0 and buf[pos-1:pos] != b' ':
+                                    pos -= 1
+                                if old_pos > pos:
+                                    out(b'\x1b[%dD' % (old_pos - pos))
+
                     elif c == 0x48 and pos > 0:  # Home
                         out(b'\x1b[%dD' % pos)
                         pos = 0
@@ -274,6 +302,7 @@ def _relay_pipe(sock: socket.socket) -> None:
                     buf.clear()
                     pos = 0
                     hist_idx = -1
+                    sock.sendall(b'\n')  # trigger fresh prompt
 
                 elif b == 0x04:  # Ctrl+D
                     break
@@ -299,6 +328,26 @@ def _relay_pipe(sock: socket.socket) -> None:
                         out(b'\x1b[%dD' % deleted)
                         out(bytes(buf) + b' ' * deleted)
                         out(b'\x1b[%dD' % (len(buf) + deleted))
+
+                elif b == 0x17:  # Ctrl+W — delete word backward
+                    if pos > 0:
+                        old_pos = pos
+                        while pos > 0 and buf[pos-1:pos] == b' ':
+                            pos -= 1
+                        while pos > 0 and buf[pos-1:pos] != b' ':
+                            pos -= 1
+                        deleted = old_pos - pos
+                        del buf[pos:old_pos]
+                        out(b'\x1b[%dD' % deleted)
+                        out(bytes(buf[pos:]) + b' ' * deleted)
+                        out(b'\x1b[%dD' % (len(buf) - pos + deleted))
+
+                elif b == 0x0c:  # Ctrl+L — clear screen
+                    out(b'\x1b[2J\x1b[H')  # clear + cursor home
+                    # Redraw whatever was in the buffer
+                    out(bytes(buf))
+                    if pos < len(buf):
+                        out(b'\x1b[%dD' % (len(buf) - pos))
 
                 elif b >= 0x20:  # Printable character
                     buf.insert(pos, b)
