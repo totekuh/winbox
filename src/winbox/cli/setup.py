@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 
 import click
@@ -30,6 +31,7 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
     vm = VM(cfg)
 
     console.print("[bold]winbox setup[/] — building Windows VM\n")
+    t0 = time.monotonic()
 
     # Check prereqs
     missing = installer.check_prereqs()
@@ -114,7 +116,9 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
     # Phase 4: Snapshot
     installer.create_clean_snapshot(cfg)
 
-    console.print("\n[green][+][/] [bold]winbox setup complete![/]\n")
+    elapsed = time.monotonic() - t0
+    minutes, seconds = divmod(int(elapsed), 60)
+    console.print(f"\n[green][+][/] [bold]winbox setup complete![/] ({minutes}m {seconds}s)\n")
     console.print("  [bold]Quick start:[/]")
     console.print('    winbox exec cmd.exe /c "echo hello"')
     console.print("    winbox exec SharpHound.exe --help")

@@ -71,14 +71,19 @@ def ssh(ctx: click.Context) -> None:
     console.print(f"[blue][*][/] Connecting to {ip}...")
 
     ssh_args = [
-        "ssh",
+        "ssh", "-t",
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
     ]
     if cfg.ssh_key.exists():
         ssh_args += ["-i", str(cfg.ssh_key)]
 
-    ssh_args += [f"{cfg.vm_user}@{ip}", "powershell.exe"]
+    # Map Z: for Administrator (GA maps it for SYSTEM only), then go interactive
+    ssh_args += [
+        f"{cfg.vm_user}@{ip}",
+        "powershell.exe", "-NoLogo", "-NoExit", "-Command",
+        r"net use Z: \\{}\winbox".format(cfg.smb_host_ip),
+    ]
 
     # Use sshpass for automatic password auth if available
     if shutil.which("sshpass"):

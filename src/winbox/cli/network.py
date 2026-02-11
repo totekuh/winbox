@@ -27,7 +27,7 @@ def dns() -> None:
 @click.argument("ip")
 @click.pass_context
 def dns_set(ctx: click.Context, ip: str) -> None:
-    """Set a DNS nameserver on the VM and reboot.
+    """Set a DNS nameserver on the VM.
 
     Example: winbox dns set 192.168.56.11
     """
@@ -51,19 +51,6 @@ def dns_set(ctx: click.Context, ip: str) -> None:
         raise SystemExit(1)
 
     console.print(f"[green][+][/] DNS set to {ip}")
-
-    # Reboot for clean slate
-    console.print("[blue][*][/] Rebooting...")
-    try:
-        ga.exec("shutdown /r /t 0", timeout=10)
-    except Exception:
-        pass  # Expected — VM reboots before we get a response
-
-    time.sleep(10)
-    console.print("[blue][*][/] Waiting for VM to come back...")
-    ga.wait(timeout=120)
-    _ensure_smb_mapped(ga, cfg)
-    console.print(f"[green][+][/] VM ready — DNS pointing at {ip}")
 
 
 @dns.command("sync")

@@ -6,7 +6,9 @@ import base64
 import os
 import select
 import shutil
+import signal
 import socket
+import struct
 import sys
 import termios
 import tty
@@ -24,13 +26,12 @@ console = Console()
 
 CONPTY_SCRIPT = "Invoke-ConPtyShell.ps1"
 DEFAULT_PORT = 4444
+RESIZE_MAGIC = b"\x00RSIZ"
 
 
 def _ensure_conpty_on_share(cfg: Config) -> None:
-    """Copy Invoke-ConPtyShell.ps1 from package data to share root if missing."""
+    """Copy Invoke-ConPtyShell.ps1 from package data to share root (always refreshed)."""
     dest = cfg.shared_dir / CONPTY_SCRIPT
-    if dest.exists():
-        return
     src = resources.files("winbox.data").joinpath(CONPTY_SCRIPT)
     with resources.as_file(src) as src_path:
         shutil.copy2(src_path, dest)
@@ -98,9 +99,27 @@ def _relay(sock: socket.socket) -> None:
     old_settings = termios.tcgetattr(sys.stdin)
     tty.setraw(sys.stdin)
 
+    # Self-pipe so SIGWINCH wakes up select()
+    sig_r, sig_w = os.pipe()
+    os.set_blocking(sig_r, False)
+    os.set_blocking(sig_w, False)
+    old_wakeup = signal.set_wakeup_fd(sig_w)
+    old_handler = signal.signal(signal.SIGWINCH, lambda *_: None)
+
     try:
         while True:
-            readable, _, _ = select.select([sys.stdin, sock], [], [])
+            readable, _, _ = select.select([sys.stdin, sock, sig_r], [], [])
+            if sig_r in readable:
+                try:
+                    os.read(sig_r, 4096)  # drain wakeup bytes
+                except OSError:
+                    pass
+                try:
+                    size = os.get_terminal_size()
+                    msg = RESIZE_MAGIC + struct.pack(">HH", size.lines, size.columns)
+                    sock.sendall(msg)
+                except OSError:
+                    pass
             if sys.stdin in readable:
                 data = os.read(sys.stdin.fileno(), 1024)
                 if not data:
@@ -114,6 +133,10 @@ def _relay(sock: socket.socket) -> None:
     except (ConnectionResetError, BrokenPipeError, OSError):
         pass
     finally:
+        signal.signal(signal.SIGWINCH, old_handler)
+        signal.set_wakeup_fd(old_wakeup)
+        os.close(sig_r)
+        os.close(sig_w)
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         sock.close()
         console.print("\n[blue][*][/] Shell closed")

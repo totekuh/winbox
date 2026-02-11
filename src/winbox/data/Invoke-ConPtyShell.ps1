@@ -952,6 +952,8 @@ public static class ConPtyShell
     private const int STD_ERROR_HANDLE = -12;
     private const int WSAEWOULDBLOCK = 10035;
     private const int FD_READ = (1 << 0);
+    private static readonly byte[] RESIZE_MAGIC = new byte[] { 0x00, 0x52, 0x53, 0x49, 0x5A };
+    private const int RESIZE_MSG_LEN = 9;
 
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -1079,6 +1081,9 @@ public static class ConPtyShell
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern int ClosePseudoConsole(IntPtr hPC);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern int ResizePseudoConsole(IntPtr hPC, COORD size);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint mode);
@@ -1372,23 +1377,66 @@ public static class ConPtyShell
         return thThreadReadPipeWriteSocket;
     }
 
+    private static int FindResizeMsg(byte[] buf, int len)
+    {
+        if (len < RESIZE_MSG_LEN) return -1;
+        for (int i = 0; i <= len - RESIZE_MSG_LEN; i++)
+        {
+            if (buf[i] == RESIZE_MAGIC[0] && buf[i+1] == RESIZE_MAGIC[1] && buf[i+2] == RESIZE_MAGIC[2] && buf[i+3] == RESIZE_MAGIC[3] && buf[i+4] == RESIZE_MAGIC[4])
+                return i;
+        }
+        return -1;
+    }
+
+    private static bool HandleResizeAndForward(byte[] buf, int len, IntPtr pipe, IntPtr hPC)
+    {
+        if (len <= 0) return true;
+        int pos = (hPC != IntPtr.Zero) ? FindResizeMsg(buf, len) : -1;
+        if (pos == -1)
+        {
+            uint bw;
+            return WriteFile(pipe, buf, (uint)len, out bw, IntPtr.Zero);
+        }
+        if (pos > 0)
+        {
+            uint bw;
+            byte[] before = new byte[pos];
+            Array.Copy(buf, 0, before, 0, pos);
+            WriteFile(pipe, before, (uint)pos, out bw, IntPtr.Zero);
+        }
+        ushort rows = (ushort)((buf[pos + 5] << 8) | buf[pos + 6]);
+        ushort cols = (ushort)((buf[pos + 7] << 8) | buf[pos + 8]);
+        COORD sz;
+        sz.X = (short)cols;
+        sz.Y = (short)rows;
+        ResizePseudoConsole(hPC, sz);
+        int after = pos + RESIZE_MSG_LEN;
+        if (after < len)
+        {
+            uint bw;
+            byte[] rest = new byte[len - after];
+            Array.Copy(buf, after, rest, 0, rest.Length);
+            return WriteFile(pipe, rest, (uint)(len - after), out bw, IntPtr.Zero);
+        }
+        return true;
+    }
+
     private static void ThreadReadSocketWritePipeOverlapped(object threadParams)
     {
         object[] threadParameters = (object[])threadParams;
         IntPtr InputPipeWrite = (IntPtr)threadParameters[0];
         IntPtr shellSocket = (IntPtr)threadParameters[1];
         IntPtr hChildProcess = (IntPtr)threadParameters[2];
+        IntPtr hPC = (IntPtr)threadParameters[3];
         int bufferSize = 8192;
         bool writeSuccess = false;
         Int32 nBytesReceived = 0;
-        uint bytesWritten = 0;
         do
         {
             byte[] bytesReceived = new byte[bufferSize];
             nBytesReceived = recv(shellSocket, bytesReceived, bufferSize, 0);
-            writeSuccess = WriteFile(InputPipeWrite, bytesReceived, (uint)nBytesReceived, out bytesWritten, IntPtr.Zero);
+            writeSuccess = HandleResizeAndForward(bytesReceived, nBytesReceived, InputPipeWrite, hPC);
         } while (nBytesReceived > 0 && writeSuccess);
-        //  Console.WriteLine("debug: nBytesReceived = " + nBytesReceived + " WSAGetLastError() = " + WSAGetLastError().ToString());
         TerminateProcess(hChildProcess, 0);
     }
 
@@ -1398,13 +1446,12 @@ public static class ConPtyShell
         IntPtr InputPipeWrite = (IntPtr)threadParameters[0];
         IntPtr shellSocket = (IntPtr)threadParameters[1];
         IntPtr hChildProcess = (IntPtr)threadParameters[2];
+        IntPtr hPC = (IntPtr)threadParameters[3];
         int bufferSize = 8192;
         bool writeSuccess = false;
         Int32 nBytesReceived = 0;
-        uint bytesWritten = 0;
         bool socketBlockingOperation = false;
         IntPtr wsaReadEvent = WSACreateEvent();
-        // we expect the socket to be non-blocking at this point. we create an asynch event to be signaled when the recv operation is ready to get some data
         WSAEventSelect(shellSocket, wsaReadEvent, FD_READ);
         IntPtr[] wsaEventsArray = new IntPtr[] { wsaReadEvent };
         do
@@ -1412,7 +1459,6 @@ public static class ConPtyShell
             byte[] bytesReceived = new byte[bufferSize];
             WSAWaitForMultipleEvents(wsaEventsArray.Length, wsaEventsArray, true, 500, false);
             nBytesReceived = recv(shellSocket, bytesReceived, bufferSize, 0);
-            // we still check WSAEWOULDBLOCK for a more robust implementation
             if (WSAGetLastError() == WSAEWOULDBLOCK)
             {
                 socketBlockingOperation = true;
@@ -1420,20 +1466,19 @@ public static class ConPtyShell
             }
             WSAResetEvent(wsaReadEvent);
             socketBlockingOperation = false;
-            // Console.WriteLine("debug: ThreadReadSocketWritePipe recv: nBytesReceived = " + nBytesReceived + " WSAGetLastError() = " + WSAGetLastError().ToString());
-            writeSuccess = WriteFile(InputPipeWrite, bytesReceived, (uint)nBytesReceived, out bytesWritten, IntPtr.Zero);
-            // Console.WriteLine("debug ThreadReadSocketWritePipe WriteFile: bytesWritten = " + bytesWritten + " Marshal.GetLastWin32Error() = " + Marshal.GetLastWin32Error());
+            writeSuccess = HandleResizeAndForward(bytesReceived, nBytesReceived, InputPipeWrite, hPC);
         } while (socketBlockingOperation || (nBytesReceived > 0 && writeSuccess));
         WSACloseEvent(wsaReadEvent);
         TerminateProcess(hChildProcess, 0);
     }
 
-    private static Thread StartThreadReadSocketWritePipe(IntPtr InputPipeWrite, IntPtr shellSocket, IntPtr hChildProcess, bool overlappedSocket)
+    private static Thread StartThreadReadSocketWritePipe(IntPtr InputPipeWrite, IntPtr shellSocket, IntPtr hChildProcess, bool overlappedSocket, IntPtr handlePseudoConsole)
     {
-        object[] threadParameters = new object[3];
+        object[] threadParameters = new object[4];
         threadParameters[0] = InputPipeWrite;
         threadParameters[1] = shellSocket;
         threadParameters[2] = hChildProcess;
+        threadParameters[3] = handlePseudoConsole;
         Thread thReadSocketWritePipe;
         if(overlappedSocket)
             thReadSocketWritePipe = new Thread(ThreadReadSocketWritePipeOverlapped);
@@ -1576,7 +1621,7 @@ public static class ConPtyShell
         }
         //Threads have better performance than Tasks
         Thread thThreadReadPipeWriteSocket = StartThreadReadPipeWriteSocket(OutputPipeRead, shellSocket, IsSocketOverlapped);
-        Thread thReadSocketWritePipe = StartThreadReadSocketWritePipe(InputPipeWrite, shellSocket, childProcessInfo.hProcess, IsSocketOverlapped);
+        Thread thReadSocketWritePipe = StartThreadReadSocketWritePipe(InputPipeWrite, shellSocket, childProcessInfo.hProcess, IsSocketOverlapped, handlePseudoConsole);
         // wait for the child process until exit
         WaitForSingleObject(childProcessInfo.hProcess, INFINITE);
         //cleanup everything
