@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,10 +19,28 @@ console = Console()
 
 
 def resolve_exe(exe: str, tools_dir: Path) -> str:
-    """Resolve a bare .exe name to Z:\\tools\\ path if it exists locally."""
-    if exe.lower().endswith(".exe") and "\\" not in exe and "/" not in exe:
+    """Resolve executable to Z:\\tools\\ path.
+
+    Handles three cases:
+    - Local Linux path (/tmp/foo.exe, ./foo.exe) → copy to tools dir
+    - Bare .exe name (foo.exe) → check tools dir
+    - Windows path or system command → pass through
+    """
+    # Local Linux path → copy to VirtIO-FS share
+    if "/" in exe:
+        local = Path(exe).resolve()
+        if local.is_file():
+            dest = tools_dir / local.name
+            if local != dest.resolve():
+                tools_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(local, dest)
+            return f"Z:\\tools\\{local.name}"
+
+    # Bare .exe name → check tools dir
+    if exe.lower().endswith(".exe") and "\\" not in exe:
         if (tools_dir / exe).exists():
             return f"Z:\\tools\\{exe}"
+
     return exe
 
 
