@@ -7,7 +7,6 @@ import time
 import click
 from rich.console import Console
 
-from winbox.vm import smb
 from winbox.config import Config
 from winbox.vm import GuestAgent
 from winbox.vm import VM, VMState
@@ -16,21 +15,18 @@ console = Console()
 
 
 def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
-    """Make sure the VM and SMB server are running, guest agent responding."""
+    """Make sure the VM is running and guest agent responding."""
     state = vm.state()
 
     if state == VMState.NOT_FOUND:
         console.print("[red][-][/] VM not found. Run [bold]winbox setup[/] first.")
         raise SystemExit(1)
 
-    # Ensure SMB server is up
-    smb.start(cfg)
-
     if state == VMState.RUNNING:
         if not ga.ping():
             console.print("[blue][*][/] Waiting for guest agent...")
             ga.wait(timeout=60)
-        _ensure_smb_mapped(ga, cfg)
+        _ensure_z_drive(ga)
         _ensure_sshd_running(ga)
         return
 
@@ -49,26 +45,22 @@ def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
 
     console.print("[blue][*][/] Waiting for guest agent...")
     ga.wait(timeout=120)
-    _ensure_smb_mapped(ga, cfg)
+    _ensure_z_drive(ga)
     _ensure_sshd_running(ga)
     console.print("[green][+][/] VM ready")
 
 
-def _ensure_smb_mapped(ga: GuestAgent, cfg: Config) -> None:
-    """Ensure Z: drive is mapped to the host SMB share."""
+def _ensure_z_drive(ga: GuestAgent) -> None:
+    """Verify the VirtIO-FS Z: drive is accessible (VirtioFsSvc auto-mounts it)."""
+    # Kick the service in case it hasn't started yet
     try:
-        result = ga.exec(f"net use Z: \\\\{cfg.smb_host_ip}\\winbox", timeout=10)
-        if result.exitcode != 0 and "already" not in result.stderr.lower():
-            # Failed for some reason other than "already mapped" — remap
-            ga.exec("net use Z: /delete /y", timeout=10)
-            ga.exec(f"net use Z: \\\\{cfg.smb_host_ip}\\winbox", timeout=10)
+        ga.exec("net start VirtioFsSvc", timeout=10)
     except Exception:
-        pass  # Best effort — exec will fail with a clear error if Z: is missing
+        pass
 
-    # Verify the drive is actually accessible (SMB needs a moment after net use)
-    for _ in range(5):
+    for _ in range(15):
         try:
-            result = ga.exec("dir Z:\\", timeout=5)
+            result = ga.exec("dir Z:", timeout=5)
             if result.exitcode == 0:
                 return
         except Exception:

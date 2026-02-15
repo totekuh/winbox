@@ -8,7 +8,7 @@ from pathlib import Path
 
 import click
 
-from winbox.cli import console, ensure_running, _ensure_smb_mapped
+from winbox.cli import console, ensure_running, _ensure_z_drive
 from winbox.config import Config
 from winbox.vm import GuestAgent
 from winbox.vm import VM, VMState
@@ -372,7 +372,7 @@ def domain_join(
     time.sleep(10)
     console.print("[blue][*][/] Waiting for VM to come back...")
     ga.wait(timeout=120)
-    _ensure_smb_mapped(ga, cfg)
+    _ensure_z_drive(ga)
     console.print(f"[green][+][/] VM back up — domain-joined to {name}")
     console.print("    Undo with: [bold]winbox domain leave[/]")
 
@@ -418,5 +418,5 @@ def domain_leave(ctx: click.Context) -> None:
     time.sleep(10)
     console.print("[blue][*][/] Waiting for VM to come back...")
     ga.wait(timeout=120)
-    _ensure_smb_mapped(ga, cfg)
+    _ensure_z_drive(ga)
     console.print("[green][+][/] Domain left — back to workgroup, all files intact")

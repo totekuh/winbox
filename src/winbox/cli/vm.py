@@ -8,7 +8,6 @@ import click
 
 from winbox.cli import console, ensure_running
 from winbox.config import Config
-from winbox.vm import smb
 from winbox.vm import GuestAgent
 from winbox.vm import VM, VMState
 
@@ -59,7 +58,6 @@ def down(ctx: click.Context) -> None:
     else:
         vm.shutdown()
 
-    smb.stop(cfg)
     console.print("[green][+][/] VM stopped")
 
 
@@ -76,7 +74,6 @@ def suspend(ctx: click.Context) -> None:
 
     console.print("[blue][*][/] Saving VM state...")
     vm.suspend()
-    smb.stop(cfg)
     console.print("[green][+][/] VM state saved — resume with [bold]winbox up[/]")
 
 
@@ -97,7 +94,6 @@ def destroy(ctx: click.Context, yes: bool) -> None:
         return
 
     console.print("[blue][*][/] Destroying VM and all storage...")
-    smb.stop(cfg)
     vm.destroy()
     console.print("[green][+][/] VM destroyed")
 

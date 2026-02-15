@@ -26,7 +26,7 @@ def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int) -> None
     """Execute a command in the Windows VM.
 
     Bare .exe names are resolved from Z:\\tools\\. Output files land in
-    ~/.winbox/shared/loot/ via SMB share.
+    ~/.winbox/shared/loot/ via VirtIO-FS.
     """
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
@@ -79,11 +79,9 @@ def ssh(ctx: click.Context) -> None:
     if cfg.ssh_key.exists():
         ssh_args += ["-i", str(cfg.ssh_key)]
 
-    # Map Z: for Administrator (GA maps it for SYSTEM only), then go interactive
     ssh_args += [
         f"{cfg.vm_user}@{ip}",
-        "powershell.exe", "-NoLogo", "-NoExit", "-Command",
-        r"net use Z: \\{}\winbox".format(cfg.smb_host_ip),
+        "powershell.exe", "-NoLogo", "-NoExit",
     ]
 
     # Use sshpass for automatic password auth if available

@@ -37,9 +37,12 @@ REQUIRED_TOOLS = [
     "virsh",
     "virt-install",
     "virt-customize",
+    "7z",
     "jq",
-    "impacket-smbserver",
 ]
+
+# virtiofsd is installed to /usr/libexec on Debian/Kali, not on PATH
+VIRTIOFSD_PATHS = ["/usr/libexec/virtiofsd", "/usr/lib/qemu/virtiofsd"]
 
 
 def check_prereqs() -> list[str]:
@@ -48,6 +51,8 @@ def check_prereqs() -> list[str]:
     for tool in REQUIRED_TOOLS:
         if shutil.which(tool) is None:
             missing.append(tool)
+    if not shutil.which("virtiofsd") and not any(Path(p).exists() for p in VIRTIOFSD_PATHS):
+        missing.append("virtiofsd")
     if not Path("/dev/kvm").exists():
         missing.append("/dev/kvm")
     return missing
@@ -140,10 +145,22 @@ def grant_libvirt_access(cfg: Config) -> None:
         )
 
     # Grant read+traverse on subdirs that contain VM files
-    for d in [cfg.winbox_dir, cfg.iso_dir, cfg.shared_dir, cfg.tools_dir, cfg.loot_dir]:
+    for d in [cfg.winbox_dir, cfg.iso_dir]:
         if d.exists():
             subprocess.run(
                 ["setfacl", "-m", "u:libvirt-qemu:rx", str(d)],
+                capture_output=True, check=False,
+            )
+
+    # virtiofsd needs full rwx on the shared directory tree
+    for d in [cfg.shared_dir, cfg.tools_dir, cfg.loot_dir]:
+        if d.exists():
+            subprocess.run(
+                ["setfacl", "-R", "-m", "u:libvirt-qemu:rwx", str(d)],
+                capture_output=True, check=False,
+            )
+            subprocess.run(
+                ["setfacl", "-R", "-d", "-m", "u:libvirt-qemu:rwx", str(d)],
                 capture_output=True, check=False,
             )
 
@@ -175,6 +192,11 @@ OPENSSH_URL = (
 )
 OPENSSH_ZIP = "OpenSSH-Win64.zip"
 
+WINFSP_URL = (
+    "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi"
+)
+WINFSP_MSI = "winfsp.msi"
+
 
 def download_openssh(cfg: Config) -> Path:
     """Download Win32-OpenSSH zip if not cached. Returns path to zip."""
@@ -189,6 +211,42 @@ def download_openssh(cfg: Config) -> Path:
         check=True,
     )
     console.print("[green][+][/] OpenSSH zip downloaded")
+    return dest
+
+
+def download_winfsp(cfg: Config) -> Path:
+    """Download WinFsp MSI if not cached. Returns path to MSI."""
+    dest = cfg.iso_dir / WINFSP_MSI
+    if dest.exists():
+        console.print("[green][+][/] WinFsp MSI cached")
+        return dest
+
+    console.print("[blue][*][/] Downloading WinFsp...")
+    subprocess.run(
+        ["wget", "-q", "--show-progress", "-O", str(dest), WINFSP_URL],
+        check=True,
+    )
+    console.print("[green][+][/] WinFsp MSI downloaded")
+    return dest
+
+
+VIRTIOFS_ISO_PATH = "viofs/2k22/amd64/virtiofs.exe"
+VIRTIOFS_EXE = "virtiofs.exe"
+
+
+def extract_virtiofs(cfg: Config) -> Path:
+    """Extract virtiofs.exe from the VirtIO ISO. Returns path to extracted exe."""
+    dest = cfg.iso_dir / VIRTIOFS_EXE
+    if dest.exists():
+        console.print("[green][+][/] virtiofs.exe cached")
+        return dest
+
+    console.print("[blue][*][/] Extracting virtiofs.exe from VirtIO ISO...")
+    subprocess.run(
+        ["7z", "e", str(cfg.virtio_iso), f"-o{cfg.iso_dir}", VIRTIOFS_ISO_PATH, "-y"],
+        capture_output=True, check=True,
+    )
+    console.print("[green][+][/] virtiofs.exe extracted")
     return dest
 
 
@@ -302,12 +360,18 @@ def run_virt_install(cfg: Config, windows_iso: str) -> None:
         "--name", cfg.vm_name,
         "--ram", str(cfg.vm_ram),
         "--vcpus", str(cfg.vm_cpus),
+        "--memorybacking", "source.type=memfd,access.mode=shared",
         "--disk", f"path={cfg.disk_path},bus=sata",
         "--cdrom", windows_iso,
         "--disk", f"{cfg.unattend_img},device=cdrom",
         "--disk", f"{cfg.virtio_iso},device=cdrom",
         "--network", "network=default,model=e1000",
         "--channel", "unix,target.type=virtio,target.name=org.qemu.guest_agent.0",
+        "--filesystem", (
+            f"type=mount,accessmode=passthrough,driver.type=virtiofs,"
+            f"driver.queue=1024,source.dir={cfg.shared_dir},"
+            f"target.dir=winbox_share"
+        ),
         "--os-variant", "win2k22",
         "--graphics", "vnc,listen=127.0.0.1",
         "--noautoconsole",
@@ -336,8 +400,10 @@ def provision_vm_disk(cfg: Config) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
 
-        # Build provision.zip containing provision.ps1, tools.txt, .ssh_pubkey, OpenSSH
+        # Build provision.zip: provision.ps1, tools.txt, .ssh_pubkey, OpenSSH, WinFsp, virtiofs.exe
         openssh_zip = cfg.iso_dir / OPENSSH_ZIP
+        winfsp_msi = cfg.iso_dir / WINFSP_MSI
+        virtiofs_exe = cfg.iso_dir / VIRTIOFS_EXE
         zip_path = tmpdir_path / "provision.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for name in ("provision.ps1", "tools.txt"):
@@ -347,6 +413,10 @@ def provision_vm_disk(cfg: Config) -> None:
                 zf.write(cfg.ssh_pubkey, ".ssh_pubkey")
             if openssh_zip.exists():
                 zf.write(openssh_zip, OPENSSH_ZIP)
+            if winfsp_msi.exists():
+                zf.write(winfsp_msi, WINFSP_MSI)
+            if virtiofs_exe.exists():
+                zf.write(virtiofs_exe, VIRTIOFS_EXE)
 
         # Copy bootstrap.ps1 to temp dir
         bootstrap_src = _data_file("bootstrap.ps1")
@@ -368,13 +438,11 @@ def provision_vm_disk(cfg: Config) -> None:
 def boot_for_provisioning(cfg: Config) -> None:
     """Phase 3: Boot VM, run bootstrap.ps1 via guest agent, wait for shutdown.
 
-    Starts SMB server (so guest can map Z:), boots VM, waits for guest agent,
-    then triggers bootstrap.ps1 which runs provisioning and shuts down.
+    VirtIO-FS is configured in the VM definition but WinFsp isn't installed yet,
+    so provisioning reads from C:\\Provision\\ (injected by virt-customize).
+    The provision script installs WinFsp + VirtioFsSvc so Z: works after setup.
     """
-    from winbox.vm import smb
     from winbox.vm import GuestAgent
-
-    smb.start(cfg)
 
     console.print("[blue][*][/] Booting VM for provisioning...")
     vm = VM(cfg)
@@ -397,7 +465,6 @@ def boot_for_provisioning(cfg: Config) -> None:
         console.print(f"    Check with: virsh console {cfg.vm_name}")
         raise RuntimeError("Provisioning timed out")
 
-    smb.stop(cfg)
     console.print("[green][+][/] Provisioning complete")
 
 

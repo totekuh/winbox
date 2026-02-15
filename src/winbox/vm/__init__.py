@@ -1,7 +1,6 @@
-"""VM infrastructure — lifecycle, guest agent, SMB."""
+"""VM infrastructure — lifecycle, guest agent."""
 
 from winbox.vm.lifecycle import VM, VMState
 from winbox.vm.guest import ExecResult, GuestAgent, GuestAgentError
-from winbox.vm import smb
 
-__all__ = ["VM", "VMState", "ExecResult", "GuestAgent", "GuestAgentError", "smb"]
+__all__ = ["VM", "VMState", "ExecResult", "GuestAgent", "GuestAgentError"]

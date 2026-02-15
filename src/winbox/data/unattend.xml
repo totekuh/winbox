@@ -140,30 +140,37 @@
           <Description>Install VirtIO serial driver</Description>
         </SynchronousCommand>
 
-        <!-- 2. Disable MSI install restriction policy -->
+        <!-- 2. Install VirtIO-FS driver (required for host filesystem sharing) -->
         <SynchronousCommand wcm:action="add">
           <Order>2</Order>
+          <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\viofs\2k22\amd64\viofs.inf pnputil /add-driver %d:\viofs\2k22\amd64\viofs.inf /install</CommandLine>
+          <Description>Install VirtIO-FS driver</Description>
+        </SynchronousCommand>
+
+        <!-- 3. Disable MSI install restriction policy -->
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
           <CommandLine>reg add "HKLM\Software\Policies\Microsoft\Windows\Installer" /v DisableMSI /t REG_DWORD /d 0 /f</CommandLine>
           <Description>Allow MSI installations</Description>
         </SynchronousCommand>
 
-        <!-- 3. Install QEMU Guest Agent from VirtIO CD -->
+        <!-- 4. Install QEMU Guest Agent from VirtIO CD -->
         <SynchronousCommand wcm:action="add">
-          <Order>3</Order>
+          <Order>4</Order>
           <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\guest-agent\qemu-ga-x86_64.msi msiexec /i %d:\guest-agent\qemu-ga-x86_64.msi /qn /norestart</CommandLine>
           <Description>Install QEMU Guest Agent</Description>
         </SynchronousCommand>
 
-        <!-- 4. Start guest agent service -->
+        <!-- 5. Start guest agent service -->
         <SynchronousCommand wcm:action="add">
-          <Order>4</Order>
+          <Order>5</Order>
           <CommandLine>net start QEMU-GA</CommandLine>
           <Description>Start QEMU Guest Agent</Description>
         </SynchronousCommand>
 
-        <!-- 5. Shut down so host can proceed with provisioning -->
+        <!-- 6. Shut down so host can proceed with provisioning -->
         <SynchronousCommand wcm:action="add">
-          <Order>5</Order>
+          <Order>6</Order>
           <CommandLine>shutdown /s /t 30</CommandLine>
           <Description>Shutdown after install</Description>
         </SynchronousCommand>

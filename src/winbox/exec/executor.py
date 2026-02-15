@@ -69,7 +69,7 @@ def run_command(
     if result.stderr:
         console.print(result.stderr, end="", markup=False, style="red", highlight=False)
 
-    # List new output files (already on host via SMB share)
+    # List new output files (already on host via VirtIO-FS)
     _show_new_files(cfg.loot_dir, marker_time)
 
     return result.exitcode

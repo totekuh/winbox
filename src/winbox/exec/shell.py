@@ -58,18 +58,18 @@ def open_shell(
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        server.bind((cfg.smb_host_ip, port))
+        server.bind((cfg.host_ip, port))
     except OSError as e:
-        console.print(f"[red][-][/] Cannot bind {cfg.smb_host_ip}:{port}: {e}")
+        console.print(f"[red][-][/] Cannot bind {cfg.host_ip}:{port}: {e}")
         return
     server.listen(1)
-    console.print(f"[blue][*][/] Listening on {cfg.smb_host_ip}:{port}")
+    console.print(f"[blue][*][/] Listening on {cfg.host_ip}:{port}")
 
-    # Build PowerShell command — read script from Z:\ (SMB share root)
+    # Build PowerShell command — read script from Z:\ (VirtIO-FS share root)
     nopty_flag = " -NoPty" if pipe_mode else ""
     ps_cmd = (
         f"IEX(Get-Content 'Z:\\{CONPTY_SCRIPT}' -Raw); "
-        f"Invoke-ConPtyShell -RemoteIp {cfg.smb_host_ip} -RemotePort {port} "
+        f"Invoke-ConPtyShell -RemoteIp {cfg.host_ip} -RemotePort {port} "
         f"-Rows {rows} -Cols {cols}{nopty_flag}"
     )
     encoded = base64.b64encode(ps_cmd.encode("utf-16-le")).decode("ascii")

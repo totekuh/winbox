@@ -1,7 +1,7 @@
 # winbox post-install provisioning script
 # Runs inside Windows VM via:
-#   - bootstrap.ps1 (firstboot) — files in C:\Provision\
-#   - winbox provision (re-run) — files in Z:\tools\
+#   - bootstrap.ps1 (firstboot) - files in C:\Provision\
+#   - winbox provision (re-run) - files in Z:\tools\
 
 $ErrorActionPreference = "Continue"
 
@@ -103,12 +103,54 @@ if (Test-Path $pubkeyPath) {
     Write-Host "[!] No SSH pubkey found at $pubkeyPath - skipping key auth"
 }
 
-# --- Map SMB share (host on virbr0) ---
-Write-Host "[*] Mapping SMB share..."
-net use Z: \\192.168.122.1\winbox /persistent:yes 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "[!] Z: mapping failed or already mapped, continuing..."
+# --- VirtIO-FS (host filesystem via shared memory, replaces SMB) ---
+Write-Host "[*] Setting up VirtIO-FS..."
+$winfspMsi = "$provDir\winfsp.msi"
+try {
+    # Install WinFsp (user-mode filesystem framework required by VirtIO-FS)
+    Write-Host "[*] Installing WinFsp..."
+    $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$winfspMsi`" /qn /norestart INSTALLLEVEL=1000" -Wait -PassThru -NoNewWindow
+    Write-Host "[+] WinFsp installed (exit code: $($proc.ExitCode))"
+
+    # Find virtiofs.exe - bundled in provision payload or already installed
+    $viofsExe = $null
+    if (Test-Path "$provDir\virtiofs.exe") {
+        $viofsExe = "$provDir\virtiofs.exe"
+    } elseif (Test-Path "C:\virtiofs\virtiofs.exe") {
+        $viofsExe = "C:\virtiofs\virtiofs.exe"
+    }
+
+    if ($viofsExe) {
+        # Copy virtiofs.exe to a permanent location
+        $viofsDir = "C:\virtiofs"
+        New-Item -ItemType Directory -Path $viofsDir -Force | Out-Null
+        if ($viofsExe -ne "$viofsDir\virtiofs.exe") {
+            Copy-Item $viofsExe "$viofsDir\virtiofs.exe" -Force
+        }
+
+        # Register the VirtioFsSvc service - mounts VirtIO-FS as a drive letter
+        $svcName = "VirtioFsSvc"
+        $existing = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Stop-Service $svcName -Force -ErrorAction SilentlyContinue
+            sc.exe delete $svcName | Out-Null
+            Start-Sleep -Seconds 2
+        }
+        sc.exe create $svcName binPath= "`"$viofsDir\virtiofs.exe`" -m Z: -t winbox_share" start= auto depend= "WinFsp.Launcher/VirtioFsDrv" | Out-Null
+        Write-Host "[+] VirtioFsSvc registered (Z: = winbox_share)"
+
+        # Start the service (will mount Z: if the VirtIO-FS device is present)
+        Start-Service $svcName -ErrorAction SilentlyContinue
+        if ((Get-Service $svcName).Status -eq "Running") {
+            Write-Host "[+] VirtioFsSvc running - Z: mounted"
+        } else {
+            Write-Host "[!] VirtioFsSvc did not start (normal during firstboot provisioning)"
+        }
+    } else {
+        Write-Host "[!] virtiofs.exe not found - VirtIO-FS will not be available"
+    }
+} catch {
+    Write-Host "[!] VirtIO-FS setup error: $_"
 }
-Write-Host "[+] Z: drive mapped"
 
 Write-Host "[+] winbox provisioning complete"

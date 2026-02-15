@@ -9,7 +9,6 @@ from pathlib import Path
 import click
 
 from winbox.setup import installer
-from winbox.vm import smb
 from winbox.cli import console, ensure_running
 from winbox.config import Config
 from winbox.vm import GuestAgent
@@ -39,13 +38,10 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
         console.print(f"[red][-][/] Missing: {', '.join(missing)}")
         console.print(
             "    Install with: [bold]apt install "
-            "qemu-system-x86 libvirt-daemon-system virtinst guestfs-tools jq "
-            "genisoimage python3-impacket impacket-scripts[/]"
+            "qemu-system-x86 libvirt-daemon-system virtinst guestfs-tools "
+            "virtiofsd p7zip-full jq genisoimage[/]"
         )
         raise SystemExit(1)
-
-    # Clean up previous resources
-    smb.stop(cfg)
 
     if vm.exists():
         console.print(f"[yellow][!][/] VM '{cfg.vm_name}' already exists.")
@@ -93,6 +89,8 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
     installer.grant_libvirt_access(cfg)
     installer.download_virtio_iso(cfg)
     installer.download_openssh(cfg)
+    installer.download_winfsp(cfg)
+    installer.extract_virtiofs(cfg)
     installer.download_tools(cfg)
     installer.generate_ssh_keypair(cfg)
     installer.build_unattend_image(cfg)

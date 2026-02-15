@@ -29,7 +29,7 @@ TOOLS_DIR="{tools_dir}"
 
 EXE_NAME="$(basename "$EXE_PATH")"
 
-# If exe is NOT in tools dir, copy it there so it's accessible via SMB
+# If exe is NOT in tools dir, copy it there so it's accessible via VirtIO-FS
 if [ "$(dirname "$(realpath "$EXE_PATH")")" != "$(realpath "$TOOLS_DIR")" ]; then
     cp "$EXE_PATH" "$TOOLS_DIR/$EXE_NAME" 2>/dev/null
 fi
