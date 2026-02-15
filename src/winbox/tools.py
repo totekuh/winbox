@@ -28,7 +28,10 @@ def add(cfg: Config, files: tuple[str, ...]) -> None:
         if not src.exists():
             console.print(f"[yellow][!][/] File not found: {f}")
             continue
-        shutil.copy2(src, cfg.tools_dir / src.name)
+        dest = cfg.tools_dir / src.name
+        shutil.copy2(src, dest)
+        if src.name.lower().endswith(".exe"):
+            dest.chmod(dest.stat().st_mode | 0o755)
         console.print(f"[green][+][/] Added: {src.name}")
 
 

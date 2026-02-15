@@ -59,11 +59,22 @@ def _ensure_smb_mapped(ga: GuestAgent, cfg: Config) -> None:
     try:
         result = ga.exec(f"net use Z: \\\\{cfg.smb_host_ip}\\winbox", timeout=10)
         if result.exitcode != 0 and "already" not in result.stderr.lower():
-            # Already mapped or different error — try remapping
+            # Failed for some reason other than "already mapped" — remap
             ga.exec("net use Z: /delete /y", timeout=10)
             ga.exec(f"net use Z: \\\\{cfg.smb_host_ip}\\winbox", timeout=10)
     except Exception:
         pass  # Best effort — exec will fail with a clear error if Z: is missing
+
+    # Verify the drive is actually accessible (SMB needs a moment after net use)
+    for _ in range(5):
+        try:
+            result = ga.exec("dir Z:\\", timeout=5)
+            if result.exitcode == 0:
+                return
+        except Exception:
+            pass
+        time.sleep(1)
+    console.print("[yellow][!][/] Z: drive may not be ready")
 
 
 def _ensure_sshd_running(ga: GuestAgent) -> None:
@@ -93,6 +104,7 @@ from winbox.cli.setup import setup, provision  # noqa: E402
 from winbox.cli.exec import exec_cmd, shell, ssh  # noqa: E402
 from winbox.cli.network import dns, domain, hosts  # noqa: E402
 from winbox.cli.files import tools, iso  # noqa: E402
+from winbox.cli.binfmt import binfmt  # noqa: E402
 
 cli.add_command(up)
 cli.add_command(down)
@@ -111,3 +123,4 @@ cli.add_command(domain)
 cli.add_command(hosts)
 cli.add_command(tools)
 cli.add_command(iso)
+cli.add_command(binfmt)
