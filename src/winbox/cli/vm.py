@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+import subprocess
+
 import click
 
 from winbox.cli import console, ensure_running
@@ -170,7 +172,11 @@ def restore(ctx: click.Context, name: str) -> None:
     ga = GuestAgent(cfg)
 
     console.print(f"[blue][*][/] Restoring snapshot '{name}'...")
-    vm.snapshot_revert(name)
+    try:
+        vm.snapshot_revert(name)
+    except subprocess.CalledProcessError:
+        console.print(f"[red][-][/] Failed to restore snapshot '{name}'")
+        raise SystemExit(1)
     console.print(f"[green][+][/] Restored to '{name}'")
 
     if vm.state() == VMState.RUNNING:

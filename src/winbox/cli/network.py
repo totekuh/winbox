@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import re
 import time
 from pathlib import Path
 
@@ -36,6 +37,7 @@ def dns_set(ctx: click.Context, ip: str) -> None:
     ga = GuestAgent(cfg)
 
     ensure_running(vm, ga, cfg)
+    _validate_ip(ip)
 
     console.print(f"[blue][*][/] Setting DNS to {ip}...")
     dns_script = (
@@ -140,6 +142,26 @@ def dns_view(ctx: click.Context) -> None:
 
 HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
 
+# Validation patterns for user-supplied values interpolated into PowerShell
+_IP_RE = re.compile(r"^[\d.:a-fA-F]+$")  # IPv4/IPv6
+_HOSTNAME_RE = re.compile(r"^[\w.\-]+$")  # hostname/FQDN
+_DOMAIN_RE = re.compile(r"^[\w.\-]+$")    # domain name
+
+
+def _validate_ip(ip: str) -> None:
+    if not _IP_RE.match(ip):
+        raise click.BadParameter(f"Invalid IP address: {ip}")
+
+
+def _validate_hostname(hostname: str) -> None:
+    if not _HOSTNAME_RE.match(hostname):
+        raise click.BadParameter(f"Invalid hostname: {hostname}")
+
+
+def _validate_domain(name: str) -> None:
+    if not _DOMAIN_RE.match(name):
+        raise click.BadParameter(f"Invalid domain name: {name}")
+
 
 @click.group()
 def hosts() -> None:
@@ -187,6 +209,8 @@ def hosts_add(ctx: click.Context, ip: str, hostname: str) -> None:
     ga = GuestAgent(cfg)
 
     ensure_running(vm, ga, cfg)
+    _validate_ip(ip)
+    _validate_hostname(hostname)
 
     script = f"Add-Content -Path '{HOSTS_PATH}' -Value \"{ip}`t{hostname}\""
     result = ga.exec_powershell(script, timeout=15)
@@ -211,11 +235,14 @@ def hosts_set(ctx: click.Context, ip: str, hostname: str) -> None:
     ga = GuestAgent(cfg)
 
     ensure_running(vm, ga, cfg)
+    _validate_ip(ip)
+    _validate_hostname(hostname)
 
+    hostname_escaped = hostname.replace('.', '\\.')
     script = (
         f"$f = '{HOSTS_PATH}'\n"
         f"$lines = Get-Content $f\n"
-        f"$lines = @($lines | Where-Object {{ $_ -notmatch '\\s+{hostname}\\s*$' }})\n"
+        f"$lines = @($lines | Where-Object {{ $_ -notmatch '\\s+{hostname_escaped}\\s*$' }})\n"
         f"$lines += \"{ip}`t{hostname}\"\n"
         f"Set-Content -Path $f -Value $lines"
     )
@@ -240,11 +267,13 @@ def hosts_delete(ctx: click.Context, hostname: str) -> None:
     ga = GuestAgent(cfg)
 
     ensure_running(vm, ga, cfg)
+    _validate_hostname(hostname)
 
+    hostname_escaped = hostname.replace('.', '\\.')
     script = (
         f"$f = '{HOSTS_PATH}'\n"
         f"$lines = Get-Content $f\n"
-        f"$lines = @($lines | Where-Object {{ $_ -notmatch '\\s+{hostname}\\s*$' }})\n"
+        f"$lines = @($lines | Where-Object {{ $_ -notmatch '\\s+{hostname_escaped}\\s*$' }})\n"
         f"Set-Content -Path $f -Value $lines"
     )
     result = ga.exec_powershell(script, timeout=15)
@@ -289,6 +318,9 @@ def domain_join(
     ga = GuestAgent(cfg)
 
     ensure_running(vm, ga, cfg)
+    _validate_domain(name)
+    _validate_ip(ns_ip)
+    _validate_hostname(user)
 
     # Set DNS to domain name server
     console.print(f"[blue][*][/] Setting DNS to {ns_ip}...")

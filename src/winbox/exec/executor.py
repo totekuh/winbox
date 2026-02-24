@@ -36,10 +36,12 @@ def resolve_exe(exe: str, tools_dir: Path) -> str:
                 shutil.copy2(local, dest)
             return f"Z:\\tools\\{local.name}"
 
-    # Bare .exe name → check tools dir
+    # Bare .exe name → check tools dir (case-insensitive on Linux)
     if exe.lower().endswith(".exe") and "\\" not in exe:
-        if (tools_dir / exe).exists():
-            return f"Z:\\tools\\{exe}"
+        if tools_dir.exists():
+            for f in tools_dir.iterdir():
+                if f.name.lower() == exe.lower():
+                    return f"Z:\\tools\\{f.name}"
 
     return exe
 
@@ -75,12 +77,12 @@ def run_command(
 
     # Execute via guest agent (retry on "handle is invalid" — GA pipe race)
     max_retries = 3
-    for attempt in range(max_retries):
-        result: ExecResult = ga.exec(full_cmd, timeout=timeout)
+    result: ExecResult = ga.exec(full_cmd, timeout=timeout)
+    for attempt in range(1, max_retries):
         if "handle is invalid" not in result.stdout.lower() + result.stderr.lower():
             break
-        if attempt < max_retries - 1:
-            time.sleep(0.5)
+        time.sleep(0.5)
+        result = ga.exec(full_cmd, timeout=timeout)
 
     # Print stdout/stderr
     if result.stdout:

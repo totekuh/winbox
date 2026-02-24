@@ -63,7 +63,10 @@ def list_tools(cfg: Config) -> None:
 
 def remove(cfg: Config, name: str) -> None:
     """Remove a tool from the shared directory."""
-    target = cfg.tools_dir / name
+    target = (cfg.tools_dir / name).resolve()
+    if not str(target).startswith(str(cfg.tools_dir.resolve())):
+        console.print(f"[red][-][/] Invalid name: {name}")
+        return
     if target.exists():
         target.unlink()
         console.print(f"[green][+][/] Removed: {name}")

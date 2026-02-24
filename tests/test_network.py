@@ -199,7 +199,7 @@ class TestHostsSet:
 
         script = mock_env.exec_powershell.call_args[0][0]
         assert "notmatch" in script
-        assert "dc01.corp.local" in script
+        assert r"dc01\.corp\.local" in script
         assert "Set-Content" in script
 
     def test_set_failure(self, runner, mock_env):
@@ -225,7 +225,7 @@ class TestHostsDelete:
 
         script = mock_env.exec_powershell.call_args[0][0]
         assert "notmatch" in script
-        assert "dc01.corp.local" in script
+        assert r"dc01\.corp\.local" in script
         assert "Set-Content" in script
 
     def test_delete_failure(self, runner, mock_env):

@@ -96,6 +96,12 @@ def download_iso(
                 f"[yellow][!][/] Partial download detected "
                 f"({human_size(local_size)} / {human_size(remote_size)}), resuming..."
             )
+        elif remote_size and local_size > remote_size:
+            console.print(
+                f"[yellow][!][/] Local file ({human_size(local_size)}) is larger than remote "
+                f"({human_size(remote_size)}). Use --force to re-download."
+            )
+            return dest
         elif not remote_size and local_size > 1_000_000_000:
             # Can't verify size but file looks complete (>1GB)
             console.print(f"[green][+][/] ISO already downloaded: {dest}")

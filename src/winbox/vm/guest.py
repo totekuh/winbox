@@ -65,14 +65,13 @@ class GuestAgent:
 
     def wait(self, timeout: int = 120, interval: int = 2) -> None:
         """Block until the guest agent responds or timeout."""
-        elapsed = 0
+        deadline = time.monotonic() + timeout
         while not self.ping():
-            time.sleep(interval)
-            elapsed += interval
-            if elapsed >= timeout:
+            if time.monotonic() >= deadline:
                 raise GuestAgentError(
                     f"Guest agent not responding after {timeout}s"
                 )
+            time.sleep(interval)
 
     def exec_detached(self, command: str) -> int:
         """Fire a command in the guest and return immediately.
@@ -125,18 +124,17 @@ class GuestAgent:
             "execute": "guest-exec-status",
             "arguments": {"pid": pid},
         }
-        elapsed = 0.0
+        deadline = time.monotonic() + timeout
         while True:
             status = self._raw_command(status_payload)
             ret = status.get("return", {})
             if ret.get("exited"):
                 break
-            time.sleep(poll_interval)
-            elapsed += poll_interval
-            if elapsed >= timeout:
+            if time.monotonic() >= deadline:
                 raise GuestAgentError(
                     f"Command timed out after {timeout}s (PID {pid})"
                 )
+            time.sleep(poll_interval)
 
         # Decode output
         exitcode = ret.get("exitcode", 1)

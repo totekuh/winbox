@@ -39,7 +39,6 @@ REQUIRED_TOOLS = [
     "virt-install",
     "virt-customize",
     "7z",
-    "jq",
 ]
 
 # virtiofsd is installed to /usr/libexec on Debian/Kali, not on PATH
@@ -133,7 +132,7 @@ def grant_libvirt_access(cfg: Config) -> None:
     # so libvirt-qemu can reach the files inside
     dirs = []
     path = cfg.winbox_dir
-    while path != Path.home().parent:
+    while path != Path.home() and path != path.parent:
         dirs.append(path)
         path = path.parent
     # Include home dir itself
@@ -305,11 +304,22 @@ def download_tools(cfg: Config) -> None:
                 continue
             if filename.endswith(".zip"):
                 with zipfile.ZipFile(dest) as zf:
-                    zf.extractall(cfg.tools_dir)
+                    for member in zf.namelist():
+                        member_path = (cfg.tools_dir / member).resolve()
+                        if not str(member_path).startswith(
+                            str(cfg.tools_dir.resolve())
+                        ):
+                            console.print(
+                                f"    [red][!][/] Zip slip detected: {member}"
+                            )
+                            continue
+                        zf.extract(member, cfg.tools_dir)
                 dest.unlink()
             console.print(f"    [green][+][/] {filename}")
         except subprocess.CalledProcessError:
             console.print(f"    [yellow][!][/] Failed: {filename}")
+            if dest.exists():
+                dest.unlink()
 
 
 def generate_ssh_keypair(cfg: Config) -> None:

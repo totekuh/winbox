@@ -92,7 +92,7 @@ def unregister(remove_handler: bool = True) -> None:
     if is_registered():
         _sudo_write(BINFMT_ENTRY, "-1")
 
-    if BINFMT_PERSIST.exists():
+    if remove_handler and BINFMT_PERSIST.exists():
         subprocess.run(
             ["sudo", "rm", "-f", str(BINFMT_PERSIST)],
             check=True,

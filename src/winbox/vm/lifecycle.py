@@ -121,12 +121,11 @@ class VM:
 
     def wait_shutdown(self, timeout: int = 600, poll: int = 5) -> bool:
         """Wait for the VM to reach SHUTOFF state. Returns True if shut down within timeout."""
-        elapsed = 0
+        deadline = time.monotonic() + timeout
         while self.state() != VMState.SHUTOFF:
-            time.sleep(poll)
-            elapsed += poll
-            if elapsed >= timeout:
+            if time.monotonic() >= deadline:
                 return False
+            time.sleep(poll)
         return True
 
     def disk_usage(self) -> str | None:

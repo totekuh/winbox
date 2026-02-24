@@ -86,7 +86,6 @@ def open_shell(
         client, _ = server.accept()
     except socket.timeout:
         console.print("[red][-][/] Timed out waiting for connection")
-        server.close()
         return
     finally:
         server.close()
@@ -102,6 +101,9 @@ def open_shell(
 
 def _relay(sock: socket.socket) -> None:
     """Raw terminal I/O relay between stdin/stdout and the socket."""
+    if not sys.stdin.isatty():
+        console.print("[red][-][/] shell requires an interactive terminal")
+        return
     old_settings = termios.tcgetattr(sys.stdin)
     tty.setraw(sys.stdin)
 
@@ -158,6 +160,9 @@ def _relay_pipe(sock: socket.socket) -> None:
     Handles multi-line wrapping by tracking terminal width and prompt
     column, using cursor up/down + absolute column for line crossings.
     """
+    if not sys.stdin.isatty():
+        console.print("[red][-][/] shell requires an interactive terminal")
+        return
     old_settings = termios.tcgetattr(sys.stdin)
     tty.setraw(sys.stdin)
 
@@ -236,6 +241,9 @@ def _relay_pipe(sock: socket.socket) -> None:
                 if i < len(data):
                     i += 1
             elif b == 0x0d:  # \r
+                start_col = 0
+                i += 1
+            elif b == 0x0a:  # \n
                 start_col = 0
                 i += 1
             elif b == 0x08:  # \b

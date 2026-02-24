@@ -8,7 +8,7 @@ import click
 from rich.console import Console
 
 from winbox.config import Config
-from winbox.vm import GuestAgent
+from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM, VMState
 
 console = Console()
@@ -25,7 +25,11 @@ def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
     if state == VMState.RUNNING:
         if not ga.ping():
             console.print("[blue][*][/] Waiting for guest agent...")
-            ga.wait(timeout=60)
+            try:
+                ga.wait(timeout=60)
+            except GuestAgentError:
+                console.print("[red][-][/] Guest agent not responding. Is the VM healthy?")
+                raise SystemExit(1)
         _ensure_z_drive(ga)
         _ensure_sshd_running(ga)
         return
@@ -44,7 +48,11 @@ def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
         raise SystemExit(1)
 
     console.print("[blue][*][/] Waiting for guest agent...")
-    ga.wait(timeout=120)
+    try:
+        ga.wait(timeout=120)
+    except GuestAgentError:
+        console.print("[red][-][/] Guest agent not responding. Is the VM healthy?")
+        raise SystemExit(1)
     _ensure_z_drive(ga)
     _ensure_sshd_running(ga)
     console.print("[green][+][/] VM ready")

@@ -74,6 +74,8 @@ class Config:
         """Parse shell-style KEY=VALUE config file and apply to config."""
         mapping = {
             "VM_NAME": "vm_name",
+            "VM_USER": "vm_user",
+            "VM_PASSWORD": "vm_password",
             "VM_RAM": "vm_ram",
             "VM_CPUS": "vm_cpus",
             "VM_DISK": "vm_disk",

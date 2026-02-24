@@ -83,7 +83,7 @@ class TestDownloadToolsParsing:
         ])
         with (
             patch("winbox.setup.installer._data_file", return_value=txt),
-            patch("subprocess.run") as mock_run,
+            patch("winbox.setup.installer.subprocess.run") as mock_run,
         ):
             download_tools(cfg)
             mock_run.assert_not_called()
@@ -100,7 +100,7 @@ class TestDownloadToolsCaching:
 
         with (
             patch("winbox.setup.installer._data_file", return_value=txt),
-            patch("subprocess.run") as mock_run,
+            patch("winbox.setup.installer.subprocess.run") as mock_run,
         ):
             download_tools(cfg)
             mock_run.assert_not_called()
@@ -117,7 +117,7 @@ class TestDownloadToolsCaching:
 
         with (
             patch("winbox.setup.installer._data_file", return_value=txt),
-            patch("subprocess.run") as mock_run,
+            patch("winbox.setup.installer.subprocess.run") as mock_run,
         ):
             download_tools(cfg)
             mock_run.assert_not_called()
@@ -133,13 +133,13 @@ class TestDownloadToolsRedownload:
         # Place a file with wrong content
         (cfg.tools_dir / "Tool.exe").write_bytes(b"corrupted")
 
-        def fake_wget(cmd, *, check=True):
+        def fake_wget(cmd, *, check=True, **kwargs):
             # Simulate wget writing the correct file
             (cfg.tools_dir / "Tool.exe").write_bytes(correct_data)
 
         with (
+            patch("winbox.setup.installer.subprocess.run", side_effect=fake_wget),
             patch("winbox.setup.installer._data_file", return_value=txt),
-            patch("subprocess.run", side_effect=fake_wget),
         ):
             download_tools(cfg)
 
@@ -149,13 +149,13 @@ class TestDownloadToolsRedownload:
         expected_hash = _hash(b"expected_content")
         txt = _make_tools_txt(tmp_path, [f"https://example.com/Bad.exe {expected_hash}"])
 
-        def fake_wget(cmd, *, check=True):
+        def fake_wget(cmd, *, check=True, **kwargs):
             # wget writes a file but with wrong content
             (cfg.tools_dir / "Bad.exe").write_bytes(b"still_wrong")
 
         with (
+            patch("winbox.setup.installer.subprocess.run", side_effect=fake_wget),
             patch("winbox.setup.installer._data_file", return_value=txt),
-            patch("subprocess.run", side_effect=fake_wget),
         ):
             download_tools(cfg)
 
@@ -171,12 +171,12 @@ class TestDownloadToolsFreshDownload:
         h = _hash(content)
         txt = _make_tools_txt(tmp_path, [f"https://example.com/Fresh.exe {h}"])
 
-        def fake_wget(cmd, *, check=True):
+        def fake_wget(cmd, *, check=True, **kwargs):
             (cfg.tools_dir / "Fresh.exe").write_bytes(content)
 
         with (
+            patch("winbox.setup.installer.subprocess.run", side_effect=fake_wget),
             patch("winbox.setup.installer._data_file", return_value=txt),
-            patch("subprocess.run", side_effect=fake_wget),
         ):
             download_tools(cfg)
 
@@ -190,8 +190,8 @@ class TestDownloadToolsFreshDownload:
         ])
 
         with (
+            patch("winbox.setup.installer.subprocess.run", side_effect=sp.CalledProcessError(1, "wget")),
             patch("winbox.setup.installer._data_file", return_value=txt),
-            patch("subprocess.run", side_effect=sp.CalledProcessError(1, "wget")),
         ):
             download_tools(cfg)  # should not raise
 
@@ -207,12 +207,12 @@ class TestDownloadToolsFreshDownload:
 
         txt = _make_tools_txt(tmp_path, [f"https://example.com/archive.zip {h}"])
 
-        def fake_wget(cmd, *, check=True):
+        def fake_wget(cmd, *, check=True, **kwargs):
             (cfg.tools_dir / "archive.zip").write_bytes(zip_data)
 
         with (
+            patch("winbox.setup.installer.subprocess.run", side_effect=fake_wget),
             patch("winbox.setup.installer._data_file", return_value=txt),
-            patch("subprocess.run", side_effect=fake_wget),
         ):
             download_tools(cfg)
 
@@ -241,7 +241,7 @@ class TestDownloadToolsMixed:
 
         wget_calls = []
 
-        def fake_wget(cmd, *, check=True):
+        def fake_wget(cmd, *, check=True, **kwargs):
             url = cmd[-1]
             wget_calls.append(url)
             filename = url.rsplit("/", 1)[-1]
@@ -251,8 +251,8 @@ class TestDownloadToolsMixed:
                 (cfg.tools_dir / filename).write_bytes(fresh_data)
 
         with (
+            patch("winbox.setup.installer.subprocess.run", side_effect=fake_wget),
             patch("winbox.setup.installer._data_file", return_value=txt),
-            patch("subprocess.run", side_effect=fake_wget),
         ):
             download_tools(cfg)
 
