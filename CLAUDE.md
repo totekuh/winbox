@@ -12,7 +12,7 @@ Type `winbox exec SharpHound.exe -c All -d corp.local` on Kali and it Just Works
 - **Package:** installed editable (`pip install -e .`), `winbox` CLI works
 - **Windows ISO:** downloaded at `~/.winbox/iso/SERVER_EVAL_x64FRE_en-us.iso` (4.7GB)
 - **VM:** created, setup works end-to-end (`winbox setup -y`)
-- **Tests:** 161 passing (shared conftest.py fixtures, mocked CLI tests)
+- **Tests:** 180 passing (shared conftest.py fixtures, mocked CLI tests)
 - **Git:** `master` branch
 
 ## Package Structure
@@ -49,15 +49,16 @@ src/winbox/
   data/                     # Bundled files for VM setup
     unattend.xml            # Windows unattended install (disk, OOBE, vioserial, viofs, guest agent, shutdown)
     bootstrap.ps1           # Provision wrapper: unpack provision.zip, run provision.ps1, shutdown
-    provision.ps1           # Post-install script (disable Defender, install OpenSSH, WinFsp, VirtioFsSvc)
-    tools.txt               # Tool download URLs (downloaded on Kali side during setup)
+    provision.ps1           # Post-install script (disable Defender/firewall/LLMNR/NetBIOS, install OpenSSH, WinFsp, VirtioFsSvc)
+    tools.txt               # Tool download URLs + SHA256 checksums (downloaded on Kali side during setup)
     config.default          # Default VM config values
     Invoke-ConPtyShell.ps1  # ConPTY reverse shell module (modified: ResizePseudoConsole support)
 tests/
   conftest.py               # Shared fixtures: runner, cfg, mock_env (VM/GA/ensure_running)
   test_binfmt.py            # 41 tests — handler generation, registration, CLI commands
   test_config.py            # 29 tests — defaults, properties, config file parsing
-  test_executor.py          # 9 tests — resolve_exe path resolution
+  test_download_tools.py    # 14 tests — _sha256, tools.txt parsing, caching, zip extraction, wget failure
+  test_executor.py          # 14 tests — resolve_exe path resolution, local copy, case insensitivity
   test_guest.py             # 12 tests — base64 decoding, ExecResult dataclass
   test_iso.py               # 4 tests — constants, URL resolution (live)
   test_network.py           # 20 tests — dns (set, sync, view), hosts (view, add, set, delete)
@@ -132,8 +133,9 @@ Phase 3: Provisioning via Guest Agent
   → bootstrap.ps1 (try/finally — always shuts down):
     unpack provision.zip, run provision.ps1, cleanup, Stop-Computer
   → provision.ps1 (ErrorAction Continue, per-section try/catch):
-    disable Defender, disable firewall, install OpenSSH (from bundled zip),
-    configure SSH keys, install WinFsp + VirtioFsSvc (mounts Z: via VirtIO-FS)
+    disable Defender, disable firewall, disable LLMNR/NetBIOS,
+    install OpenSSH (from bundled zip), configure SSH keys,
+    install WinFsp + VirtioFsSvc (mounts Z: via VirtIO-FS), add Z:\tools to PATH
   → wait for VM to shut down
 
 Phase 4: Snapshot
@@ -186,7 +188,9 @@ tools in the VM can reach any target the Kali host can reach.
 - Provisioning files (provision.ps1, tools.txt) cleaned from tools dir after re-provision
 - Rich markup disabled on command output (tools like Rubeus output bracket syntax)
 - Config stores vm_user (Administrator) and vm_password — single source of truth
-- `.exe` resolution is case-insensitive (`Tool.EXE` resolves to `Z:\tools\Tool.EXE`)
+- `.exe` resolution intended to be case-insensitive (BUG: actually case-sensitive on Linux ext4)
+- `ensure_running` also starts sshd (`_ensure_sshd_running`) — every command ensures SSH is ready
+- `download_tools` verifies SHA256 checksums, re-downloads on mismatch, auto-extracts zips
 - `human_size()` lives in `utils.py` (single source, used by executor/tools/iso/vm)
 - Config silently skips invalid int values (`VM_RAM=abc` keeps default)
 - TYPE_CHECKING guarded imports for Config across modules (avoids circular imports)
@@ -226,7 +230,8 @@ tools in the VM can reach any target the Kali host can reach.
 
 ## Prerequisites
 
-- `qemu-system-x86_64`, `virsh`, `virt-install`, `virt-customize`, `7z`, `jq`
+- `qemu-system-x86_64`, `virsh`, `virt-install`, `virt-customize`, `7z`
+- `wget` (for all binary downloads during setup)
 - `virtiofsd` (at `/usr/libexec/virtiofsd` or on PATH)
 - `/dev/kvm` (KVM hardware virtualization)
 - `mkisofs` or `genisoimage` (for unattend image)

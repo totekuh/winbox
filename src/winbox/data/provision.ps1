@@ -153,4 +153,18 @@ try {
     Write-Host "[!] VirtIO-FS setup error: $_"
 }
 
+# --- Add Z:\tools to system PATH ---
+Write-Host "[*] Adding Z:\tools to system PATH..."
+try {
+    $machPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::Machine)
+    if ($machPath -notlike '*Z:\tools*') {
+        [Environment]::SetEnvironmentVariable("Path", "$machPath;Z:\tools", [EnvironmentVariableTarget]::Machine)
+        Write-Host "[+] Z:\tools added to system PATH"
+    } else {
+        Write-Host "[+] Z:\tools already in system PATH"
+    }
+} catch {
+    Write-Host "[!] Could not add Z:\tools to PATH: $_"
+}
+
 Write-Host "[+] winbox provisioning complete"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.resources
 import os
 import shutil
@@ -250,28 +251,58 @@ def extract_virtiofs(cfg: Config) -> Path:
     return dest
 
 
+def _sha256(path: Path) -> str:
+    """Compute SHA256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def download_tools(cfg: Config) -> None:
-    """Download tools listed in tools.txt to shared tools directory."""
+    """Download tools listed in tools.txt to shared tools directory.
+
+    Format: URL SHA256 (one per line). Skips tools that already exist with
+    matching checksum. Re-downloads if checksum doesn't match.
+    """
     tools_txt = _data_file("tools.txt")
-    urls = []
+    entries = []
     for line in Path(tools_txt).read_text().splitlines():
         line = line.strip()
-        if line and not line.startswith("#") and line.startswith("http"):
-            urls.append(line)
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].startswith("http"):
+            entries.append((parts[0], parts[1]))
 
-    if not urls:
+    if not entries:
         return
 
-    console.print(f"[blue][*][/] Downloading {len(urls)} tools...")
-    for url in urls:
+    console.print(f"[blue][*][/] Checking {len(entries)} tools...")
+    for url, expected_hash in entries:
         filename = url.rsplit("/", 1)[-1]
         dest = cfg.tools_dir / filename
-        console.print(f"    {filename}...")
+
+        # Check if file exists with correct checksum
+        if dest.exists():
+            actual_hash = _sha256(dest)
+            if actual_hash == expected_hash:
+                console.print(f"    [green][+][/] {filename} (cached)")
+                continue
+            console.print(f"    [yellow][!][/] {filename} checksum mismatch, re-downloading...")
+
         try:
+            console.print(f"    {filename}...")
             subprocess.run(
                 ["wget", "-q", "--show-progress", "-O", str(dest), url],
                 check=True,
             )
+            actual_hash = _sha256(dest)
+            if actual_hash != expected_hash:
+                console.print(f"    [red][!][/] {filename} checksum mismatch after download!")
+                dest.unlink()
+                continue
             if filename.endswith(".zip"):
                 with zipfile.ZipFile(dest) as zf:
                     zf.extractall(cfg.tools_dir)
