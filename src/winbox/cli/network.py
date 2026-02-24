@@ -255,7 +255,7 @@ def hosts_set(ctx: click.Context, ip: str, hostname: str) -> None:
     script = (
         f"$f = '{HOSTS_PATH}'\n"
         f"$lines = Get-Content $f\n"
-        f"$lines = @($lines | Where-Object {{ $_ -notmatch '\\s+{hostname_escaped}\\s*$' }})\n"
+        f"$lines = @($lines | Where-Object {{ $_ -match '^\\s*#' -or $_ -notmatch '\\s{hostname_escaped}(\\s|$)' }})\n"
         f"$lines += \"{ip}`t{hostname}\"\n"
         f"Set-Content -Path $f -Value $lines"
     )
@@ -286,7 +286,7 @@ def hosts_delete(ctx: click.Context, hostname: str) -> None:
     script = (
         f"$f = '{HOSTS_PATH}'\n"
         f"$lines = Get-Content $f\n"
-        f"$lines = @($lines | Where-Object {{ $_ -notmatch '\\s+{hostname_escaped}\\s*$' }})\n"
+        f"$lines = @($lines | Where-Object {{ $_ -match '^\\s*#' -or $_ -notmatch '\\s{hostname_escaped}(\\s|$)' }})\n"
         f"Set-Content -Path $f -Value $lines"
     )
     result = ga.exec_powershell(script, timeout=15)

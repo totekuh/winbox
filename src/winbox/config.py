@@ -94,7 +94,12 @@ class Config:
                 continue
             key, _, value = line.partition("=")
             key = key.strip()
-            value = value.strip().strip('"').strip("'")
+            value = value.strip()
+            if len(value) >= 2 and (
+                (value[0] == '"' and value[-1] == '"')
+                or (value[0] == "'" and value[-1] == "'")
+            ):
+                value = value[1:-1]
             # Expand ~ and env vars
             value = os.path.expandvars(os.path.expanduser(value))
 

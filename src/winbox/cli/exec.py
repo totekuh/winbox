@@ -86,7 +86,8 @@ def ssh(ctx: click.Context) -> None:
 
     # Use sshpass for automatic password auth if available
     if shutil.which("sshpass"):
-        ssh_args = ["sshpass", "-p", cfg.vm_password] + ssh_args
-        os.execvp("sshpass", ssh_args)
+        ssh_args = ["sshpass", "-e"] + ssh_args
+        env = {**os.environ, "SSHPASS": cfg.vm_password}
+        os.execvpe("sshpass", ssh_args, env)
     else:
         os.execvp("ssh", ssh_args)

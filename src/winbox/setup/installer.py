@@ -61,10 +61,10 @@ def ensure_default_network() -> None:
     """Ensure the libvirt 'default' network exists and is active."""
     # Check if network is active
     result = subprocess.run(
-        ["virsh", "-c", "qemu:///system", "net-info", "default"],
+        ["virsh", "-c", "qemu:///system", "net-list", "--name"],
         capture_output=True, text=True, check=False,
     )
-    if result.returncode == 0 and "Active:         yes" in result.stdout:
+    if result.returncode == 0 and "default" in result.stdout.split():
         return
 
     # Try to start it (might be defined but inactive)

@@ -59,6 +59,15 @@ def down(ctx: click.Context) -> None:
                 break
     else:
         vm.shutdown()
+        timeout = 60
+        elapsed = 0
+        while vm.state() == VMState.RUNNING:
+            time.sleep(2)
+            elapsed += 2
+            if elapsed >= timeout:
+                console.print("[yellow][!][/] Graceful shutdown timeout, forcing...")
+                vm.force_stop()
+                break
 
     console.print("[green][+][/] VM stopped")
 

@@ -79,6 +79,7 @@ class VM:
             self.force_stop()
 
         # Undefine without --remove-all-storage (that deletes attached ISOs too)
+        undefine_ok = False
         for flags in [
             ["--managed-save", "--snapshots-metadata", "--nvram"],
             ["--managed-save", "--snapshots-metadata"],
@@ -86,7 +87,14 @@ class VM:
         ]:
             result = _virsh("undefine", self.name, *flags, check=False)
             if result.returncode == 0:
+                undefine_ok = True
                 break
+
+        if not undefine_ok:
+            raise RuntimeError(
+                f"Failed to undefine VM '{self.name}'. "
+                f"Manual cleanup: virsh undefine {self.name} && rm {self.cfg.disk_path}"
+            )
 
         # Clean up disk only
         if self.cfg.disk_path.exists():

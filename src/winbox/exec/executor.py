@@ -33,6 +33,8 @@ def resolve_exe(exe: str, tools_dir: Path) -> str:
             dest = tools_dir / local.name
             if local != dest.resolve():
                 tools_dir.mkdir(parents=True, exist_ok=True)
+                if dest.exists():
+                    console.print(f"[yellow][!][/] Overwriting {local.name} in tools dir")
                 shutil.copy2(local, dest)
             return f"Z:\\tools\\{local.name}"
 
@@ -81,6 +83,7 @@ def run_command(
     for attempt in range(1, max_retries):
         if "handle is invalid" not in result.stdout.lower() + result.stderr.lower():
             break
+        console.print(f"[yellow][!][/] GA pipe race detected, retrying ({attempt}/{max_retries - 1})...")
         time.sleep(0.5)
         result = ga.exec(full_cmd, timeout=timeout)
 
