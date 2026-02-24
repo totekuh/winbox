@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 console = Console()
 
 # Internal files that shouldn't show up in tools list
-_HIDDEN = {".ssh_pubkey", "tools.txt", "provision.ps1"}
+_HIDDEN = {".ssh_pubkey", "provision.ps1"}
 
 
 def add(cfg: Config, files: tuple[str, ...]) -> None:

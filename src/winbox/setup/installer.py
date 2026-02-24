@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.resources
 import os
 import shutil
@@ -138,11 +137,14 @@ def grant_libvirt_access(cfg: Config) -> None:
     # Include home dir itself
     dirs.append(Path.home())
 
+    acl_ok = True
     for d in dirs:
-        subprocess.run(
+        r = subprocess.run(
             ["setfacl", "-m", "u:libvirt-qemu:x", str(d)],
             capture_output=True, check=False,
         )
+        if r.returncode != 0:
+            acl_ok = False
 
     # Grant read+traverse on subdirs that contain VM files
     for d in [cfg.winbox_dir, cfg.iso_dir]:
@@ -164,7 +166,11 @@ def grant_libvirt_access(cfg: Config) -> None:
                 capture_output=True, check=False,
             )
 
-    console.print("[green][+][/] Granted libvirt-qemu access to ~/.winbox")
+    if acl_ok:
+        console.print("[green][+][/] Granted libvirt-qemu access to ~/.winbox")
+    else:
+        console.print("[yellow][!][/] Some ACL operations failed — VirtIO-FS may not work")
+        console.print("    Check QEMU user with: ps aux | grep qemu")
 
 
 def create_directories(cfg: Config) -> None:
@@ -250,77 +256,6 @@ def extract_virtiofs(cfg: Config) -> Path:
     return dest
 
 
-def _sha256(path: Path) -> str:
-    """Compute SHA256 hex digest of a file."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def download_tools(cfg: Config) -> None:
-    """Download tools listed in tools.txt to shared tools directory.
-
-    Format: URL SHA256 (one per line). Skips tools that already exist with
-    matching checksum. Re-downloads if checksum doesn't match.
-    """
-    tools_txt = _data_file("tools.txt")
-    entries = []
-    for line in Path(tools_txt).read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) >= 2 and parts[0].startswith("http"):
-            entries.append((parts[0], parts[1]))
-
-    if not entries:
-        return
-
-    console.print(f"[blue][*][/] Checking {len(entries)} tools...")
-    for url, expected_hash in entries:
-        filename = url.rsplit("/", 1)[-1]
-        dest = cfg.tools_dir / filename
-
-        # Check if file exists with correct checksum
-        if dest.exists():
-            actual_hash = _sha256(dest)
-            if actual_hash == expected_hash:
-                console.print(f"    [green][+][/] {filename} (cached)")
-                continue
-            console.print(f"    [yellow][!][/] {filename} checksum mismatch, re-downloading...")
-
-        try:
-            console.print(f"    {filename}...")
-            subprocess.run(
-                ["wget", "-q", "--show-progress", "-O", str(dest), url],
-                check=True,
-            )
-            actual_hash = _sha256(dest)
-            if actual_hash != expected_hash:
-                console.print(f"    [red][!][/] {filename} checksum mismatch after download!")
-                dest.unlink()
-                continue
-            if filename.endswith(".zip"):
-                with zipfile.ZipFile(dest) as zf:
-                    for member in zf.namelist():
-                        member_path = (cfg.tools_dir / member).resolve()
-                        if not str(member_path).startswith(
-                            str(cfg.tools_dir.resolve())
-                        ):
-                            console.print(
-                                f"    [red][!][/] Zip slip detected: {member}"
-                            )
-                            continue
-                        zf.extract(member, cfg.tools_dir)
-                dest.unlink()
-            console.print(f"    [green][+][/] {filename}")
-        except subprocess.CalledProcessError:
-            console.print(f"    [yellow][!][/] Failed: {filename}")
-            if dest.exists():
-                dest.unlink()
-
 
 def generate_ssh_keypair(cfg: Config) -> None:
     """Generate an ED25519 SSH keypair for fallback access."""
@@ -338,10 +273,9 @@ def generate_ssh_keypair(cfg: Config) -> None:
 
 def copy_setup_files(cfg: Config) -> None:
     """Copy provisioning files to shared tools directory (for re-provisioning)."""
-    for name in ("provision.ps1", "tools.txt"):
-        src = _data_file(name)
-        dst = cfg.tools_dir / name
-        dst.write_bytes(Path(src).read_bytes())
+    src = _data_file("provision.ps1")
+    dst = cfg.tools_dir / "provision.ps1"
+    dst.write_bytes(Path(src).read_bytes())
     # Copy SSH pubkey so provision.ps1 can find it at Z:\tools\.ssh_pubkey
     if cfg.ssh_pubkey.exists():
         shutil.copy2(cfg.ssh_pubkey, cfg.tools_dir / ".ssh_pubkey")
@@ -441,15 +375,18 @@ def provision_vm_disk(cfg: Config) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
 
-        # Build provision.zip: provision.ps1, tools.txt, .ssh_pubkey, OpenSSH, WinFsp, virtiofs.exe
+        # Build provision.zip: provision.ps1, .ssh_pubkey, OpenSSH, WinFsp, virtiofs.exe
         openssh_zip = cfg.iso_dir / OPENSSH_ZIP
         winfsp_msi = cfg.iso_dir / WINFSP_MSI
         virtiofs_exe = cfg.iso_dir / VIRTIOFS_EXE
+        for path, label in [
+            (openssh_zip, "OpenSSH"), (winfsp_msi, "WinFsp"), (virtiofs_exe, "virtiofs"),
+        ]:
+            if not path.exists():
+                console.print(f"[yellow][!][/] {label} not found: {path}")
         zip_path = tmpdir_path / "provision.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for name in ("provision.ps1", "tools.txt"):
-                src = _data_file(name)
-                zf.write(src, name)
+            zf.write(_data_file("provision.ps1"), "provision.ps1")
             if cfg.ssh_pubkey.exists():
                 zf.write(cfg.ssh_pubkey, ".ssh_pubkey")
             if openssh_zip.exists():

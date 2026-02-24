@@ -10,7 +10,7 @@ import click
 
 from winbox.cli import console, ensure_running
 from winbox.config import Config
-from winbox.vm import GuestAgent
+from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM, VMState
 
 
@@ -70,8 +70,9 @@ def suspend(ctx: click.Context) -> None:
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
 
-    if vm.state() != VMState.RUNNING:
-        console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
+    state = vm.state()
+    if state != VMState.RUNNING:
+        console.print(f"[yellow][!][/] VM is not running (state: {state.value})")
         return
 
     console.print("[blue][*][/] Saving VM state...")
@@ -181,4 +182,7 @@ def restore(ctx: click.Context, name: str) -> None:
 
     if vm.state() == VMState.RUNNING:
         console.print("[blue][*][/] Waiting for guest agent...")
-        ga.wait(timeout=60)
+        try:
+            ga.wait(timeout=60)
+        except GuestAgentError:
+            console.print("[yellow][!][/] Guest agent not responding after restore")

@@ -91,7 +91,6 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
     installer.download_openssh(cfg)
     installer.download_winfsp(cfg)
     installer.extract_virtiofs(cfg)
-    installer.download_tools(cfg)
     installer.generate_ssh_keypair(cfg)
     installer.build_unattend_image(cfg)
     installer.create_disk(cfg)
@@ -147,12 +146,11 @@ def provision(ctx: click.Context) -> None:
         console.print(result.stderr, end="", style="red", highlight=False)
 
     # Clean up provisioning files from shared tools dir
-    for name in ("provision.ps1", "tools.txt", ".ssh_pubkey"):
+    for name in ("provision.ps1", ".ssh_pubkey"):
         (cfg.tools_dir / name).unlink(missing_ok=True)
 
     if result.exitcode == 0:
         console.print("[green][+][/] Provisioning complete")
     else:
         console.print(f"[yellow][!][/] Provisioning exited with code {result.exitcode}")
-
-    raise SystemExit(result.exitcode)
+        raise SystemExit(result.exitcode)

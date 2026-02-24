@@ -60,6 +60,7 @@ def open_shell(
     try:
         server.bind((cfg.host_ip, port))
     except OSError as e:
+        server.close()
         console.print(f"[red][-][/] Cannot bind {cfg.host_ip}:{port}: {e}")
         return
     server.listen(1)
@@ -78,7 +79,12 @@ def open_shell(
     # Fire via guest agent — detached, the shell runs until we disconnect
     mode = "pipe" if pipe_mode else "ConPTY"
     console.print(f"[blue][*][/] Launching reverse shell as SYSTEM ({mode})...")
-    ga.exec_detached(cmd)
+    try:
+        ga.exec_detached(cmd)
+    except Exception:
+        server.close()
+        console.print("[red][-][/] Failed to launch reverse shell via guest agent")
+        return
 
     # Wait for incoming connection
     server.settimeout(30)

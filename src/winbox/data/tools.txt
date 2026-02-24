@@ -1,7 +1,0 @@
-# Tool download URLs (one per line)
-# Format: URL SHA256
-# Archives (.zip) are auto-extracted to Z:\tools\
-
-https://live.sysinternals.com/PsExec64.exe edfae1a69522f87b12c6dac3225d930e4848832e3c551ee1e7d31736bf4525ef
-https://github.com/totekuh/RunEx/releases/download/v2.0/RunEx.exe 2f42f4102579e5be59b2a7d4aeba105c9f0435e276fcf27bafc2937e8b86c185
-https://github.com/SnaffCon/Snaffler/releases/download/1.0.234/Snaffler.exe fbd7e6cb37d758f9ec179fe427ca645569868099c16819f16f9e86392d8f2abd

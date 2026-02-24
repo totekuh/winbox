@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 import subprocess
 import time
-import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -28,16 +26,6 @@ def cfg(tmp_path):
     c.tools_dir.mkdir(parents=True)
     c.loot_dir.mkdir(parents=True)
     return c
-
-
-def _hash(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _make_tools_txt(tmp_path, lines):
-    txt = tmp_path / "tools.txt"
-    txt.write_text("\n".join(lines) + "\n")
-    return txt
 
 
 # ─── Bug #1: Double server.close() in shell.py ──────────────────────────────
@@ -217,36 +205,6 @@ class TestBinfmtRemoveHandler:
             unregister()  # default = True
 
 
-# ─── Bug #5: Zip-slip protection ────────────────────────────────────────────
-
-
-class TestZipSlipProtection:
-    """Bug #6: extractall() had no path validation."""
-
-    def test_safe_zip_extracts_normally(self, cfg, tmp_path):
-        from winbox.setup.installer import download_tools
-
-        zip_path = tmp_path / "safe.zip"
-        with zipfile.ZipFile(zip_path, "w") as zf:
-            zf.writestr("inner.exe", b"safe_content")
-        zip_data = zip_path.read_bytes()
-        h = _hash(zip_data)
-
-        txt = _make_tools_txt(tmp_path, [f"https://example.com/safe.zip {h}"])
-
-        def fake_wget(cmd, *, check=True, **kwargs):
-            (cfg.tools_dir / "safe.zip").write_bytes(zip_data)
-
-        with (
-            patch("winbox.setup.installer.subprocess.run", side_effect=fake_wget),
-            patch("winbox.setup.installer._data_file", return_value=txt),
-        ):
-            download_tools(cfg)
-
-        assert (cfg.tools_dir / "inner.exe").exists()
-        assert (cfg.tools_dir / "inner.exe").read_bytes() == b"safe_content"
-
-
 # ─── Bug #6: PowerShell input validation ────────────────────────────────────
 
 
@@ -330,31 +288,6 @@ class TestExecutorRetryLoop:
 
         assert code == 0
         assert ga.exec.call_count == 2
-
-
-# ─── Bug #8: Partial download not cleaned up ────────────────────────────────
-
-
-class TestPartialDownloadCleanup:
-    """Bug #5: wget failure left partial files on disk."""
-
-    def test_partial_file_removed_on_failure(self, cfg, tmp_path):
-        from winbox.setup.installer import download_tools
-
-        txt = _make_tools_txt(tmp_path, [f"https://example.com/Fail.exe {'a' * 64}"])
-
-        # wget writes a partial file then raises CalledProcessError
-        def fake_wget(cmd, *, check=True, **kwargs):
-            (cfg.tools_dir / "Fail.exe").write_bytes(b"partial")
-            raise subprocess.CalledProcessError(1, "wget")
-
-        with (
-            patch("winbox.setup.installer.subprocess.run", side_effect=fake_wget),
-            patch("winbox.setup.installer._data_file", return_value=txt),
-        ):
-            download_tools(cfg)
-
-        assert not (cfg.tools_dir / "Fail.exe").exists(), "Partial file should be cleaned up"
 
 
 # ─── Bug #9: grant_libvirt_access off-by-one ─────────────────────────────────
@@ -494,32 +427,6 @@ def mock_env(cfg):
         yield ga
 
 
-# ─── Bug #12: test_download_tools mock signatures ───────────────────────────
-
-
-class TestDownloadToolsMockSignatures:
-    """Bug #13: fake_wget mocks didn't accept **kwargs."""
-
-    def test_mock_accepts_extra_kwargs(self, cfg, tmp_path):
-        """Verify our mocks work with additional keyword args."""
-        from winbox.setup.installer import download_tools
-
-        content = b"binary"
-        h = _hash(content)
-        txt = _make_tools_txt(tmp_path, [f"https://example.com/T.exe {h}"])
-        (cfg.tools_dir / "T.exe").write_bytes(content)
-
-        def fake_run(cmd, *, check=True, **kwargs):
-            pass  # accepts any kwargs
-
-        with (
-            patch("winbox.setup.installer.subprocess.run", side_effect=fake_run),
-            patch("winbox.setup.installer._data_file", return_value=txt),
-        ):
-            download_tools(cfg)  # should not raise TypeError
-
-
-
 # ─── Bug #14: wait() and wait_shutdown() elapsed time accuracy ───────────────
 
 
@@ -613,19 +520,19 @@ class TestDomainJoinUserValidation:
         with pytest.raises(click.BadParameter):
             _validate_hostname("admin'$(whoami)")
 
-    def test_domain_join_calls_validate_hostname_on_user(self, runner, mock_env):
-        """Verify that domain_join invokes _validate_hostname for the user param."""
+    def test_domain_join_calls_validate_user_on_user(self, runner, mock_env):
+        """Verify that domain_join invokes _validate_user for the user param."""
         from winbox.cli import cli
 
-        with patch("winbox.cli.network._validate_hostname") as mock_vh:
-            mock_vh.side_effect = click.BadParameter("Invalid hostname: bad;user")
+        with patch("winbox.cli.network._validate_user") as mock_vu:
+            mock_vu.side_effect = click.BadParameter("Invalid username: bad;user")
             result = runner.invoke(
                 cli,
                 ["domain", "join", "corp.local", "--ns", "10.0.0.1",
                  "--user", "bad;user", "--password", "pass"],
             )
-            # _validate_hostname should have been called with the user value
-            mock_vh.assert_called_with("bad;user")
+            # _validate_user should have been called with the user value
+            mock_vu.assert_called_with("bad;user")
 
 
 # ─── Bug #17: Unescaped dots in hostname regex for hosts set/delete ──────

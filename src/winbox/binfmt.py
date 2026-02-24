@@ -129,6 +129,8 @@ def _sudo_write(path: Path, content: str) -> None:
         ["sudo", "tee", str(path)],
         input=content.encode(),
         stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
     if result.returncode != 0:
-        raise PermissionError(f"Failed to write to {path} (sudo denied?)")
+        detail = result.stderr.decode().strip() if result.stderr else "sudo denied?"
+        raise PermissionError(f"Failed to write to {path}: {detail}")

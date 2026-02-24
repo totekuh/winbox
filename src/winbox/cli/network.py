@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import re
 import time
 from pathlib import Path
@@ -11,7 +12,7 @@ import click
 
 from winbox.cli import console, ensure_running, _ensure_z_drive
 from winbox.config import Config
-from winbox.vm import GuestAgent
+from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM, VMState
 
 
@@ -72,7 +73,13 @@ def dns_sync(ctx: click.Context) -> None:
     for line in resolv.read_text().splitlines():
         parts = line.split()
         if len(parts) >= 2 and parts[0] == "nameserver":
-            nameservers.append(parts[1])
+            ns = parts[1]
+            try:
+                ipaddress.ip_address(ns)
+            except ValueError:
+                console.print(f"[yellow][!][/] Skipping invalid nameserver: {ns}")
+                continue
+            nameservers.append(ns)
 
     if not nameservers:
         console.print("[red][-][/] No nameservers found in /etc/resolv.conf")
@@ -143,19 +150,25 @@ def dns_view(ctx: click.Context) -> None:
 HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
 
 # Validation patterns for user-supplied values interpolated into PowerShell
-_IP_RE = re.compile(r"^[\d.:a-fA-F]+$")  # IPv4/IPv6
 _HOSTNAME_RE = re.compile(r"^[\w.\-]+$")  # hostname/FQDN
 _DOMAIN_RE = re.compile(r"^[\w.\-]+$")    # domain name
 
 
 def _validate_ip(ip: str) -> None:
-    if not _IP_RE.match(ip):
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
         raise click.BadParameter(f"Invalid IP address: {ip}")
 
 
 def _validate_hostname(hostname: str) -> None:
     if not _HOSTNAME_RE.match(hostname):
         raise click.BadParameter(f"Invalid hostname: {hostname}")
+
+
+def _validate_user(user: str) -> None:
+    if not _HOSTNAME_RE.match(user):
+        raise click.BadParameter(f"Invalid username: {user}")
 
 
 def _validate_domain(name: str) -> None:
@@ -320,7 +333,7 @@ def domain_join(
     ensure_running(vm, ga, cfg)
     _validate_domain(name)
     _validate_ip(ns_ip)
-    _validate_hostname(user)
+    _validate_user(user)
 
     # Set DNS to domain name server
     console.print(f"[blue][*][/] Setting DNS to {ns_ip}...")
@@ -403,8 +416,13 @@ def domain_join(
 
     time.sleep(10)
     console.print("[blue][*][/] Waiting for VM to come back...")
-    ga.wait(timeout=120)
-    _ensure_z_drive(ga)
+    try:
+        ga.wait(timeout=120)
+        _ensure_z_drive(ga)
+    except GuestAgentError:
+        console.print("[yellow][!][/] Guest agent not responding after reboot")
+        console.print(f"    Check with: virsh console winbox")
+        raise SystemExit(1)
     console.print(f"[green][+][/] VM back up — domain-joined to {name}")
     console.print("    Undo with: [bold]winbox domain leave[/]")
 
@@ -449,6 +467,11 @@ def domain_leave(ctx: click.Context) -> None:
 
     time.sleep(10)
     console.print("[blue][*][/] Waiting for VM to come back...")
-    ga.wait(timeout=120)
-    _ensure_z_drive(ga)
+    try:
+        ga.wait(timeout=120)
+        _ensure_z_drive(ga)
+    except GuestAgentError:
+        console.print("[yellow][!][/] Guest agent not responding after reboot")
+        console.print(f"    Check with: virsh console winbox")
+        raise SystemExit(1)
     console.print("[green][+][/] Domain left — back to workgroup, all files intact")

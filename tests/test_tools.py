@@ -96,7 +96,7 @@ class TestToolsList:
     def test_list_hides_internal_files(self, setup_dirs):
         cfg = setup_dirs
         # These should be hidden
-        for name in (".ssh_pubkey", "tools.txt", "provision.ps1"):
+        for name in (".ssh_pubkey", "provision.ps1"):
             (cfg.tools_dir / name).write_text("internal")
         # This should show
         (cfg.tools_dir / "Rubeus.exe").write_bytes(b"\x00")
