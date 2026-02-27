@@ -9,7 +9,7 @@ import click
 
 from winbox.cli import console, ensure_running
 from winbox.config import Config
-from winbox.exec import run_command
+from winbox.exec import run_command, run_command_bg
 from winbox.vm import GuestAgent
 from winbox.exec import open_shell
 from winbox.vm import VM
@@ -21,8 +21,10 @@ from winbox.vm import VM
 ))
 @click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
 @click.option("--timeout", default=300, help="Execution timeout in seconds.")
+@click.option("--bg", is_flag=True, help="Run in background, return immediately.")
+@click.option("--log", is_flag=True, help="Redirect output to log files (with --bg).")
 @click.pass_context
-def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int) -> None:
+def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int, bg: bool, log: bool) -> None:
     """Execute a command in the Windows VM.
 
     Bare .exe names are resolved from Z:\\tools\\. Output files land in
@@ -36,6 +38,20 @@ def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int) -> None
 
     exe = command[0]
     args = command[1:]
+
+    if bg:
+        from winbox.jobs import JobMode
+        job = run_command_bg(cfg, ga, exe, args, log=log)
+        console.print(f"[green][+][/] Job {job.id} started (PID {job.pid})")
+        if job.mode == JobMode.LOG:
+            from winbox.jobs import JobStore
+            store = JobStore(cfg)
+            console.print(f"    stdout: {store.log_path(job.id, 'stdout')}")
+            console.print(f"    tail -f {store.log_path(job.id, 'stdout')}")
+        else:
+            console.print(f"    Retrieve output: winbox jobs output {job.id}")
+        return
+
     exitcode = run_command(cfg, ga, exe, args, timeout=timeout)
     raise SystemExit(exitcode)
 

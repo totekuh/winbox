@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 
 from winbox.vm.guest import ExecResult, GuestAgent
+from winbox.jobs import Job, JobMode, JobStatus, JobStore
 from winbox.utils import human_size
 
 if TYPE_CHECKING:
@@ -97,6 +98,44 @@ def run_command(
     _show_new_files(cfg.loot_dir, marker_time)
 
     return result.exitcode
+
+
+def run_command_bg(
+    cfg: Config,
+    ga: GuestAgent,
+    exe: str,
+    args: tuple[str, ...],
+    *,
+    log: bool = False,
+) -> Job:
+    """Launch a command in the Windows VM as a background job.
+
+    If log=True, redirects stdout/stderr to files on VirtIO-FS (supports
+    tail -f). Otherwise uses GA-buffered output (retrieved via exec_status).
+    """
+    resolved = resolve_exe(exe, cfg.tools_dir)
+    args_str = " ".join(args)
+    full_cmd = f"cd /d Z:\\tools && {resolved}"
+    if args_str:
+        full_cmd += f" {args_str}"
+
+    store = JobStore(cfg)
+    job_id = store.next_id()
+
+    if log:
+        cfg.jobs_log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = store.vm_log_path(job_id, "stdout")
+        stderr_path = store.vm_log_path(job_id, "stderr")
+        wrapped = f"{full_cmd} > {stdout_path} 2> {stderr_path}"
+        pid = ga.exec_detached(wrapped)
+        mode = JobMode.LOG
+    else:
+        pid = ga.exec_background(full_cmd)
+        mode = JobMode.BUFFERED
+
+    job = Job(id=job_id, pid=pid, command=f"{resolved} {args_str}".strip(), mode=mode)
+    store.add(job)
+    return job
 
 
 def _show_new_files(loot_dir: Path, since: float) -> None:

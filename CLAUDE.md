@@ -12,7 +12,7 @@ Type `winbox exec SharpHound.exe -c All -d corp.local` on Kali and it Just Works
 - **Package:** installed editable (`pip install -e .`), `winbox` CLI works
 - **Windows ISO:** downloaded at `~/.winbox/iso/SERVER_EVAL_x64FRE_en-us.iso` (4.7GB)
 - **VM:** created, setup works end-to-end (`winbox setup -y`)
-- **Tests:** 180 passing (shared conftest.py fixtures, mocked CLI tests)
+- **Tests:** 277 passing (265 unit + 12 integration, `pytest -m 'not integration'` for fast)
 - **Git:** `master` branch
 
 ## Package Structure
@@ -24,40 +24,40 @@ src/winbox/
   __main__.py               # python -m winbox
   binfmt.py                 # binfmt_misc registration for transparent .exe execution
   config.py                 # Config dataclass, ~/.winbox/config shell-style overrides
+  jobs.py                   # Background job tracking (JobStore, Job, JobStatus/JobMode enums)
   tools.py                  # Shared tools dir management (add/list/remove)
   utils.py                  # human_size() — single shared utility
   cli/                      # CLI commands (Click)
     __init__.py             #   entry point, ensure_running, _ensure_z_drive
     vm.py                   #   up, down, suspend, destroy, status, snapshot, restore
     setup.py                #   setup, provision
-    exec.py                 #   exec, shell, ssh
+    exec.py                 #   exec (--bg, --log, --timeout), shell, ssh
+    jobs.py                 #   jobs (list, output, kill)
     network.py              #   dns (set, sync, view), hosts (view, add, set, delete), domain (join, leave)
     files.py                #   tools (add, list, remove), iso (download, status)
     binfmt.py               #   binfmt enable/disable/status CLI commands
   vm/                       # VM infrastructure
     __init__.py             #   re-exports: VM, VMState, GuestAgent, GuestAgentError, ExecResult
     lifecycle.py            #   VM class, VMState enum (virsh lifecycle)
-    guest.py                #   GuestAgent, ExecResult (virtio-serial)
+    guest.py                #   GuestAgent, ExecResult (virtio-serial), exec_background, exec_status
   setup/                    # Setup pipeline
     __init__.py             #   re-exports: check_prereqs, ..., download_iso, ISO_FILENAME
     installer.py            #   4-phase setup, download_openssh, download_winfsp, extract_virtiofs
     iso.py                  #   Windows ISO downloader (Microsoft CDN, resume)
   exec/                     # Execution
-    __init__.py             #   re-exports: run_command, resolve_exe, open_shell
-    executor.py             #   run_command, resolve_exe (tool path resolution)
+    __init__.py             #   re-exports: run_command, run_command_bg, resolve_exe, open_shell
+    executor.py             #   run_command, run_command_bg, resolve_exe (tool path resolution)
     shell.py                #   open_shell (ConPTY reverse connection, SIGWINCH resize)
   data/                     # Bundled files for VM setup
     unattend.xml            # Windows unattended install (disk, OOBE, vioserial, viofs, guest agent, shutdown)
     bootstrap.ps1           # Provision wrapper: unpack provision.zip, run provision.ps1, shutdown
     provision.ps1           # Post-install script (disable Defender/firewall/LLMNR/NetBIOS, install OpenSSH, WinFsp, VirtioFsSvc)
-    tools.txt               # Tool download URLs + SHA256 checksums (downloaded on Kali side during setup)
     config.default          # Default VM config values
     Invoke-ConPtyShell.ps1  # ConPTY reverse shell module (modified: ResizePseudoConsole support)
 tests/
   conftest.py               # Shared fixtures: runner, cfg, mock_env (VM/GA/ensure_running)
   test_binfmt.py            # 41 tests — handler generation, registration, CLI commands
   test_config.py            # 29 tests — defaults, properties, config file parsing
-  test_download_tools.py    # 14 tests — _sha256, tools.txt parsing, caching, zip extraction, wget failure
   test_executor.py          # 14 tests — resolve_exe path resolution, local copy, case insensitivity
   test_guest.py             # 12 tests — base64 decoding, ExecResult dataclass
   test_iso.py               # 4 tests — constants, URL resolution (live)
@@ -65,6 +65,8 @@ tests/
   test_status.py            # 22 tests — status output for all VM states
   test_tools.py             # 11 tests — add/remove/list with real filesystem
   test_utils.py             # 7 tests — human_size conversions
+  test_jobs.py              # 31 tests — JobStore, Job, exec --bg, jobs list/output/kill (unit)
+  test_jobs_integration.py  # 12 tests — end-to-end background jobs against live VM (@integration)
   test_vm.py                # 6 tests — VMState enum, disk_usage
 ```
 
@@ -79,6 +81,8 @@ winbox destroy [-y]                  # Delete VM + storage
 winbox status                        # VM state, IP, disk, tool/loot counts
 winbox exec <cmd> [args]             # Execute in VM (via guest agent, auto-starts)
   [--timeout SEC]                    #   timeout flag must come BEFORE the command
+  [--bg]                             #   run in background, return immediately
+  [--log]                            #   with --bg: redirect output to log files (supports tail -f)
 winbox shell [--port PORT] [--pipe]  # Interactive SYSTEM shell via ConPTY (default 4444)
 winbox tools add <file>...           # Copy to shared tools dir
 winbox tools list                    # List tools
@@ -98,6 +102,9 @@ winbox hosts set <ip> <name>         # Add or replace hosts entry (idempotent)
 winbox hosts delete <name>           # Remove hosts entries for hostname
 winbox domain join <name>            # Join VM to AD domain (--ns, --user, --password)
 winbox domain leave                  # Leave domain, reset DNS, return to workgroup
+winbox jobs list                     # Show background jobs with live status
+winbox jobs output <id>              # Print captured/logged output from a job
+winbox jobs kill <id>                # Kill a running background job
 winbox binfmt enable [--no-persist]  # Register .exe handler for transparent execution
 winbox binfmt disable                # Unregister .exe handler
 winbox binfmt status                 # Show binfmt_misc registration status
@@ -207,12 +214,19 @@ tools in the VM can reach any target the Kali host can reach.
 - `winbox domain join` validates credentials via LDAP bind + checks ms-DS-MachineAccountQuota before join
 - `winbox domain leave` unjoins cleanly (Remove-Computer), resets DNS to DHCP, reboots
 - binfmt_misc handler copies .exe to tools dir if not there, then runs `winbox exec`
+- `winbox exec --bg` has two modes: GA-buffered (default, output in GA memory) and `--log` (file redirect to VirtIO-FS)
+- `--bg` and `--log` are long-form only on exec — same rationale as `--timeout` (avoids tool flag conflicts)
+- Background job state persisted in `~/.winbox/jobs.json` — survives CLI restarts
+- Log mode uses unquoted cmd.exe redirects — quoted paths break cmd.exe `>` operator
+- `exec_background` uses `capture-output: True` without polling — GA buffers output until queried
+- `jobs list` polls GA for running jobs (best-effort), marks unreachable ones as LOST
 
 ## Filesystem Layout (runtime)
 
 ```
 ~/.winbox/
 ├── config                              # User config overrides (optional)
+├── jobs.json                           # Background job state (persisted across CLI runs)
 ├── id_ed25519 / .pub                   # SSH keypair
 ├── disk.qcow2                          # VM disk
 ├── iso/
@@ -224,8 +238,9 @@ tools in the VM can reach any target the Kali host can reach.
 │   └── unattend.img                    # Built during setup
 └── shared/                             # VirtIO-FS share <=> Z:\ in VM
     ├── Invoke-ConPtyShell.ps1          # ConPTY script (refreshed each shell invocation)
-    ├── tools/                          # Pentest tools (.exe files, downloaded during setup)
+    ├── tools/                          # Pentest tools (.exe files)
     └── loot/                           # Output directory
+        └── .jobs/                      # Background job log files (<id>.stdout, <id>.stderr)
 ```
 
 ## Prerequisites

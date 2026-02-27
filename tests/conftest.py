@@ -21,6 +21,7 @@ def cfg(tmp_path):
     c.shared_dir.mkdir(parents=True)
     c.tools_dir.mkdir(parents=True)
     c.loot_dir.mkdir(parents=True)
+    c.jobs_log_dir.mkdir(parents=True)
     return c
 
 
@@ -55,6 +56,9 @@ def mock_env(cfg):
         patch("winbox.cli.exec.ensure_running"),
         patch("winbox.cli.exec.GuestAgent", return_value=ga),
         patch("winbox.cli.exec.VM", return_value=vm),
+        patch("winbox.cli.jobs.ensure_running"),
+        patch("winbox.cli.jobs.GuestAgent", return_value=ga),
+        patch("winbox.cli.jobs.VM", return_value=vm),
         patch("winbox.cli.setup.VM", return_value=vm),
         patch("winbox.cli.Config.load", return_value=cfg),
     ):

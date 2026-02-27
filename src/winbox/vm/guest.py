@@ -93,6 +93,45 @@ class GuestAgent:
             raise GuestAgentError("Failed to start process — no PID returned")
         return pid
 
+    def exec_background(self, command: str) -> int:
+        """Start a command with output capture but don't poll for completion.
+
+        Returns the guest PID immediately. Output stays buffered in the
+        guest agent until retrieved via exec_status().
+        """
+        payload = {
+            "execute": "guest-exec",
+            "arguments": {
+                "path": "cmd.exe",
+                "arg": ["/c", command],
+                "capture-output": True,
+            },
+        }
+        response = self._raw_command(payload)
+        pid = response.get("return", {}).get("pid")
+        if pid is None:
+            raise GuestAgentError("Failed to start process — no PID returned")
+        return pid
+
+    def exec_status(self, pid: int) -> dict:
+        """Query the status of a previously started guest-exec process.
+
+        Returns dict with keys: exited (bool), exitcode (int),
+        stdout (str), stderr (str).
+        """
+        payload = {
+            "execute": "guest-exec-status",
+            "arguments": {"pid": pid},
+        }
+        response = self._raw_command(payload)
+        ret = response.get("return", {})
+        return {
+            "exited": ret.get("exited", False),
+            "exitcode": ret.get("exitcode", -1),
+            "stdout": _decode_b64(ret.get("out-data", "")),
+            "stderr": _decode_b64(ret.get("err-data", "")),
+        }
+
     def exec(
         self,
         command: str,

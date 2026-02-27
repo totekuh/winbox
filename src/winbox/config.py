@@ -37,6 +37,14 @@ class Config:
         return self.shared_dir / "loot"
 
     @property
+    def jobs_file(self) -> Path:
+        return self.winbox_dir / "jobs.json"
+
+    @property
+    def jobs_log_dir(self) -> Path:
+        return self.shared_dir / "loot" / ".jobs"
+
+    @property
     def iso_dir(self) -> Path:
         return self.winbox_dir / "iso"
 
