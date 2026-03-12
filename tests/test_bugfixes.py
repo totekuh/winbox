@@ -593,6 +593,38 @@ class TestHostsRegexDotEscaping:
         script = mock_env.exec_powershell.call_args[0][0]
         assert "server01" in script
 
+    def test_hosts_set_escapes_hyphens_in_regex(self, runner, mock_env):
+        """Hyphens in hostnames must be escaped to avoid regex range."""
+        from winbox.cli import cli
+        from winbox.vm.guest import ExecResult
+
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="", stderr=""
+        )
+
+        result = runner.invoke(
+            cli, ["hosts", "set", "10.0.0.5", "dc-01.corp.local"]
+        )
+        assert result.exit_code == 0
+        script = mock_env.exec_powershell.call_args[0][0]
+        assert r"dc\-01\.corp\.local" in script
+
+    def test_hosts_delete_escapes_hyphens_in_regex(self, runner, mock_env):
+        """Hyphens in hostnames must be escaped in delete too."""
+        from winbox.cli import cli
+        from winbox.vm.guest import ExecResult
+
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="", stderr=""
+        )
+
+        result = runner.invoke(
+            cli, ["hosts", "delete", "web-server.corp.local"]
+        )
+        assert result.exit_code == 0
+        script = mock_env.exec_powershell.call_args[0][0]
+        assert r"web\-server\.corp\.local" in script
+
 
 # ─── Bug #18: Infinite loop in grant_libvirt_access outside $HOME ────────
 

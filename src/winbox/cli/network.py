@@ -251,7 +251,7 @@ def hosts_set(ctx: click.Context, ip: str, hostname: str) -> None:
     _validate_ip(ip)
     _validate_hostname(hostname)
 
-    hostname_escaped = hostname.replace('.', '\\.')
+    hostname_escaped = hostname.replace('.', '\\.').replace('-', '\\-')
     script = (
         f"$f = '{HOSTS_PATH}'\n"
         f"$lines = Get-Content $f\n"
@@ -282,7 +282,7 @@ def hosts_delete(ctx: click.Context, hostname: str) -> None:
     ensure_running(vm, ga, cfg)
     _validate_hostname(hostname)
 
-    hostname_escaped = hostname.replace('.', '\\.')
+    hostname_escaped = hostname.replace('.', '\\.').replace('-', '\\-')
     script = (
         f"$f = '{HOSTS_PATH}'\n"
         f"$lines = Get-Content $f\n"

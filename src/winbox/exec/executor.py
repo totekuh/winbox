@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from winbox.vm.guest import ExecResult, GuestAgent
+from winbox.vm.guest import ExecResult, GuestAgent, GuestAgentError
 from winbox.jobs import Job, JobMode, JobStatus, JobStore
 from winbox.utils import human_size
 
@@ -86,7 +86,11 @@ def run_command(
             break
         console.print(f"[yellow][!][/] GA pipe race detected, retrying ({attempt}/{max_retries - 1})...")
         time.sleep(0.5)
-        result = ga.exec(full_cmd, timeout=timeout)
+        try:
+            result = ga.exec(full_cmd, timeout=timeout)
+        except GuestAgentError as e:
+            console.print(f"[red][-][/] Retry failed: {e}")
+            break
 
     # Print stdout/stderr
     if result.stdout:

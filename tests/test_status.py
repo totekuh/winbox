@@ -1,4 +1,6 @@
-"""Tests for winbox status command."""
+"""Tests for winbox status and vnc commands."""
+
+from unittest.mock import patch, MagicMock
 
 from winbox.cli import cli
 from winbox.vm import VMState
@@ -31,12 +33,13 @@ class TestStatusRunning:
         assert "1" in result.output
 
     def test_shows_tool_count(self, runner, mock_env, cfg):
-        # Create some fake .exe files
+        # Create some tool files (all non-hidden files counted)
         (cfg.tools_dir / "SharpHound.exe").touch()
         (cfg.tools_dir / "PsExec64.exe").touch()
-        (cfg.tools_dir / "readme.txt").touch()  # not an exe
+        (cfg.tools_dir / "Invoke-Kerberoast.ps1").touch()
+        (cfg.tools_dir / ".ssh_pubkey").touch()  # hidden, not counted
         result = runner.invoke(cli, ["status"])
-        assert "2 executables" in result.output
+        assert "3 files" in result.output
 
     def test_shows_loot_count(self, runner, mock_env, cfg):
         (cfg.loot_dir / "creds.txt").write_text("data")
@@ -46,11 +49,19 @@ class TestStatusRunning:
 
     def test_zero_tools(self, runner, mock_env):
         result = runner.invoke(cli, ["status"])
-        assert "0 executables" in result.output
+        assert "0 files" in result.output
 
     def test_zero_loot(self, runner, mock_env):
         result = runner.invoke(cli, ["status"])
         assert "0 files" in result.output
+
+    def test_loot_excludes_job_logs(self, runner, mock_env, cfg):
+        """Job log files in .jobs/ should not inflate the loot count."""
+        (cfg.loot_dir / "creds.txt").write_text("data")
+        (cfg.jobs_log_dir / "1.stdout").write_text("output")
+        (cfg.jobs_log_dir / "1.stderr").write_text("")
+        result = runner.invoke(cli, ["status"])
+        assert "1 files" in result.output
 
 
 class TestStatusAgent:
@@ -118,3 +129,29 @@ class TestStatusOtherStates:
         mock_env._vm.ip.return_value = None
         result = runner.invoke(cli, ["status"])
         assert "IP" not in result.output
+
+
+# ─── VNC command ─────────────────────────────────────────────────────────────
+
+
+class TestVnc:
+    @patch("winbox.cli.vm.subprocess.Popen")
+    @patch("winbox.cli.vm.shutil.which", return_value="/usr/bin/virt-manager")
+    def test_launches_virt_manager(self, mock_which, mock_popen, runner, mock_env):
+        result = runner.invoke(cli, ["vnc"])
+        assert result.exit_code == 0
+        assert "virt-manager launched" in result.output
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert args[0] == "virt-manager"
+        assert "--connect" in args
+        assert "qemu:///system" in args
+        assert "--show-domain-console" in args
+        assert "winbox" in args
+
+    @patch("winbox.cli.vm.shutil.which", return_value=None)
+    def test_not_installed(self, mock_which, runner, mock_env):
+        result = runner.invoke(cli, ["vnc"])
+        assert result.exit_code != 0
+        assert "virt-manager not found" in result.output
+        assert "apt install virt-manager" in result.output

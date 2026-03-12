@@ -34,10 +34,12 @@ def run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.Completed
 
 REQUIRED_TOOLS = [
     "qemu-system-x86_64",
+    "qemu-img",
     "virsh",
     "virt-install",
     "virt-customize",
     "7z",
+    "wget",
 ]
 
 # virtiofsd is installed to /usr/libexec on Debian/Kali, not on PATH
@@ -256,7 +258,6 @@ def extract_virtiofs(cfg: Config) -> Path:
     return dest
 
 
-
 def generate_ssh_keypair(cfg: Config) -> None:
     """Generate an ED25519 SSH keypair for fallback access."""
     if cfg.ssh_key.exists():
@@ -281,7 +282,7 @@ def copy_setup_files(cfg: Config) -> None:
         shutil.copy2(cfg.ssh_pubkey, cfg.tools_dir / ".ssh_pubkey")
 
 
-def build_unattend_image(cfg: Config) -> None:
+def build_unattend_image(cfg: Config, *, desktop: bool = False) -> None:
     """Build an ISO image containing autounattend.xml."""
     mkisofs = _find_mkisofs()
     if mkisofs is None:
@@ -297,11 +298,15 @@ def build_unattend_image(cfg: Config) -> None:
         except PermissionError:
             subprocess.run(["rm", "-f", str(cfg.unattend_img)], check=False)
 
-    console.print("[blue][*][/] Building unattend image...")
+    edition = "Desktop Experience" if desktop else "Server Core"
+    console.print(f"[blue][*][/] Building unattend image ({edition})...")
     with tempfile.TemporaryDirectory() as tmpdir:
         src = _data_file("unattend.xml")
         dst = Path(tmpdir) / "autounattend.xml"
-        dst.write_bytes(Path(src).read_bytes())
+        xml = Path(src).read_text()
+        if desktop:
+            xml = xml.replace("SERVERSTANDARDCORE", "SERVERSTANDARD")
+        dst.write_text(xml)
 
         subprocess.run(
             [mkisofs, "-o", str(cfg.unattend_img), "-J", "-r", tmpdir],

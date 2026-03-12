@@ -44,12 +44,10 @@ def jobs_list(ctx: click.Context) -> None:
 
     updated = False
     for job in all_jobs:
-        if job.status != JobStatus.RUNNING:
+        if job.status not in (JobStatus.RUNNING, JobStatus.LOST):
             continue
         if ga is None:
-            job.status = JobStatus.LOST
-            updated = True
-            continue
+            continue  # VM offline — skip, don't permanently mark LOST
         try:
             status = ga.exec_status(job.pid)
             if status["exited"]:

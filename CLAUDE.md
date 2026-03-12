@@ -12,7 +12,7 @@ Type `winbox exec SharpHound.exe -c All -d corp.local` on Kali and it Just Works
 - **Package:** installed editable (`pip install -e .`), `winbox` CLI works
 - **Windows ISO:** downloaded at `~/.winbox/iso/SERVER_EVAL_x64FRE_en-us.iso` (4.7GB)
 - **VM:** created, setup works end-to-end (`winbox setup -y`)
-- **Tests:** 277 passing (265 unit + 12 integration, `pytest -m 'not integration'` for fast)
+- **Tests:** 338 passing (326 unit + 12 integration, `pytest -m 'not integration'` for fast)
 - **Git:** `master` branch
 
 ## Package Structure
@@ -29,7 +29,7 @@ src/winbox/
   utils.py                  # human_size() — single shared utility
   cli/                      # CLI commands (Click)
     __init__.py             #   entry point, ensure_running, _ensure_z_drive
-    vm.py                   #   up, down, suspend, destroy, status, snapshot, restore
+    vm.py                   #   up, down, suspend, destroy, status, snapshot, restore, vnc
     setup.py                #   setup, provision
     exec.py                 #   exec (--bg, --log, --timeout), shell, ssh
     jobs.py                 #   jobs (list, output, kill)
@@ -52,7 +52,6 @@ src/winbox/
     unattend.xml            # Windows unattended install (disk, OOBE, vioserial, viofs, guest agent, shutdown)
     bootstrap.ps1           # Provision wrapper: unpack provision.zip, run provision.ps1, shutdown
     provision.ps1           # Post-install script (disable Defender/firewall/LLMNR/NetBIOS, install OpenSSH, WinFsp, VirtioFsSvc)
-    config.default          # Default VM config values
     Invoke-ConPtyShell.ps1  # ConPTY reverse shell module (modified: ResizePseudoConsole support)
 tests/
   conftest.py               # Shared fixtures: runner, cfg, mock_env (VM/GA/ensure_running)
@@ -60,13 +59,15 @@ tests/
   test_config.py            # 29 tests — defaults, properties, config file parsing
   test_executor.py          # 14 tests — resolve_exe path resolution, local copy, case insensitivity
   test_guest.py             # 12 tests — base64 decoding, ExecResult dataclass
+  test_installer.py         # 29 tests — prereqs, mkisofs, directories, keygen, downloads, disk, desktop flag
   test_iso.py               # 4 tests — constants, URL resolution (live)
+  test_jobs.py              # 44 tests — JobStore, Job, exec --bg, jobs list/output/kill (unit)
+  test_jobs_integration.py  # 12 tests — end-to-end background jobs against live VM (@integration)
   test_network.py           # 20 tests — dns (set, sync, view), hosts (view, add, set, delete)
-  test_status.py            # 22 tests — status output for all VM states
+  test_shell.py             # 14 tests — constants, ConPTY setup, open_shell paths, relay guards
+  test_status.py            # 25 tests — status output for all VM states, loot/tool counting, vnc
   test_tools.py             # 11 tests — add/remove/list with real filesystem
   test_utils.py             # 7 tests — human_size conversions
-  test_jobs.py              # 31 tests — JobStore, Job, exec --bg, jobs list/output/kill (unit)
-  test_jobs_integration.py  # 12 tests — end-to-end background jobs against live VM (@integration)
   test_vm.py                # 6 tests — VMState enum, disk_usage
 ```
 
@@ -74,6 +75,7 @@ tests/
 
 ```
 winbox setup [--iso PATH] [-y]       # Build Windows VM (one-time, shows elapsed time)
+  [--desktop]                        #   install Desktop Experience instead of Server Core
 winbox up                            # Start or resume VM
 winbox down                          # Graceful shutdown
 winbox suspend                       # Save state to disk (instant resume)
@@ -108,13 +110,14 @@ winbox jobs kill <id>                # Kill a running background job
 winbox binfmt enable [--no-persist]  # Register .exe handler for transparent execution
 winbox binfmt disable                # Unregister .exe handler
 winbox binfmt status                 # Show binfmt_misc registration status
+winbox vnc                           # Open VM display in virt-manager
 ```
 
 ## Setup Flow (4-phase)
 
 ```
 Pre-setup downloads (Kali side, cached):
-  VirtIO drivers ISO, OpenSSH-Win64.zip, WinFsp MSI, virtiofs.exe (from VirtIO ISO), tools from tools.txt
+  VirtIO drivers ISO, OpenSSH-Win64.zip, WinFsp MSI, virtiofs.exe (from VirtIO ISO)
 
 Phase 1: ISO Install
   virt-install --cdrom (Windows ISO + VirtIO ISO + unattend)
@@ -130,7 +133,7 @@ Phase 1: ISO Install
 
 Phase 2: Offline Injection
   virt-customize on disk.qcow2:
-    --upload provision.zip:/provision.zip   (provision.ps1, tools.txt, .ssh_pubkey, OpenSSH-Win64.zip, winfsp.msi, virtiofs.exe)
+    --upload provision.zip:/provision.zip   (provision.ps1, .ssh_pubkey, OpenSSH-Win64.zip, winfsp.msi, virtiofs.exe)
     --upload bootstrap.ps1:/bootstrap.ps1
 
 Phase 3: Provisioning via Guest Agent
@@ -192,12 +195,12 @@ tools in the VM can reach any target the Kali host can reach.
 - VirtIO-FS: virtiofsd managed by libvirt (auto-starts/stops with VM), memfd shared memory
 - VirtioFsSvc registered as auto-start service — Z: available immediately on boot
 - `winbox setup -y` auto-destroys previous VM, orphaned disk/unattend files
-- Provisioning files (provision.ps1, tools.txt) cleaned from tools dir after re-provision
+- Provisioning files (provision.ps1) cleaned from tools dir after re-provision
 - Rich markup disabled on command output (tools like Rubeus output bracket syntax)
 - Config stores vm_user (Administrator) and vm_password — single source of truth
-- `.exe` resolution intended to be case-insensitive (BUG: actually case-sensitive on Linux ext4)
+- `.exe` resolution is case-insensitive (iterates tools dir, compares `.lower()`)
 - `ensure_running` also starts sshd (`_ensure_sshd_running`) — every command ensures SSH is ready
-- `download_tools` verifies SHA256 checksums, re-downloads on mismatch, auto-extracts zips
+- No `download_tools` — users `winbox tools add` their own binaries
 - `human_size()` lives in `utils.py` (single source, used by executor/tools/iso/vm)
 - Config silently skips invalid int values (`VM_RAM=abc` keeps default)
 - TYPE_CHECKING guarded imports for Config across modules (avoids circular imports)
@@ -219,7 +222,13 @@ tools in the VM can reach any target the Kali host can reach.
 - Background job state persisted in `~/.winbox/jobs.json` — survives CLI restarts
 - Log mode uses unquoted cmd.exe redirects — quoted paths break cmd.exe `>` operator
 - `exec_background` uses `capture-output: True` without polling — GA buffers output until queried
-- `jobs list` polls GA for running jobs (best-effort), marks unreachable ones as LOST
+- `jobs list` polls GA for running/lost jobs (best-effort); VM offline → skips (doesn't permanently mark LOST)
+- `--log` without `--bg` prints a warning (no silent ignore)
+- Hostname regex escapes both dots and hyphens in `hosts set`/`hosts delete` PowerShell scripts
+- GA retry loop catches `GuestAgentError` on retry (no uncaught traceback)
+- `winbox status` tool count includes all non-hidden files (not just .exe), loot count excludes `.jobs/`
+- `winbox setup --desktop` selects Desktop Experience instead of Server Core (same ISO, different image name)
+- `winbox vnc` opens virt-manager console (requires `virt-manager`, fails fast if missing)
 
 ## Filesystem Layout (runtime)
 
@@ -245,8 +254,7 @@ tools in the VM can reach any target the Kali host can reach.
 
 ## Prerequisites
 
-- `qemu-system-x86_64`, `virsh`, `virt-install`, `virt-customize`, `7z`
-- `wget` (for all binary downloads during setup)
+- `qemu-system-x86_64`, `qemu-img`, `virsh`, `virt-install`, `virt-customize`, `7z`, `wget`
 - `virtiofsd` (at `/usr/libexec/virtiofsd` or on PATH)
 - `/dev/kvm` (KVM hardware virtualization)
 - `mkisofs` or `genisoimage` (for unattend image)

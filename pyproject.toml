@@ -7,16 +7,28 @@ name = "winbox"
 version = "0.1.0"
 description = "Transparent Windows execution proxy for Kali — run Windows pentest tools via a headless QEMU/KVM VM"
 requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "totekuh"}]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
 dependencies = [
     "click>=8.0",
     "rich>=13.0",
 ]
 
+[project.urls]
+Repository = "https://github.com/totekuh/winbox"
+
 [project.scripts]
 winbox = "winbox.cli:cli"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "pytest-cov>=4.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/winbox"]

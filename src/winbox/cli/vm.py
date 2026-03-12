@@ -1,10 +1,10 @@
-"""VM lifecycle commands — up, down, suspend, destroy, status, snapshot, restore."""
+"""VM lifecycle commands — up, down, suspend, destroy, status, snapshot, restore, vnc."""
 
 from __future__ import annotations
 
-import time
-
+import shutil
 import subprocess
+import time
 
 import click
 
@@ -143,11 +143,14 @@ def status(ctx: click.Context) -> None:
         console.print(f"  Disk:    {disk}")
 
     if cfg.tools_dir.exists():
-        exe_count = sum(1 for f in cfg.tools_dir.iterdir() if f.suffix == ".exe")
-        console.print(f"  Tools:   {exe_count} executables")
+        tool_count = sum(1 for f in cfg.tools_dir.iterdir() if f.is_file() and not f.name.startswith("."))
+        console.print(f"  Tools:   {tool_count} files")
 
     if cfg.loot_dir.exists():
-        loot_count = sum(1 for f in cfg.loot_dir.rglob("*") if f.is_file())
+        loot_count = sum(
+            1 for f in cfg.loot_dir.rglob("*")
+            if f.is_file() and not f.is_relative_to(cfg.jobs_log_dir)
+        )
         console.print(f"  Loot:    {loot_count} files")
 
     snaps = vm.snapshot_list()
@@ -184,7 +187,7 @@ def restore(ctx: click.Context, name: str) -> None:
     console.print(f"[blue][*][/] Restoring snapshot '{name}'...")
     try:
         vm.snapshot_revert(name)
-    except subprocess.CalledProcessError:
+    except Exception:
         console.print(f"[red][-][/] Failed to restore snapshot '{name}'")
         raise SystemExit(1)
     console.print(f"[green][+][/] Restored to '{name}'")
@@ -195,3 +198,26 @@ def restore(ctx: click.Context, name: str) -> None:
             ga.wait(timeout=60)
         except GuestAgentError:
             console.print("[yellow][!][/] Guest agent not responding after restore")
+
+
+@click.command()
+@click.pass_context
+def vnc(ctx: click.Context) -> None:
+    """Open the VM display in virt-manager."""
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    if not shutil.which("virt-manager"):
+        console.print("[red][-][/] virt-manager not found. Install with: [bold]apt install virt-manager[/]")
+        raise SystemExit(1)
+
+    ensure_running(vm, ga, cfg)
+
+    console.print(f"[blue][*][/] Opening virt-manager console for {cfg.vm_name}")
+    subprocess.Popen(
+        ["virt-manager", "--connect", "qemu:///system", "--show-domain-console", cfg.vm_name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    console.print("[green][+][/] virt-manager launched")

@@ -23,8 +23,12 @@ from winbox.vm import VM
     help="Path to Windows Server 2022 ISO.",
 )
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts.")
+@click.option(
+    "--desktop", is_flag=True,
+    help="Install Desktop Experience instead of Server Core (needed for Office/GUI apps).",
+)
 @click.pass_context
-def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
+def setup(ctx: click.Context, windows_iso: str | None, yes: bool, desktop: bool) -> None:
     """Build the Windows VM (one-time setup)."""
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
@@ -92,7 +96,7 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool) -> None:
     installer.download_winfsp(cfg)
     installer.extract_virtiofs(cfg)
     installer.generate_ssh_keypair(cfg)
-    installer.build_unattend_image(cfg)
+    installer.build_unattend_image(cfg, desktop=desktop)
     installer.create_disk(cfg)
     installer.run_virt_install(cfg, windows_iso)
 

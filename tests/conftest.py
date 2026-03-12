@@ -18,6 +18,7 @@ def runner():
 def cfg(tmp_path):
     c = Config(winbox_dir=tmp_path / ".winbox")
     c.winbox_dir.mkdir(parents=True)
+    c.iso_dir.mkdir(parents=True)
     c.shared_dir.mkdir(parents=True)
     c.tools_dir.mkdir(parents=True)
     c.loot_dir.mkdir(parents=True)

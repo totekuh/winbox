@@ -39,6 +39,9 @@ def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int, bg: boo
     exe = command[0]
     args = command[1:]
 
+    if log and not bg:
+        console.print("[yellow][!][/] --log has no effect without --bg, ignoring")
+
     if bg:
         from winbox.jobs import JobMode
         job = run_command_bg(cfg, ga, exe, args, log=log)

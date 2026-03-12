@@ -162,12 +162,13 @@ class TestExecBg:
         result = runner.invoke(cli, ["exec", "--bg", "b.exe"])
         assert "Job 2 started" in result.output
 
-    def test_log_without_bg_ignored(self, runner, cfg, mock_env):
-        """--log without --bg runs synchronously (--log is silently ignored)."""
+    def test_log_without_bg_warns(self, runner, cfg, mock_env):
+        """--log without --bg runs synchronously and warns."""
         mock_env.exec.return_value = ExecResult(exitcode=0, stdout="ok\n", stderr="")
         result = runner.invoke(cli, ["exec", "--log", "cmd.exe", "/c", "echo", "hi"])
-        # Should run normally (not bg)
+        # Should run normally (not bg) but warn
         assert "Job" not in result.output
+        assert "--log has no effect without --bg" in result.output
 
 
 # ─── jobs list ────────────────────────────────────────────────────────────────
@@ -295,3 +296,169 @@ class TestJobsKill:
         result = runner.invoke(cli, ["jobs", "kill", "99"])
         assert result.exit_code == 1
         assert "not found" in result.output
+
+    def test_kill_ga_error(self, runner, cfg, mock_env):
+        """Kill fails when taskkill GA exec raises GuestAgentError."""
+        from winbox.vm.guest import GuestAgentError
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING))
+        mock_env.exec.side_effect = GuestAgentError("connection lost")
+        result = runner.invoke(cli, ["jobs", "kill", "1"])
+        assert result.exit_code == 1
+        assert "Kill failed" in result.output
+
+
+# ─── jobs list edge cases ────────────────────────────────────────────────────
+
+
+class TestJobsListEdge:
+    def test_ga_unavailable_keeps_running(self, runner, cfg, mock_env):
+        """Running jobs stay RUNNING when GA is unreachable (not permanently LOST)."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="slow.exe", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING, started=time.time()))
+        mock_env.ping.return_value = False
+        result = runner.invoke(cli, ["jobs", "list"])
+        assert result.exit_code == 0
+        assert "running" in result.output
+        reloaded = JobStore(cfg)
+        assert reloaded.get(1).status == JobStatus.RUNNING
+
+    def test_ga_init_exception_keeps_running(self, runner, cfg):
+        """Running jobs stay RUNNING when GA constructor throws."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x.exe", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING, started=time.time()))
+        with (
+            patch("winbox.cli.jobs.VM") as mock_vm_cls,
+            patch("winbox.cli.jobs.GuestAgent", side_effect=Exception("no socket")),
+            patch("winbox.cli.Config.load", return_value=cfg),
+        ):
+            mock_vm_cls.return_value.state.return_value.value = "running"
+            result = CliRunner().invoke(cli, ["jobs", "list"])
+        assert result.exit_code == 0
+        assert "running" in result.output
+
+    def test_exec_status_error_marks_lost(self, runner, cfg, mock_env):
+        """Running job marked LOST when exec_status raises GuestAgentError."""
+        from winbox.vm.guest import GuestAgentError
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="crash.exe", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING, started=time.time()))
+        mock_env.exec_status.side_effect = GuestAgentError("pid expired")
+        result = runner.invoke(cli, ["jobs", "list"])
+        assert result.exit_code == 0
+        assert "lost" in result.output
+        reloaded = JobStore(cfg)
+        assert reloaded.get(1).status == JobStatus.LOST
+
+    def test_lost_job_repolled_when_vm_back(self, runner, cfg, mock_env):
+        """LOST jobs are re-polled when VM comes back online."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="recovered.exe", mode=JobMode.BUFFERED,
+                       status=JobStatus.LOST, started=time.time()))
+        mock_env.exec_status.return_value = {
+            "exited": True, "exitcode": 0, "stdout": "done", "stderr": "",
+        }
+        result = runner.invoke(cli, ["jobs", "list"])
+        assert result.exit_code == 0
+        assert "done" in result.output
+        reloaded = JobStore(cfg)
+        assert reloaded.get(1).status == JobStatus.DONE
+
+    def test_age_minutes(self, runner, cfg, mock_env):
+        """Jobs between 1-59 minutes display as Xm."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="mid.exe", mode=JobMode.BUFFERED,
+                       status=JobStatus.DONE, exitcode=0,
+                       started=time.time() - 300))  # 5 minutes ago
+        result = runner.invoke(cli, ["jobs", "list"])
+        assert result.exit_code == 0
+        assert "5m" in result.output
+
+    def test_age_hours(self, runner, cfg, mock_env):
+        """Jobs older than 1 hour display as XhYm."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="long.exe", mode=JobMode.BUFFERED,
+                       status=JobStatus.DONE, exitcode=0,
+                       started=time.time() - 7200))  # 2 hours ago
+        result = runner.invoke(cli, ["jobs", "list"])
+        assert result.exit_code == 0
+        assert "2h0m" in result.output
+
+
+# ─── jobs output edge cases ──────────────────────────────────────────────────
+
+
+class TestJobsOutputEdge:
+    def test_log_stderr(self, runner, cfg, mock_env):
+        """LOG mode prints stderr from file."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.LOG,
+                       status=JobStatus.DONE))
+        store.log_path(1, "stdout").write_text("out\n")
+        store.log_path(1, "stderr").write_text("err msg\n")
+        result = runner.invoke(cli, ["jobs", "output", "1"])
+        assert result.exit_code == 0
+        assert "out" in result.output
+        assert "err msg" in result.output
+
+    def test_buffered_cached_stderr(self, runner, cfg, mock_env):
+        """Buffered mode prints cached stderr."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.DONE, stdout="", stderr="error line\n"))
+        result = runner.invoke(cli, ["jobs", "output", "1"])
+        assert result.exit_code == 0
+        assert "error line" in result.output
+
+    def test_ga_fetch_error(self, runner, cfg, mock_env):
+        """GA exec_status failure when fetching output."""
+        from winbox.vm.guest import GuestAgentError
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING))
+        mock_env.exec_status.side_effect = GuestAgentError("gone")
+        result = runner.invoke(cli, ["jobs", "output", "1"])
+        assert result.exit_code == 1
+        assert "Cannot fetch output" in result.output
+
+    def test_ga_returns_stderr(self, runner, cfg, mock_env):
+        """GA status returns stderr content."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING))
+        mock_env.exec_status.return_value = {
+            "exited": True, "exitcode": 1,
+            "stdout": "", "stderr": "fatal error\n",
+        }
+        result = runner.invoke(cli, ["jobs", "output", "1"])
+        assert result.exit_code == 0
+        assert "fatal error" in result.output
+
+    def test_no_output_exited(self, runner, cfg, mock_env):
+        """Job finished with no stdout or stderr."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING))
+        mock_env.exec_status.return_value = {
+            "exited": True, "exitcode": 0,
+            "stdout": "", "stderr": "",
+        }
+        result = runner.invoke(cli, ["jobs", "output", "1"])
+        assert result.exit_code == 0
+        assert "finished with no output" in result.output
+
+    def test_no_output_still_running(self, runner, cfg, mock_env):
+        """Job still running with no output yet."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING))
+        mock_env.exec_status.return_value = {
+            "exited": False, "exitcode": -1,
+            "stdout": "", "stderr": "",
+        }
+        result = runner.invoke(cli, ["jobs", "output", "1"])
+        assert result.exit_code == 0
+        assert "still running" in result.output

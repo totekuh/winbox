@@ -1,8 +1,0 @@
-# winbox default configuration
-# Override in ~/.winbox/config
-
-VM_NAME=winbox
-VM_RAM=4096
-VM_CPUS=4
-VM_DISK=30
-# HOST_IP=192.168.122.1
