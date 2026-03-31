@@ -145,9 +145,9 @@ def provision(ctx: click.Context) -> None:
     result = ga.exec_powershell_file("Z:\\tools\\provision.ps1", timeout=600)
 
     if result.stdout:
-        console.print(result.stdout, end="", highlight=False)
+        console.print(result.stdout, end="", markup=False, highlight=False)
     if result.stderr:
-        console.print(result.stderr, end="", style="red", highlight=False)
+        console.print(result.stderr, end="", markup=False, style="red", highlight=False)
 
     # Clean up provisioning files from shared tools dir
     for name in ("provision.ps1", ".ssh_pubkey"):
