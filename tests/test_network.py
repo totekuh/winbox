@@ -50,6 +50,12 @@ class TestDnsSync:
             mock_path.return_value.exists.return_value = True
             result = runner.invoke(cli, ["dns", "sync"])
 
+        assert result.exit_code == 0
+        mock_env.exec_powershell.assert_called_once()
+        script = mock_env.exec_powershell.call_args[0][0]
+        assert "10.0.0.1" in script
+        assert "Set-DnsClientServerAddress" in script
+
     def test_sync_no_resolv(self, runner, mock_env):
         with patch("winbox.cli.network.Path") as mock_path:
             mock_path.return_value.exists.return_value = False
@@ -63,9 +69,16 @@ class TestDnsSync:
         mock_env.exec_powershell.return_value = ExecResult(
             exitcode=0, stdout="", stderr=""
         )
-        with patch("winbox.cli.network.Path", wraps=Path) as mock_path:
-            mock_path.__call__ = lambda self, p: resolv if p == "/etc/resolv.conf" else Path(p)
+        with patch("winbox.cli.network.Path") as mock_path:
+            mock_path.side_effect = lambda p: resolv if p == "/etc/resolv.conf" else Path(p)
+            mock_path.return_value.exists.return_value = True
             result = runner.invoke(cli, ["dns", "sync"])
+
+        assert result.exit_code == 0
+        mock_env.exec_powershell.assert_called_once()
+        script = mock_env.exec_powershell.call_args[0][0]
+        assert "10.0.0.1" in script
+        assert "10.0.0.2" in script
 
 
 # ─── dns view ─────────────────────────────────────────────────────────────────

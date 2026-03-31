@@ -78,19 +78,26 @@ def run_command(
     marker.touch()
     marker_time = time.time()
 
-    # Execute via guest agent (retry on "handle is invalid" — GA pipe race)
+    # Execute via guest agent (retry on "handle is invalid" — GA pipe race).
+    # Uses cmd.exe /c for cd /d and tools PATH; exec_argv() is available for
+    # callers that don't need shell features (pipes, redirects, cd).
     max_retries = 3
-    result: ExecResult = ga.exec(full_cmd, timeout=timeout)
-    for attempt in range(1, max_retries):
-        if "handle is invalid" not in result.stdout.lower() + result.stderr.lower():
-            break
-        console.print(f"[yellow][!][/] GA pipe race detected, retrying ({attempt}/{max_retries - 1})...")
-        time.sleep(0.5)
+    result: ExecResult | None = None
+    for attempt in range(max_retries):
         try:
             result = ga.exec(full_cmd, timeout=timeout)
         except GuestAgentError as e:
-            console.print(f"[red][-][/] Retry failed: {e}")
+            if attempt < max_retries - 1:
+                console.print(f"[yellow][!][/] GA error, retrying ({attempt + 1}/{max_retries})...")
+                time.sleep(0.5)
+                continue
+            raise
+        if "handle is invalid" not in result.stdout.lower() + result.stderr.lower():
             break
+        if attempt < max_retries - 1:
+            console.print(f"[yellow][!][/] GA pipe race detected, retrying ({attempt + 1}/{max_retries})...")
+            time.sleep(0.5)
+    assert result is not None
 
     # Print stdout/stderr
     if result.stdout:

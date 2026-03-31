@@ -183,7 +183,7 @@ def create_directories(cfg: Config) -> None:
 
 def download_virtio_iso(cfg: Config) -> None:
     """Download VirtIO drivers ISO if not cached."""
-    if cfg.virtio_iso.exists():
+    if cfg.virtio_iso.exists() and cfg.virtio_iso.stat().st_size > 500_000_000:
         console.print("[green][+][/] VirtIO ISO cached")
         return
 
@@ -192,6 +192,8 @@ def download_virtio_iso(cfg: Config) -> None:
         ["wget", "-q", "--show-progress", "-O", str(cfg.virtio_iso), cfg.virtio_iso_url],
         check=True,
     )
+    if not cfg.virtio_iso.exists() or cfg.virtio_iso.stat().st_size < 500_000_000:
+        raise RuntimeError(f"VirtIO ISO download appears truncated: {cfg.virtio_iso}")
     console.print("[green][+][/] VirtIO ISO downloaded")
 
 
@@ -209,7 +211,7 @@ WINFSP_MSI = "winfsp.msi"
 def download_openssh(cfg: Config) -> Path:
     """Download Win32-OpenSSH zip if not cached. Returns path to zip."""
     dest = cfg.iso_dir / OPENSSH_ZIP
-    if dest.exists():
+    if dest.exists() and dest.stat().st_size > 5_000_000:
         console.print("[green][+][/] OpenSSH zip cached")
         return dest
 
@@ -218,6 +220,8 @@ def download_openssh(cfg: Config) -> Path:
         ["wget", "-q", "--show-progress", "-O", str(dest), OPENSSH_URL],
         check=True,
     )
+    if not dest.exists() or dest.stat().st_size < 5_000_000:
+        raise RuntimeError(f"OpenSSH download appears truncated: {dest}")
     console.print("[green][+][/] OpenSSH zip downloaded")
     return dest
 
@@ -225,7 +229,7 @@ def download_openssh(cfg: Config) -> Path:
 def download_winfsp(cfg: Config) -> Path:
     """Download WinFsp MSI if not cached. Returns path to MSI."""
     dest = cfg.iso_dir / WINFSP_MSI
-    if dest.exists():
+    if dest.exists() and dest.stat().st_size > 1_000_000:
         console.print("[green][+][/] WinFsp MSI cached")
         return dest
 
@@ -234,6 +238,8 @@ def download_winfsp(cfg: Config) -> Path:
         ["wget", "-q", "--show-progress", "-O", str(dest), WINFSP_URL],
         check=True,
     )
+    if not dest.exists() or dest.stat().st_size < 1_000_000:
+        raise RuntimeError(f"WinFsp download appears truncated: {dest}")
     console.print("[green][+][/] WinFsp MSI downloaded")
     return dest
 
@@ -384,11 +390,17 @@ def provision_vm_disk(cfg: Config) -> None:
         openssh_zip = cfg.iso_dir / OPENSSH_ZIP
         winfsp_msi = cfg.iso_dir / WINFSP_MSI
         virtiofs_exe = cfg.iso_dir / VIRTIOFS_EXE
+        missing_files = []
         for path, label in [
             (openssh_zip, "OpenSSH"), (winfsp_msi, "WinFsp"), (virtiofs_exe, "virtiofs"),
         ]:
             if not path.exists():
-                console.print(f"[yellow][!][/] {label} not found: {path}")
+                missing_files.append(f"{label}: {path}")
+        if missing_files:
+            raise RuntimeError(
+                "Missing critical provisioning files (re-run setup):\n  "
+                + "\n  ".join(missing_files)
+            )
         zip_path = tmpdir_path / "provision.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(_data_file("provision.ps1"), "provision.ps1")

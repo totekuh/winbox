@@ -53,12 +53,12 @@ class TestGenerateHandler:
     def test_winbox_path_embedded(self, cfg):
         with patch("shutil.which", return_value="/usr/local/bin/winbox"):
             script = generate_handler(cfg)
-        assert 'WINBOX="/usr/local/bin/winbox"' in script
+        assert "WINBOX=/usr/local/bin/winbox" in script
 
     def test_tools_dir_embedded(self, cfg):
         with patch("shutil.which", return_value="/usr/local/bin/winbox"):
             script = generate_handler(cfg)
-        assert f'TOOLS_DIR="{cfg.tools_dir}"' in script
+        assert f"TOOLS_DIR={cfg.tools_dir}" in script
 
     def test_uses_exec(self, cfg):
         with patch("shutil.which", return_value="/usr/local/bin/winbox"):

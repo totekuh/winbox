@@ -1,3 +1,8 @@
+<!--
+  Office Deployment Tool configuration.
+  O365ProPlusRetail requires a Microsoft 365 subscription.
+  Installs Word, Excel, PowerPoint only. Updates disabled.
+-->
 <Configuration>
   <Add OfficeClientEdition="64" Channel="Current">
     <Product ID="O365ProPlusRetail">

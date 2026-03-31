@@ -135,7 +135,8 @@ winbox hosts set 10.10.10.5 dc01.corp.local   # idempotent — replaces existing
 winbox hosts delete dc01.corp.local
 
 # Active Directory
-winbox domain join corp.local --ns 10.10.10.2 --user admin --password 'P@ssw0rd'
+winbox domain join corp.local --ns 10.10.10.2 --user admin
+# password is prompted interactively
 winbox domain leave
 ```
 
@@ -157,6 +158,17 @@ winbox snapshot pre-attack
 # ... do your thing ...
 winbox restore pre-attack    # revert to clean state
 ```
+
+### Office Installation
+
+For testing macro-based payloads, install Office on a Desktop Experience VM:
+
+```bash
+winbox setup --desktop -y    # build VM with Desktop Experience
+winbox office                # install Word, Excel, PowerPoint with macros enabled
+```
+
+Requires a Microsoft 365 subscription. Macros are enabled (VBAWarnings=1) for Word, Excel, and PowerPoint.
 
 ### Transparent .exe Execution (binfmt_misc)
 

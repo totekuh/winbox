@@ -76,8 +76,11 @@ try {
         }
         & "$installDir\install-sshd.ps1" | Out-Null
         if ($env:Path -notlike "*$installDir*") {
+            $machPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::Machine)
+            if ($machPath -notlike "*$installDir*") {
+                [Environment]::SetEnvironmentVariable("Path", "$machPath;$installDir", [EnvironmentVariableTarget]::Machine)
+            }
             $env:Path += ";$installDir"
-            [Environment]::SetEnvironmentVariable("Path", $env:Path, [EnvironmentVariableTarget]::Machine)
         }
     } else {
         # Fallback: install from Windows Update (re-provision without bundled zip)

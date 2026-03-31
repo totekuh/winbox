@@ -6,6 +6,26 @@ build/
 .pytest_cache/
 .coverage
 
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Build artifacts
+*.egg
+.eggs/
+*.whl
+
+# Coverage
+htmlcov/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+
 # Safety nets — prevent accidental commits of large/sensitive files
 *.qcow2
 *.iso

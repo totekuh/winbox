@@ -5,10 +5,13 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 import subprocess
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from winbox.config import Config
@@ -144,6 +147,9 @@ class GuestAgent:
         Uses guest-exec to launch cmd.exe /c <command>, polls for completion,
         and decodes the base64-encoded stdout/stderr.
         """
+        if poll_interval <= 0:
+            poll_interval = 0.5
+
         # Start the process
         payload = {
             "execute": "guest-exec",
@@ -170,12 +176,87 @@ class GuestAgent:
             if ret.get("exited"):
                 break
             if time.monotonic() >= deadline:
+                # Best-effort kill on timeout
+                try:
+                    self._raw_command({
+                        "execute": "guest-exec",
+                        "arguments": {
+                            "path": "taskkill",
+                            "arg": ["/PID", str(pid), "/F"],
+                            "capture-output": False,
+                        },
+                    }, timeout=5)
+                except Exception:
+                    pass
                 raise GuestAgentError(
                     f"Command timed out after {timeout}s (PID {pid})"
                 )
             time.sleep(poll_interval)
 
         # Decode output
+        exitcode = ret.get("exitcode", 1)
+        stdout = _decode_b64(ret.get("out-data", ""))
+        stderr = _decode_b64(ret.get("err-data", ""))
+
+        return ExecResult(exitcode=exitcode, stdout=stdout, stderr=stderr)
+
+    def exec_argv(
+        self,
+        path: str,
+        args: list[str],
+        *,
+        timeout: int = 300,
+        poll_interval: float = 0.5,
+    ) -> ExecResult:
+        """Execute a command by passing path and args directly to guest-exec.
+
+        Unlike exec(), this bypasses cmd.exe entirely — no shell interpretation
+        of metacharacters. Use this for direct exe calls that don't need shell
+        features (pipes, redirects, cd).
+        """
+        if poll_interval <= 0:
+            poll_interval = 0.5
+
+        payload = {
+            "execute": "guest-exec",
+            "arguments": {
+                "path": path,
+                "arg": list(args),
+                "capture-output": True,
+            },
+        }
+        response = self._raw_command(payload)
+        pid = response.get("return", {}).get("pid")
+        if pid is None:
+            raise GuestAgentError("Failed to start process — no PID returned")
+
+        status_payload = {
+            "execute": "guest-exec-status",
+            "arguments": {"pid": pid},
+        }
+        deadline = time.monotonic() + timeout
+        while True:
+            status = self._raw_command(status_payload)
+            ret = status.get("return", {})
+            if ret.get("exited"):
+                break
+            if time.monotonic() >= deadline:
+                try:
+                    self._raw_command({
+                        "execute": "guest-exec",
+                        "arguments": {
+                            "path": "taskkill",
+                            "arg": ["/PID", str(pid), "/F"],
+                            "capture-output": False,
+                        },
+                    }, timeout=5)
+                except Exception:
+                    pass
+                raise GuestAgentError(
+                    f"Command timed out after {timeout}s (PID {pid})"
+                )
+            time.sleep(poll_interval)
+
         exitcode = ret.get("exitcode", 1)
         stdout = _decode_b64(ret.get("out-data", ""))
         stderr = _decode_b64(ret.get("err-data", ""))
@@ -219,4 +300,5 @@ def _decode_b64(data: str) -> str:
     try:
         return base64.b64decode(data).decode("utf-8", errors="replace")
     except (binascii.Error, ValueError):
+        logger.warning("Failed to decode base64 output from guest agent")
         return ""

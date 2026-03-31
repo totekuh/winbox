@@ -90,11 +90,13 @@ class TestCheckPrereqs:
             path_str = str(self_path) if self_path else ""
             return "/usr/libexec/virtiofsd" in path_str or "/dev/kvm" in path_str
         mock_exists.side_effect = lambda: True  # /dev/kvm
-        # This is tricky with Path.exists — use a simpler approach
         missing = check_prereqs()
-        # If virtiofsd is missing from PATH and not at known paths, it's reported
-        # Just check it doesn't crash
+        # virtiofsd not on PATH — whether it's reported depends on Path.exists mock
+        # At minimum verify the function returns a list and doesn't crash
         assert isinstance(missing, list)
+        # Tools on PATH should not be reported as missing
+        assert "qemu-system-x86_64" not in missing
+        assert "virsh" not in missing
 
 
 # ─── _find_mkisofs ──────────────────────────────────────────────────────────
@@ -166,7 +168,10 @@ class TestGenerateSshKeypair:
 class TestDownloads:
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_virtio_iso(self, mock_run, cfg):
-        mock_run.return_value = MagicMock(returncode=0)
+        def fake_wget(*a, **kw):
+            # Create a fake file large enough to pass size check
+            cfg.virtio_iso.write_bytes(b"\x00" * 500_000_001)
+        mock_run.side_effect = fake_wget
         download_virtio_iso(cfg)
         mock_run.assert_called_once()
         args = mock_run.call_args[0][0]
@@ -174,36 +179,42 @@ class TestDownloads:
 
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_virtio_iso_cached(self, mock_run, cfg):
-        cfg.virtio_iso.touch()
+        cfg.virtio_iso.write_bytes(b"\x00" * 500_000_001)
         download_virtio_iso(cfg)
         mock_run.assert_not_called()
 
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_openssh(self, mock_run, cfg):
-        mock_run.return_value = MagicMock(returncode=0)
+        dest = cfg.iso_dir / "OpenSSH-Win64.zip"
+        def fake_wget(*a, **kw):
+            dest.write_bytes(b"\x00" * 5_000_001)
+        mock_run.side_effect = fake_wget
         result = download_openssh(cfg)
-        assert result == cfg.iso_dir / "OpenSSH-Win64.zip"
+        assert result == dest
         mock_run.assert_called_once()
 
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_openssh_cached(self, mock_run, cfg):
         dest = cfg.iso_dir / "OpenSSH-Win64.zip"
-        dest.touch()
+        dest.write_bytes(b"\x00" * 5_000_001)
         result = download_openssh(cfg)
         assert result == dest
         mock_run.assert_not_called()
 
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_winfsp(self, mock_run, cfg):
-        mock_run.return_value = MagicMock(returncode=0)
+        dest = cfg.iso_dir / "winfsp.msi"
+        def fake_wget(*a, **kw):
+            dest.write_bytes(b"\x00" * 1_000_001)
+        mock_run.side_effect = fake_wget
         result = download_winfsp(cfg)
-        assert result == cfg.iso_dir / "winfsp.msi"
+        assert result == dest
         mock_run.assert_called_once()
 
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_winfsp_cached(self, mock_run, cfg):
         dest = cfg.iso_dir / "winfsp.msi"
-        dest.touch()
+        dest.write_bytes(b"\x00" * 1_000_001)
         result = download_winfsp(cfg)
         assert result == dest
         mock_run.assert_not_called()

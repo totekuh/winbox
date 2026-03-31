@@ -17,7 +17,10 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
+import click
+
 from winbox.vm.guest import GuestAgent
+from winbox.vm.lifecycle import VM
 
 if TYPE_CHECKING:
     from winbox.config import Config
@@ -45,6 +48,11 @@ def open_shell(
     pipe_mode: bool = False,
 ) -> None:
     """Open an interactive SYSTEM shell via ConPTY reverse connection."""
+    if cfg.host_ip == "0.0.0.0":
+        console.print(
+            "[yellow][!][/] Warning: host_ip is 0.0.0.0 — shell listener exposed on all interfaces"
+        )
+
     _ensure_conpty_on_share(cfg)
 
     # Get terminal size
@@ -79,8 +87,9 @@ def open_shell(
     # Fire via guest agent — detached, the shell runs until we disconnect
     mode = "pipe" if pipe_mode else "ConPTY"
     console.print(f"[blue][*][/] Launching reverse shell as SYSTEM ({mode})...")
+    shell_pid: int | None = None
     try:
-        ga.exec_detached(cmd)
+        shell_pid = ga.exec_detached(cmd)
     except Exception:
         server.close()
         console.print("[red][-][/] Failed to launch reverse shell via guest agent")
@@ -89,12 +98,32 @@ def open_shell(
     # Wait for incoming connection
     server.settimeout(30)
     try:
-        client, _ = server.accept()
+        client, addr = server.accept()
     except socket.timeout:
+        # Kill orphaned shell process in VM
+        if shell_pid:
+            try:
+                ga.exec(f"taskkill /PID {shell_pid} /F", timeout=10)
+            except Exception:
+                pass
         console.print("[red][-][/] Timed out waiting for connection")
         return
     finally:
         server.close()
+
+    # Validate connecting IP matches expected VM
+    vm = VM(cfg)
+    expected_ip = vm.ip()
+    if not expected_ip:
+        client.close()
+        raise click.ClickException(
+            f"Cannot verify connecting IP {addr[0]} — VM IP unknown"
+        )
+    if addr[0] != expected_ip:
+        client.close()
+        raise click.ClickException(
+            f"Rejected connection from {addr[0]} (expected VM at {expected_ip})"
+        )
 
     console.print("[green][+][/] SYSTEM shell ready — type 'exit' to close\n")
 

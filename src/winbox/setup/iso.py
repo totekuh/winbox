@@ -97,11 +97,11 @@ def download_iso(
                 f"({human_size(local_size)} / {human_size(remote_size)}), resuming..."
             )
         elif remote_size and local_size > remote_size:
-            console.print(
-                f"[yellow][!][/] Local file ({human_size(local_size)}) is larger than remote "
-                f"({human_size(remote_size)}). Use --force to re-download."
+            raise RuntimeError(
+                f"Local ISO ({human_size(local_size)}) is larger than remote "
+                f"({human_size(remote_size)}). Delete {dest} and re-download, "
+                f"or use --force."
             )
-            return dest
         elif not remote_size and local_size > 1_000_000_000:
             # Can't verify size but file looks complete (>1GB)
             console.print(f"[green][+][/] ISO already downloaded: {dest}")
@@ -131,6 +131,12 @@ def download_iso(
         resp = urllib.request.urlopen(req, timeout=60)
     except urllib.error.URLError as e:
         raise RuntimeError(f"Download failed: {e}") from e
+
+    # If we requested a Range but server returned 200 (not 206), it sent
+    # the full file — switch to overwrite mode to avoid doubling content.
+    if existing_size > 0 and resp.status == 200:
+        mode = "wb"
+        existing_size = 0
 
     try:
         # Determine total for progress bar
@@ -170,5 +176,11 @@ def download_iso(
         resp.close()
 
     final_size = dest.stat().st_size
+    # Sanity check — Windows Server 2022 eval ISO is ~4.7GB
+    if final_size < 4_500_000_000:
+        raise RuntimeError(
+            f"Downloaded ISO appears truncated ({human_size(final_size)}). "
+            f"Delete {dest} and retry."
+        )
     console.print(f"[green][+][/] Downloaded: {dest} ({human_size(final_size)})")
     return dest

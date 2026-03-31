@@ -9,6 +9,8 @@ description = "Transparent Windows execution proxy for Kali — run Windows pent
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "totekuh"}]
+readme = "README.md"
+keywords = ["windows", "kali", "pentest", "qemu", "kvm", "vm"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Environment :: Console",
@@ -22,7 +24,9 @@ dependencies = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/totekuh/winbox"
 Repository = "https://github.com/totekuh/winbox"
+Issues = "https://github.com/totekuh/winbox/issues"
 
 [project.scripts]
 winbox = "winbox.cli:cli"

@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -54,7 +59,7 @@ class Job:
     def from_dict(cls, d: dict) -> Job:
         return cls(
             id=d["id"],
-            pid=d["pid"],
+            pid=int(d["pid"]),
             command=d["command"],
             mode=JobMode(d["mode"]),
             status=JobStatus(d["status"]),
@@ -81,14 +86,27 @@ class JobStore:
         try:
             data = json.loads(self._path.read_text())
             self._jobs = {j["id"]: Job.from_dict(j) for j in data}
-        except (json.JSONDecodeError, KeyError, ValueError):
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            logger.warning("Corrupt jobs.json, resetting")
             self._jobs = {}
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
-            json.dumps([j.to_dict() for j in self._jobs.values()], indent=2)
+        data = json.dumps([j.to_dict() for j in self._jobs.values()], indent=2)
+        # Atomic write: temp file + rename to prevent corruption on crash
+        fd, tmp = tempfile.mkstemp(
+            dir=str(self._path.parent), suffix=".tmp",
         )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(data)
+            os.rename(tmp, str(self._path))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def next_id(self) -> int:
         if not self._jobs:

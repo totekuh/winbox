@@ -29,6 +29,10 @@ def add(cfg: Config, files: tuple[str, ...]) -> None:
             console.print(f"[yellow][!][/] File not found: {f}")
             continue
         dest = cfg.tools_dir / src.name
+        # Prevent path traversal via crafted filenames
+        if not dest.resolve().is_relative_to(cfg.tools_dir.resolve()):
+            console.print(f"[red][-][/] Invalid filename: {src.name}")
+            continue
         shutil.copy2(src, dest)
         if src.name.lower().endswith(".exe"):
             dest.chmod(dest.stat().st_mode | 0o755)

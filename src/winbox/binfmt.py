@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -24,8 +25,8 @@ HANDLER_TEMPLATE = """\
 EXE_PATH="$1"
 shift
 
-WINBOX="{winbox_path}"
-TOOLS_DIR="{tools_dir}"
+WINBOX={winbox_path}
+TOOLS_DIR={tools_dir}
 
 EXE_NAME="$(basename "$EXE_PATH")"
 
@@ -44,8 +45,8 @@ def generate_handler(cfg: Config) -> str:
     if winbox_path is None:
         raise FileNotFoundError("winbox not found on PATH")
     return HANDLER_TEMPLATE.format(
-        winbox_path=winbox_path,
-        tools_dir=cfg.tools_dir,
+        winbox_path=shlex.quote(winbox_path),
+        tools_dir=shlex.quote(str(cfg.tools_dir)),
     )
 
 

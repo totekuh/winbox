@@ -22,6 +22,7 @@ class TestIsoConstants:
 
 
 class TestResolveDownloadUrl:
+    @pytest.mark.integration
     def test_resolves_to_microsoft_cdn(self):
         """Verify the redirect chain lands on Microsoft's CDN."""
         url = resolve_download_url()

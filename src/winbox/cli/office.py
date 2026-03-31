@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.resources
+import subprocess
 from pathlib import Path
 
 import click
@@ -28,30 +29,38 @@ def office(ctx: click.Context) -> None:
 
     ensure_running(vm, ga, cfg)
 
+    # Verify Desktop Experience is available (Office needs it)
+    result = ga.exec("where explorer.exe", timeout=30)
+    if result.exitcode != 0:
+        raise click.ClickException(
+            "Office requires Desktop Experience. Rebuild VM with: winbox setup --desktop -y"
+        )
+
     # Copy config XML to shared dir so VM can read it as Z:\office-config.xml
     src = _data_file("office-config.xml")
     dst = cfg.shared_dir / "office-config.xml"
-    dst.write_bytes(Path(src).read_bytes())
+    with importlib.resources.as_file(src) as src_path:
+        dst.write_bytes(src_path.read_bytes())
+
+    # Download ODT on host, copy to shared dir for VM access
+    odt_path = cfg.shared_dir / "setup.exe"
 
     try:
-        # Download ODT setup.exe into VM
-        console.print("[blue][*][/] Downloading Office Deployment Tool...")
-        result = ga.exec_powershell(
-            "New-Item -Path C:\\Office -ItemType Directory -Force | Out-Null\n"
-            f"Invoke-WebRequest -Uri '{ODT_URL}' -OutFile 'C:\\Office\\setup.exe'",
-            timeout=120,
-        )
-        if result.exitcode != 0:
-            console.print("[red][-][/] Failed to download ODT")
-            if result.stderr:
-                console.print(result.stderr, style="red", highlight=False)
-            raise SystemExit(1)
-        console.print("[green][+][/] ODT downloaded")
+        if not odt_path.exists():
+            console.print("[blue][*][/] Downloading Office Deployment Tool...")
+            try:
+                subprocess.run(
+                    ["wget", "-q", "-O", str(odt_path), ODT_URL],
+                    check=True,
+                )
+            except subprocess.CalledProcessError:
+                raise click.ClickException("Failed to download ODT setup.exe")
+        console.print("[green][+][/] ODT ready")
 
         # Install Office (downloads from CDN + installs in one step)
         console.print("[blue][*][/] Installing Office (this takes 20-40 minutes)...")
         result = ga.exec(
-            "C:\\Office\\setup.exe /configure Z:\\office-config.xml",
+            "Z:\\setup.exe /configure Z:\\office-config.xml",
             timeout=3600,
         )
         if result.exitcode != 0:
@@ -63,7 +72,7 @@ def office(ctx: click.Context) -> None:
 
         # Enable macros for Word, Excel, PowerPoint
         console.print("[blue][*][/] Enabling macros...")
-        ga.exec_powershell("""
+        result = ga.exec_powershell("""
 $apps = @('Word', 'Excel', 'PowerPoint')
 foreach ($app in $apps) {
     $p = "HKCU:\\Software\\Microsoft\\Office\\16.0\\$app\\Security"
@@ -71,12 +80,12 @@ foreach ($app in $apps) {
     Set-ItemProperty -Path $p -Name VBAWarnings -Value 1 -Type DWord
 }
 """)
-        console.print("[green][+][/] Macros enabled (Word, Excel, PowerPoint)")
+        if result.exitcode != 0:
+            console.print("[yellow][!][/] Warning: macro registry keys may not have been set")
+        else:
+            console.print("[green][+][/] Macros enabled (Word, Excel, PowerPoint)")
 
     finally:
-        # Clean up ODT files from VM and config from share
-        ga.exec_powershell(
-            "Remove-Item -Path C:\\Office -Recurse -Force -ErrorAction SilentlyContinue",
-            timeout=60,
-        )
-        dst.unlink(missing_ok=True)
+        # Clean up host-side files from shared dir
+        for f in ["setup.exe", "office-config.xml"]:
+            (cfg.shared_dir / f).unlink(missing_ok=True)

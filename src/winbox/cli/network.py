@@ -421,7 +421,7 @@ def domain_join(
         _ensure_z_drive(ga)
     except GuestAgentError:
         console.print("[yellow][!][/] Guest agent not responding after reboot")
-        console.print(f"    Check with: virsh console winbox")
+        console.print(f"    Check with: virsh console {cfg.vm_name}")
         raise SystemExit(1)
     console.print(f"[green][+][/] VM back up — domain-joined to {name}")
     console.print("    Undo with: [bold]winbox domain leave[/]")
@@ -472,6 +472,6 @@ def domain_leave(ctx: click.Context) -> None:
         _ensure_z_drive(ga)
     except GuestAgentError:
         console.print("[yellow][!][/] Guest agent not responding after reboot")
-        console.print(f"    Check with: virsh console winbox")
+        console.print(f"    Check with: virsh console {cfg.vm_name}")
         raise SystemExit(1)
     console.print("[green][+][/] Domain left — back to workgroup, all files intact")

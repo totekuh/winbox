@@ -104,36 +104,40 @@ class TestOpenShell:
         mock_relay.assert_not_called()
         mock_sock.close.assert_called()
 
+    @patch("winbox.exec.shell.VM")
     @patch("winbox.exec.shell._relay")
     @patch("winbox.exec.shell._ensure_conpty_on_share")
     @patch("winbox.exec.shell.os.get_terminal_size")
     @patch("winbox.exec.shell.socket.socket")
     def test_successful_conpty_connection(self, mock_socket_cls, mock_termsize,
-                                          mock_ensure, mock_relay, cfg):
+                                          mock_ensure, mock_relay, mock_vm_cls, cfg):
         """open_shell calls _relay on successful connection."""
         mock_termsize.return_value = MagicMock(lines=24, columns=80)
         mock_server = MagicMock()
         mock_client = MagicMock()
         mock_server.accept.return_value = (mock_client, ("192.168.122.100", 5555))
         mock_socket_cls.return_value = mock_server
+        mock_vm_cls.return_value.ip.return_value = "192.168.122.100"
         ga = MagicMock()
 
         open_shell(cfg, ga)
 
         mock_relay.assert_called_once_with(mock_client)
 
+    @patch("winbox.exec.shell.VM")
     @patch("winbox.exec.shell._relay_pipe")
     @patch("winbox.exec.shell._ensure_conpty_on_share")
     @patch("winbox.exec.shell.os.get_terminal_size")
     @patch("winbox.exec.shell.socket.socket")
     def test_pipe_mode(self, mock_socket_cls, mock_termsize,
-                       mock_ensure, mock_relay_pipe, cfg):
+                       mock_ensure, mock_relay_pipe, mock_vm_cls, cfg):
         """open_shell calls _relay_pipe in pipe mode."""
         mock_termsize.return_value = MagicMock(lines=24, columns=80)
         mock_server = MagicMock()
         mock_client = MagicMock()
         mock_server.accept.return_value = (mock_client, ("192.168.122.100", 5555))
         mock_socket_cls.return_value = mock_server
+        mock_vm_cls.return_value.ip.return_value = "192.168.122.100"
         ga = MagicMock()
 
         open_shell(cfg, ga, pipe_mode=True)
@@ -161,36 +165,40 @@ class TestOpenShell:
         assert "-Rows 24" in decoded
         assert "-Cols 80" in decoded
 
+    @patch("winbox.exec.shell.VM")
     @patch("winbox.exec.shell._relay")
     @patch("winbox.exec.shell._ensure_conpty_on_share")
     @patch("winbox.exec.shell.os.get_terminal_size")
     @patch("winbox.exec.shell.socket.socket")
     def test_custom_port(self, mock_socket_cls, mock_termsize,
-                         mock_ensure, mock_relay, cfg):
+                         mock_ensure, mock_relay, mock_vm_cls, cfg):
         """open_shell binds to custom port."""
         mock_termsize.return_value = MagicMock(lines=24, columns=80)
         mock_server = MagicMock()
         mock_client = MagicMock()
         mock_server.accept.return_value = (mock_client, ("192.168.122.100", 9999))
         mock_socket_cls.return_value = mock_server
+        mock_vm_cls.return_value.ip.return_value = "192.168.122.100"
         ga = MagicMock()
 
         open_shell(cfg, ga, port=9999)
 
         mock_server.bind.assert_called_once_with((cfg.host_ip, 9999))
 
+    @patch("winbox.exec.shell.VM")
     @patch("winbox.exec.shell._relay")
     @patch("winbox.exec.shell._ensure_conpty_on_share")
     @patch("winbox.exec.shell.os.get_terminal_size")
     @patch("winbox.exec.shell.socket.socket")
     def test_encodes_command(self, mock_socket_cls, mock_termsize,
-                             mock_ensure, mock_relay, cfg):
+                             mock_ensure, mock_relay, mock_vm_cls, cfg):
         """open_shell sends base64-encoded PowerShell command."""
         mock_termsize.return_value = MagicMock(lines=30, columns=120)
         mock_server = MagicMock()
         mock_client = MagicMock()
         mock_server.accept.return_value = (mock_client, ("192.168.122.100", 5555))
         mock_socket_cls.return_value = mock_server
+        mock_vm_cls.return_value.ip.return_value = "192.168.122.100"
         ga = MagicMock()
 
         open_shell(cfg, ga)
