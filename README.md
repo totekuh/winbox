@@ -50,7 +50,7 @@ sudo apt install qemu-system-x86 qemu-utils libvirt-daemon-system virtinst \
 ```
 
 Required:
-- `qemu-system-x86_64`, `virsh`, `virt-install`, `virt-customize`
+- `qemu-system-x86_64`, `qemu-img`, `virsh`, `virt-install`, `virt-customize`
 - `7z` (p7zip-full)
 - `virtiofsd` (at `/usr/libexec/virtiofsd` or on PATH)
 - `/dev/kvm` (hardware virtualization must be enabled)
@@ -60,6 +60,7 @@ Required:
 
 Optional:
 - `sshpass` — auto-auth for `winbox ssh` (falls back to manual password entry)
+- `virt-manager` — required for `winbox vnc` (VM display)
 
 ## Installation
 

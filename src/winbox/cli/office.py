@@ -43,7 +43,7 @@ def office(ctx: click.Context) -> None:
         dst.write_bytes(src_path.read_bytes())
 
     # Download ODT on host, copy to shared dir for VM access
-    odt_path = cfg.shared_dir / "setup.exe"
+    odt_path = cfg.shared_dir / "odt-setup.exe"
 
     try:
         if not odt_path.exists():
@@ -60,13 +60,13 @@ def office(ctx: click.Context) -> None:
         # Install Office (downloads from CDN + installs in one step)
         console.print("[blue][*][/] Installing Office (this takes 20-40 minutes)...")
         result = ga.exec(
-            "Z:\\setup.exe /configure Z:\\office-config.xml",
+            "Z:\\odt-setup.exe /configure Z:\\office-config.xml",
             timeout=3600,
         )
         if result.exitcode != 0:
             console.print("[red][-][/] Office installation failed")
             if result.stderr:
-                console.print(result.stderr, style="red", highlight=False)
+                console.print(result.stderr, style="red", markup=False, highlight=False)
             raise SystemExit(1)
         console.print("[green][+][/] Office installed")
 
@@ -87,5 +87,5 @@ foreach ($app in $apps) {
 
     finally:
         # Clean up host-side files from shared dir
-        for f in ["setup.exe", "office-config.xml"]:
+        for f in ["odt-setup.exe", "office-config.xml"]:
             (cfg.shared_dir / f).unlink(missing_ok=True)

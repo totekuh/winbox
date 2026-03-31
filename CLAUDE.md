@@ -12,7 +12,7 @@ Type `winbox exec SharpHound.exe -c All -d corp.local` on Kali and it Just Works
 - **Package:** installed editable (`pip install -e .`), `winbox` CLI works
 - **Windows ISO:** downloaded at `~/.winbox/iso/SERVER_EVAL_x64FRE_en-us.iso` (4.7GB)
 - **VM:** created, setup works end-to-end (`winbox setup -y`)
-- **Tests:** 338 passing (326 unit + 12 integration, `pytest -m 'not integration'` for fast)
+- **Tests:** 345 passing (332 unit + 13 integration, `pytest -m 'not integration'` for fast)
 - **Git:** `master` branch
 
 ## Package Structure
@@ -36,10 +36,11 @@ src/winbox/
     network.py              #   dns (set, sync, view), hosts (view, add, set, delete), domain (join, leave)
     files.py                #   tools (add, list, remove), iso (download, status)
     binfmt.py               #   binfmt enable/disable/status CLI commands
+    office.py               #   office (install Microsoft Office with macros)
   vm/                       # VM infrastructure
     __init__.py             #   re-exports: VM, VMState, GuestAgent, GuestAgentError, ExecResult
     lifecycle.py            #   VM class, VMState enum (virsh lifecycle)
-    guest.py                #   GuestAgent, ExecResult (virtio-serial), exec_background, exec_status
+    guest.py                #   GuestAgent, ExecResult (virtio-serial), exec_argv, exec_background, exec_status
   setup/                    # Setup pipeline
     __init__.py             #   re-exports: check_prereqs, ..., download_iso, ISO_FILENAME
     installer.py            #   4-phase setup, download_openssh, download_winfsp, extract_virtiofs
@@ -53,6 +54,7 @@ src/winbox/
     bootstrap.ps1           # Provision wrapper: unpack provision.zip, run provision.ps1, shutdown
     provision.ps1           # Post-install script (disable Defender/firewall/LLMNR/NetBIOS, install OpenSSH, WinFsp, VirtioFsSvc)
     Invoke-ConPtyShell.ps1  # ConPTY reverse shell module (modified: ResizePseudoConsole support)
+    office-config.xml       # Office Deployment Tool config (Word/Excel/PowerPoint, O365ProPlusRetail)
 tests/
   conftest.py               # Shared fixtures: runner, cfg, mock_env (VM/GA/ensure_running)
   test_binfmt.py            # 41 tests — handler generation, registration, CLI commands
@@ -60,7 +62,8 @@ tests/
   test_executor.py          # 14 tests — resolve_exe path resolution, local copy, case insensitivity
   test_guest.py             # 12 tests — base64 decoding, ExecResult dataclass
   test_installer.py         # 29 tests — prereqs, mkisofs, directories, keygen, downloads, disk, desktop flag
-  test_iso.py               # 4 tests — constants, URL resolution (live)
+  test_iso.py               # 4 tests — constants, URL resolution (live, @integration)
+  test_office.py            # 7 tests — office install command (success, failures, cleanup, macros)
   test_jobs.py              # 44 tests — JobStore, Job, exec --bg, jobs list/output/kill (unit)
   test_jobs_integration.py  # 12 tests — end-to-end background jobs against live VM (@integration)
   test_network.py           # 20 tests — dns (set, sync, view), hosts (view, add, set, delete)
@@ -111,6 +114,7 @@ winbox binfmt enable [--no-persist]  # Register .exe handler for transparent exe
 winbox binfmt disable                # Unregister .exe handler
 winbox binfmt status                 # Show binfmt_misc registration status
 winbox vnc                           # Open VM display in virt-manager
+winbox office                        # Install Microsoft Office with macros enabled (needs --desktop)
 ```
 
 ## Setup Flow (4-phase)
@@ -172,7 +176,7 @@ Kali Linux
     └── Defender/Firewall disabled
 ```
 
-Three channels:
+Four channels:
 - **Guest agent** — command execution (primary for `winbox exec`) + VM management (ping, wait, provisioning, shutdown)
 - **VirtIO-FS** — shared filesystem (virtiofsd on host, VirtioFsSvc on guest, Z: auto-mounted via shared memory)
 - **SSH** — interactive PowerShell session (`winbox ssh` only, auto-auth via sshpass)

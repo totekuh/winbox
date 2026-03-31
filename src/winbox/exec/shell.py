@@ -114,13 +114,18 @@ def open_shell(
     # Validate connecting IP matches expected VM
     vm = VM(cfg)
     expected_ip = vm.ip()
-    if not expected_ip:
+    if not expected_ip or addr[0] != expected_ip:
         client.close()
-        raise click.ClickException(
-            f"Cannot verify connecting IP {addr[0]} — VM IP unknown"
-        )
-    if addr[0] != expected_ip:
-        client.close()
+        # Kill orphaned shell process in VM
+        if shell_pid:
+            try:
+                ga.exec(f"taskkill /PID {shell_pid} /F", timeout=10)
+            except Exception:
+                pass
+        if not expected_ip:
+            raise click.ClickException(
+                f"Cannot verify connecting IP {addr[0]} — VM IP unknown"
+            )
         raise click.ClickException(
             f"Rejected connection from {addr[0]} (expected VM at {expected_ip})"
         )

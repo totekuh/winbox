@@ -154,9 +154,11 @@ def _show_new_files(loot_dir: Path, since: float) -> None:
     if not loot_dir.exists():
         return
 
+    jobs_dir = loot_dir / ".jobs"
     new_files = [
         f for f in loot_dir.rglob("*")
         if f.is_file() and f.stat().st_mtime > since
+        and not str(f).startswith(str(jobs_dir))
     ]
 
     if new_files:
