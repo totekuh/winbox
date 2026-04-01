@@ -42,8 +42,8 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool, desktop: bool)
         console.print(f"[red][-][/] Missing: {', '.join(missing)}")
         console.print(
             "    Install with: [bold]apt install "
-            "qemu-system-x86 libvirt-daemon-system virtinst guestfs-tools "
-            "virtiofsd p7zip-full jq genisoimage[/]"
+            "qemu-system-x86 qemu-utils libvirt-daemon-system virtinst "
+            "libguestfs-tools virtiofsd p7zip-full genisoimage wget[/]"
         )
         raise SystemExit(1)
 

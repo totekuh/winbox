@@ -31,14 +31,14 @@ PS C:\Windows\system32>
 ## Features
 
 - **Transparent execution** — run `.exe` files as if they were native Kali commands
-- **Auto-start** — VM boots on demand, suspends when idle
+- **Auto-start** — VM boots on demand, use `winbox suspend` to save state
 - **Shared filesystem** — `~/.winbox/shared/tools/` maps to `Z:\tools\` in Windows via VirtIO-FS
 - **Background jobs** — `--bg` for long-running tools, `--log` for persistent output
 - **Interactive shells** — ConPTY SYSTEM shell with resize support, or SSH into PowerShell
 - **Network integration** — VM traffic is NAT'd through Kali; push DNS, manage hosts file, join AD domains
 - **Snapshots** — save and restore VM state
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
-- **No internet in VM** — all tools and dependencies are staged from the host side
+- **No VM internet needed for setup** — all tools and dependencies are staged from the host side
 
 ## Prerequisites
 
@@ -46,7 +46,7 @@ Install on Kali (most are pre-installed):
 
 ```bash
 sudo apt install qemu-system-x86 qemu-utils libvirt-daemon-system virtinst \
-    libguestfs-tools p7zip-full genisoimage sshpass wget
+    libguestfs-tools virtiofsd p7zip-full genisoimage sshpass wget
 ```
 
 Required:
