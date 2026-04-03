@@ -1,5 +1,6 @@
 """Shared test fixtures for winbox CLI tests."""
 
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,6 +27,10 @@ def cfg(tmp_path):
     return c
 
 
+# CLI modules that need VM/GA/ensure_running patched
+_CLI_MODULES = ["vm", "network", "exec", "jobs", "av", "applocker"]
+
+
 @pytest.fixture
 def mock_env(cfg):
     """Patch VM/GA/ensure_running so CLI commands run without a real VM.
@@ -46,25 +51,15 @@ def mock_env(cfg):
     vm.disk_usage.return_value = "6.5 GB"
     vm.snapshot_list.return_value = ["clean"]
 
-    with (
-        patch("winbox.cli.vm.ensure_running"),
-        patch("winbox.cli.vm.GuestAgent", return_value=ga),
-        patch("winbox.cli.vm.VM", return_value=vm),
-        patch("winbox.cli.network.ensure_running"),
-        patch("winbox.cli.network.GuestAgent", return_value=ga),
-        patch("winbox.cli.network.VM", return_value=vm),
-        patch("winbox.cli.network.VMState", VMState),
-        patch("winbox.cli.exec.ensure_running"),
-        patch("winbox.cli.exec.GuestAgent", return_value=ga),
-        patch("winbox.cli.exec.VM", return_value=vm),
-        patch("winbox.cli.jobs.ensure_running"),
-        patch("winbox.cli.jobs.GuestAgent", return_value=ga),
-        patch("winbox.cli.jobs.VM", return_value=vm),
-        patch("winbox.cli.setup.VM", return_value=vm),
-        patch("winbox.cli.av.ensure_running"),
-        patch("winbox.cli.av.GuestAgent", return_value=ga),
-        patch("winbox.cli.av.VM", return_value=vm),
-        patch("winbox.cli.Config.load", return_value=cfg),
-    ):
+    with ExitStack() as stack:
+        for mod in _CLI_MODULES:
+            stack.enter_context(patch(f"winbox.cli.{mod}.ensure_running"))
+            stack.enter_context(patch(f"winbox.cli.{mod}.GuestAgent", return_value=ga))
+            stack.enter_context(patch(f"winbox.cli.{mod}.VM", return_value=vm))
+
+        stack.enter_context(patch("winbox.cli.network.VMState", VMState))
+        stack.enter_context(patch("winbox.cli.setup.VM", return_value=vm))
+        stack.enter_context(patch("winbox.cli.Config.load", return_value=cfg))
+
         ga._vm = vm
         yield ga

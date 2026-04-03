@@ -108,6 +108,7 @@ from winbox.cli.binfmt import binfmt  # noqa: E402
 from winbox.cli.jobs import jobs  # noqa: E402
 from winbox.cli.office import office  # noqa: E402
 from winbox.cli.av import av  # noqa: E402
+from winbox.cli.applocker import applocker  # noqa: E402
 
 cli.add_command(up)
 cli.add_command(down)
@@ -131,3 +132,4 @@ cli.add_command(jobs)
 cli.add_command(vnc)
 cli.add_command(office)
 cli.add_command(av)
+cli.add_command(applocker)
