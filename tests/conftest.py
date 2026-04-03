@@ -61,6 +61,9 @@ def mock_env(cfg):
         patch("winbox.cli.jobs.GuestAgent", return_value=ga),
         patch("winbox.cli.jobs.VM", return_value=vm),
         patch("winbox.cli.setup.VM", return_value=vm),
+        patch("winbox.cli.av.ensure_running"),
+        patch("winbox.cli.av.GuestAgent", return_value=ga),
+        patch("winbox.cli.av.VM", return_value=vm),
         patch("winbox.cli.Config.load", return_value=cfg),
     ):
         ga._vm = vm
