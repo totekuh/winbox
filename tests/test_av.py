@@ -1,6 +1,6 @@
 """Tests for winbox.cli.av — enable/disable/status commands."""
 
-from unittest.mock import call
+from unittest.mock import patch
 
 from winbox.cli import cli
 from winbox.cli.av import (
@@ -84,6 +84,19 @@ class TestAvEnable:
         assert result.exit_code == 0
         assert "Defender enabled" in result.output
 
+    def test_enable_exclusions_are_best_effort(self, runner, mock_env):
+        """Exclusion failures should not block the rest of the flow."""
+        mock_env.exec_powershell.side_effect = [
+            ExecResult(exitcode=0, stdout="", stderr=""),  # registry
+            ExecResult(exitcode=1, stdout="", stderr="failed"),  # exclusions (ignored)
+            ExecResult(exitcode=0, stdout="", stderr=""),  # prefs
+        ]
+        mock_env.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+
+        result = runner.invoke(cli, ["av", "enable"])
+        assert result.exit_code == 0
+        assert "Defender enabled" in result.output
+
     def test_enable_service_start_fails(self, runner, mock_env):
         mock_env.exec_powershell.return_value = ExecResult(
             exitcode=0, stdout="", stderr=""
@@ -123,7 +136,10 @@ class TestAvDisable:
             exitcode=0, stdout="", stderr=""
         )
 
-        result = runner.invoke(cli, ["av", "disable"])
+        with patch("winbox.cli.av.time.sleep"), \
+             patch("winbox.cli.av._ensure_z_drive"):
+            result = runner.invoke(cli, ["av", "disable"])
+
         assert result.exit_code == 0
         assert "Defender disabled" in result.output
 
@@ -134,7 +150,7 @@ class TestAvDisable:
             assert call_args[0][0] == "reg.exe"
             assert call_args[0][1] == args
 
-        # Verify reboot was triggered (first exec call after reg keys)
+        # Verify reboot was triggered
         reboot_calls = [
             c for c in mock_env.exec.call_args_list
             if "shutdown" in c[0][0]
@@ -154,6 +170,25 @@ class TestAvDisable:
         # Should NOT have rebooted
         mock_env.exec.assert_not_called()
 
+    def test_disable_reboot_wait_failure(self, runner, mock_env):
+        """GuestAgentError during reboot wait should exit cleanly."""
+        from winbox.vm.guest import GuestAgentError
+
+        mock_env.exec_argv.return_value = ExecResult(
+            exitcode=0, stdout="", stderr=""
+        )
+        mock_env.exec.return_value = ExecResult(
+            exitcode=0, stdout="", stderr=""
+        )
+        mock_env.wait.side_effect = GuestAgentError("timeout")
+
+        with patch("winbox.cli.av.time.sleep"), \
+             patch("winbox.cli.av._ensure_z_drive"):
+            result = runner.invoke(cli, ["av", "disable"])
+
+        assert result.exit_code != 0
+        assert "not responding" in result.output
+
     def test_disable_uses_no_encoded_powershell(self, runner, mock_env):
         """AMSI blocks encoded PowerShell — disable uses reg.exe only."""
         mock_env.exec_argv.return_value = ExecResult(
@@ -163,7 +198,10 @@ class TestAvDisable:
             exitcode=0, stdout="", stderr=""
         )
 
-        runner.invoke(cli, ["av", "disable"])
+        with patch("winbox.cli.av.time.sleep"), \
+             patch("winbox.cli.av._ensure_z_drive"):
+            runner.invoke(cli, ["av", "disable"])
+
         mock_env.exec_powershell.assert_not_called()
 
 
@@ -210,6 +248,34 @@ class TestAvStatus:
         result = runner.invoke(cli, ["av", "status"])
         assert result.exit_code == 0
         assert "off" in result.output
+
+    def test_status_not_installed(self, runner, mock_env):
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout="Defender: not installed\n",
+            stderr="",
+        )
+
+        result = runner.invoke(cli, ["av", "status"])
+        assert result.exit_code == 0
+        assert "not installed" in result.output
+
+    def test_status_partial(self, runner, mock_env):
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout=(
+                "Defender: partial\n"
+                "  RealTimeProtection: True\n"
+                "  AMSI/ScriptScanning: False\n"
+                "  BehaviorMonitoring: False\n"
+                "  IOAVProtection: False\n"
+            ),
+            stderr="",
+        )
+
+        result = runner.invoke(cli, ["av", "status"])
+        assert result.exit_code == 0
+        assert "partial" in result.output
 
     def test_status_query_fails(self, runner, mock_env):
         mock_env.exec_powershell.return_value = ExecResult(
@@ -258,6 +324,12 @@ class TestScriptContent:
         # All arg lists start with "add"
         for args in _DISABLE_REG_ARGS:
             assert args[0] == "add"
+
+    def test_registry_paths_are_consistent(self):
+        """PS paths (HKLM:) must match reg.exe paths (HKLM) after colon strip."""
+        assert _GP_DEFENDER == _GP_DEFENDER_REG.replace("HKLM", "HKLM:", 1)
+        assert _GP_RTP == _GP_RTP_REG.replace("HKLM", "HKLM:", 1)
+        assert _MS_RTP == _MS_RTP_REG.replace("HKLM", "HKLM:", 1)
 
     def test_status_script_checks_service_and_prefs(self):
         assert "Get-Service WinDefend" in _STATUS_SCRIPT

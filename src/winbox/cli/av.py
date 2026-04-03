@@ -11,25 +11,30 @@ from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM
 
-# Registry paths that provision.ps1 sets to disable Defender persistently
-_GP_DEFENDER = r"HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
-_GP_RTP = r"HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"
-_MS_RTP = r"HKLM:\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection"
+# Registry paths — PowerShell uses "HKLM:\", reg.exe uses "HKLM\".
+# Define reg.exe style, derive PowerShell style to avoid duplication.
+_GP_DEFENDER_REG = r"HKLM\SOFTWARE\Policies\Microsoft\Windows Defender"
+_GP_RTP_REG = r"HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"
+_MS_RTP_REG = r"HKLM\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection"
 
-_ENABLE_SCRIPT = r"""
+_GP_DEFENDER = _GP_DEFENDER_REG.replace("HKLM", "HKLM:", 1)
+_GP_RTP = _GP_RTP_REG.replace("HKLM", "HKLM:", 1)
+_MS_RTP = _MS_RTP_REG.replace("HKLM", "HKLM:", 1)
+
+_ENABLE_SCRIPT = f"""
 # Remove GP-level registry overrides (provisioning + av disable set these)
-Remove-ItemProperty -Path '{gp_def}' -Name DisableAntiSpyware -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path '{gp_rtp}' -Name DisableRealtimeMonitoring -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path '{gp_rtp}' -Name DisableIOAVProtection -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path '{gp_rtp}' -Name DisableBehaviorMonitoring -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path '{gp_rtp}' -Name DisableScriptScanning -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path '{_GP_DEFENDER}' -Name DisableAntiSpyware -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path '{_GP_RTP}' -Name DisableRealtimeMonitoring -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path '{_GP_RTP}' -Name DisableIOAVProtection -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path '{_GP_RTP}' -Name DisableBehaviorMonitoring -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path '{_GP_RTP}' -Name DisableScriptScanning -ErrorAction SilentlyContinue
 
 # Remove non-policy registry keys
-Remove-ItemProperty -Path '{ms_rtp}' -Name DisableRealtimeMonitoring -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path '{ms_rtp}' -Name DisableIOAVProtection -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path '{ms_rtp}' -Name DisableBehaviorMonitoring -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path '{ms_rtp}' -Name DisableScriptScanning -ErrorAction SilentlyContinue
-""".format(gp_def=_GP_DEFENDER, gp_rtp=_GP_RTP, ms_rtp=_MS_RTP)
+Remove-ItemProperty -Path '{_MS_RTP}' -Name DisableRealtimeMonitoring -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path '{_MS_RTP}' -Name DisableIOAVProtection -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path '{_MS_RTP}' -Name DisableBehaviorMonitoring -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path '{_MS_RTP}' -Name DisableScriptScanning -ErrorAction SilentlyContinue
+"""
 
 _EXCLUSION_SCRIPT = r"""
 # Add exclusions so Defender doesn't block the QEMU guest agent or VirtIO-FS
@@ -59,10 +64,6 @@ Set-MpPreference -DisableScriptScanning $false -ErrorAction Stop
 # AMSI flags Set-MpPreference -Disable* $true inside -EncodedCommand as
 # Trojan:Win32/PowExcEnv.B!MTB, so we use reg.exe via exec_argv instead.
 # exec_argv bypasses cmd.exe too, avoiding quote-stripping on paths with spaces.
-_GP_DEFENDER_REG = r"HKLM\SOFTWARE\Policies\Microsoft\Windows Defender"
-_GP_RTP_REG = r"HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"
-_MS_RTP_REG = r"HKLM\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection"
-
 _DISABLE_REG_ARGS: list[list[str]] = [
     # GP-level overrides — these take precedence over everything else and
     # persist across reboots. The non-policy keys under
@@ -136,7 +137,8 @@ def av_enable(ctx: click.Context) -> None:
     result = ga.exec("sc.exe start WinDefend", timeout=15)
     # sc.exe returns 0 on success, 1056 if already running — both are fine
     if result.exitcode not in (0, 1056):
-        console.print(f"[red][-][/] Failed to start WinDefend: {result.stdout.strip()}")
+        console.print("[red][-][/] Failed to start WinDefend:")
+        console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
         raise SystemExit(1)
 
     # Step 3: Add exclusions BEFORE enabling protections — Defender flags
