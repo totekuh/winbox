@@ -222,11 +222,11 @@ def applocker_enable(ctx: click.Context) -> None:
     # exec_powershell doesn't give the converter the right context.
     console.print("[blue][*][/] Starting AppLocker stack...")
     ga.exec("appidtel.exe start", timeout=15)
-    time.sleep(3)
+    time.sleep(5)
 
     console.print("[blue][*][/] Compiling rules...")
     ga.exec(r"C:\Windows\System32\AppIdPolicyConverter.exe", timeout=15)
-    time.sleep(2)
+    time.sleep(5)
     ga.exec("gpupdate /force", timeout=30)
 
     console.print("[green][+][/] AppLocker enforced (Exe, Script, MSI, Appx)")
