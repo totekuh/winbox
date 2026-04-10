@@ -37,7 +37,11 @@ PS C:\Windows\system32>
 - **Interactive shells** — ConPTY SYSTEM shell with resize support, or SSH into PowerShell
 - **Network integration** — VM traffic is NAT'd through Kali; push DNS, manage hosts file, join AD domains
 - **Snapshots** — save and restore VM state
+- **AV toggle** — disable/enable Windows Defender on demand (`winbox av disable/enable`)
+- **AppLocker** — enable AppLocker with default rules for bypass testing
+- **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
+- **MCP server** — expose VM tools to AI agents (Claude Code) for assisted vulnerability research
 - **No VM internet needed for setup** — all tools and dependencies are staged from the host side
 
 ## Prerequisites
@@ -124,6 +128,11 @@ winbox tools remove Rubeus.exe
 ### Network
 
 ```bash
+# Isolation
+winbox net isolate           # disconnect VM from network (host-VM channels stay up)
+winbox net connect           # reconnect VM to network
+winbox net status            # show link state
+
 # DNS
 winbox dns view              # show DNS on Kali and VM
 winbox dns set 10.10.10.2    # set VM DNS nameserver
@@ -165,11 +174,30 @@ winbox restore pre-attack    # revert to clean state
 For testing macro-based payloads, install Office on a Desktop Experience VM:
 
 ```bash
-winbox setup --desktop -y    # build VM with Desktop Experience
+winbox setup --desktop -y          # build VM with Desktop Experience
+winbox setup --autologin -y        # enable auto-login as Administrator
 winbox office                # install Word, Excel, PowerPoint with macros enabled
 ```
 
 Requires a Microsoft 365 subscription. Macros are enabled (VBAWarnings=1) for Word, Excel, and PowerPoint.
+
+### AppLocker
+
+Test application whitelisting bypass techniques:
+
+```bash
+winbox applocker enable      # enable AppLocker with default rules (Exe, Script, MSI, Appx)
+winbox applocker status      # show enforcement status
+winbox applocker disable     # disable AppLocker, clear policy, reboot
+```
+
+### Antivirus (Windows Defender)
+
+```bash
+winbox av disable            # disable Defender completely (reboot required — WinDefend is PPL)
+winbox av status             # show Defender/AMSI protection status
+winbox av enable             # re-enable Defender + AMSI (adds QEMU GA/VirtIO-FS exclusions)
+```
 
 ### Transparent .exe Execution (binfmt_misc)
 
@@ -206,7 +234,15 @@ claude mcp add winbox -- winbox mcp
 | `ioctl(device, code, input_hex, output_size)` | Send DeviceIoControl to a driver — no ctypes boilerplate |
 | `reg_query(key, value?)` | Query registry key or value |
 | `reg_set(key, value, data, type)` | Set registry value (creates key if needed) |
+| `reg_delete(key, value?)` | Delete registry value or entire key tree |
 | `ps(filter?)` | List processes with PID, name, path, memory usage |
+| `upload(src, dst?)` | Upload file from Kali to VM via VirtIO-FS (optionally copy to dst inside VM) |
+| `file_copy(src, dst)` | Copy file within the VM (DLL sideloading, staging binaries) |
+| `mem_read(pid, address, size)` | Read memory from a process (ReadProcessMemory) |
+| `service_start(name)` | Start a Windows service |
+| `service_stop(name)` | Stop a Windows service |
+| `net_isolate()` | Disconnect VM from network (host-VM channels stay up) |
+| `net_connect()` | Reconnect VM to network (restarts adapter, renews DHCP) |
 
 **Requires** Python installed in the VM (see roadmap).
 
