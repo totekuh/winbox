@@ -243,6 +243,9 @@ claude mcp add winbox -- winbox mcp
 | `service_stop(name)` | Stop a Windows service |
 | `net_isolate()` | Disconnect VM from network (host-VM channels stay up) |
 | `net_connect()` | Reconnect VM to network (restarts adapter, renews DHCP) |
+| `pipe_list(filter?)` | Enumerate named pipes matching a pattern |
+| `pipe_info(name)` | Get DACL/SDDL, pipe mode, buffer sizes, owner for a pipe |
+| `pipe_connect(name, access?)` | Open a handle to a pipe and return result (access denied = useful info) |
 
 **Requires** Python installed in the VM (see roadmap).
 

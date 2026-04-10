@@ -774,3 +774,125 @@ class TestGetState:
         mcp_mod._cfg = None
         mcp_mod._vm = None
         mcp_mod._ga = None
+
+
+# ─── pipe_list / pipe_info / pipe_connect tools ─────────────────────────────
+
+
+class TestPipeTools:
+    def test_pipe_list_no_filter(self, mock_mcp):
+        from winbox.mcp import pipe_list
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=0,
+            stdout="3 pipe(s):\n  lsass\n  svcctl\n  winreg\n",
+            stderr="",
+        )
+
+        result = pipe_list()
+        assert "lsass" in result
+        assert "3 pipe(s)" in result
+
+    def test_pipe_list_with_filter(self, mock_mcp):
+        from winbox.mcp import pipe_list
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=0,
+            stdout="1 pipe(s):\n  lsass\n",
+            stderr="",
+        )
+
+        result = pipe_list(filter="lsass")
+        assert "lsass" in result
+        args = (cfg.shared_dir / ".mcp" / "args.json").read_text()
+        import json
+        assert json.loads(args)["filter"] == "lsass"
+
+    def test_pipe_list_empty(self, mock_mcp):
+        from winbox.mcp import pipe_list
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=0, stdout="0 pipe(s):\n", stderr=""
+        )
+
+        result = pipe_list(filter="nomatch")
+        assert "0 pipe(s)" in result
+
+    def test_pipe_info_success(self, mock_mcp):
+        from winbox.mcp import pipe_info
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=0,
+            stdout=(
+                "Pipe:       \\\\.\\pipe\\svcctl\n"
+                "Mode:       message\n"
+                "End:        server\n"
+                "OutBuf:     4096 bytes\n"
+                "InBuf:      4096 bytes\n"
+                "MaxInst:    unlimited\n"
+                "SDDL:       O:SYG:SYD:(A;;0x12019b;;;WD)\n"
+            ),
+            stderr="",
+        )
+
+        result = pipe_info(name="svcctl")
+        assert "Mode:       message" in result
+        assert "SDDL:" in result
+
+        args = (cfg.shared_dir / ".mcp" / "args.json").read_text()
+        import json
+        assert json.loads(args)["name"] == "svcctl"
+
+    def test_pipe_info_access_denied(self, mock_mcp):
+        from winbox.mcp import pipe_info
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=0,
+            stdout="Cannot open pipe (error 5) — trying SDDL via PowerShell only\n(no SDDL)\n",
+            stderr="",
+        )
+
+        result = pipe_info(name="lsass")
+        assert "error 5" in result
+
+    def test_pipe_connect_success(self, mock_mcp):
+        from winbox.mcp import pipe_connect
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=0,
+            stdout="OK: opened \\\\.\\pipe\\svcctl [read] successfully\n",
+            stderr="",
+        )
+
+        result = pipe_connect(name="svcctl")
+        assert "OK" in result
+
+        args = (cfg.shared_dir / ".mcp" / "args.json").read_text()
+        import json
+        data = json.loads(args)
+        assert data["name"] == "svcctl"
+        assert data["access"] == "read"
+
+    def test_pipe_connect_access_denied(self, mock_mcp):
+        from winbox.mcp import pipe_connect
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=1,
+            stdout="",
+            stderr="FAILED: \\\\.\\pipe\\lsass [write] -> ACCESS_DENIED\n",
+        )
+
+        result = pipe_connect(name="lsass", access="write")
+        assert "ACCESS_DENIED" in result
+
+    def test_pipe_connect_readwrite(self, mock_mcp):
+        from winbox.mcp import pipe_connect
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=0, stdout="OK: opened \\\\.\\pipe\\test [readwrite] successfully\n", stderr=""
+        )
+
+        pipe_connect(name="test", access="readwrite")
+        args = (cfg.shared_dir / ".mcp" / "args.json").read_text()
+        import json
+        assert json.loads(args)["access"] == "readwrite"

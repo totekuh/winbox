@@ -919,6 +919,268 @@ def net_connect() -> str:
     return "Network connected (DHCP pending)"
 
 
+# ─── Tool 10: pipe_list / pipe_info / pipe_connect ──────────────────────────
+
+@mcp.tool()
+def pipe_list(filter: str = "") -> str:
+    """Enumerate named pipes in the Windows VM matching a pattern.
+
+    Uses Get-ChildItem on \\\\.\\pipe\\ via PowerShell. Returns pipe names,
+    one per line, sorted alphabetically.
+
+    Args:
+        filter: Optional substring filter (case-insensitive). Empty = all pipes.
+    """
+    script = textwrap.dedent("""\
+        import json
+        import subprocess
+        import sys
+
+        args = json.load(open(r'Z:\\.mcp\\args.json'))
+        filter_str = args.get('filter', '').lower()
+
+        r = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             'Get-ChildItem \\\\\\\\.\\\\pipe\\\\ | Select-Object -ExpandProperty Name | Sort-Object'],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(r.stderr, file=sys.stderr)
+            sys.exit(r.returncode)
+
+        pipes = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+        if filter_str:
+            pipes = [p for p in pipes if filter_str in p.lower()]
+        print(f"{len(pipes)} pipe(s):")
+        for p in pipes:
+            print(f"  {p}")
+    """)
+
+    result = _exec_python(script, args={"filter": filter})
+    output = ""
+    if result["stdout"]:
+        output += result["stdout"]
+    if result["stderr"]:
+        output += f"\n[stderr]\n{result['stderr']}"
+    if result["exitcode"] != 0:
+        output += f"\n[exit code: {result['exitcode']}]"
+    return output or "(no output)"
+
+
+@mcp.tool()
+def pipe_info(name: str) -> str:
+    """Get security and configuration details for a named pipe.
+
+    Returns the SDDL (DACL/owner/group), pipe mode (byte/message),
+    input/output buffer sizes, and current instance count.
+
+    Args:
+        name: Pipe name without prefix (e.g. 'lsass' not '\\\\\\\\.\\\\pipe\\\\lsass').
+    """
+    script = textwrap.dedent("""\
+        import ctypes
+        from ctypes import wintypes
+        import json
+        import subprocess
+        import sys
+
+        args = json.load(open(r'Z:\\.mcp\\args.json'))
+        name = args['name']
+        pipe_path = f'\\\\\\\\.\\\\pipe\\\\{name}'
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        advapi32 = ctypes.WinDLL('advapi32', use_last_error=True)
+
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        kernel32.GetNamedPipeInfo.restype = wintypes.BOOL
+        kernel32.GetNamedPipeInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+        ]
+        advapi32.GetSecurityInfo.restype = wintypes.DWORD
+        advapi32.GetSecurityInfo.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
+        advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_READ = 1
+        FILE_SHARE_WRITE = 2
+        OPEN_EXISTING = 3
+        INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+        handle = kernel32.CreateFileW(
+            pipe_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None,
+        )
+        if handle == INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error()
+            # Try read-only with no access (just for security query)
+            print(f"Cannot open pipe (error {err}) — trying SDDL via PowerShell only")
+            r = subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 f'(Get-Acl -Path "\\\\\\\\.${{pipe_path.replace(chr(92)*2+chr(46)+chr(92), chr(92))}}").Sddl'],
+                capture_output=True, text=True,
+            )
+            print(r.stdout.strip() or "(no SDDL)")
+            sys.exit(0)
+
+        try:
+            # GetNamedPipeInfo
+            flags = wintypes.DWORD(0)
+            out_buf = wintypes.DWORD(0)
+            in_buf = wintypes.DWORD(0)
+            max_inst = wintypes.DWORD(0)
+            kernel32.GetNamedPipeInfo(
+                handle,
+                ctypes.byref(flags), ctypes.byref(out_buf),
+                ctypes.byref(in_buf), ctypes.byref(max_inst),
+            )
+            PIPE_TYPE_MESSAGE = 0x4
+            PIPE_SERVER_END = 0x1
+            mode = "message" if (flags.value & PIPE_TYPE_MESSAGE) else "byte"
+            end = "server" if (flags.value & PIPE_SERVER_END) else "client"
+            max_i = max_inst.value if max_inst.value != 255 else "unlimited"
+            print(f"Pipe:       {pipe_path}")
+            print(f"Mode:       {mode}")
+            print(f"End:        {end}")
+            print(f"OutBuf:     {out_buf.value} bytes")
+            print(f"InBuf:      {in_buf.value} bytes")
+            print(f"MaxInst:    {max_i}")
+
+            # SDDL
+            SE_KERNEL_OBJECT = 6
+            DACL_SECURITY_INFORMATION = 4
+            OWNER_SECURITY_INFORMATION = 1
+            GROUP_SECURITY_INFORMATION = 2
+            sd_ptr = ctypes.c_void_p()
+            ret = advapi32.GetSecurityInfo(
+                handle, SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                None, None, None, None,
+                ctypes.byref(sd_ptr),
+            )
+            if ret == 0 and sd_ptr.value:
+                sddl_ptr = wintypes.LPWSTR()
+                SDDL_REVISION_1 = 1
+                advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    sd_ptr, SDDL_REVISION_1,
+                    OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    ctypes.byref(sddl_ptr), None,
+                )
+                if sddl_ptr.value:
+                    print(f"SDDL:       {sddl_ptr.value}")
+                    kernel32.LocalFree(sddl_ptr)
+                kernel32.LocalFree(sd_ptr)
+        finally:
+            kernel32.CloseHandle(handle)
+    """)
+
+    result = _exec_python(script, args={"name": name})
+    output = ""
+    if result["stdout"]:
+        output += result["stdout"]
+    if result["stderr"]:
+        output += f"\n[stderr]\n{result['stderr']}"
+    if result["exitcode"] != 0:
+        output += f"\n[exit code: {result['exitcode']}]"
+    return output or "(no output)"
+
+
+@mcp.tool()
+def pipe_connect(name: str, access: str = "read") -> str:
+    """Open a handle to a named pipe and return the result.
+
+    Attempts to connect to the pipe with the specified access. Useful for
+    testing pipe ACLs, impersonation opportunities, and access control.
+    Returns success + handle info, or the Win32 error on failure.
+
+    Args:
+        name: Pipe name without prefix (e.g. 'lsass').
+        access: Access mode — 'read', 'write', or 'readwrite' (default: 'read').
+    """
+    script = textwrap.dedent("""\
+        import ctypes
+        from ctypes import wintypes
+        import json
+        import sys
+
+        args = json.load(open(r'Z:\\.mcp\\args.json'))
+        name = args['name']
+        access_str = args.get('access', 'read').lower()
+
+        GENERIC_READ  = 0x80000000
+        GENERIC_WRITE = 0x40000000
+        access_map = {
+            'read':      GENERIC_READ,
+            'write':     GENERIC_WRITE,
+            'readwrite': GENERIC_READ | GENERIC_WRITE,
+        }
+        desired_access = access_map.get(access_str, GENERIC_READ)
+
+        pipe_path = f'\\\\\\\\.\\\\pipe\\\\{name}'
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        FILE_SHARE_READ = 1
+        FILE_SHARE_WRITE = 2
+        OPEN_EXISTING = 3
+        INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+        handle = kernel32.CreateFileW(
+            pipe_path, desired_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None,
+        )
+        if handle == INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error()
+            msgs = {
+                5:   'ACCESS_DENIED',
+                2:   'NOT_FOUND',
+                231: 'PIPE_BUSY (all instances in use)',
+            }
+            msg = msgs.get(err, f'error {err}')
+            print(f"FAILED: {pipe_path} [{access_str}] -> {msg}", file=sys.stderr)
+            sys.exit(1)
+
+        kernel32.CloseHandle(handle)
+        print(f"OK: opened {pipe_path} [{access_str}] successfully")
+    """)
+
+    result = _exec_python(script, args={"name": name, "access": access})
+    output = ""
+    if result["stdout"]:
+        output += result["stdout"]
+    if result["stderr"]:
+        output += f"\n[stderr]\n{result['stderr']}"
+    if result["exitcode"] != 0:
+        output += f"\n[exit code: {result['exitcode']}]"
+    return output or "(no output)"
+
+
 # ─── Entry point ────────────────────────────────────────────────────────────
 
 def run_server() -> None:
