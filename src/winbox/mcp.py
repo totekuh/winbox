@@ -904,6 +904,7 @@ def net_connect() -> str:
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
 
+    ga.exec("ipconfig /release", timeout=15)
     ga.exec("ipconfig /renew", timeout=30)
     for _ in range(15):
         ip = vm.ip()

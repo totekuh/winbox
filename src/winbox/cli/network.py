@@ -61,8 +61,10 @@ def net_connect(ctx: click.Context) -> None:
         console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
         raise SystemExit(1)
 
-    # Renew DHCP — restores default gateway and DNS without releasing the IP
+    # Full DHCP cycle — release forces a fresh DISCOVER so Windows re-adds
+    # the default gateway (plain /renew on a valid lease skips route setup)
     console.print("[blue][*][/] Renewing DHCP lease...")
+    ga.exec("ipconfig /release", timeout=15)
     ga.exec("ipconfig /renew", timeout=30)
 
     ip = None
