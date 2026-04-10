@@ -925,8 +925,8 @@ def net_connect() -> str:
 def pipe_list(filter: str = "") -> str:
     """Enumerate named pipes in the Windows VM matching a pattern.
 
-    Uses Get-ChildItem on \\\\.\\pipe\\ via PowerShell. Returns pipe names,
-    one per line, sorted alphabetically.
+    Uses Get-ChildItem on \\\\.\\pipe\\ via PowerShell. Returns a JSON array
+    of pipe names, sorted alphabetically.
 
     Args:
         filter: Optional substring filter (case-insensitive). Empty = all pipes.
@@ -951,9 +951,7 @@ def pipe_list(filter: str = "") -> str:
         pipes = [line.strip() for line in r.stdout.splitlines() if line.strip()]
         if filter_str:
             pipes = [p for p in pipes if filter_str in p.lower()]
-        print(f"{len(pipes)} pipe(s):")
-        for p in pipes:
-            print(f"  {p}")
+        print(json.dumps(pipes))
     """)
 
     result = _exec_python(script, args={"filter": filter})
@@ -971,8 +969,8 @@ def pipe_list(filter: str = "") -> str:
 def pipe_info(name: str) -> str:
     """Get security and configuration details for a named pipe.
 
-    Returns the SDDL (DACL/owner/group), pipe mode (byte/message),
-    input/output buffer sizes, and current instance count.
+    Returns a JSON object with keys: pipe, mode, end, out_buf, in_buf,
+    max_instances, sddl. sddl is null if it could not be retrieved.
 
     Args:
         name: Pipe name without prefix (e.g. 'lsass' not '\\\\\\\\.\\\\pipe\\\\lsass').
@@ -1031,14 +1029,19 @@ def pipe_info(name: str) -> str:
         )
         if handle == INVALID_HANDLE_VALUE:
             err = ctypes.get_last_error()
-            # Try read-only with no access (just for security query)
-            print(f"Cannot open pipe (error {err}) — trying SDDL via PowerShell only")
+            # Try SDDL via PowerShell as fallback
+            ps_path = pipe_path.replace('\\\\.\\', '\\')
             r = subprocess.run(
                 ['powershell', '-NoProfile', '-Command',
-                 f'(Get-Acl -Path "\\\\\\\\.${{pipe_path.replace(chr(92)*2+chr(46)+chr(92), chr(92))}}").Sddl'],
+                 f'(Get-Acl -Path "{ps_path}").Sddl'],
                 capture_output=True, text=True,
             )
-            print(r.stdout.strip() or "(no SDDL)")
+            sddl = r.stdout.strip() or None
+            print(json.dumps({
+                "pipe": pipe_path,
+                "error": f"Cannot open (error {err})",
+                "sddl": sddl,
+            }))
             sys.exit(0)
 
         try:
@@ -1057,12 +1060,6 @@ def pipe_info(name: str) -> str:
             mode = "message" if (flags.value & PIPE_TYPE_MESSAGE) else "byte"
             end = "server" if (flags.value & PIPE_SERVER_END) else "client"
             max_i = max_inst.value if max_inst.value != 255 else "unlimited"
-            print(f"Pipe:       {pipe_path}")
-            print(f"Mode:       {mode}")
-            print(f"End:        {end}")
-            print(f"OutBuf:     {out_buf.value} bytes")
-            print(f"InBuf:      {in_buf.value} bytes")
-            print(f"MaxInst:    {max_i}")
 
             # SDDL
             SE_KERNEL_OBJECT = 6
@@ -1070,6 +1067,7 @@ def pipe_info(name: str) -> str:
             OWNER_SECURITY_INFORMATION = 1
             GROUP_SECURITY_INFORMATION = 2
             sd_ptr = ctypes.c_void_p()
+            sddl = None
             ret = advapi32.GetSecurityInfo(
                 handle, SE_KERNEL_OBJECT,
                 OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
@@ -1085,9 +1083,19 @@ def pipe_info(name: str) -> str:
                     ctypes.byref(sddl_ptr), None,
                 )
                 if sddl_ptr.value:
-                    print(f"SDDL:       {sddl_ptr.value}")
+                    sddl = sddl_ptr.value
                     kernel32.LocalFree(sddl_ptr)
                 kernel32.LocalFree(sd_ptr)
+
+            print(json.dumps({
+                "pipe": pipe_path,
+                "mode": mode,
+                "end": end,
+                "out_buf": out_buf.value,
+                "in_buf": in_buf.value,
+                "max_instances": max_i,
+                "sddl": sddl,
+            }))
         finally:
             kernel32.CloseHandle(handle)
     """)

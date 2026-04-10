@@ -781,75 +781,80 @@ class TestGetState:
 
 class TestPipeTools:
     def test_pipe_list_no_filter(self, mock_mcp):
+        import json
         from winbox.mcp import pipe_list
         ga, vm, cfg = mock_mcp
         ga.exec.return_value = ExecResult(
             exitcode=0,
-            stdout="3 pipe(s):\n  lsass\n  svcctl\n  winreg\n",
+            stdout=json.dumps(["lsass", "svcctl", "winreg"]) + "\n",
             stderr="",
         )
 
         result = pipe_list()
         assert "lsass" in result
-        assert "3 pipe(s)" in result
+        assert "svcctl" in result
 
     def test_pipe_list_with_filter(self, mock_mcp):
+        import json
         from winbox.mcp import pipe_list
         ga, vm, cfg = mock_mcp
         ga.exec.return_value = ExecResult(
             exitcode=0,
-            stdout="1 pipe(s):\n  lsass\n",
+            stdout=json.dumps(["lsass"]) + "\n",
             stderr="",
         )
 
         result = pipe_list(filter="lsass")
         assert "lsass" in result
         args = (cfg.shared_dir / ".mcp" / "args.json").read_text()
-        import json
         assert json.loads(args)["filter"] == "lsass"
 
     def test_pipe_list_empty(self, mock_mcp):
+        import json
         from winbox.mcp import pipe_list
         ga, vm, cfg = mock_mcp
         ga.exec.return_value = ExecResult(
-            exitcode=0, stdout="0 pipe(s):\n", stderr=""
+            exitcode=0, stdout=json.dumps([]) + "\n", stderr=""
         )
 
         result = pipe_list(filter="nomatch")
-        assert "0 pipe(s)" in result
+        assert "[]" in result
 
     def test_pipe_info_success(self, mock_mcp):
+        import json
         from winbox.mcp import pipe_info
         ga, vm, cfg = mock_mcp
+        info = {
+            "pipe": "\\\\.\\pipe\\svcctl",
+            "mode": "message",
+            "end": "server",
+            "out_buf": 4096,
+            "in_buf": 4096,
+            "max_instances": "unlimited",
+            "sddl": "O:SYG:SYD:(A;;0x12019b;;;WD)",
+        }
         ga.exec.return_value = ExecResult(
-            exitcode=0,
-            stdout=(
-                "Pipe:       \\\\.\\pipe\\svcctl\n"
-                "Mode:       message\n"
-                "End:        server\n"
-                "OutBuf:     4096 bytes\n"
-                "InBuf:      4096 bytes\n"
-                "MaxInst:    unlimited\n"
-                "SDDL:       O:SYG:SYD:(A;;0x12019b;;;WD)\n"
-            ),
-            stderr="",
+            exitcode=0, stdout=json.dumps(info) + "\n", stderr=""
         )
 
         result = pipe_info(name="svcctl")
-        assert "Mode:       message" in result
-        assert "SDDL:" in result
+        assert '"mode": "message"' in result
+        assert "O:SYG:SYD:" in result
 
         args = (cfg.shared_dir / ".mcp" / "args.json").read_text()
-        import json
         assert json.loads(args)["name"] == "svcctl"
 
     def test_pipe_info_access_denied(self, mock_mcp):
+        import json
         from winbox.mcp import pipe_info
         ga, vm, cfg = mock_mcp
+        info = {
+            "pipe": "\\\\.\\pipe\\lsass",
+            "error": "Cannot open (error 5)",
+            "sddl": None,
+        }
         ga.exec.return_value = ExecResult(
-            exitcode=0,
-            stdout="Cannot open pipe (error 5) — trying SDDL via PowerShell only\n(no SDDL)\n",
-            stderr="",
+            exitcode=0, stdout=json.dumps(info) + "\n", stderr=""
         )
 
         result = pipe_info(name="lsass")
