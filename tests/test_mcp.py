@@ -691,20 +691,21 @@ class TestNetTools:
     def test_isolate(self, mock_mcp):
         from winbox.mcp import net_isolate
         ga, vm, cfg = mock_mcp
-        vm.net_set_link = MagicMock(return_value=True)
 
         result = net_isolate()
         assert "isolated" in result.lower()
-        vm.net_set_link.assert_called_once_with("down")
+        script = ga.exec_powershell.call_args[0][0]
+        assert "Remove-NetRoute" in script
+        assert "0.0.0.0/0" in script
 
     def test_connect(self, mock_mcp):
         from winbox.mcp import net_connect
         ga, vm, cfg = mock_mcp
-        vm.net_set_link = MagicMock(return_value=True)
+        vm.ip.return_value = "192.168.122.43"
 
         result = net_connect()
         assert "connected" in result.lower()
-        vm.net_set_link.assert_called_once_with("up")
+        ga.exec.assert_called_with("ipconfig /renew", timeout=30)
 
     def test_isolate_vm_not_running(self, mock_mcp):
         from winbox.mcp import net_isolate
@@ -714,13 +715,13 @@ class TestNetTools:
         result = net_isolate()
         assert "not running" in result.lower()
 
-    def test_isolate_no_interface(self, mock_mcp):
-        from winbox.mcp import net_isolate
+    def test_connect_vm_not_running(self, mock_mcp):
+        from winbox.mcp import net_connect
         ga, vm, cfg = mock_mcp
-        vm.net_set_link = MagicMock(return_value=False)
+        vm.state.return_value = VMState.SHUTOFF
 
-        result = net_isolate()
-        assert "failed" in result.lower()
+        result = net_connect()
+        assert "not running" in result.lower()
 
 
 # ─── CLI command ────────────────────────────────────────────────────────────

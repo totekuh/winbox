@@ -877,46 +877,40 @@ def service_start(name: str) -> str:
 
 @mcp.tool()
 def net_isolate() -> str:
-    """Disconnect the VM from the network (unplug the cable).
+    """Block internet access on the VM by removing the default gateway.
 
-    Host-VM channels (guest agent, VirtIO-FS) stay up since they use
-    virtio-serial, not the network. Only the NIC is disconnected.
+    The NIC stays up — traffic to directly routed targets still works.
     Undo with net_connect.
     """
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
-    if not vm.net_set_link("down"):
-        return "Failed to set link down (no interface found?)"
-    return "Network isolated — cable unplugged"
+    ga.exec_powershell(
+        "Remove-NetRoute -DestinationPrefix '0.0.0.0/0' -Confirm:$false -ErrorAction SilentlyContinue",
+        timeout=15,
+    )
+    return "Internet isolated — default gateway removed"
 
 
 @mcp.tool()
 def net_connect() -> str:
-    """Reconnect the VM to the network (plug the cable back in).
+    """Restore internet access by renewing DHCP (gets gateway + DNS back).
 
-    Automatically restarts the adapter and renews DHCP.
+    The NIC is always up; this just restores the default gateway.
     """
     import time
 
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
-    if not vm.net_set_link("up"):
-        return "Failed to set link up (no interface found?)"
 
-    # Restart adapter + renew DHCP — Windows doesn't auto-renew after replug
-    ga.exec_powershell(
-        "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
-        "-Confirm:$false",
-        timeout=15,
-    )
-    for _ in range(10):
+    ga.exec("ipconfig /renew", timeout=30)
+    for _ in range(15):
         ip = vm.ip()
         if ip:
-            return f"Network connected — IP: {ip}"
+            return f"Internet connected — IP: {ip}"
         time.sleep(1)
-    return "Network connected (DHCP pending)"
+    return "Internet connected (DHCP pending)"
 
 
 # ─── Tool 10: pipe_list / pipe_info / pipe_connect ──────────────────────────

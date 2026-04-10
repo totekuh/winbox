@@ -55,6 +55,14 @@ def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
         raise SystemExit(1)
     _ensure_z_drive(ga)
     _ensure_sshd_running(ga)
+    try:
+        ga.exec_powershell(
+            "Remove-NetRoute -DestinationPrefix '0.0.0.0/0' -Confirm:$false -ErrorAction SilentlyContinue",
+            timeout=15,
+        )
+        console.print("[blue][*][/] Internet isolated (reconnect with: winbox net connect)")
+    except Exception:
+        pass
     console.print("[green][+][/] VM ready")
 
 
