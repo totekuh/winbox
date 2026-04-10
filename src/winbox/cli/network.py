@@ -1,4 +1,4 @@
-"""Network commands — dns (sync, view), domain (join, leave)."""
+"""Network commands — dns (sync, view), domain (join, leave), net (isolate, connect)."""
 
 from __future__ import annotations
 
@@ -14,6 +14,95 @@ from winbox.cli import console, ensure_running, _ensure_z_drive
 from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM, VMState
+
+
+# ─── net ─────────────────────────────────────────────────────────────────────
+
+
+@click.group()
+def net() -> None:
+    """Control VM network connectivity."""
+    pass
+
+
+@net.command("isolate")
+@click.pass_context
+def net_isolate(ctx: click.Context) -> None:
+    """Disconnect VM from the network (unplug the cable).
+
+    Host-VM channels (guest agent, VirtIO-FS, SSH) stay up.
+    Undo with: winbox net connect
+    """
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+
+    if vm.state() != VMState.RUNNING:
+        console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
+        raise SystemExit(1)
+
+    if not vm.net_set_link("down"):
+        console.print("[red][-][/] Failed to set link down (no interface found?)")
+        raise SystemExit(1)
+
+    console.print("[green][+][/] Network isolated — cable unplugged")
+    console.print("    Undo with: [bold]winbox net connect[/]")
+
+
+@net.command("connect")
+@click.pass_context
+def net_connect(ctx: click.Context) -> None:
+    """Reconnect VM to the network (plug the cable back in)."""
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    if vm.state() != VMState.RUNNING:
+        console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
+        raise SystemExit(1)
+
+    if not vm.net_set_link("up"):
+        console.print("[red][-][/] Failed to set link up (no interface found?)")
+        raise SystemExit(1)
+
+    # Restart the adapter and renew DHCP — Windows doesn't auto-renew
+    # after a cable replug
+    console.print("[blue][*][/] Renewing DHCP lease...")
+    ga.exec_powershell(
+        "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
+        "-Confirm:$false",
+        timeout=15,
+    )
+    # Wait for DHCP to assign an address
+    for _ in range(10):
+        ip = vm.ip()
+        if ip:
+            break
+        time.sleep(1)
+
+    if ip:
+        console.print(f"[green][+][/] Network connected — IP: {ip}")
+    else:
+        console.print("[green][+][/] Network connected (DHCP pending)")
+
+
+@net.command("status")
+@click.pass_context
+def net_status(ctx: click.Context) -> None:
+    """Show VM network link state."""
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+
+    if vm.state() != VMState.RUNNING:
+        console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
+        return
+
+    state = vm.net_link_state()
+    if state is None:
+        console.print("[yellow][!][/] Could not determine link state")
+        return
+
+    color = "green" if state == "up" else "red"
+    console.print(f"Network link: [{color}]{state}[/]")
 
 
 # ─── dns ─────────────────────────────────────────────────────────────────────

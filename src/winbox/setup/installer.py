@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from winbox.vm import VM
+from winbox.vm import VM, GuestAgent
 
 if TYPE_CHECKING:
     from winbox.config import Config
@@ -461,6 +461,40 @@ def boot_for_provisioning(cfg: Config) -> None:
         raise RuntimeError("Provisioning timed out")
 
     console.print("[green][+][/] Provisioning complete")
+
+
+def enable_autologin(cfg: Config) -> None:
+    """Enable persistent auto-login via registry.
+
+    Boots the VM, sets Winlogon keys via guest agent, shuts down.
+    Called after Phase 3 provisioning (VM is shut off at this point).
+    """
+    console.print("[blue][*][/] Enabling persistent auto-login...")
+
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    vm.start()
+    ga.wait(timeout=120)
+
+    winlogon = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+    for name, data in [
+        ("AutoAdminLogon", "1"),
+        ("DefaultUserName", cfg.vm_user),
+        ("DefaultPassword", cfg.vm_password),
+    ]:
+        result = ga.exec_argv("reg.exe", [
+            "add", winlogon, "/v", name, "/t", "REG_SZ", "/d", data, "/f",
+        ], timeout=15)
+        if result.exitcode != 0:
+            console.print(f"[red][-][/] Failed to set {name}: {result.stderr.strip()}")
+            raise RuntimeError(f"Auto-login setup failed: {name}")
+
+    ga.shutdown()
+    if not vm.wait_shutdown(timeout=60):
+        vm.force_stop()
+
+    console.print("[green][+][/] Auto-login enabled for Administrator")
 
 
 def create_clean_snapshot(cfg: Config) -> None:

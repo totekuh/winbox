@@ -182,6 +182,34 @@ sudo winbox binfmt disable
 winbox binfmt status
 ```
 
+### MCP Server (AI-assisted vulnerability research)
+
+winbox exposes an MCP server so AI agents (Claude Code, etc.) can interact with the Windows VM directly — run Python code, send IOCTLs to drivers, query/set registry, list processes.
+
+**Install:**
+
+```bash
+pip install -e '.[mcp]'
+```
+
+**Add to Claude Code:**
+
+```bash
+claude mcp add winbox -- winbox mcp
+```
+
+**Available tools:**
+
+| Tool | Description |
+|------|-------------|
+| `python(code)` | Execute Python code in the VM (ctypes, winreg, COM, WMI — full Win32 access) |
+| `ioctl(device, code, input_hex, output_size)` | Send DeviceIoControl to a driver — no ctypes boilerplate |
+| `reg_query(key, value?)` | Query registry key or value |
+| `reg_set(key, value, data, type)` | Set registry value (creates key if needed) |
+| `ps(filter?)` | List processes with PID, name, path, memory usage |
+
+**Requires** Python installed in the VM (see roadmap).
+
 ## Architecture
 
 ```

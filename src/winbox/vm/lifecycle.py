@@ -112,6 +112,39 @@ class VM:
                         return part.split("/")[0]
         return None
 
+    def interface(self) -> str | None:
+        """Get the VM's network interface name (e.g. 'vnet0')."""
+        result = _virsh("domiflist", self.name, check=False)
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line and not line.startswith("Interface") and not line.startswith("-"):
+                return line.split()[0]
+        return None
+
+    def net_set_link(self, state: str) -> bool:
+        """Set network interface link state ('up' or 'down')."""
+        iface = self.interface()
+        if not iface:
+            return False
+        result = _virsh("domif-setlink", self.name, iface, state, check=False)
+        return result.returncode == 0
+
+    def net_link_state(self) -> str | None:
+        """Get current network link state ('up' or 'down')."""
+        iface = self.interface()
+        if not iface:
+            return None
+        result = _virsh("domif-getlink", self.name, iface, check=False)
+        if result.returncode != 0:
+            return None
+        # Output like: "vnet0 up" or "vnet0 down"
+        for word in result.stdout.strip().split():
+            if word in ("up", "down"):
+                return word
+        return None
+
     def snapshot_create(self, name: str) -> None:
         _virsh(
             "snapshot-create-as", self.name, name,

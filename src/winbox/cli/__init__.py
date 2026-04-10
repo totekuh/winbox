@@ -102,13 +102,14 @@ def cli(ctx: click.Context) -> None:
 from winbox.cli.vm import up, down, suspend, destroy, status, snapshot, restore, vnc  # noqa: E402
 from winbox.cli.setup import setup, provision  # noqa: E402
 from winbox.cli.exec import exec_cmd, shell, ssh  # noqa: E402
-from winbox.cli.network import dns, domain, hosts  # noqa: E402
+from winbox.cli.network import dns, domain, hosts, net  # noqa: E402
 from winbox.cli.files import tools, iso  # noqa: E402
 from winbox.cli.binfmt import binfmt  # noqa: E402
 from winbox.cli.jobs import jobs  # noqa: E402
 from winbox.cli.office import office  # noqa: E402
 from winbox.cli.av import av  # noqa: E402
 from winbox.cli.applocker import applocker  # noqa: E402
+from winbox.cli.mcp import mcp_cmd  # noqa: E402
 
 cli.add_command(up)
 cli.add_command(down)
@@ -125,6 +126,7 @@ cli.add_command(ssh)
 cli.add_command(dns)
 cli.add_command(domain)
 cli.add_command(hosts)
+cli.add_command(net)
 cli.add_command(tools)
 cli.add_command(iso)
 cli.add_command(binfmt)
@@ -133,3 +135,4 @@ cli.add_command(vnc)
 cli.add_command(office)
 cli.add_command(av)
 cli.add_command(applocker)
+cli.add_command(mcp_cmd)

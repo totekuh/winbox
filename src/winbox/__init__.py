@@ -1,3 +1,3 @@
 """winbox — Transparent Windows Execution Proxy for Kali."""
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
