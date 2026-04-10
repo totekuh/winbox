@@ -1180,6 +1180,183 @@ def pipe_connect(name: str, access: str = "read") -> str:
     return output or "(no output)"
 
 
+# ─── Tool 11: pipe_send / pipe_recv ─────────────────────────────────────────
+
+@mcp.tool()
+def pipe_send(name: str, data_hex: str) -> str:
+    """Write bytes to a named pipe.
+
+    Opens the pipe with GENERIC_WRITE, calls WriteFile, closes the handle.
+    Returns the number of bytes written or a Win32 error.
+
+    Args:
+        name: Pipe name without prefix (e.g. 'spoolss').
+        data_hex: Bytes to write as a hex string (e.g. 'deadbeef0a').
+    """
+    script = textwrap.dedent("""\
+        import ctypes
+        from ctypes import wintypes
+        import json
+        import sys
+
+        args = json.load(open(r'Z:\\.mcp\\args.json'))
+        name = args['name']
+        data = bytes.fromhex(args['data_hex'])
+
+        pipe_path = f'\\\\\\\\.\\\\pipe\\\\{name}'
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        kernel32.WriteFile.restype = wintypes.BOOL
+        kernel32.WriteFile.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ = 1
+        FILE_SHARE_WRITE = 2
+        OPEN_EXISTING = 3
+        INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+        handle = kernel32.CreateFileW(
+            pipe_path, GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None,
+        )
+        if handle == INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error()
+            msgs = {5: 'ACCESS_DENIED', 2: 'NOT_FOUND', 231: 'PIPE_BUSY'}
+            msg = msgs.get(err, f'error {err}')
+            print(f"FAILED: {pipe_path} -> {msg}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            written = wintypes.DWORD(0)
+            buf = ctypes.create_string_buffer(data)
+            ok = kernel32.WriteFile(handle, buf, len(data), ctypes.byref(written), None)
+            if not ok:
+                err = ctypes.get_last_error()
+                print(f"WriteFile failed: error {err}", file=sys.stderr)
+                sys.exit(1)
+            print(f"wrote {written.value} bytes to {pipe_path}")
+        finally:
+            kernel32.CloseHandle(handle)
+    """)
+
+    result = _exec_python(script, args={"name": name, "data_hex": data_hex})
+    output = ""
+    if result["stdout"]:
+        output += result["stdout"]
+    if result["stderr"]:
+        output += f"\n[stderr]\n{result['stderr']}"
+    if result["exitcode"] != 0:
+        output += f"\n[exit code: {result['exitcode']}]"
+    return output or "(no output)"
+
+
+@mcp.tool()
+def pipe_recv(name: str, size: int, timeout: int = 5) -> str:
+    """Read bytes from a named pipe.
+
+    Opens the pipe with GENERIC_READ, calls ReadFile, closes the handle.
+    Returns received bytes as a hex string, or a Win32 error.
+
+    Args:
+        name: Pipe name without prefix (e.g. 'spoolss').
+        size: Maximum number of bytes to read.
+        timeout: Seconds to wait before giving up (default: 5).
+    """
+    script = textwrap.dedent("""\
+        import ctypes
+        from ctypes import wintypes
+        import json
+        import sys
+        import time
+
+        args = json.load(open(r'Z:\\.mcp\\args.json'))
+        name = args['name']
+        size = args['size']
+        timeout = args.get('timeout', 5)
+
+        pipe_path = f'\\\\\\\\.\\\\pipe\\\\{name}'
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        kernel32.ReadFile.restype = wintypes.BOOL
+        kernel32.ReadFile.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+        ]
+        kernel32.WaitNamedPipeW.restype = wintypes.BOOL
+        kernel32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_READ = 1
+        FILE_SHARE_WRITE = 2
+        OPEN_EXISTING = 3
+        INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+        # Wait for pipe to be available
+        deadline = time.time() + timeout
+        while True:
+            handle = kernel32.CreateFileW(
+                pipe_path, GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None, OPEN_EXISTING, 0, None,
+            )
+            if handle != INVALID_HANDLE_VALUE:
+                break
+            err = ctypes.get_last_error()
+            if err == 231 and time.time() < deadline:  # PIPE_BUSY
+                kernel32.WaitNamedPipeW(pipe_path, 1000)
+                continue
+            msgs = {5: 'ACCESS_DENIED', 2: 'NOT_FOUND', 231: 'PIPE_BUSY (timeout)'}
+            msg = msgs.get(err, f'error {err}')
+            print(f"FAILED: {pipe_path} -> {msg}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            buf = ctypes.create_string_buffer(size)
+            read = wintypes.DWORD(0)
+            ok = kernel32.ReadFile(handle, buf, size, ctypes.byref(read), None)
+            if not ok:
+                err = ctypes.get_last_error()
+                print(f"ReadFile failed: error {err}", file=sys.stderr)
+                sys.exit(1)
+            data = buf.raw[:read.value]
+            print(data.hex())
+        finally:
+            kernel32.CloseHandle(handle)
+    """)
+
+    result = _exec_python(
+        script,
+        timeout=timeout + 10,
+        args={"name": name, "size": size, "timeout": timeout},
+    )
+    output = ""
+    if result["stdout"]:
+        output += result["stdout"]
+    if result["stderr"]:
+        output += f"\n[stderr]\n{result['stderr']}"
+    if result["exitcode"] != 0:
+        output += f"\n[exit code: {result['exitcode']}]"
+    return output or "(no output)"
+
+
 # ─── Entry point ────────────────────────────────────────────────────────────
 
 def run_server() -> None:

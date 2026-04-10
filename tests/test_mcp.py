@@ -898,3 +898,101 @@ class TestPipeTools:
         args = (cfg.shared_dir / ".mcp" / "args.json").read_text()
         import json
         assert json.loads(args)["access"] == "readwrite"
+
+
+# ─── pipe_send / pipe_recv tools ────────────────────────────────────────────
+
+
+class TestPipeSendRecv:
+    def test_send_success(self, mock_mcp):
+        import json
+        from winbox.mcp import pipe_send
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=0,
+            stdout="wrote 4 bytes to \\\\.\\pipe\\spoolss\n",
+            stderr="",
+        )
+
+        result = pipe_send(name="spoolss", data_hex="deadbeef")
+        assert "wrote 4 bytes" in result
+
+        args = json.loads((cfg.shared_dir / ".mcp" / "args.json").read_text())
+        assert args["name"] == "spoolss"
+        assert args["data_hex"] == "deadbeef"
+
+    def test_send_access_denied(self, mock_mcp):
+        from winbox.mcp import pipe_send
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=1,
+            stdout="",
+            stderr="FAILED: \\\\.\\pipe\\lsass -> ACCESS_DENIED\n",
+        )
+
+        result = pipe_send(name="lsass", data_hex="0a")
+        assert "ACCESS_DENIED" in result
+
+    def test_send_write_error(self, mock_mcp):
+        from winbox.mcp import pipe_send
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=1,
+            stdout="",
+            stderr="WriteFile failed: error 109\n",
+        )
+
+        result = pipe_send(name="spoolss", data_hex="ff")
+        assert "error 109" in result
+
+    def test_recv_success(self, mock_mcp):
+        import json
+        from winbox.mcp import pipe_recv
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=0,
+            stdout="deadbeef\n",
+            stderr="",
+        )
+
+        result = pipe_recv(name="spoolss", size=4)
+        assert "deadbeef" in result
+
+        args = json.loads((cfg.shared_dir / ".mcp" / "args.json").read_text())
+        assert args["name"] == "spoolss"
+        assert args["size"] == 4
+        assert args["timeout"] == 5
+
+    def test_recv_custom_timeout(self, mock_mcp):
+        import json
+        from winbox.mcp import pipe_recv
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="aabbcc\n", stderr="")
+
+        pipe_recv(name="test", size=64, timeout=10)
+
+        args = json.loads((cfg.shared_dir / ".mcp" / "args.json").read_text())
+        assert args["timeout"] == 10
+
+    def test_recv_access_denied(self, mock_mcp):
+        from winbox.mcp import pipe_recv
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=1,
+            stdout="",
+            stderr="FAILED: \\\\.\\pipe\\lsass -> ACCESS_DENIED\n",
+        )
+
+        result = pipe_recv(name="lsass", size=256)
+        assert "ACCESS_DENIED" in result
+
+    def test_recv_uses_script(self, mock_mcp):
+        from winbox.mcp import pipe_recv
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="00\n", stderr="")
+
+        pipe_recv(name="test", size=1)
+
+        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        assert "ReadFile" in script
+        assert "WaitNamedPipeW" in script
