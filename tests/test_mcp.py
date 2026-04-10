@@ -848,17 +848,14 @@ class TestPipeTools:
         import json
         from winbox.mcp import pipe_info
         ga, vm, cfg = mock_mcp
-        info = {
-            "pipe": "\\\\.\\pipe\\lsass",
-            "error": "Cannot open (error 5)",
-            "sddl": None,
-        }
+        info = {"pipe": "\\\\.\\pipe\\lsass", "error": "Cannot open (error 5)", "sddl": None}
         ga.exec.return_value = ExecResult(
             exitcode=0, stdout=json.dumps(info) + "\n", stderr=""
         )
 
         result = pipe_info(name="lsass")
         assert "error 5" in result
+        assert '"sddl": null' in result
 
     def test_pipe_connect_success(self, mock_mcp):
         from winbox.mcp import pipe_connect

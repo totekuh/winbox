@@ -979,7 +979,6 @@ def pipe_info(name: str) -> str:
         import ctypes
         from ctypes import wintypes
         import json
-        import subprocess
         import sys
 
         args = json.load(open(r'Z:\\.mcp\\args.json'))
@@ -1029,18 +1028,10 @@ def pipe_info(name: str) -> str:
         )
         if handle == INVALID_HANDLE_VALUE:
             err = ctypes.get_last_error()
-            # Try SDDL via PowerShell as fallback
-            ps_path = pipe_path.replace('\\\\.\\', '\\')
-            r = subprocess.run(
-                ['powershell', '-NoProfile', '-Command',
-                 f'(Get-Acl -Path "{ps_path}").Sddl'],
-                capture_output=True, text=True,
-            )
-            sddl = r.stdout.strip() or None
             print(json.dumps({
                 "pipe": pipe_path,
                 "error": f"Cannot open (error {err})",
-                "sddl": sddl,
+                "sddl": None,
             }))
             sys.exit(0)
 
