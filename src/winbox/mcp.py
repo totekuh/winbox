@@ -1180,182 +1180,312 @@ def pipe_connect(name: str, access: str = "read") -> str:
     return output or "(no output)"
 
 
-# ─── Tool 11: pipe_send / pipe_recv ─────────────────────────────────────────
+# ─── Pipe session broker ────────────────────────────────────────────────────
+# Written to Z:\.mcp\pipes\<session_id>\broker.py and run as a detached
+# background process that holds the pipe handle open between tool calls.
+# IPC is file-based via the VirtIO-FS shared directory.
+
+_BROKER_SCRIPT = """\
+import ctypes
+from ctypes import wintypes
+import json
+import os
+import time
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+config = json.load(open(os.path.join(script_dir, 'config.json')))
+name = config['name']
+access_str = config.get('access', 'readwrite').lower()
+
+bs = chr(92)
+pipe_path = bs * 2 + '.' + bs + 'pipe' + bs + name
+
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+kernel32.CreateFileW.restype = wintypes.HANDLE
+kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+    ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+]
+kernel32.WriteFile.restype = wintypes.BOOL
+kernel32.WriteFile.argtypes = [
+    wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+]
+kernel32.ReadFile.restype = wintypes.BOOL
+kernel32.ReadFile.argtypes = [
+    wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+]
+kernel32.CloseHandle.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+GENERIC_READ  = 0x80000000
+GENERIC_WRITE = 0x40000000
+FILE_SHARE_READ  = 1
+FILE_SHARE_WRITE = 2
+OPEN_EXISTING = 3
+INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+access_map = {
+    'read':      GENERIC_READ,
+    'write':     GENERIC_WRITE,
+    'readwrite': GENERIC_READ | GENERIC_WRITE,
+}
+desired_access = access_map.get(access_str, GENERIC_READ | GENERIC_WRITE)
+
+status_file = os.path.join(script_dir, 'status.json')
+cmd_file    = os.path.join(script_dir, 'cmd.json')
+result_file = os.path.join(script_dir, 'result.json')
+
+handle = kernel32.CreateFileW(
+    pipe_path, desired_access,
+    FILE_SHARE_READ | FILE_SHARE_WRITE,
+    None, OPEN_EXISTING, 0, None,
+)
+if handle == INVALID_HANDLE_VALUE:
+    err = ctypes.get_last_error()
+    msgs = {5: 'ACCESS_DENIED', 2: 'NOT_FOUND', 231: 'PIPE_BUSY'}
+    msg = msgs.get(err, f'error {err}')
+    with open(status_file, 'w') as f:
+        json.dump({'status': 'error', 'error': f'{pipe_path} -> {msg}'}, f)
+    raise SystemExit(1)
+
+with open(status_file, 'w') as f:
+    json.dump({'status': 'ready'}, f)
+
+while True:
+    if not os.path.exists(cmd_file):
+        time.sleep(0.05)
+        continue
+
+    try:
+        with open(cmd_file) as f:
+            cmd = json.load(f)
+        os.remove(cmd_file)
+    except Exception:
+        time.sleep(0.05)
+        continue
+
+    action = cmd.get('cmd')
+
+    if action == 'write':
+        data = bytes.fromhex(cmd['data_hex'])
+        buf  = ctypes.create_string_buffer(data)
+        written = wintypes.DWORD(0)
+        ok = kernel32.WriteFile(handle, buf, len(data), ctypes.byref(written), None)
+        if ok:
+            result = {'ok': True, 'written': written.value}
+        else:
+            err = ctypes.get_last_error()
+            result = {'ok': False, 'error': f'WriteFile failed: error {err}'}
+
+    elif action == 'read':
+        size = cmd['size']
+        buf  = ctypes.create_string_buffer(size)
+        nread = wintypes.DWORD(0)
+        ok = kernel32.ReadFile(handle, buf, size, ctypes.byref(nread), None)
+        if ok:
+            result = {'ok': True, 'data_hex': buf.raw[:nread.value].hex()}
+        else:
+            err = ctypes.get_last_error()
+            result = {'ok': False, 'error': f'ReadFile failed: error {err}'}
+
+    elif action == 'close':
+        kernel32.CloseHandle(handle)
+        with open(result_file, 'w') as f:
+            json.dump({'ok': True}, f)
+        break
+
+    else:
+        result = {'ok': False, 'error': f'unknown command: {action}'}
+
+    with open(result_file, 'w') as f:
+        json.dump(result, f)
+"""
+
+
+def _session_dir(session_id: str) -> Path:
+    cfg, _, _ = _get_state()
+    return cfg.shared_dir / ".mcp" / "pipes" / session_id
+
+
+def _poll_result(result_file: Path, timeout: int) -> dict | None:
+    """Poll for result.json on the Kali side (VirtIO-FS). Returns parsed dict or None on timeout."""
+    import time as _time
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        if result_file.exists():
+            try:
+                data = _json.loads(result_file.read_text())
+                result_file.unlink(missing_ok=True)
+                return data
+            except _json.JSONDecodeError:
+                pass  # partial write — retry
+        _time.sleep(0.1)
+    return None
+
+
+# ─── Tool 11: pipe_open / pipe_send / pipe_recv / pipe_close ─────────────────
 
 @mcp.tool()
-def pipe_send(name: str, data_hex: str) -> str:
-    """Write bytes to a named pipe.
+def pipe_open(name: str, access: str = "readwrite", timeout: int = 10) -> str:
+    """Open a named pipe and return a session ID for subsequent send/recv/close calls.
 
-    Opens the pipe with GENERIC_WRITE, calls WriteFile, closes the handle.
-    Returns the number of bytes written or a Win32 error.
-
-    Args:
-        name: Pipe name without prefix (e.g. 'spoolss').
-        data_hex: Bytes to write as a hex string (e.g. 'deadbeef0a').
-    """
-    script = textwrap.dedent("""\
-        import ctypes
-        from ctypes import wintypes
-        import json
-        import sys
-
-        args = json.load(open(r'Z:\\.mcp\\args.json'))
-        name = args['name']
-        data = bytes.fromhex(args['data_hex'])
-
-        pipe_path = f'\\\\\\\\.\\\\pipe\\\\{name}'
-
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        kernel32.CreateFileW.restype = wintypes.HANDLE
-        kernel32.CreateFileW.argtypes = [
-            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-        ]
-        kernel32.WriteFile.restype = wintypes.BOOL
-        kernel32.WriteFile.argtypes = [
-            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
-        ]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-
-        GENERIC_WRITE = 0x40000000
-        FILE_SHARE_READ = 1
-        FILE_SHARE_WRITE = 2
-        OPEN_EXISTING = 3
-        INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
-
-        handle = kernel32.CreateFileW(
-            pipe_path, GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None, OPEN_EXISTING, 0, None,
-        )
-        if handle == INVALID_HANDLE_VALUE:
-            err = ctypes.get_last_error()
-            msgs = {5: 'ACCESS_DENIED', 2: 'NOT_FOUND', 231: 'PIPE_BUSY'}
-            msg = msgs.get(err, f'error {err}')
-            print(f"FAILED: {pipe_path} -> {msg}", file=sys.stderr)
-            sys.exit(1)
-
-        try:
-            written = wintypes.DWORD(0)
-            buf = ctypes.create_string_buffer(data)
-            ok = kernel32.WriteFile(handle, buf, len(data), ctypes.byref(written), None)
-            if not ok:
-                err = ctypes.get_last_error()
-                print(f"WriteFile failed: error {err}", file=sys.stderr)
-                sys.exit(1)
-            print(f"wrote {written.value} bytes to {pipe_path}")
-        finally:
-            kernel32.CloseHandle(handle)
-    """)
-
-    result = _exec_python(script, args={"name": name, "data_hex": data_hex})
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
-
-
-@mcp.tool()
-def pipe_recv(name: str, size: int, timeout: int = 5) -> str:
-    """Read bytes from a named pipe.
-
-    Opens the pipe with GENERIC_READ, calls ReadFile, closes the handle.
-    Returns received bytes as a hex string, or a Win32 error.
+    Starts a persistent broker process inside the VM that holds the handle open.
+    The broker communicates with MCP tools via files on the VirtIO-FS share.
 
     Args:
-        name: Pipe name without prefix (e.g. 'spoolss').
-        size: Maximum number of bytes to read.
-        timeout: Seconds to wait before giving up (default: 5).
+        name: Pipe name without prefix (e.g. 'srvsvc').
+        access: 'read', 'write', or 'readwrite' (default: 'readwrite').
+        timeout: Seconds to wait for broker to start (default: 10).
+
+    Returns:
+        session_id string on success, or an error message.
     """
-    script = textwrap.dedent("""\
-        import ctypes
-        from ctypes import wintypes
-        import json
-        import sys
-        import time
+    import time as _time
+    import uuid
 
-        args = json.load(open(r'Z:\\.mcp\\args.json'))
-        name = args['name']
-        size = args['size']
-        timeout = args.get('timeout', 5)
+    cfg, _, _ = _ensure_vm_ready()
 
-        pipe_path = f'\\\\\\\\.\\\\pipe\\\\{name}'
+    session_id = uuid.uuid4().hex[:12]
+    session_dir = cfg.shared_dir / ".mcp" / "pipes" / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
 
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        kernel32.CreateFileW.restype = wintypes.HANDLE
-        kernel32.CreateFileW.argtypes = [
-            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-        ]
-        kernel32.ReadFile.restype = wintypes.BOOL
-        kernel32.ReadFile.argtypes = [
-            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
-        ]
-        kernel32.WaitNamedPipeW.restype = wintypes.BOOL
-        kernel32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-
-        GENERIC_READ = 0x80000000
-        FILE_SHARE_READ = 1
-        FILE_SHARE_WRITE = 2
-        OPEN_EXISTING = 3
-        INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
-
-        # Wait for pipe to be available
-        deadline = time.time() + timeout
-        while True:
-            handle = kernel32.CreateFileW(
-                pipe_path, GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None, OPEN_EXISTING, 0, None,
-            )
-            if handle != INVALID_HANDLE_VALUE:
-                break
-            err = ctypes.get_last_error()
-            if err == 231 and time.time() < deadline:  # PIPE_BUSY
-                kernel32.WaitNamedPipeW(pipe_path, 1000)
-                continue
-            msgs = {5: 'ACCESS_DENIED', 2: 'NOT_FOUND', 231: 'PIPE_BUSY (timeout)'}
-            msg = msgs.get(err, f'error {err}')
-            print(f"FAILED: {pipe_path} -> {msg}", file=sys.stderr)
-            sys.exit(1)
-
-        try:
-            buf = ctypes.create_string_buffer(size)
-            read = wintypes.DWORD(0)
-            ok = kernel32.ReadFile(handle, buf, size, ctypes.byref(read), None)
-            if not ok:
-                err = ctypes.get_last_error()
-                print(f"ReadFile failed: error {err}", file=sys.stderr)
-                sys.exit(1)
-            data = buf.raw[:read.value]
-            print(data.hex())
-        finally:
-            kernel32.CloseHandle(handle)
-    """)
-
-    result = _exec_python(
-        script,
-        timeout=timeout + 10,
-        args={"name": name, "size": size, "timeout": timeout},
+    (session_dir / "config.json").write_text(
+        _json.dumps({"name": name, "access": access})
     )
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    (session_dir / "broker.py").write_text(_BROKER_SCRIPT)
 
+    # Windows path to broker on Z: (VirtIO-FS)
+    broker_win = f"Z:\\.mcp\\pipes\\{session_id}\\broker.py"
+
+    spawner = textwrap.dedent("""\
+        import subprocess
+        import json
+
+        args = json.load(open(r'Z:\\.mcp\\args.json'))
+        broker_path = args['broker_path']
+
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NO_WINDOW  = 0x08000000
+
+        proc = subprocess.Popen(
+            ['python.exe', broker_path],
+            creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"pid:{proc.pid}")
+    """)
+
+    result = _exec_python(spawner, args={"broker_path": broker_win})
+    if result["exitcode"] != 0:
+        import shutil
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return f"spawner failed: {result['stderr'].strip()}"
+
+    # Poll status.json on Kali side via VirtIO-FS
+    status_file = session_dir / "status.json"
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        if status_file.exists():
+            try:
+                status = _json.loads(status_file.read_text())
+            except _json.JSONDecodeError:
+                _time.sleep(0.1)
+                continue
+            if status.get("status") == "ready":
+                return session_id
+            else:
+                import shutil
+                shutil.rmtree(session_dir, ignore_errors=True)
+                return f"broker error: {status.get('error', 'unknown')}"
+        _time.sleep(0.1)
+
+    import shutil
+    shutil.rmtree(session_dir, ignore_errors=True)
+    return f"timeout waiting for broker (session: {session_id})"
+
+
+@mcp.tool()
+def pipe_send(session_id: str, data_hex: str, timeout: int = 10) -> str:
+    """Write bytes to an open pipe session.
+
+    Args:
+        session_id: Session ID returned by pipe_open.
+        data_hex: Bytes to write as a hex string (e.g. 'deadbeef0a').
+        timeout: Seconds to wait for the write to complete (default: 10).
+    """
+    session_dir = _session_dir(session_id)
+    if not session_dir.exists():
+        return f"session not found: {session_id}"
+
+    cmd_file    = session_dir / "cmd.json"
+    result_file = session_dir / "result.json"
+    result_file.unlink(missing_ok=True)
+    cmd_file.write_text(_json.dumps({"cmd": "write", "data_hex": data_hex}))
+
+    res = _poll_result(result_file, timeout)
+    if res is None:
+        return "timeout waiting for write result"
+    if res.get("ok"):
+        return f"wrote {res['written']} bytes"
+    return f"error: {res.get('error')}"
+
+
+@mcp.tool()
+def pipe_recv(session_id: str, size: int, timeout: int = 10) -> str:
+    """Read bytes from an open pipe session.
+
+    Returns received bytes as a hex string, or an error message.
+
+    Args:
+        session_id: Session ID returned by pipe_open.
+        size: Maximum number of bytes to read.
+        timeout: Seconds to wait for data (default: 10).
+    """
+    session_dir = _session_dir(session_id)
+    if not session_dir.exists():
+        return f"session not found: {session_id}"
+
+    cmd_file    = session_dir / "cmd.json"
+    result_file = session_dir / "result.json"
+    result_file.unlink(missing_ok=True)
+    cmd_file.write_text(_json.dumps({"cmd": "read", "size": size}))
+
+    res = _poll_result(result_file, timeout)
+    if res is None:
+        return "timeout waiting for read result"
+    if res.get("ok"):
+        return res["data_hex"]
+    return f"error: {res.get('error')}"
+
+
+@mcp.tool()
+def pipe_close(session_id: str) -> str:
+    """Close an open pipe session and clean up.
+
+    Args:
+        session_id: Session ID returned by pipe_open.
+    """
+    import shutil
+
+    session_dir = _session_dir(session_id)
+    if not session_dir.exists():
+        return f"session not found: {session_id}"
+
+    cmd_file    = session_dir / "cmd.json"
+    result_file = session_dir / "result.json"
+    result_file.unlink(missing_ok=True)
+    cmd_file.write_text(_json.dumps({"cmd": "close"}))
+
+    _poll_result(result_file, timeout=5)  # best-effort — broker may already be gone
+    shutil.rmtree(session_dir, ignore_errors=True)
+    return f"closed session {session_id}"
+
+
+# ── removed: old pipe_recv(name, size) — superseded by pipe_open/pipe_recv ───
 
 # ─── Entry point ────────────────────────────────────────────────────────────
 

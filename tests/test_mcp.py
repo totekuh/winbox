@@ -900,99 +900,235 @@ class TestPipeTools:
         assert json.loads(args)["access"] == "readwrite"
 
 
-# ─── pipe_send / pipe_recv tools ────────────────────────────────────────────
+# ─── pipe_open / pipe_send / pipe_recv / pipe_close (session-based) ──────────
 
 
-class TestPipeSendRecv:
+def _make_session(cfg, session_id: str) -> object:
+    """Create a session dir with a fake ready status.json."""
+    from pathlib import Path
+    session_dir = cfg.shared_dir / ".mcp" / "pipes" / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "status.json").write_text('{"status": "ready"}')
+    return session_dir
+
+
+def _broker_thread(session_dir, response: dict, *, delay: float = 0.05):
+    """Simulate the broker: wait for cmd.json, write result.json."""
+    import json
+    import threading
+    import time as _t
+
+    def _run():
+        cmd_file    = session_dir / "cmd.json"
+        result_file = session_dir / "result.json"
+        deadline = _t.time() + 3
+        while _t.time() < deadline:
+            if cmd_file.exists():
+                cmd_file.unlink()
+                _t.sleep(delay)
+                result_file.write_text(json.dumps(response))
+                return
+            _t.sleep(0.01)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return t
+
+
+class TestPipeSession:
+    # ── pipe_open ──────────────────────────────────────────────────────────────
+
+    def test_open_success(self, mock_mcp):
+        import json
+        from unittest.mock import patch
+        from winbox.mcp import pipe_open
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="pid:1234\n", stderr="")
+
+        # Intercept _exec_python to write status.json immediately
+        import winbox.mcp as mcp_mod
+        real_exec = mcp_mod._exec_python
+
+        def _fake_exec(code, timeout=300, args=None):
+            result = real_exec(code, timeout=timeout, args=args)
+            # Find the session dir that was just created and write status.json
+            pipes_dir = cfg.shared_dir / ".mcp" / "pipes"
+            for d in pipes_dir.iterdir():
+                sfile = d / "status.json"
+                if not sfile.exists():
+                    sfile.write_text('{"status": "ready"}')
+            return result
+
+        with patch.object(mcp_mod, '_exec_python', side_effect=_fake_exec):
+            session_id = pipe_open(name="srvsvc")
+
+        assert len(session_id) == 12
+        assert session_id.isalnum()
+
+        # Broker script and config were written
+        session_dir = cfg.shared_dir / ".mcp" / "pipes" / session_id
+        assert (session_dir / "broker.py").exists()
+        config = json.loads((session_dir / "config.json").read_text())
+        assert config["name"] == "srvsvc"
+        assert config["access"] == "readwrite"
+
+    def test_open_spawner_failure(self, mock_mcp):
+        from winbox.mcp import pipe_open
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=1, stdout="", stderr="python not found\n"
+        )
+
+        result = pipe_open(name="srvsvc")
+        assert "spawner failed" in result
+
+    def test_open_broker_error(self, mock_mcp):
+        import winbox.mcp as mcp_mod
+        from unittest.mock import patch
+        from winbox.mcp import pipe_open
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="pid:1234\n", stderr="")
+
+        def _fake_exec(code, timeout=300, args=None):
+            pipes_dir = cfg.shared_dir / ".mcp" / "pipes"
+            if pipes_dir.exists():
+                for d in pipes_dir.iterdir():
+                    sfile = d / "status.json"
+                    if not sfile.exists():
+                        sfile.write_text('{"status": "error", "error": "ACCESS_DENIED"}')
+            return {"exitcode": 0, "stdout": "pid:1234\n", "stderr": ""}
+
+        with patch.object(mcp_mod, '_exec_python', side_effect=_fake_exec):
+            result = pipe_open(name="lsass")
+
+        assert "ACCESS_DENIED" in result
+
+    # ── pipe_send ──────────────────────────────────────────────────────────────
+
     def test_send_success(self, mock_mcp):
         import json
         from winbox.mcp import pipe_send
-        ga, vm, cfg = mock_mcp
-        ga.exec.return_value = ExecResult(
-            exitcode=0,
-            stdout="wrote 4 bytes to \\\\.\\pipe\\spoolss\n",
-            stderr="",
-        )
+        _, _, cfg = mock_mcp
 
-        result = pipe_send(name="spoolss", data_hex="deadbeef")
+        sid = "aabbcc001122"
+        session_dir = _make_session(cfg, sid)
+        _broker_thread(session_dir, {"ok": True, "written": 4})
+
+        result = pipe_send(sid, "deadbeef")
         assert "wrote 4 bytes" in result
-
-        args = json.loads((cfg.shared_dir / ".mcp" / "args.json").read_text())
-        assert args["name"] == "spoolss"
-        assert args["data_hex"] == "deadbeef"
-
-    def test_send_access_denied(self, mock_mcp):
-        from winbox.mcp import pipe_send
-        ga, vm, cfg = mock_mcp
-        ga.exec.return_value = ExecResult(
-            exitcode=1,
-            stdout="",
-            stderr="FAILED: \\\\.\\pipe\\lsass -> ACCESS_DENIED\n",
-        )
-
-        result = pipe_send(name="lsass", data_hex="0a")
-        assert "ACCESS_DENIED" in result
 
     def test_send_write_error(self, mock_mcp):
         from winbox.mcp import pipe_send
-        ga, vm, cfg = mock_mcp
-        ga.exec.return_value = ExecResult(
-            exitcode=1,
-            stdout="",
-            stderr="WriteFile failed: error 109\n",
-        )
+        _, _, cfg = mock_mcp
 
-        result = pipe_send(name="spoolss", data_hex="ff")
+        sid = "aabbcc001123"
+        session_dir = _make_session(cfg, sid)
+        _broker_thread(session_dir, {"ok": False, "error": "WriteFile failed: error 109"})
+
+        result = pipe_send(sid, "ff")
         assert "error 109" in result
 
+    def test_send_session_not_found(self, mock_mcp):
+        from winbox.mcp import pipe_send
+        result = pipe_send("nonexistent123", "deadbeef")
+        assert "session not found" in result
+
+    def test_send_timeout(self, mock_mcp):
+        from winbox.mcp import pipe_send
+        _, _, cfg = mock_mcp
+
+        sid = "aabbcc001124"
+        _make_session(cfg, sid)
+        # No broker thread — result.json never appears
+
+        result = pipe_send(sid, "ff", timeout=0)
+        assert "timeout" in result
+
+    # ── pipe_recv ──────────────────────────────────────────────────────────────
+
     def test_recv_success(self, mock_mcp):
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "aabbcc001125"
+        session_dir = _make_session(cfg, sid)
+        _broker_thread(session_dir, {"ok": True, "data_hex": "deadbeef"})
+
+        result = pipe_recv(sid, 4)
+        assert result == "deadbeef"
+
+    def test_recv_read_error(self, mock_mcp):
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "aabbcc001126"
+        session_dir = _make_session(cfg, sid)
+        _broker_thread(session_dir, {"ok": False, "error": "ReadFile failed: error 109"})
+
+        result = pipe_recv(sid, 256)
+        assert "error 109" in result
+
+    def test_recv_session_not_found(self, mock_mcp):
+        from winbox.mcp import pipe_recv
+        result = pipe_recv("nonexistent456", 64)
+        assert "session not found" in result
+
+    def test_recv_cmd_written(self, mock_mcp):
         import json
         from winbox.mcp import pipe_recv
-        ga, vm, cfg = mock_mcp
-        ga.exec.return_value = ExecResult(
-            exitcode=0,
-            stdout="deadbeef\n",
-            stderr="",
-        )
+        _, _, cfg = mock_mcp
 
-        result = pipe_recv(name="spoolss", size=4)
-        assert "deadbeef" in result
+        sid = "aabbcc001127"
+        session_dir = _make_session(cfg, sid)
+        _broker_thread(session_dir, {"ok": True, "data_hex": "ff"})
 
-        args = json.loads((cfg.shared_dir / ".mcp" / "args.json").read_text())
-        assert args["name"] == "spoolss"
-        assert args["size"] == 4
-        assert args["timeout"] == 5
+        pipe_recv(sid, 128)
+        # cmd.json was consumed by the broker thread — just check result
+        # (cmd.json is deleted by broker before writing result)
 
-    def test_recv_custom_timeout(self, mock_mcp):
-        import json
-        from winbox.mcp import pipe_recv
-        ga, vm, cfg = mock_mcp
-        ga.exec.return_value = ExecResult(exitcode=0, stdout="aabbcc\n", stderr="")
+    # ── pipe_close ─────────────────────────────────────────────────────────────
 
-        pipe_recv(name="test", size=64, timeout=10)
+    def test_close_success(self, mock_mcp):
+        from winbox.mcp import pipe_close
+        _, _, cfg = mock_mcp
 
-        args = json.loads((cfg.shared_dir / ".mcp" / "args.json").read_text())
-        assert args["timeout"] == 10
+        sid = "aabbcc001128"
+        session_dir = _make_session(cfg, sid)
+        _broker_thread(session_dir, {"ok": True})
 
-    def test_recv_access_denied(self, mock_mcp):
-        from winbox.mcp import pipe_recv
-        ga, vm, cfg = mock_mcp
-        ga.exec.return_value = ExecResult(
-            exitcode=1,
-            stdout="",
-            stderr="FAILED: \\\\.\\pipe\\lsass -> ACCESS_DENIED\n",
-        )
+        result = pipe_close(sid)
+        assert "closed session" in result
+        assert not session_dir.exists()
 
-        result = pipe_recv(name="lsass", size=256)
-        assert "ACCESS_DENIED" in result
+    def test_close_session_not_found(self, mock_mcp):
+        from winbox.mcp import pipe_close
+        result = pipe_close("nonexistent789")
+        assert "session not found" in result
 
-    def test_recv_uses_script(self, mock_mcp):
-        from winbox.mcp import pipe_recv
-        ga, vm, cfg = mock_mcp
-        ga.exec.return_value = ExecResult(exitcode=0, stdout="00\n", stderr="")
+    def test_close_cleans_up_even_without_broker_ack(self, mock_mcp):
+        from winbox.mcp import pipe_close
+        _, _, cfg = mock_mcp
 
-        pipe_recv(name="test", size=1)
+        sid = "aabbcc001129"
+        session_dir = _make_session(cfg, sid)
+        # No broker thread — result.json never appears; close should still clean up
 
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
-        assert "ReadFile" in script
-        assert "WaitNamedPipeW" in script
+        result = pipe_close(sid)
+        assert "closed session" in result
+        assert not session_dir.exists()
+
+    # ── broker script content ──────────────────────────────────────────────────
+
+    def test_broker_script_content(self, mock_mcp):
+        from winbox.mcp import _BROKER_SCRIPT
+        assert "chr(92)" in _BROKER_SCRIPT
+        assert "WriteFile" in _BROKER_SCRIPT
+        assert "ReadFile" in _BROKER_SCRIPT
+        assert "status.json" in _BROKER_SCRIPT
+        assert "cmd.json" in _BROKER_SCRIPT
+        assert "result.json" in _BROKER_SCRIPT
+
+    def test_broker_script_is_valid_python(self, mock_mcp):
+        import ast
+        from winbox.mcp import _BROKER_SCRIPT
+        ast.parse(_BROKER_SCRIPT)  # raises SyntaxError if invalid
