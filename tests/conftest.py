@@ -29,7 +29,7 @@ def cfg(tmp_path):
 
 # CLI modules that need VM/GA/ensure_running patched
 # network module has net group which uses VM directly (no ensure_running)
-_CLI_MODULES = ["vm", "network", "exec", "jobs", "av", "applocker", "autologin"]
+_CLI_MODULES = ["vm", "network", "exec", "jobs", "av", "applocker", "autologin", "msi"]
 
 
 @pytest.fixture
