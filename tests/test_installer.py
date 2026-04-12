@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from winbox.setup.installer import (
+    PYTHON_EXE,
+    PYTHON_URL,
     REQUIRED_TOOLS,
     check_prereqs,
     _find_mkisofs,
@@ -16,6 +18,7 @@ from winbox.setup.installer import (
     download_virtio_iso,
     download_openssh,
     download_winfsp,
+    download_python,
     download_spice_tools,
     extract_virtiofs,
     build_unattend_image,
@@ -219,6 +222,38 @@ class TestDownloads:
         result = download_winfsp(cfg)
         assert result == dest
         mock_run.assert_not_called()
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_python(self, mock_run, cfg):
+        dest = cfg.iso_dir / PYTHON_EXE
+        def fake_wget(*a, **kw):
+            dest.write_bytes(b"\x00" * 25_000_000)
+        mock_run.side_effect = fake_wget
+        result = download_python(cfg)
+        assert result == dest
+        mock_run.assert_called_once()
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_python_cached(self, mock_run, cfg):
+        dest = cfg.iso_dir / PYTHON_EXE
+        dest.write_bytes(b"\x00" * 25_000_000)
+        result = download_python(cfg)
+        assert result == dest
+        mock_run.assert_not_called()
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_python_truncated(self, mock_run, cfg):
+        dest = cfg.iso_dir / PYTHON_EXE
+        def fake_wget(*a, **kw):
+            dest.write_bytes(b"\x00" * 500)
+        mock_run.side_effect = fake_wget
+        with pytest.raises(RuntimeError, match="truncated"):
+            download_python(cfg)
+
+    def test_python_url_is_regular_installer(self):
+        """URL must point at the regular Python installer, not the embeddable zip."""
+        assert PYTHON_URL.endswith("-amd64.exe")
+        assert "embed" not in PYTHON_URL
 
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_spice_tools(self, mock_run, cfg):

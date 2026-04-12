@@ -160,28 +160,25 @@ try {
     Write-Host "[!] VirtIO-FS setup error: $_"
 }
 
-# --- Python (embeddable, for MCP python tool) ---
-Write-Host "[*] Installing Python embeddable..."
-$pythonZip = "$provDir\python-embed-amd64.zip"
+# --- Python (regular installer — pip, tkinter, py.exe, registry) ---
+Write-Host "[*] Installing Python..."
+$pythonExe = "$provDir\python-3.13.13-amd64.exe"
 try {
-    if (Test-Path $pythonZip) {
-        $pythonDir = "C:\Python313"
-        New-Item -ItemType Directory -Path $pythonDir -Force | Out-Null
-        Expand-Archive -Path $pythonZip -DestinationPath $pythonDir -Force
-        # Uncomment python313._pth to enable site-packages (needed for pip/modules)
-        $pthFile = Get-ChildItem -Path $pythonDir -Filter "*._pth" | Select-Object -First 1
-        if ($pthFile) {
-            $pthContent = Get-Content $pthFile.FullName -Raw
-            $pthContent = $pthContent -replace '#import site', 'import site'
-            Set-Content -Path $pthFile.FullName -Value $pthContent
-        }
-        $machPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::Machine)
-        if ($machPath -notlike "*$pythonDir*") {
-            [Environment]::SetEnvironmentVariable("Path", "$machPath;$pythonDir", [EnvironmentVariableTarget]::Machine)
-        }
-        Write-Host "[+] Python installed at $pythonDir"
+    if (Test-Path $pythonExe) {
+        $args = @(
+            "/quiet",
+            "InstallAllUsers=1",
+            "PrependPath=1",
+            "Include_pip=1",
+            "Include_tcltk=0",
+            "Include_doc=0",
+            "Include_test=0",
+            "CompileAll=0"
+        )
+        $proc = Start-Process -FilePath $pythonExe -ArgumentList $args -Wait -PassThru -NoNewWindow
+        Write-Host "[+] Python installed (exit code: $($proc.ExitCode))"
     } else {
-        Write-Host "[!] Python zip not found at $pythonZip - skipping"
+        Write-Host "[!] Python installer not found at $pythonExe - skipping"
     }
 } catch {
     Write-Host "[!] Python install failed: $_"
@@ -200,6 +197,15 @@ try {
     }
 } catch {
     Write-Host "[!] spice-guest-tools install failed: $_"
+}
+
+# --- Skip Windows Boot Manager menu (boot default immediately) ---
+Write-Host "[*] Disabling boot manager menu..."
+try {
+    & bcdedit /timeout 0 | Out-Null
+    Write-Host "[+] Boot manager timeout = 0"
+} catch {
+    Write-Host "[!] Could not set bcdedit timeout: $_"
 }
 
 # --- Add Z:\tools to system PATH ---

@@ -207,8 +207,8 @@ WINFSP_URL = (
 )
 WINFSP_MSI = "winfsp.msi"
 
-PYTHON_URL = "https://www.python.org/ftp/python/3.13.13/python-3.13.13-embed-amd64.zip"
-PYTHON_ZIP = "python-embed-amd64.zip"
+PYTHON_URL = "https://www.python.org/ftp/python/3.13.13/python-3.13.13-amd64.exe"
+PYTHON_EXE = "python-3.13.13-amd64.exe"
 
 SPICE_TOOLS_URL = (
     "https://www.spice-space.org/download/windows/spice-guest-tools/"
@@ -254,20 +254,20 @@ def download_winfsp(cfg: Config) -> Path:
 
 
 def download_python(cfg: Config) -> Path:
-    """Download Python embeddable zip if not cached. Returns path to zip."""
-    dest = cfg.iso_dir / PYTHON_ZIP
-    if dest.exists() and dest.stat().st_size > 5_000_000:
-        console.print("[green][+][/] Python embeddable zip cached")
+    """Download the regular Python Windows installer if not cached."""
+    dest = cfg.iso_dir / PYTHON_EXE
+    if dest.exists() and dest.stat().st_size > 20_000_000:
+        console.print("[green][+][/] Python installer cached")
         return dest
 
-    console.print("[blue][*][/] Downloading Python embeddable zip...")
+    console.print("[blue][*][/] Downloading Python installer...")
     subprocess.run(
         ["wget", "-q", "--show-progress", "-O", str(dest), PYTHON_URL],
         check=True,
     )
-    if not dest.exists() or dest.stat().st_size < 5_000_000:
-        raise RuntimeError(f"Python download appears truncated: {dest}")
-    console.print("[green][+][/] Python embeddable zip downloaded")
+    if not dest.exists() or dest.stat().st_size < 20_000_000:
+        raise RuntimeError(f"Python installer download appears truncated: {dest}")
+    console.print("[green][+][/] Python installer downloaded")
     return dest
 
 
@@ -444,7 +444,7 @@ def provision_vm_disk(cfg: Config) -> None:
         openssh_zip = cfg.iso_dir / OPENSSH_ZIP
         winfsp_msi = cfg.iso_dir / WINFSP_MSI
         virtiofs_exe = cfg.iso_dir / VIRTIOFS_EXE
-        python_zip = cfg.iso_dir / PYTHON_ZIP
+        python_exe = cfg.iso_dir / PYTHON_EXE
         spice_tools_exe = cfg.iso_dir / SPICE_TOOLS_EXE
         missing_files = []
         for path, label in [
@@ -468,8 +468,8 @@ def provision_vm_disk(cfg: Config) -> None:
                 zf.write(winfsp_msi, WINFSP_MSI)
             if virtiofs_exe.exists():
                 zf.write(virtiofs_exe, VIRTIOFS_EXE)
-            if python_zip.exists():
-                zf.write(python_zip, PYTHON_ZIP)
+            if python_exe.exists():
+                zf.write(python_exe, PYTHON_EXE)
             if spice_tools_exe.exists():
                 zf.write(spice_tools_exe, SPICE_TOOLS_EXE)
 
