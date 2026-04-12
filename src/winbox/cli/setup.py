@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import subprocess
 import time
 from pathlib import Path
@@ -32,6 +33,25 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool, desktop: bool)
     """Build the Windows VM (one-time setup)."""
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
+
+    # Serialize concurrent `winbox setup` runs. We hit a race earlier where a
+    # backgrounded setup fought a manual one over disk.qcow2 — this lock makes
+    # that impossible. The lock is held for the entire setup lifetime by keeping
+    # lock_fh alive as a local; Python releases it when setup() returns (normal
+    # exit) or when the stack unwinds (exception propagation).
+    cfg.winbox_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cfg.winbox_dir / ".setup.lock"
+    lock_fh = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_fh.close()
+        console.print(
+            "[red][-][/] Another [bold]winbox setup[/] is already running.\n"
+            f"    Lock file: {lock_path}\n"
+            "    If you're sure no other setup is running, delete the lock file and retry."
+        )
+        raise SystemExit(1)
 
     console.print("[bold]winbox setup[/] — building Windows VM\n")
     t0 = time.monotonic()

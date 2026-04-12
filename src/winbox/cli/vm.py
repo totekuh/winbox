@@ -109,6 +109,13 @@ def destroy(ctx: click.Context, yes: bool) -> None:
 
     console.print("[blue][*][/] Destroying VM and all storage...")
     vm.destroy()
+
+    # Wipe the job ledger — entries referencing guest PIDs are now meaningless,
+    # and leaving them makes `winbox jobs list` report stale RUNNING jobs after
+    # the next setup. missing_ok=True makes this safe if the file was already
+    # gone (race with a concurrent process, or never existed).
+    cfg.jobs_file.unlink(missing_ok=True)
+
     console.print("[green][+][/] VM destroyed")
 
 

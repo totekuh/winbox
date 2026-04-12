@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -13,6 +14,7 @@ from winbox.setup.installer import (
     REQUIRED_TOOLS,
     check_prereqs,
     _find_mkisofs,
+    create_clean_snapshot,
     create_directories,
     generate_ssh_keypair,
     download_virtio_iso,
@@ -296,6 +298,37 @@ class TestDownloads:
         result = extract_virtiofs(cfg)
         assert result == dest
         mock_run.assert_not_called()
+
+
+# ─── create_clean_snapshot — catches RuntimeError from new snapshot_create ──
+
+
+class TestCreateCleanSnapshot:
+    @patch("winbox.setup.installer.VM")
+    def test_success(self, mock_vm_cls, cfg):
+        vm = MagicMock()
+        mock_vm_cls.return_value = vm
+        create_clean_snapshot(cfg)
+        vm.snapshot_create.assert_called_once_with("clean")
+
+    @patch("winbox.setup.installer.VM")
+    def test_runtime_error_is_caught(self, mock_vm_cls, cfg):
+        """RuntimeError from vm.snapshot_create() must not escape — commit
+        aaa81ed made snapshot_create raise RuntimeError but create_clean_snapshot
+        only caught CalledProcessError, so setup crashed on snapshot failure."""
+        vm = MagicMock()
+        vm.snapshot_create.side_effect = RuntimeError("internal snapshot unsupported")
+        mock_vm_cls.return_value = vm
+        # Must not raise — the exception must be caught and turned into a warning.
+        create_clean_snapshot(cfg)
+
+    @patch("winbox.setup.installer.VM")
+    def test_called_process_error_still_caught(self, mock_vm_cls, cfg):
+        """The old CalledProcessError path stays catchable for safety."""
+        vm = MagicMock()
+        vm.snapshot_create.side_effect = subprocess.CalledProcessError(1, "virsh")
+        mock_vm_cls.return_value = vm
+        create_clean_snapshot(cfg)
 
 
 # ─── build_unattend_image ────────────────────────────────────────────────────

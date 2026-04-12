@@ -535,5 +535,5 @@ def create_clean_snapshot(cfg: Config) -> None:
     try:
         vm.snapshot_create("clean")
         console.print("[green][+][/] Snapshot 'clean' created")
-    except subprocess.CalledProcessError:
-        console.print("[yellow][!][/] Could not create snapshot")
+    except (RuntimeError, subprocess.CalledProcessError) as e:
+        console.print(f"[yellow][!][/] Could not create snapshot: {e}")

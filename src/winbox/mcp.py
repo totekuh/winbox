@@ -82,6 +82,11 @@ def _exec_python(
     read via ``json.load(open(r'Z:\\.mcp\\args.json'))``. This avoids
     all escaping issues when embedding values like device paths.
 
+    Both the script and args.json are removed from the share after the
+    call completes, including on timeout/exception — otherwise the
+    previous tool call's code (which may include sensitive snippets)
+    would sit on the host filesystem until the next invocation.
+
     Returns dict with exitcode, stdout, stderr.
     """
     cfg, vm, ga = _ensure_vm_ready()
@@ -90,24 +95,26 @@ def _exec_python(
     script_dir = cfg.shared_dir / ".mcp"
     script_dir.mkdir(parents=True, exist_ok=True)
     script_path = script_dir / "script.py"
+    args_path = script_dir / "args.json"
     script_path.write_text(code, encoding="utf-8")
 
     # Write args as JSON for the script to read
     if args is not None:
-        args_path = script_dir / "args.json"
         args_path.write_text(_json.dumps(args), encoding="utf-8")
 
-    # Execute via guest agent
-    result = ga.exec(
-        r'python.exe Z:\.mcp\script.py',
-        timeout=timeout,
-    )
-
-    return {
-        "exitcode": result.exitcode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    }
+    try:
+        result = ga.exec(
+            r'python.exe Z:\.mcp\script.py',
+            timeout=timeout,
+        )
+        return {
+            "exitcode": result.exitcode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    finally:
+        script_path.unlink(missing_ok=True)
+        args_path.unlink(missing_ok=True)
 
 
 # ─── Tool 1: python ────────────────────────────────────────────────────────
@@ -1391,6 +1398,33 @@ def pipe_open(name: str, access: str = "readwrite", timeout: int = 10) -> str:
         shutil.rmtree(session_dir, ignore_errors=True)
         return f"spawner failed: {result['stderr'].strip()}"
 
+    # The broker is already running detached in the VM at this point. Parse
+    # its PID so we can kill it on any failure path — otherwise a broken
+    # pipe_open leaves zombie python.exe processes accumulating forever.
+    broker_pid: int | None = None
+    for line in result["stdout"].splitlines():
+        line = line.strip()
+        if line.startswith("pid:"):
+            try:
+                broker_pid = int(line[4:])
+            except ValueError:
+                pass
+            break
+    if broker_pid is not None:
+        (session_dir / "broker.pid").write_text(str(broker_pid))
+
+    def _abort(reason: str) -> str:
+        """Kill the orphaned broker (if any) and clean up the session dir."""
+        import shutil
+        if broker_pid is not None:
+            try:
+                _, _, ga = _ensure_vm_ready()
+                ga.exec_argv("taskkill.exe", ["/F", "/PID", str(broker_pid)], timeout=5)
+            except Exception:
+                pass  # best-effort — broker may already have exited
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return reason
+
     # Poll status.json on Kali side via VirtIO-FS
     status_file = session_dir / "status.json"
     deadline = _time.time() + timeout
@@ -1404,14 +1438,10 @@ def pipe_open(name: str, access: str = "readwrite", timeout: int = 10) -> str:
             if status.get("status") == "ready":
                 return session_id
             else:
-                import shutil
-                shutil.rmtree(session_dir, ignore_errors=True)
-                return f"broker error: {status.get('error', 'unknown')}"
+                return _abort(f"broker error: {status.get('error', 'unknown')}")
         _time.sleep(0.1)
 
-    import shutil
-    shutil.rmtree(session_dir, ignore_errors=True)
-    return f"timeout waiting for broker (session: {session_id})"
+    return _abort(f"timeout waiting for broker (session: {session_id})")
 
 
 @mcp.tool()

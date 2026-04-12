@@ -27,11 +27,20 @@ def cfg(tmp_path):
 
 @pytest.fixture
 def mock_mcp(cfg):
-    """Patch MCP server internals so tools run without a real VM."""
+    """Patch MCP server internals so tools run without a real VM.
+
+    Wraps _exec_python so tests can inspect the code/args that were
+    sent to the VM via `ga.captured_code` / `ga.captured_args_dict`.
+    This replaces the older pattern of reading .mcp/script.py off the
+    shared dir, which became unreliable after _exec_python started
+    cleaning up its temp files in a finally block.
+    """
     import winbox.mcp as mcp_mod
 
     ga = MagicMock()
     ga.ping.return_value = True
+    ga.captured_code = None
+    ga.captured_args_dict = None
 
     vm = MagicMock()
     vm.state.return_value = VMState.RUNNING
@@ -40,9 +49,18 @@ def mock_mcp(cfg):
     mcp_mod._vm = vm
     mcp_mod._ga = ga
 
+    original_exec_python = mcp_mod._exec_python
+
+    def capturing_exec_python(code, timeout=300, args=None):
+        ga.captured_code = code
+        ga.captured_args_dict = args
+        return original_exec_python(code, timeout=timeout, args=args)
+
+    mcp_mod._exec_python = capturing_exec_python
+
     yield ga, vm, cfg
 
-    # Reset global state
+    mcp_mod._exec_python = original_exec_python
     mcp_mod._cfg = None
     mcp_mod._vm = None
     mcp_mod._ga = None
@@ -130,19 +148,36 @@ class TestEnsureVmReady:
 
 class TestExecPython:
     def test_writes_script_and_executes(self, mock_mcp):
+        """_exec_python writes the script to disk, runs it, then cleans up.
+
+        We verify the cleanup and inspect the sent code via the fixture's
+        captured hook (ga.captured_code) rather than reading the file,
+        because the file is unlinked before this test body runs.
+        """
         from winbox.mcp import _exec_python
         ga, vm, cfg = mock_mcp
-        ga.exec.return_value = ExecResult(exitcode=0, stdout="hello\n", stderr="")
+
+        # Capture the file state at the moment ga.exec() is called — the only
+        # instant where the script still exists on disk.
+        seen_script = {}
+        def capture_fs(*args, **kwargs):
+            script_path = cfg.shared_dir / ".mcp" / "script.py"
+            seen_script["existed"] = script_path.exists()
+            seen_script["content"] = script_path.read_text() if script_path.exists() else None
+            return ExecResult(exitcode=0, stdout="hello\n", stderr="")
+        ga.exec.side_effect = capture_fs
 
         result = _exec_python("print('hello')")
 
         assert result["exitcode"] == 0
         assert result["stdout"] == "hello\n"
 
-        # Verify script was written to .mcp dir
-        script = cfg.shared_dir / ".mcp" / "script.py"
-        assert script.exists()
-        assert script.read_text() == "print('hello')"
+        # The file existed at exec time…
+        assert seen_script["existed"] is True
+        assert seen_script["content"] == "print('hello')"
+        # …and has been cleaned up now (finally block).
+        assert not (cfg.shared_dir / ".mcp" / "script.py").exists()
+        assert ga.captured_code == "print('hello')"
 
         # Verify GA exec was called with correct path
         ga.exec.assert_called_once()
@@ -221,13 +256,13 @@ class TestIoctlTool:
         assert "deadbeef" in result
 
         # Verify the generated script has the right elements
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        script = ga.captured_code
         assert "CreateFileW" in script
         assert "DeviceIoControl" in script
         assert "CloseHandle" in script
 
         # Verify args.json has the right values
-        args = json.loads((cfg.shared_dir / ".mcp" / "args.json").read_text())
+        args = ga.captured_args_dict
         assert args["device"] == r"\\.\PhysicalDrive0"
         assert args["code"] == 0x70000
         assert args["input_hex"] == "01020304"
@@ -274,7 +309,7 @@ class TestRegQueryTool:
         )
         assert "Windows Server 2022" in result
 
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        script = ga.captured_code
         assert "QueryValueEx" in script
 
     def test_query_all_values(self, mock_mcp):
@@ -290,7 +325,7 @@ class TestRegQueryTool:
         assert "val1" in result
         assert "val2" in result
 
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        script = ga.captured_code
         assert "EnumValue" in script
 
     def test_key_not_found(self, mock_mcp):
@@ -326,7 +361,7 @@ class TestRegSetTool:
         )
         assert "Set" in result
 
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        script = ga.captured_code
         assert "SetValueEx" in script
         assert "CreateKey" in script
 
@@ -358,7 +393,7 @@ class TestRegSetTool:
             data="deadbeef",
             type="REG_BINARY",
         )
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        script = ga.captured_code
         assert "REG_BINARY" in script
 
 
@@ -398,7 +433,7 @@ class TestPsTool:
         result = ps(filter="lsass")
         assert "lsass" in result
 
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        script = ga.captured_code
         assert "'lsass'" in script
 
     def test_no_filter(self, mock_mcp):
@@ -407,7 +442,7 @@ class TestPsTool:
         ga.exec.return_value = ExecResult(exitcode=0, stdout="[]\n", stderr="")
 
         ps(filter=None)
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        script = ga.captured_code
         assert "None" in script
 
 
@@ -427,7 +462,7 @@ class TestRegDeleteTool:
         result = reg_delete(key=r"HKLM\SOFTWARE\Test", value="MyVal")
         assert "Deleted value" in result
 
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        script = ga.captured_code
         assert "DeleteValue" in script
 
     def test_delete_key(self, mock_mcp):
@@ -442,7 +477,7 @@ class TestRegDeleteTool:
         result = reg_delete(key=r"HKLM\SOFTWARE\Test")
         assert "Deleted key" in result
 
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        script = ga.captured_code
         assert "DeleteKey" in script
         assert "delete_key_tree" in script
 
@@ -505,7 +540,7 @@ class TestUploadTool:
         assert "C:\\Users\\Public\\evil.exe" in result
 
         # Verify args.json was written with correct paths
-        args = json.loads((cfg.shared_dir / ".mcp" / "args.json").read_text())
+        args = ga.captured_args_dict
         assert args["dst"] == "C:\\Users\\Public\\evil.exe"
         assert "Z:\\" in args["src"]
 
@@ -550,7 +585,7 @@ class TestFileCopyTool:
         assert "12345" in result
 
         # Verify args.json
-        args = json.loads((cfg.shared_dir / ".mcp" / "args.json").read_text())
+        args = ga.captured_args_dict
         assert args["src"] == "Z:\\tools\\cytool.exe"
         assert args["dst"] == "C:\\temp\\cytool.exe"
 
@@ -572,7 +607,7 @@ class TestFileCopyTool:
         ga.exec.return_value = ExecResult(exitcode=0, stdout="ok\n", stderr="")
 
         file_copy(src="a", dst="b")
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        script = ga.captured_code
         assert "shutil.copy2" in script
 
 
@@ -590,7 +625,7 @@ class TestMemReadTool:
         result = mem_read(pid=672, address=0x7FF600000000, size=4)
         assert "4d5a9000" in result
 
-        script = (cfg.shared_dir / ".mcp" / "script.py").read_text()
+        script = ga.captured_code
         assert "ReadProcessMemory" in script
         assert "672" in script
 
@@ -806,8 +841,7 @@ class TestPipeTools:
 
         result = pipe_list(filter="lsass")
         assert "lsass" in result
-        args = (cfg.shared_dir / ".mcp" / "args.json").read_text()
-        assert json.loads(args)["filter"] == "lsass"
+        assert ga.captured_args_dict["filter"] == "lsass"
 
     def test_pipe_list_empty(self, mock_mcp):
         import json
@@ -841,8 +875,7 @@ class TestPipeTools:
         assert '"mode": "message"' in result
         assert "O:SYG:SYD:" in result
 
-        args = (cfg.shared_dir / ".mcp" / "args.json").read_text()
-        assert json.loads(args)["name"] == "svcctl"
+        assert ga.captured_args_dict["name"] == "svcctl"
 
     def test_pipe_info_access_denied(self, mock_mcp):
         import json
@@ -869,11 +902,8 @@ class TestPipeTools:
         result = pipe_connect(name="svcctl")
         assert "OK" in result
 
-        args = (cfg.shared_dir / ".mcp" / "args.json").read_text()
-        import json
-        data = json.loads(args)
-        assert data["name"] == "svcctl"
-        assert data["access"] == "read"
+        assert ga.captured_args_dict["name"] == "svcctl"
+        assert ga.captured_args_dict["access"] == "read"
 
     def test_pipe_connect_access_denied(self, mock_mcp):
         from winbox.mcp import pipe_connect
@@ -895,9 +925,7 @@ class TestPipeTools:
         )
 
         pipe_connect(name="test", access="readwrite")
-        args = (cfg.shared_dir / ".mcp" / "args.json").read_text()
-        import json
-        assert json.loads(args)["access"] == "readwrite"
+        assert ga.captured_args_dict["access"] == "readwrite"
 
 
 # ─── pipe_open / pipe_send / pipe_recv / pipe_close (session-based) ──────────
@@ -1002,6 +1030,89 @@ class TestPipeSession:
             result = pipe_open(name="lsass")
 
         assert "ACCESS_DENIED" in result
+
+    def test_open_broker_error_kills_orphan_broker(self, mock_mcp):
+        """On broker-error path the orphaned python.exe must be taskkilled —
+        otherwise repeated pipe_open failures accumulate zombie brokers."""
+        import winbox.mcp as mcp_mod
+        from unittest.mock import patch
+        from winbox.mcp import pipe_open
+        ga, vm, cfg = mock_mcp
+
+        def _fake_exec(code, timeout=300, args=None):
+            pipes_dir = cfg.shared_dir / ".mcp" / "pipes"
+            if pipes_dir.exists():
+                for d in pipes_dir.iterdir():
+                    sfile = d / "status.json"
+                    if not sfile.exists():
+                        sfile.write_text('{"status": "error", "error": "boom"}')
+            return {"exitcode": 0, "stdout": "pid:4242\n", "stderr": ""}
+
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
+            pipe_open(name="lsass")
+
+        taskkill_calls = [
+            c for c in ga.exec_argv.call_args_list
+            if c[0][0] == "taskkill.exe" and "/PID" in c[0][1] and "4242" in c[0][1]
+        ]
+        assert len(taskkill_calls) == 1, (
+            f"expected one taskkill /F /PID 4242 call on broker error, "
+            f"got {len(taskkill_calls)}: {ga.exec_argv.call_args_list}"
+        )
+
+    def test_open_timeout_kills_orphan_broker(self, mock_mcp):
+        """On the timeout path the orphaned broker must also be taskkilled."""
+        import winbox.mcp as mcp_mod
+        from unittest.mock import patch
+        from winbox.mcp import pipe_open
+        ga, vm, cfg = mock_mcp
+
+        def _fake_exec(code, timeout=300, args=None):
+            # Never writes status.json → pipe_open polls until timeout.
+            return {"exitcode": 0, "stdout": "pid:7777\n", "stderr": ""}
+
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
+            result = pipe_open(name="srvsvc", timeout=0)  # instant timeout
+
+        assert "timeout" in result
+        taskkill_calls = [
+            c for c in ga.exec_argv.call_args_list
+            if c[0][0] == "taskkill.exe" and "/PID" in c[0][1] and "7777" in c[0][1]
+        ]
+        assert len(taskkill_calls) == 1, (
+            f"expected one taskkill /F /PID 7777 call on timeout, "
+            f"got {len(taskkill_calls)}: {ga.exec_argv.call_args_list}"
+        )
+
+    def test_open_success_does_not_kill_broker(self, mock_mcp):
+        """Happy path must not taskkill the broker we just launched."""
+        import winbox.mcp as mcp_mod
+        from unittest.mock import patch
+        from winbox.mcp import pipe_open
+        ga, vm, cfg = mock_mcp
+
+        def _fake_exec(code, timeout=300, args=None):
+            pipes_dir = cfg.shared_dir / ".mcp" / "pipes"
+            if pipes_dir.exists():
+                for d in pipes_dir.iterdir():
+                    sfile = d / "status.json"
+                    if not sfile.exists():
+                        sfile.write_text('{"status": "ready"}')
+            return {"exitcode": 0, "stdout": "pid:5555\n", "stderr": ""}
+
+        with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
+            session_id = pipe_open(name="srvsvc")
+
+        assert len(session_id) == 12
+        taskkill_calls = [
+            c for c in ga.exec_argv.call_args_list
+            if c[0][0] == "taskkill.exe"
+        ]
+        assert taskkill_calls == [], (
+            f"taskkill must not run on success path, got: {taskkill_calls}"
+        )
 
     # ── pipe_send ──────────────────────────────────────────────────────────────
 
