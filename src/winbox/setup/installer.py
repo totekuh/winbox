@@ -207,6 +207,9 @@ WINFSP_URL = (
 )
 WINFSP_MSI = "winfsp.msi"
 
+PYTHON_URL = "https://www.python.org/ftp/python/3.13.13/python-3.13.13-embed-amd64.zip"
+PYTHON_ZIP = "python-embed-amd64.zip"
+
 
 def download_openssh(cfg: Config) -> Path:
     """Download Win32-OpenSSH zip if not cached. Returns path to zip."""
@@ -241,6 +244,24 @@ def download_winfsp(cfg: Config) -> Path:
     if not dest.exists() or dest.stat().st_size < 1_000_000:
         raise RuntimeError(f"WinFsp download appears truncated: {dest}")
     console.print("[green][+][/] WinFsp MSI downloaded")
+    return dest
+
+
+def download_python(cfg: Config) -> Path:
+    """Download Python embeddable zip if not cached. Returns path to zip."""
+    dest = cfg.iso_dir / PYTHON_ZIP
+    if dest.exists() and dest.stat().st_size > 5_000_000:
+        console.print("[green][+][/] Python embeddable zip cached")
+        return dest
+
+    console.print("[blue][*][/] Downloading Python embeddable zip...")
+    subprocess.run(
+        ["wget", "-q", "--show-progress", "-O", str(dest), PYTHON_URL],
+        check=True,
+    )
+    if not dest.exists() or dest.stat().st_size < 5_000_000:
+        raise RuntimeError(f"Python download appears truncated: {dest}")
+    console.print("[green][+][/] Python embeddable zip downloaded")
     return dest
 
 
@@ -390,6 +411,7 @@ def provision_vm_disk(cfg: Config) -> None:
         openssh_zip = cfg.iso_dir / OPENSSH_ZIP
         winfsp_msi = cfg.iso_dir / WINFSP_MSI
         virtiofs_exe = cfg.iso_dir / VIRTIOFS_EXE
+        python_zip = cfg.iso_dir / PYTHON_ZIP
         missing_files = []
         for path, label in [
             (openssh_zip, "OpenSSH"), (winfsp_msi, "WinFsp"), (virtiofs_exe, "virtiofs"),
@@ -412,6 +434,8 @@ def provision_vm_disk(cfg: Config) -> None:
                 zf.write(winfsp_msi, WINFSP_MSI)
             if virtiofs_exe.exists():
                 zf.write(virtiofs_exe, VIRTIOFS_EXE)
+            if python_zip.exists():
+                zf.write(python_zip, PYTHON_ZIP)
 
         # Copy bootstrap.ps1 to temp dir
         bootstrap_src = _data_file("bootstrap.ps1")
@@ -458,43 +482,14 @@ def boot_for_provisioning(cfg: Config) -> None:
     if not vm.wait_shutdown(timeout=600):
         console.print("[yellow][!][/] Provisioning timed out (VM did not shut down in 600s)")
         console.print(f"    Check with: virsh console {cfg.vm_name}")
+        console.print("[blue][*][/] Force-stopping hung VM...")
+        try:
+            vm.force_stop()
+        except Exception:
+            pass
         raise RuntimeError("Provisioning timed out")
 
     console.print("[green][+][/] Provisioning complete")
-
-
-def enable_autologin(cfg: Config) -> None:
-    """Enable persistent auto-login via registry.
-
-    Boots the VM, sets Winlogon keys via guest agent, shuts down.
-    Called after Phase 3 provisioning (VM is shut off at this point).
-    """
-    console.print("[blue][*][/] Enabling persistent auto-login...")
-
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    vm.start()
-    ga.wait(timeout=120)
-
-    winlogon = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-    for name, data in [
-        ("AutoAdminLogon", "1"),
-        ("DefaultUserName", cfg.vm_user),
-        ("DefaultPassword", cfg.vm_password),
-    ]:
-        result = ga.exec_argv("reg.exe", [
-            "add", winlogon, "/v", name, "/t", "REG_SZ", "/d", data, "/f",
-        ], timeout=15)
-        if result.exitcode != 0:
-            console.print(f"[red][-][/] Failed to set {name}: {result.stderr.strip()}")
-            raise RuntimeError(f"Auto-login setup failed: {name}")
-
-    ga.shutdown()
-    if not vm.wait_shutdown(timeout=60):
-        vm.force_stop()
-
-    console.print("[green][+][/] Auto-login enabled for Administrator")
 
 
 def create_clean_snapshot(cfg: Config) -> None:

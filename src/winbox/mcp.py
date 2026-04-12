@@ -764,6 +764,12 @@ def mem_read(pid: int, address: int, size: int) -> str:
         address: Memory address to read from (integer).
         size: Number of bytes to read.
     """
+    if size <= 0:
+        return f"Invalid size: {size} (must be > 0)"
+    if size > 100 * 1024 * 1024:
+        return f"Invalid size: {size} (max 100MB per read)"
+    if address < 0:
+        return f"Invalid address: {address} (must be >= 0)"
     script = textwrap.dedent(f"""\
         import ctypes
         from ctypes import wintypes
@@ -877,41 +883,46 @@ def service_start(name: str) -> str:
 
 @mcp.tool()
 def net_isolate() -> str:
-    """Block internet access on the VM by removing the default gateway.
+    """Disconnect the VM from the network (unplug the cable).
 
-    The NIC stays up — traffic to directly routed targets still works.
+    Host-VM channels (guest agent, VirtIO-FS) stay up since they use
+    virtio-serial, not the network. Only the NIC is disconnected.
     Undo with net_connect.
     """
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
-    ga.exec_powershell(
-        "Remove-NetRoute -DestinationPrefix '0.0.0.0/0' -Confirm:$false -ErrorAction SilentlyContinue",
-        timeout=15,
-    )
-    return "Internet isolated — default gateway removed"
+    if not vm.net_set_link("down"):
+        return "Failed to set link down (no interface found?)"
+    return "Network isolated — cable unplugged"
 
 
 @mcp.tool()
 def net_connect() -> str:
-    """Restore internet access by renewing DHCP (gets gateway + DNS back).
+    """Reconnect the VM to the network (plug the cable back in).
 
-    The NIC is always up; this just restores the default gateway.
+    Automatically restarts the adapter and renews DHCP.
     """
     import time
 
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
+    if not vm.net_set_link("up"):
+        return "Failed to set link up (no interface found?)"
 
-    ga.exec("ipconfig /release", timeout=15)
-    ga.exec("ipconfig /renew", timeout=30)
-    for _ in range(15):
+    # Restart adapter + renew DHCP — Windows doesn't auto-renew after replug
+    ga.exec_powershell(
+        "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
+        "-Confirm:$false",
+        timeout=15,
+    )
+    for _ in range(10):
         ip = vm.ip()
         if ip:
-            return f"Internet connected — IP: {ip}"
+            return f"Network connected — IP: {ip}"
         time.sleep(1)
-    return "Internet connected (DHCP pending)"
+    return "Network connected (DHCP pending)"
 
 
 # ─── Tool 10: pipe_list / pipe_info / pipe_connect ──────────────────────────

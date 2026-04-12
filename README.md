@@ -174,8 +174,8 @@ winbox restore pre-attack    # revert to clean state
 For testing macro-based payloads, install Office on a Desktop Experience VM:
 
 ```bash
-winbox setup --desktop -y          # build VM with Desktop Experience
-winbox setup --autologin -y        # enable auto-login as Administrator
+winbox setup --desktop -y    # build VM with Desktop Experience
+winbox autologin enable      # enable auto-login as Administrator
 winbox office                # install Word, Excel, PowerPoint with macros enabled
 ```
 

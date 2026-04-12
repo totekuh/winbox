@@ -160,6 +160,33 @@ try {
     Write-Host "[!] VirtIO-FS setup error: $_"
 }
 
+# --- Python (embeddable, for MCP python tool) ---
+Write-Host "[*] Installing Python embeddable..."
+$pythonZip = "$provDir\python-embed-amd64.zip"
+try {
+    if (Test-Path $pythonZip) {
+        $pythonDir = "C:\Python313"
+        New-Item -ItemType Directory -Path $pythonDir -Force | Out-Null
+        Expand-Archive -Path $pythonZip -DestinationPath $pythonDir -Force
+        # Uncomment python313._pth to enable site-packages (needed for pip/modules)
+        $pthFile = Get-ChildItem -Path $pythonDir -Filter "*._pth" | Select-Object -First 1
+        if ($pthFile) {
+            $pthContent = Get-Content $pthFile.FullName -Raw
+            $pthContent = $pthContent -replace '#import site', 'import site'
+            Set-Content -Path $pthFile.FullName -Value $pthContent
+        }
+        $machPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::Machine)
+        if ($machPath -notlike "*$pythonDir*") {
+            [Environment]::SetEnvironmentVariable("Path", "$machPath;$pythonDir", [EnvironmentVariableTarget]::Machine)
+        }
+        Write-Host "[+] Python installed at $pythonDir"
+    } else {
+        Write-Host "[!] Python zip not found at $pythonZip - skipping"
+    }
+} catch {
+    Write-Host "[!] Python install failed: $_"
+}
+
 # --- Add Z:\tools to system PATH ---
 Write-Host "[*] Adding Z:\tools to system PATH..."
 try {

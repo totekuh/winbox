@@ -221,13 +221,23 @@ def applocker_enable(ctx: click.Context) -> None:
     # Each step must be a separate GA call — running inside a single
     # exec_powershell doesn't give the converter the right context.
     console.print("[blue][*][/] Starting AppLocker stack...")
-    ga.exec("appidtel.exe start", timeout=15)
+    result = ga.exec("appidtel.exe start", timeout=15)
+    if result.exitcode != 0:
+        console.print("[red][-][/] Failed to start AppLocker stack (appidtel.exe):")
+        console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
+        raise SystemExit(1)
     time.sleep(5)
 
     console.print("[blue][*][/] Compiling rules...")
-    ga.exec(r"C:\Windows\System32\AppIdPolicyConverter.exe", timeout=15)
+    result = ga.exec(r"C:\Windows\System32\AppIdPolicyConverter.exe", timeout=15)
+    if result.exitcode != 0:
+        console.print("[yellow][!][/] Rule compilation warning (AppIdPolicyConverter):")
+        console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
     time.sleep(5)
-    ga.exec("gpupdate /force", timeout=30)
+    result = ga.exec("gpupdate /force", timeout=30)
+    if result.exitcode != 0:
+        console.print("[yellow][!][/] gpupdate warning:")
+        console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
 
     console.print("[green][+][/] AppLocker enforced (Exe, Script, MSI, Appx)")
     console.print("    Allowed: %WINDIR%\\*, %PROGRAMFILES%\\*, Admins everywhere")

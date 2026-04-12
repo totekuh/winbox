@@ -15,12 +15,30 @@ from winbox.vm import VM, VMState
 
 
 @click.command()
+@click.option("--reboot", "-r", is_flag=True, help="If the VM is already running, shut it down first and start it again.")
 @click.pass_context
-def up(ctx: click.Context) -> None:
+def up(ctx: click.Context, reboot: bool) -> None:
     """Start or resume the VM."""
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
+
+    if reboot and vm.state() == VMState.RUNNING:
+        console.print("[blue][*][/] Rebooting VM — shutting down first...")
+        if ga.ping():
+            ga.shutdown()
+        else:
+            vm.shutdown()
+        timeout = 60
+        elapsed = 0
+        while vm.state() == VMState.RUNNING:
+            time.sleep(2)
+            elapsed += 2
+            if elapsed >= timeout:
+                console.print("[yellow][!][/] Graceful shutdown timeout, forcing...")
+                vm.force_stop()
+                break
+        console.print("[green][+][/] VM stopped, restarting...")
 
     ensure_running(vm, ga, cfg)
 
@@ -171,7 +189,11 @@ def snapshot(ctx: click.Context, name: str) -> None:
         raise SystemExit(1)
 
     console.print(f"[blue][*][/] Creating snapshot '{name}'...")
-    vm.snapshot_create(name)
+    try:
+        vm.snapshot_create(name)
+    except Exception as e:
+        console.print(f"[red][-][/] Failed to create snapshot '{name}': {e}")
+        raise SystemExit(1)
     console.print(f"[green][+][/] Snapshot '{name}' created")
 
 

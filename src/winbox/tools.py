@@ -28,6 +28,9 @@ def add(cfg: Config, files: tuple[str, ...]) -> None:
         if not src.exists():
             console.print(f"[yellow][!][/] File not found: {f}")
             continue
+        if not src.is_file():
+            console.print(f"[yellow][!][/] Not a file (skipping directory): {f}")
+            continue
         dest = cfg.tools_dir / src.name
         # Prevent path traversal via crafted filenames
         if not dest.resolve().is_relative_to(cfg.tools_dir.resolve()):

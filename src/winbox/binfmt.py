@@ -32,7 +32,7 @@ EXE_NAME="$(basename "$EXE_PATH")"
 
 # If exe is NOT in tools dir, copy it there so it's accessible via VirtIO-FS
 if [ "$(dirname "$(realpath "$EXE_PATH")")" != "$(realpath "$TOOLS_DIR")" ]; then
-    cp "$EXE_PATH" "$TOOLS_DIR/$EXE_NAME" 2>/dev/null
+    cp "$EXE_PATH" "$TOOLS_DIR/$EXE_NAME" || {{ echo "winbox: failed to copy $EXE_PATH to $TOOLS_DIR" >&2; exit 1; }}
 fi
 
 exec "$WINBOX" exec "$EXE_NAME" "$@"

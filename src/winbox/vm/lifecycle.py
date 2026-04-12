@@ -98,7 +98,13 @@ class VM:
 
         # Clean up disk only
         if self.cfg.disk_path.exists():
-            self.cfg.disk_path.unlink()
+            try:
+                self.cfg.disk_path.unlink()
+            except OSError as e:
+                raise RuntimeError(
+                    f"VM undefined but disk deletion failed: {e}\n"
+                    f"    Manual cleanup: rm {self.cfg.disk_path}"
+                ) from e
 
     def ip(self) -> str | None:
         result = _virsh("domifaddr", self.name, check=False)

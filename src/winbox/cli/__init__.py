@@ -55,14 +55,6 @@ def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
         raise SystemExit(1)
     _ensure_z_drive(ga)
     _ensure_sshd_running(ga)
-    try:
-        ga.exec_powershell(
-            "Remove-NetRoute -DestinationPrefix '0.0.0.0/0' -Confirm:$false -ErrorAction SilentlyContinue",
-            timeout=15,
-        )
-        console.print("[blue][*][/] Internet isolated (reconnect with: winbox net connect)")
-    except Exception:
-        pass
     console.print("[green][+][/] VM ready")
 
 
@@ -117,6 +109,7 @@ from winbox.cli.jobs import jobs  # noqa: E402
 from winbox.cli.office import office  # noqa: E402
 from winbox.cli.av import av  # noqa: E402
 from winbox.cli.applocker import applocker  # noqa: E402
+from winbox.cli.autologin import autologin  # noqa: E402
 from winbox.cli.mcp import mcp_cmd  # noqa: E402
 
 cli.add_command(up)
@@ -143,4 +136,5 @@ cli.add_command(vnc)
 cli.add_command(office)
 cli.add_command(av)
 cli.add_command(applocker)
+cli.add_command(autologin)
 cli.add_command(mcp_cmd)

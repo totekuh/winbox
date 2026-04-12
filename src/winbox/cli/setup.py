@@ -27,12 +27,8 @@ from winbox.vm import VM
     "--desktop", is_flag=True,
     help="Install Desktop Experience instead of Server Core (needed for Office/GUI apps).",
 )
-@click.option(
-    "--autologin", is_flag=True,
-    help="Enable persistent auto-login for Administrator (survives all reboots).",
-)
 @click.pass_context
-def setup(ctx: click.Context, windows_iso: str | None, yes: bool, desktop: bool, autologin: bool) -> None:
+def setup(ctx: click.Context, windows_iso: str | None, yes: bool, desktop: bool) -> None:
     """Build the Windows VM (one-time setup)."""
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
@@ -98,6 +94,7 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool, desktop: bool,
     installer.download_virtio_iso(cfg)
     installer.download_openssh(cfg)
     installer.download_winfsp(cfg)
+    installer.download_python(cfg)
     installer.extract_virtiofs(cfg)
     installer.generate_ssh_keypair(cfg)
     installer.build_unattend_image(cfg, desktop=desktop)
@@ -119,10 +116,6 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool, desktop: bool,
     # Phase 3: Provisioning via guest agent
     installer.boot_for_provisioning(cfg)
     console.print("[green][+][/] Phase 3 complete — VM provisioned")
-
-    # Auto-login (optional) — set after provisioning, before snapshot
-    if autologin:
-        installer.enable_autologin(cfg)
 
     # Phase 4: Snapshot
     installer.create_clean_snapshot(cfg)

@@ -50,8 +50,9 @@ class GuestAgent:
             check=False,
         )
         if result.returncode != 0:
+            error_msg = result.stderr.strip() or f"(virsh exit code {result.returncode})"
             raise GuestAgentError(
-                f"Guest agent command failed: {result.stderr.strip()}"
+                f"Guest agent command failed: {error_msg}"
             )
         try:
             return json.loads(result.stdout)

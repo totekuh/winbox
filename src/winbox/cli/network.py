@@ -28,24 +28,23 @@ def net() -> None:
 @net.command("isolate")
 @click.pass_context
 def net_isolate(ctx: click.Context) -> None:
-    """Block internet access by removing the default gateway.
+    """Disconnect VM from the network (unplug the cable).
 
-    The NIC stays up — traffic to directly routed targets still works.
+    Host-VM channels (guest agent, VirtIO-FS, SSH) stay up.
     Undo with: winbox net connect
     """
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
-    ga = GuestAgent(cfg)
 
     if vm.state() != VMState.RUNNING:
         console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
         raise SystemExit(1)
 
-    ga.exec_powershell(
-        "Remove-NetRoute -DestinationPrefix '0.0.0.0/0' -Confirm:$false -ErrorAction SilentlyContinue",
-        timeout=15,
-    )
-    console.print("[green][+][/] Internet isolated — default gateway removed")
+    if not vm.net_set_link("down"):
+        console.print("[red][-][/] Failed to set link down (no interface found?)")
+        raise SystemExit(1)
+
+    console.print("[green][+][/] Network isolated — cable unplugged")
     console.print("    Undo with: [bold]winbox net connect[/]")
 
 
@@ -61,14 +60,22 @@ def net_connect(ctx: click.Context) -> None:
         console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
         raise SystemExit(1)
 
-    # Full DHCP cycle — release forces a fresh DISCOVER so Windows re-adds
-    # the default gateway (plain /renew on a valid lease skips route setup)
-    console.print("[blue][*][/] Renewing DHCP lease...")
-    ga.exec("ipconfig /release", timeout=15)
-    ga.exec("ipconfig /renew", timeout=30)
+    if not vm.net_set_link("up"):
+        console.print("[red][-][/] Failed to set link up (no interface found?)")
+        raise SystemExit(1)
 
-    ip = None
-    for _ in range(15):
+    # Restart the adapter and renew DHCP — Windows doesn't auto-renew
+    # after a cable replug
+    console.print("[blue][*][/] Renewing DHCP lease...")
+    result = ga.exec_powershell(
+        "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
+        "-Confirm:$false",
+        timeout=15,
+    )
+    if result.exitcode != 0:
+        console.print(f"[yellow][!][/] Adapter restart warning: {result.stderr.strip()}", markup=False)
+    # Wait for DHCP to assign an address
+    for _ in range(10):
         ip = vm.ip()
         if ip:
             break
@@ -83,31 +90,21 @@ def net_connect(ctx: click.Context) -> None:
 @net.command("status")
 @click.pass_context
 def net_status(ctx: click.Context) -> None:
-    """Show VM internet connectivity status."""
+    """Show VM network link state."""
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
-    ga = GuestAgent(cfg)
 
     if vm.state() != VMState.RUNNING:
         console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
         return
 
-    if not ga.ping():
-        console.print("[yellow][!][/] Guest agent not responding")
+    state = vm.net_link_state()
+    if state is None:
+        console.print("[yellow][!][/] Could not determine link state")
         return
 
-    result = ga.exec_powershell(
-        "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue).Count",
-        timeout=10,
-    )
-    if result.exitcode != 0 or not result.stdout.strip().isdigit():
-        console.print("[yellow][!][/] Could not determine internet status")
-        return
-
-    if int(result.stdout.strip()) > 0:
-        console.print("Internet: [green]connected[/]")
-    else:
-        console.print("Internet: [red]isolated[/]")
+    color = "green" if state == "up" else "red"
+    console.print(f"Network link: [{color}]{state}[/]")
 
 
 # ─── dns ─────────────────────────────────────────────────────────────────────
