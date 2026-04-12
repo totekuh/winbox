@@ -14,6 +14,26 @@ from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM, VMState
 
 
+def _graceful_shutdown(vm: VM, ga: GuestAgent, *, timeout: int = 60) -> None:
+    """Shut the VM down cleanly, force-stop on timeout. No-op if already off."""
+    if vm.state() != VMState.RUNNING:
+        return
+
+    if ga.ping():
+        ga.shutdown()
+    else:
+        vm.shutdown()
+
+    elapsed = 0
+    while vm.state() == VMState.RUNNING:
+        time.sleep(2)
+        elapsed += 2
+        if elapsed >= timeout:
+            console.print("[yellow][!][/] Graceful shutdown timeout, forcing...")
+            vm.force_stop()
+            break
+
+
 @click.command()
 @click.option("--reboot", "-r", is_flag=True, help="If the VM is already running, shut it down first and start it again.")
 @click.pass_context
@@ -25,19 +45,7 @@ def up(ctx: click.Context, reboot: bool) -> None:
 
     if reboot and vm.state() == VMState.RUNNING:
         console.print("[blue][*][/] Rebooting VM — shutting down first...")
-        if ga.ping():
-            ga.shutdown()
-        else:
-            vm.shutdown()
-        timeout = 60
-        elapsed = 0
-        while vm.state() == VMState.RUNNING:
-            time.sleep(2)
-            elapsed += 2
-            if elapsed >= timeout:
-                console.print("[yellow][!][/] Graceful shutdown timeout, forcing...")
-                vm.force_stop()
-                break
+        _graceful_shutdown(vm, ga)
         console.print("[green][+][/] VM stopped, restarting...")
 
     ensure_running(vm, ga, cfg)
@@ -62,31 +70,7 @@ def down(ctx: click.Context) -> None:
         return
 
     console.print("[blue][*][/] Shutting down VM...")
-
-    # Graceful shutdown via guest agent
-    if ga.ping():
-        ga.shutdown()
-        timeout = 60
-        elapsed = 0
-        while vm.state() == VMState.RUNNING:
-            time.sleep(2)
-            elapsed += 2
-            if elapsed >= timeout:
-                console.print("[yellow][!][/] Graceful shutdown timeout, forcing...")
-                vm.force_stop()
-                break
-    else:
-        vm.shutdown()
-        timeout = 60
-        elapsed = 0
-        while vm.state() == VMState.RUNNING:
-            time.sleep(2)
-            elapsed += 2
-            if elapsed >= timeout:
-                console.print("[yellow][!][/] Graceful shutdown timeout, forcing...")
-                vm.force_stop()
-                break
-
+    _graceful_shutdown(vm, ga)
     console.print("[green][+][/] VM stopped")
 
 
@@ -177,22 +161,43 @@ def status(ctx: click.Context) -> None:
 
 
 @click.command()
-@click.argument("name")
+@click.argument("name", required=False)
 @click.pass_context
-def snapshot(ctx: click.Context, name: str) -> None:
-    """Create a named VM snapshot."""
+def snapshot(ctx: click.Context, name: str | None) -> None:
+    """Create a named VM snapshot, or list existing ones if no name is given.
+
+    Shuts the VM down first if it's running — internal qcow2 snapshots
+    of a live VM with UEFI/pflash are unreliable, and virsh refuses them.
+    """
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
+    ga = GuestAgent(cfg)
 
     if not vm.exists():
         console.print("[red][-][/] VM not found")
         raise SystemExit(1)
 
+    if name is None:
+        snaps = vm.snapshot_list()
+        if not snaps:
+            console.print("[yellow][!][/] No snapshots")
+            return
+        console.print(f"[bold]Snapshots ({len(snaps)}):[/]")
+        for s in snaps:
+            console.print(f"  {s}")
+        return
+
+    if vm.state() == VMState.RUNNING:
+        console.print("[blue][*][/] VM is running — shutting down before snapshot...")
+        _graceful_shutdown(vm, ga)
+        console.print("[green][+][/] VM stopped")
+
     console.print(f"[blue][*][/] Creating snapshot '{name}'...")
     try:
         vm.snapshot_create(name)
     except Exception as e:
-        console.print(f"[red][-][/] Failed to create snapshot '{name}': {e}")
+        console.print(f"[red][-][/] Failed to create snapshot '{name}':")
+        console.print(f"    {e}", markup=False, highlight=False)
         raise SystemExit(1)
     console.print(f"[green][+][/] Snapshot '{name}' created")
 

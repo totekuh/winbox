@@ -152,10 +152,14 @@ class VM:
         return None
 
     def snapshot_create(self, name: str) -> None:
-        _virsh(
+        result = _virsh(
             "snapshot-create-as", self.name, name,
             "--description", f"winbox snapshot: {name}",
+            check=False,
         )
+        if result.returncode != 0:
+            msg = result.stderr.strip() or result.stdout.strip() or f"virsh exit {result.returncode}"
+            raise RuntimeError(msg)
 
     def snapshot_revert(self, name: str) -> None:
         _virsh("snapshot-revert", self.name, name)
