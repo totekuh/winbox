@@ -187,6 +187,21 @@ try {
     Write-Host "[!] Python install failed: $_"
 }
 
+# --- spice-guest-tools (QXL display driver + vdagent for clipboard sharing) ---
+Write-Host "[*] Installing spice-guest-tools..."
+$spiceExe = "$provDir\spice-guest-tools.exe"
+try {
+    if (Test-Path $spiceExe) {
+        # NSIS installer — /S = silent. Installs QXL WDDM driver + vdservice.
+        $proc = Start-Process -FilePath $spiceExe -ArgumentList "/S" -Wait -PassThru -NoNewWindow
+        Write-Host "[+] spice-guest-tools installed (exit code: $($proc.ExitCode))"
+    } else {
+        Write-Host "[!] spice-guest-tools.exe not found at $spiceExe - clipboard sharing will not work"
+    }
+} catch {
+    Write-Host "[!] spice-guest-tools install failed: $_"
+}
+
 # --- Add Z:\tools to system PATH ---
 Write-Host "[*] Adding Z:\tools to system PATH..."
 try {

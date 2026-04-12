@@ -210,6 +210,12 @@ WINFSP_MSI = "winfsp.msi"
 PYTHON_URL = "https://www.python.org/ftp/python/3.13.13/python-3.13.13-embed-amd64.zip"
 PYTHON_ZIP = "python-embed-amd64.zip"
 
+SPICE_TOOLS_URL = (
+    "https://www.spice-space.org/download/windows/spice-guest-tools/"
+    "spice-guest-tools-latest.exe"
+)
+SPICE_TOOLS_EXE = "spice-guest-tools.exe"
+
 
 def download_openssh(cfg: Config) -> Path:
     """Download Win32-OpenSSH zip if not cached. Returns path to zip."""
@@ -262,6 +268,24 @@ def download_python(cfg: Config) -> Path:
     if not dest.exists() or dest.stat().st_size < 5_000_000:
         raise RuntimeError(f"Python download appears truncated: {dest}")
     console.print("[green][+][/] Python embeddable zip downloaded")
+    return dest
+
+
+def download_spice_tools(cfg: Config) -> Path:
+    """Download spice-guest-tools (QXL driver + vdagent) if not cached."""
+    dest = cfg.iso_dir / SPICE_TOOLS_EXE
+    if dest.exists() and dest.stat().st_size > 10_000_000:
+        console.print("[green][+][/] spice-guest-tools cached")
+        return dest
+
+    console.print("[blue][*][/] Downloading spice-guest-tools...")
+    subprocess.run(
+        ["wget", "-q", "--show-progress", "-O", str(dest), SPICE_TOOLS_URL],
+        check=True,
+    )
+    if not dest.exists() or dest.stat().st_size < 10_000_000:
+        raise RuntimeError(f"spice-guest-tools download appears truncated: {dest}")
+    console.print("[green][+][/] spice-guest-tools downloaded")
     return dest
 
 
@@ -346,11 +370,18 @@ def build_unattend_image(cfg: Config, *, desktop: bool = False) -> None:
 def create_disk(cfg: Config) -> None:
     """Create the QCOW2 disk image."""
     console.print(f"[blue][*][/] Creating VM disk ({cfg.vm_disk}GB)...")
-    subprocess.run(
+    result = subprocess.run(
         ["qemu-img", "create", "-f", "qcow2", str(cfg.disk_path), f"{cfg.vm_disk}G"],
         capture_output=True,
-        check=True,
+        text=True,
+        check=False,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"qemu-img create failed (exit {result.returncode}):\n"
+            f"  stdout: {result.stdout.strip()}\n"
+            f"  stderr: {result.stderr.strip()}"
+        )
     console.print("[green][+][/] Disk created")
 
 
@@ -380,7 +411,9 @@ def run_virt_install(cfg: Config, windows_iso: str) -> None:
             f"target.dir=winbox_share"
         ),
         "--os-variant", "win2k22",
-        "--graphics", "vnc,listen=127.0.0.1",
+        "--graphics", "spice,listen=none",
+        "--video", "qxl",
+        "--channel", "spicevmc,target.type=virtio,target.name=com.redhat.spice.0",
         "--noautoconsole",
         "--boot", "uefi",
     ]
@@ -412,6 +445,7 @@ def provision_vm_disk(cfg: Config) -> None:
         winfsp_msi = cfg.iso_dir / WINFSP_MSI
         virtiofs_exe = cfg.iso_dir / VIRTIOFS_EXE
         python_zip = cfg.iso_dir / PYTHON_ZIP
+        spice_tools_exe = cfg.iso_dir / SPICE_TOOLS_EXE
         missing_files = []
         for path, label in [
             (openssh_zip, "OpenSSH"), (winfsp_msi, "WinFsp"), (virtiofs_exe, "virtiofs"),
@@ -436,6 +470,8 @@ def provision_vm_disk(cfg: Config) -> None:
                 zf.write(virtiofs_exe, VIRTIOFS_EXE)
             if python_zip.exists():
                 zf.write(python_zip, PYTHON_ZIP)
+            if spice_tools_exe.exists():
+                zf.write(spice_tools_exe, SPICE_TOOLS_EXE)
 
         # Copy bootstrap.ps1 to temp dir
         bootstrap_src = _data_file("bootstrap.ps1")

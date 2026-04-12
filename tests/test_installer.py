@@ -16,6 +16,7 @@ from winbox.setup.installer import (
     download_virtio_iso,
     download_openssh,
     download_winfsp,
+    download_spice_tools,
     extract_virtiofs,
     build_unattend_image,
     create_disk,
@@ -218,6 +219,33 @@ class TestDownloads:
         result = download_winfsp(cfg)
         assert result == dest
         mock_run.assert_not_called()
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_spice_tools(self, mock_run, cfg):
+        dest = cfg.iso_dir / "spice-guest-tools.exe"
+        def fake_wget(*a, **kw):
+            dest.write_bytes(b"\x00" * 10_000_001)
+        mock_run.side_effect = fake_wget
+        result = download_spice_tools(cfg)
+        assert result == dest
+        mock_run.assert_called_once()
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_spice_tools_cached(self, mock_run, cfg):
+        dest = cfg.iso_dir / "spice-guest-tools.exe"
+        dest.write_bytes(b"\x00" * 10_000_001)
+        result = download_spice_tools(cfg)
+        assert result == dest
+        mock_run.assert_not_called()
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_spice_tools_truncated(self, mock_run, cfg):
+        dest = cfg.iso_dir / "spice-guest-tools.exe"
+        def fake_wget(*a, **kw):
+            dest.write_bytes(b"\x00" * 500)
+        mock_run.side_effect = fake_wget
+        with pytest.raises(RuntimeError, match="truncated"):
+            download_spice_tools(cfg)
 
     @patch("winbox.setup.installer.subprocess.run")
     def test_extract_virtiofs(self, mock_run, cfg):
