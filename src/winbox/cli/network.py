@@ -28,9 +28,40 @@ def net() -> None:
 @net.command("isolate")
 @click.pass_context
 def net_isolate(ctx: click.Context) -> None:
-    """Disconnect VM from the network (unplug the cable).
+    """Block internet by removing the default gateway.
 
-    Host-VM channels (guest agent, VirtIO-FS, SSH) stay up.
+    The NIC stays up, so Kali <-> VM on the libvirt subnet (guest agent,
+    VirtIO-FS, SSH, any IP-based tooling against 192.168.122.x targets)
+    still works. Only traffic via the default gateway is blocked.
+    For a full air-gap use `winbox net unplug` instead.
+    Undo with: winbox net connect
+    """
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    if vm.state() != VMState.RUNNING:
+        console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
+        raise SystemExit(1)
+
+    ga.exec_powershell(
+        "Remove-NetRoute -DestinationPrefix '0.0.0.0/0' -Confirm:$false "
+        "-ErrorAction SilentlyContinue",
+        timeout=15,
+    )
+    console.print("[green][+][/] Internet isolated — default gateway removed")
+    console.print("    Undo with: [bold]winbox net connect[/]")
+
+
+@net.command("unplug")
+@click.pass_context
+def net_unplug(ctx: click.Context) -> None:
+    """Unplug the VM's virtual NIC entirely (full air-gap).
+
+    Kills all IP traffic including Kali <-> VM. Guest agent and VirtIO-FS
+    stay up because they run over virtio-serial, not the NIC. For
+    internet-only isolation that keeps Kali <-> VM working, use
+    `winbox net isolate` instead.
     Undo with: winbox net connect
     """
     cfg: Config = ctx.obj["cfg"]
@@ -44,14 +75,14 @@ def net_isolate(ctx: click.Context) -> None:
         console.print("[red][-][/] Failed to set link down (no interface found?)")
         raise SystemExit(1)
 
-    console.print("[green][+][/] Network isolated — cable unplugged")
+    console.print("[green][+][/] NIC unplugged — VM is fully air-gapped")
     console.print("    Undo with: [bold]winbox net connect[/]")
 
 
 @net.command("connect")
 @click.pass_context
 def net_connect(ctx: click.Context) -> None:
-    """Reconnect VM to the network (plug the cable back in)."""
+    """Restore full network access (undo isolate or unplug)."""
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
@@ -60,22 +91,33 @@ def net_connect(ctx: click.Context) -> None:
         console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
         raise SystemExit(1)
 
-    if not vm.net_set_link("up"):
-        console.print("[red][-][/] Failed to set link up (no interface found?)")
-        raise SystemExit(1)
+    # If the NIC was unplugged, plug it back in first. Otherwise skip —
+    # `net isolate` leaves the link up so there's nothing to re-plug.
+    if vm.net_link_state() == "down":
+        console.print("[blue][*][/] Plugging NIC back in...")
+        if not vm.net_set_link("up"):
+            console.print("[red][-][/] Failed to set link up (no interface found?)")
+            raise SystemExit(1)
+        # Windows doesn't re-notice the cable by itself; bounce the adapter
+        # so the driver re-queries DHCP.
+        ga.exec_powershell(
+            "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
+            "-Confirm:$false",
+            timeout=30,
+        )
 
-    # Restart the adapter and renew DHCP — Windows doesn't auto-renew
-    # after a cable replug
+    # Full DHCP cycle. Plain /renew on a still-valid lease does a DHCPREQUEST
+    # that skips re-adding the default route, so a `net isolate` wouldn't get
+    # undone by /renew alone — /release forces a fresh DISCOVER.
     console.print("[blue][*][/] Renewing DHCP lease...")
-    result = ga.exec_powershell(
-        "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
-        "-Confirm:$false",
-        timeout=15,
-    )
-    if result.exitcode != 0:
-        console.print(f"[yellow][!][/] Adapter restart warning: {result.stderr.strip()}", markup=False)
-    # Wait for DHCP to assign an address
-    for _ in range(10):
+    try:
+        ga.exec("ipconfig /release", timeout=15)
+    except GuestAgentError:
+        pass  # ok if there's nothing to release
+    ga.exec("ipconfig /renew", timeout=30)
+
+    ip = None
+    for _ in range(15):
         ip = vm.ip()
         if ip:
             break
@@ -90,21 +132,43 @@ def net_connect(ctx: click.Context) -> None:
 @net.command("status")
 @click.pass_context
 def net_status(ctx: click.Context) -> None:
-    """Show VM network link state."""
+    """Show VM network state — link and internet reachability."""
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
+    ga = GuestAgent(cfg)
 
     if vm.state() != VMState.RUNNING:
         console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
         return
 
-    state = vm.net_link_state()
-    if state is None:
-        console.print("[yellow][!][/] Could not determine link state")
+    link = vm.net_link_state()
+    if link is None:
+        console.print("Link:     [yellow]unknown[/]")
+    else:
+        link_color = "green" if link == "up" else "red"
+        console.print(f"Link:     [{link_color}]{link}[/]")
+
+    # Can't probe routes if the link is down or GA is unreachable
+    if link != "up" or not ga.ping():
+        console.print("Internet: [red]blocked[/] (link down)")
         return
 
-    color = "green" if state == "up" else "red"
-    console.print(f"Network link: [{color}]{state}[/]")
+    # @(...) forces a collection so .Count works even when Get-NetRoute
+    # returns $null (no match) or a single object (PS unwraps single-element
+    # pipelines by default and $null.Count prints as empty string).
+    result = ga.exec_powershell(
+        "@(Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
+        "-ErrorAction SilentlyContinue).Count",
+        timeout=10,
+    )
+    if result.exitcode != 0 or not result.stdout.strip().isdigit():
+        console.print("Internet: [yellow]unknown[/]")
+        return
+
+    if int(result.stdout.strip()) > 0:
+        console.print("Internet: [green]reachable[/]")
+    else:
+        console.print("Internet: [red]isolated[/] (no default route)")
 
 
 # ─── dns ─────────────────────────────────────────────────────────────────────

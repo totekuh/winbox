@@ -719,27 +719,24 @@ class TestServiceTools:
         assert not script_path.exists()
 
 
-# ─── net_isolate / net_connect tools ─────────────────────────────────────────
+# ─── net_isolate / net_unplug / net_connect tools ───────────────────────────
 
 
 class TestNetTools:
-    def test_isolate(self, mock_mcp):
+    def test_isolate_removes_default_route(self, mock_mcp):
         from winbox.mcp import net_isolate
         ga, vm, cfg = mock_mcp
-        vm.net_set_link = MagicMock(return_value=True)
+        vm.net_set_link = MagicMock()
 
         result = net_isolate()
         assert "isolated" in result.lower()
-        vm.net_set_link.assert_called_once_with("down")
-
-    def test_connect(self, mock_mcp):
-        from winbox.mcp import net_connect
-        ga, vm, cfg = mock_mcp
-        vm.net_set_link = MagicMock(return_value=True)
-
-        result = net_connect()
-        assert "connected" in result.lower()
-        vm.net_set_link.assert_called_once_with("up")
+        # isolate must NOT touch the link — the whole point is to keep
+        # Kali <-> VM same-subnet traffic alive
+        vm.net_set_link.assert_not_called()
+        ga.exec_powershell.assert_called_once()
+        script = ga.exec_powershell.call_args[0][0]
+        assert "Remove-NetRoute" in script
+        assert "0.0.0.0/0" in script
 
     def test_isolate_vm_not_running(self, mock_mcp):
         from winbox.mcp import net_isolate
@@ -748,14 +745,84 @@ class TestNetTools:
 
         result = net_isolate()
         assert "not running" in result.lower()
+        ga.exec_powershell.assert_not_called()
 
-    def test_isolate_no_interface(self, mock_mcp):
-        from winbox.mcp import net_isolate
+    def test_unplug_sets_link_down(self, mock_mcp):
+        from winbox.mcp import net_unplug
+        ga, vm, cfg = mock_mcp
+        vm.net_set_link = MagicMock(return_value=True)
+
+        result = net_unplug()
+        assert "unplugged" in result.lower() or "air-gapped" in result.lower()
+        vm.net_set_link.assert_called_once_with("down")
+
+    def test_unplug_vm_not_running(self, mock_mcp):
+        from winbox.mcp import net_unplug
+        ga, vm, cfg = mock_mcp
+        vm.state.return_value = VMState.SHUTOFF
+
+        result = net_unplug()
+        assert "not running" in result.lower()
+
+    def test_unplug_no_interface(self, mock_mcp):
+        from winbox.mcp import net_unplug
         ga, vm, cfg = mock_mcp
         vm.net_set_link = MagicMock(return_value=False)
 
-        result = net_isolate()
+        result = net_unplug()
         assert "failed" in result.lower()
+
+    def test_connect_from_isolated_link_up(self, mock_mcp):
+        """Undo `net isolate`: link is already up, just re-DHCP."""
+        from winbox.mcp import net_connect
+        ga, vm, cfg = mock_mcp
+        vm.net_link_state = MagicMock(return_value="up")
+        vm.net_set_link = MagicMock()
+        vm.ip.return_value = "192.168.122.42"
+
+        result = net_connect()
+        assert "192.168.122.42" in result
+        # link is up → no need to flip it
+        vm.net_set_link.assert_not_called()
+        # Full release + renew cycle
+        cmds = [c[0][0] for c in ga.exec.call_args_list]
+        assert any("ipconfig /release" in c for c in cmds)
+        assert any("ipconfig /renew" in c for c in cmds)
+
+    def test_connect_from_unplugged_link_down(self, mock_mcp):
+        """Undo `net unplug`: link is down, must flip it first."""
+        from winbox.mcp import net_connect
+        ga, vm, cfg = mock_mcp
+        vm.net_link_state = MagicMock(return_value="down")
+        vm.net_set_link = MagicMock(return_value=True)
+        vm.ip.return_value = "192.168.122.42"
+
+        result = net_connect()
+        assert "192.168.122.42" in result
+        vm.net_set_link.assert_called_once_with("up")
+        # Restart-NetAdapter after link-up so DHCP re-queries
+        assert ga.exec_powershell.called
+        cmds = [c[0][0] for c in ga.exec.call_args_list]
+        assert any("ipconfig /release" in c for c in cmds)
+        assert any("ipconfig /renew" in c for c in cmds)
+
+    def test_connect_unplug_link_up_fails(self, mock_mcp):
+        from winbox.mcp import net_connect
+        ga, vm, cfg = mock_mcp
+        vm.net_link_state = MagicMock(return_value="down")
+        vm.net_set_link = MagicMock(return_value=False)
+
+        result = net_connect()
+        assert "failed" in result.lower()
+        ga.exec.assert_not_called()
+
+    def test_connect_vm_not_running(self, mock_mcp):
+        from winbox.mcp import net_connect
+        ga, vm, cfg = mock_mcp
+        vm.state.return_value = VMState.SHUTOFF
+
+        result = net_connect()
+        assert "not running" in result.lower()
 
 
 # ─── CLI command ────────────────────────────────────────────────────────────

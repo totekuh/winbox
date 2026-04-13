@@ -886,45 +886,73 @@ def service_start(name: str) -> str:
     return output or "(no output)"
 
 
-# ─── Tool 9: net_isolate / net_connect ──────────────────────────────────────
+# ─── Tool 9: net_isolate / net_unplug / net_connect ─────────────────────────
 
 @mcp.tool()
 def net_isolate() -> str:
-    """Disconnect the VM from the network (unplug the cable).
+    """Block internet on the VM by removing the default gateway.
 
-    Host-VM channels (guest agent, VirtIO-FS) stay up since they use
-    virtio-serial, not the network. Only the NIC is disconnected.
-    Undo with net_connect.
+    The NIC stays up, so Kali <-> VM on the libvirt subnet still works
+    (guest agent, VirtIO-FS, same-subnet IP traffic). Only traffic via
+    the default gateway is blocked. For a full NIC disconnect, use
+    net_unplug() instead. Undo with net_connect().
+    """
+    cfg, vm, ga = _get_state()
+    if vm.state() != VMState.RUNNING:
+        return f"VM is not running (state: {vm.state().value})"
+    ga.exec_powershell(
+        "Remove-NetRoute -DestinationPrefix '0.0.0.0/0' -Confirm:$false "
+        "-ErrorAction SilentlyContinue",
+        timeout=15,
+    )
+    return "Internet isolated — default gateway removed"
+
+
+@mcp.tool()
+def net_unplug() -> str:
+    """Unplug the VM's virtual NIC entirely (full air-gap).
+
+    Kills all IP traffic including Kali <-> VM. GA and VirtIO-FS stay
+    up over virtio-serial. For internet-only isolation that keeps
+    Kali <-> VM working, use net_isolate(). Undo with net_connect().
     """
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
     if not vm.net_set_link("down"):
         return "Failed to set link down (no interface found?)"
-    return "Network isolated — cable unplugged"
+    return "NIC unplugged — VM is fully air-gapped"
 
 
 @mcp.tool()
 def net_connect() -> str:
-    """Reconnect the VM to the network (plug the cable back in).
+    """Restore full network access (undo net_isolate or net_unplug).
 
-    Automatically restarts the adapter and renews DHCP.
+    Brings the NIC link up if needed, then runs a full DHCP cycle
+    (release + renew) to re-add the default gateway.
     """
     import time
 
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
-    if not vm.net_set_link("up"):
-        return "Failed to set link up (no interface found?)"
 
-    # Restart adapter + renew DHCP — Windows doesn't auto-renew after replug
-    ga.exec_powershell(
-        "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
-        "-Confirm:$false",
-        timeout=15,
-    )
-    for _ in range(10):
+    if vm.net_link_state() == "down":
+        if not vm.net_set_link("up"):
+            return "Failed to set link up (no interface found?)"
+        ga.exec_powershell(
+            "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
+            "-Confirm:$false",
+            timeout=30,
+        )
+
+    try:
+        ga.exec("ipconfig /release", timeout=15)
+    except GuestAgentError:
+        pass
+    ga.exec("ipconfig /renew", timeout=30)
+
+    for _ in range(15):
         ip = vm.ip()
         if ip:
             return f"Network connected — IP: {ip}"
