@@ -111,6 +111,7 @@ from winbox.cli.av import av  # noqa: E402
 from winbox.cli.applocker import applocker  # noqa: E402
 from winbox.cli.autologin import autologin  # noqa: E402
 from winbox.cli.msi import msi  # noqa: E402
+from winbox.cli.upload import upload  # noqa: E402
 from winbox.cli.mcp import mcp_cmd  # noqa: E402
 
 cli.add_command(up)
@@ -139,4 +140,5 @@ cli.add_command(av)
 cli.add_command(applocker)
 cli.add_command(autologin)
 cli.add_command(msi)
+cli.add_command(upload)
 cli.add_command(mcp_cmd)

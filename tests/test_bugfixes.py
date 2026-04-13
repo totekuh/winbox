@@ -1040,3 +1040,74 @@ class TestGAExecMonotonicDeadline:
         assert "elapsed += poll_interval" not in source
         assert "elapsed" not in source or "deadline" in source
         assert "time.monotonic()" in source
+
+
+# ─── Bug #21: GuestAgentError mid-exec showed raw traceback ──────────────
+
+
+class TestExecMidFlightGADisconnect:
+    """When the guest agent disconnects mid-execution (VM rebooted, crashed,
+    paused), run_command raises GuestAgentError. Previously this propagated
+    all the way out of click, showing a raw Python traceback. The exec_cmd
+    handler now catches it and prints a friendly message with VM state hint."""
+
+    def test_ga_disconnect_exits_cleanly(self, runner, mock_env):
+        from winbox.cli import cli
+        from winbox.vm.guest import GuestAgentError
+
+        with patch(
+            "winbox.cli.exec.run_command",
+            side_effect=GuestAgentError(
+                "Guest agent command failed: error: Guest agent is not responding: "
+                "QEMU guest agent is not connected"
+            ),
+        ):
+            result = runner.invoke(cli, ["exec", "whoami"])
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "disconnected mid-execution" in result.output
+        # Actual GA error text should appear in the output for debugging
+        assert "not connected" in result.output
+
+    def test_ga_disconnect_vm_not_running_hints_winbox_up(self, runner, mock_env):
+        from winbox.cli import cli
+        from winbox.vm.guest import GuestAgentError
+
+        mock_env._vm.state.return_value = VMState.SHUTOFF
+
+        with patch(
+            "winbox.cli.exec.run_command",
+            side_effect=GuestAgentError("Guest agent command failed: connection reset"),
+        ):
+            result = runner.invoke(cli, ["exec", "whoami"])
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "shut off" in result.output.lower()
+        assert "winbox up" in result.output
+
+    def test_ga_disconnect_vm_still_running_hints_reboot(self, runner, mock_env):
+        from winbox.cli import cli
+        from winbox.vm.guest import GuestAgentError
+
+        mock_env._vm.state.return_value = VMState.RUNNING
+
+        with patch(
+            "winbox.cli.exec.run_command",
+            side_effect=GuestAgentError("Guest agent command failed: timeout"),
+        ):
+            result = runner.invoke(cli, ["exec", "whoami"])
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "winbox up --reboot" in result.output
+
+    def test_successful_exec_unaffected(self, runner, mock_env):
+        from winbox.cli import cli
+
+        with patch("winbox.cli.exec.run_command", return_value=0) as mock_run:
+            result = runner.invoke(cli, ["exec", "whoami"])
+
+        assert result.exit_code == 0
+        mock_run.assert_called_once()

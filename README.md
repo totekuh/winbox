@@ -33,15 +33,19 @@ PS C:\Windows\system32>
 - **Transparent execution** — run `.exe` files as if they were native Kali commands
 - **Auto-start** — VM boots on demand, use `winbox suspend` to save state
 - **Shared filesystem** — `~/.winbox/shared/tools/` maps to `Z:\tools\` in Windows via VirtIO-FS
+- **One-shot upload & MSI** — `winbox upload` stages files on Z:\, `winbox msi` installs an MSI and cleans up
 - **Background jobs** — `--bg` for long-running tools, `--log` for persistent output
 - **Interactive shells** — ConPTY SYSTEM shell with resize support, or SSH into PowerShell
 - **Network integration** — VM traffic is NAT'd through Kali; push DNS, manage hosts file, join AD domains
-- **Snapshots** — save and restore VM state
+- **Snapshots** — save and restore VM state (auto-shuts VM down, bare `winbox snapshot` lists)
 - **AV toggle** — disable/enable Windows Defender on demand (`winbox av disable/enable`)
 - **AppLocker** — enable AppLocker with default rules for bypass testing
+- **Autologin** — persistent Administrator auto-login that survives reboots on Server 2022
 - **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
-- **MCP server** — expose VM tools to AI agents (Claude Code) for assisted vulnerability research
+- **MCP server** — 20 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including a session-based named-pipe broker
+- **SPICE display** — clipboard sharing and dynamic resize via virt-manager (`winbox vnc`)
+- **Python in the guest** — Python 3.13 installed during setup (pip, PATH, py.exe launcher) for MCP-driven research
 - **No VM internet needed for setup** — all tools and dependencies are staged from the host side
 
 ## Prerequisites
@@ -64,7 +68,7 @@ Required:
 
 Optional:
 - `sshpass` — auto-auth for `winbox ssh` (falls back to manual password entry)
-- `virt-manager` — required for `winbox vnc` (VM display)
+- `virt-manager` — required for `winbox vnc` (VM display — SPICE + QXL with clipboard/resize)
 
 ## Installation
 
@@ -125,6 +129,19 @@ winbox tools list
 winbox tools remove Rubeus.exe
 ```
 
+### One-shot Uploads and MSI Installs
+
+For files that shouldn't live permanently in the tools dir:
+
+```bash
+winbox upload payload.exe                         # stage at Z:\payload.exe
+winbox upload payload.exe C:\Windows\Temp\p.exe   # also copy into the VM path
+
+winbox msi VMware-tools.msi ADDLOCAL=ALL /norestart   # extra args pass through to msiexec
+```
+
+Both stage through the VirtIO-FS share and clean up on failure. `winbox msi` treats exit code 3010 (reboot required) as success.
+
 ### Network
 
 ```bash
@@ -154,17 +171,19 @@ winbox domain leave
 
 ```bash
 winbox up                    # start or resume
+winbox up --reboot           # graceful shutdown + start in one command
 winbox down                  # graceful shutdown
 winbox suspend               # save state to disk (instant resume)
 winbox status                # state, IP, disk usage, tool/loot counts
-winbox destroy -y            # delete VM and all storage
+winbox destroy -y            # delete VM and all storage (clears jobs.json too)
 winbox provision             # re-run provisioning script
 ```
 
 ### Snapshots
 
 ```bash
-winbox snapshot pre-attack
+winbox snapshot              # list existing snapshots
+winbox snapshot pre-attack   # create named snapshot (auto-shuts VM down first)
 # ... do your thing ...
 winbox restore pre-attack    # revert to clean state
 ```
@@ -175,11 +194,21 @@ For testing macro-based payloads, install Office on a Desktop Experience VM:
 
 ```bash
 winbox setup --desktop -y    # build VM with Desktop Experience
-winbox autologin enable      # enable auto-login as Administrator
+winbox autologin enable      # enable auto-login as Administrator (persistent across reboots)
 winbox office                # install Word, Excel, PowerPoint with macros enabled
 ```
 
 Requires a Microsoft 365 subscription. Macros are enabled (VBAWarnings=1) for Word, Excel, and PowerPoint.
+
+### Persistent Autologin
+
+```bash
+winbox autologin enable      # writes all 6 Winlogon+PasswordLess keys Server 2022 needs
+winbox autologin status
+winbox autologin disable
+```
+
+Unlike the old 3-key approach, this actually survives reboots on Server 2022 (which otherwise silently wipes `DefaultPassword` on first boot without `ForceAutoLogon=1` and the `PasswordLess\Device\DevicePasswordLessBuildVersion=0` gate).
 
 ### AppLocker
 
@@ -212,7 +241,7 @@ winbox binfmt status
 
 ### MCP Server (AI-assisted vulnerability research)
 
-winbox exposes an MCP server so AI agents (Claude Code, etc.) can interact with the Windows VM directly — run Python code, send IOCTLs to drivers, query/set registry, list processes.
+winbox exposes an MCP server so AI agents (Claude Code, etc.) can interact with the Windows VM directly — run Python code, send IOCTLs to drivers, query/set registry, list processes, talk to named pipes.
 
 **Install:**
 
@@ -226,7 +255,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools:**
+**Available tools (20):**
 
 | Tool | Description |
 |------|-------------|
@@ -243,11 +272,17 @@ claude mcp add winbox -- winbox mcp
 | `service_stop(name)` | Stop a Windows service |
 | `net_isolate()` | Disconnect VM from network (host-VM channels stay up) |
 | `net_connect()` | Reconnect VM to network (restarts adapter, renews DHCP) |
-| `pipe_list(filter?)` | Enumerate named pipes matching a pattern |
-| `pipe_info(name)` | Get DACL/SDDL, pipe mode, buffer sizes, owner for a pipe |
-| `pipe_connect(name, access?)` | Open a handle to a pipe and return result (access denied = useful info) |
+| `pipe_list(filter?)` | Enumerate named pipes matching a pattern (JSON array) |
+| `pipe_info(name)` | JSON: DACL/SDDL, mode, buffer sizes, max instances for a pipe |
+| `pipe_connect(name, access?)` | One-shot pipe handle open; returns result or Win32 error |
+| `pipe_open(name, access)` | Start a session — spawns a detached broker in the VM that holds the handle open |
+| `pipe_send(session_id, data_hex)` | WriteFile through the session broker |
+| `pipe_recv(session_id, size, timeout?)` | ReadFile through the session broker |
+| `pipe_close(session_id)` | Close session + taskkill the broker |
 
-**Requires** Python installed in the VM (see roadmap).
+The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker process per session (spawned as DETACHED_PROCESS | CREATE_NO_WINDOW inside the VM). IPC happens via `cmd.json`/`result.json` files on the VirtIO-FS share, so there's no VM round-trip on the polling path. This matters for protocols where a write on one handle must be answered on the same handle (stateless `send`/`recv` open fresh handles and never see each other's messages).
+
+**Requires** Python installed in the VM — this is now done automatically as part of `winbox setup`.
 
 ## Architecture
 
@@ -259,10 +294,12 @@ Kali Linux
 │   ├── SSH ────────────────> OpenSSH Server (interactive PowerShell)
 │   └── TCP listener ───────< ConPTY reverse shell (SYSTEM, resizable PTY)
 │
-└── Windows Server Core 2022 (headless QEMU/KVM)
+└── Windows Server Core 2022 (headless QEMU/KVM, SPICE + QXL display)
     ├── QEMU Guest Agent          ← primary exec channel
     ├── VirtioFsSvc (WinFsp)      ← auto-mounts Z:\ on boot
     ├── OpenSSH Server            ← interactive sessions
+    ├── Python 3.13               ← required for MCP Python/ioctl/mem_read tools
+    ├── spice-guest-tools         ← QXL WDDM driver + vdservice (clipboard/resize)
     ├── Defender disabled         ← no AV interference
     ├── Firewall disabled         ← no port blocking
     └── NAT via libvirt           ← reaches anything Kali can reach
@@ -302,7 +339,8 @@ VIRTIO_ISO_URL=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
 ```
 ~/.winbox/
 ├── config                              # user config overrides (optional)
-├── jobs.json                           # background job state
+├── jobs.json                           # background job state (cleared on winbox destroy)
+├── .setup.lock                         # fcntl lock — serializes concurrent winbox setup
 ├── id_ed25519 / .pub                   # SSH keypair (generated during setup)
 ├── disk.qcow2                          # VM disk image
 ├── iso/
@@ -311,9 +349,12 @@ VIRTIO_ISO_URL=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
 │   ├── OpenSSH-Win64.zip               # bundled OpenSSH
 │   ├── winfsp.msi                      # WinFsp installer
 │   ├── virtiofs.exe                    # VirtIO-FS service binary
+│   ├── python-3.13.13-amd64.exe        # Python 3.13 installer for the guest
+│   ├── spice-guest-tools.exe           # SPICE guest tools (QXL driver + vdagent)
 │   └── unattend.img                    # built during setup
 └── shared/                             # VirtIO-FS share <=> Z:\ in VM
     ├── tools/                          # your pentest tools
+    ├── .msi/                           # staging dir for winbox msi (cleaned up per-run)
     └── loot/                           # output directory
         └── .jobs/                      # background job log files
 ```

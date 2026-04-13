@@ -10,7 +10,7 @@ import click
 from winbox.cli import console, ensure_running
 from winbox.config import Config
 from winbox.exec import run_command, run_command_bg
-from winbox.vm import GuestAgent
+from winbox.vm import GuestAgent, GuestAgentError
 from winbox.exec import open_shell
 from winbox.vm import VM
 
@@ -55,7 +55,22 @@ def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int, bg: boo
             console.print(f"    Retrieve output: winbox jobs output {job.id}")
         return
 
-    exitcode = run_command(cfg, ga, exe, args, timeout=timeout)
+    try:
+        exitcode = run_command(cfg, ga, exe, args, timeout=timeout)
+    except GuestAgentError as e:
+        # Mid-execution GA disconnect (VM rebooted, crashed, or paused).
+        # The command may or may not have completed on the guest side —
+        # there's no way to recover state from here. Surface it cleanly
+        # instead of letting the traceback escape.
+        console.print("[red][-][/] Guest agent disconnected mid-execution:")
+        console.print(f"    {e}", markup=False, highlight=False)
+        from winbox.vm import VMState
+        state = vm.state()
+        if state != VMState.RUNNING:
+            console.print(f"    VM state: [yellow]{state.value}[/] — try [bold]winbox up[/] and re-run")
+        else:
+            console.print("    VM is still running but GA is unreachable — try [bold]winbox up --reboot[/]")
+        raise SystemExit(1)
     raise SystemExit(exitcode)
 
 
