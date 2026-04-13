@@ -88,7 +88,51 @@ def _ensure_sshd_running(ga: GuestAgent) -> None:
 # ─── CLI Group ───────────────────────────────────────────────────────────────
 
 
-@click.group()
+class GroupedCli(click.Group):
+    """Click Group that renders commands in labeled sections in --help.
+
+    New top-level commands that aren't listed in SECTIONS fall into an "Other"
+    bucket — that's a loud signal to add them here rather than a silent drop.
+    """
+
+    SECTIONS: list[tuple[str, list[str]]] = [
+        ("VM Lifecycle", ["setup", "up", "down", "suspend", "destroy", "status", "snapshot", "restore", "provision"]),
+        ("Execute", ["exec", "shell", "ssh", "vnc", "jobs", "msi"]),
+        ("Files", ["tools", "upload", "iso"]),
+        ("Network", ["net", "dns", "hosts", "domain"]),
+        ("Target", ["av", "applocker", "autologin"]),
+        ("Integrations", ["binfmt", "mcp", "office"]),
+    ]
+
+    def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        commands: dict[str, click.Command] = {}
+        for name in self.list_commands(ctx):
+            cmd = self.get_command(ctx, name)
+            if cmd is None or cmd.hidden:
+                continue
+            commands[name] = cmd
+
+        listed: set[str] = set()
+        for section, names in self.SECTIONS:
+            rows: list[tuple[str, str]] = []
+            for name in names:
+                cmd = commands.get(name)
+                if cmd is None:
+                    continue
+                listed.add(name)
+                rows.append((name, cmd.get_short_help_str(limit=80)))
+            if rows:
+                with formatter.section(section):
+                    formatter.write_dl(rows)
+
+        leftover = [n for n in commands if n not in listed]
+        if leftover:
+            rows = [(n, commands[n].get_short_help_str(limit=80)) for n in leftover]
+            with formatter.section("Other"):
+                formatter.write_dl(rows)
+
+
+@click.group(cls=GroupedCli)
 @click.version_option(package_name="winbox")
 @click.pass_context
 def cli(ctx: click.Context) -> None:

@@ -85,6 +85,21 @@ winbox iso download          # ~4.7 GB, supports resume
 winbox setup -y              # builds and provisions the VM
 ```
 
+## Commands
+
+`winbox --help` groups commands into six sections:
+
+```
+VM Lifecycle   setup  up  down  suspend  destroy  status  snapshot  restore  provision
+Execute        exec  shell  ssh  vnc  jobs  msi
+Files          tools  upload  iso
+Network        net  dns  hosts  domain
+Target         av  applocker  autologin     (bidirectional — flip on to test bypass tools)
+Integrations   binfmt  mcp  office
+```
+
+Each command supports `--help` for its own flags and subcommands.
+
 ## Usage
 
 ### Executing Commands
