@@ -199,6 +199,44 @@ try {
     Write-Host "[!] spice-guest-tools install failed: $_"
 }
 
+# --- x64dbg (debugger - extract to C:\Tools\x64dbg) ---
+# PS 5.1's Expand-Archive blows up on this zip (pluginsdk/ has many small
+# files and the recovery path tries to Remove-Item files it hasn't written
+# yet, which raises a pipeline-stop that escapes the outer try/catch).
+# .NET's ZipFile is faster and doesn't have that bug.
+Write-Host "[*] Installing x64dbg..."
+$x64dbgZip = "$provDir\x64dbg.zip"
+try {
+    if (Test-Path $x64dbgZip) {
+        $x64dbgDir = "C:\Tools\x64dbg"
+        if (Test-Path $x64dbgDir) {
+            Remove-Item $x64dbgDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($x64dbgZip, $x64dbgDir)
+
+        # Add release\x32 and release\x64 to system PATH so x32dbg/x64dbg are runnable
+        $x32Bin = "$x64dbgDir\release\x32"
+        $x64Bin = "$x64dbgDir\release\x64"
+        if (Test-Path $x64Bin) {
+            $machPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::Machine)
+            foreach ($bin in @($x32Bin, $x64Bin)) {
+                if ((Test-Path $bin) -and ($machPath -notlike "*$bin*")) {
+                    $machPath = "$machPath;$bin"
+                }
+            }
+            [Environment]::SetEnvironmentVariable("Path", $machPath, [EnvironmentVariableTarget]::Machine)
+            Write-Host "[+] x64dbg installed at $x64dbgDir"
+        } else {
+            Write-Host "[!] x64dbg extracted but release\x64 not found - unexpected zip layout"
+        }
+    } else {
+        Write-Host "[!] x64dbg zip not found at $x64dbgZip - skipping"
+    }
+} catch {
+    Write-Host "[!] x64dbg install failed: $_"
+}
+
 # --- Skip Windows Boot Manager menu (boot default immediately) ---
 Write-Host "[*] Disabling boot manager menu..."
 try {
@@ -223,3 +261,9 @@ try {
 }
 
 Write-Host "[+] winbox provisioning complete"
+
+# --- Sentinel: proves provision.ps1 ran end-to-end ---
+# boot_for_provisioning in installer.py checks for this file after the
+# post-provision reboot. Without it, bootstrap.ps1's finally-block shutdown
+# would mask any parse error or crash and leave us with a broken VM.
+Set-Content -Path C:\winbox-provisioned.ok -Value "ok" -Force -ErrorAction SilentlyContinue

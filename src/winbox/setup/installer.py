@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from winbox.vm import VM, GuestAgent
+from winbox.vm import VM, GuestAgent, GuestAgentError
 
 if TYPE_CHECKING:
     from winbox.config import Config
@@ -216,6 +216,15 @@ SPICE_TOOLS_URL = (
 )
 SPICE_TOOLS_EXE = "spice-guest-tools.exe"
 
+X64DBG_URL = (
+    "https://github.com/x64dbg/x64dbg/releases/download/2025.08.19/"
+    "snapshot_2025-08-19_19-40.zip"
+)
+X64DBG_ZIP = "x64dbg.zip"
+
+PROVISION_SENTINEL = "C:\\winbox-provisioned.ok"
+BOOTSTRAP_LOG = "C:\\winbox-bootstrap.log"
+
 
 def download_openssh(cfg: Config) -> Path:
     """Download Win32-OpenSSH zip if not cached. Returns path to zip."""
@@ -286,6 +295,24 @@ def download_spice_tools(cfg: Config) -> Path:
     if not dest.exists() or dest.stat().st_size < 10_000_000:
         raise RuntimeError(f"spice-guest-tools download appears truncated: {dest}")
     console.print("[green][+][/] spice-guest-tools downloaded")
+    return dest
+
+
+def download_x64dbg(cfg: Config) -> Path:
+    """Download the x64dbg snapshot zip if not cached."""
+    dest = cfg.iso_dir / X64DBG_ZIP
+    if dest.exists() and dest.stat().st_size > 20_000_000:
+        console.print("[green][+][/] x64dbg zip cached")
+        return dest
+
+    console.print("[blue][*][/] Downloading x64dbg...")
+    subprocess.run(
+        ["wget", "-q", "--show-progress", "-O", str(dest), X64DBG_URL],
+        check=True,
+    )
+    if not dest.exists() or dest.stat().st_size < 20_000_000:
+        raise RuntimeError(f"x64dbg download appears truncated: {dest}")
+    console.print("[green][+][/] x64dbg downloaded")
     return dest
 
 
@@ -446,6 +473,7 @@ def provision_vm_disk(cfg: Config) -> None:
         virtiofs_exe = cfg.iso_dir / VIRTIOFS_EXE
         python_exe = cfg.iso_dir / PYTHON_EXE
         spice_tools_exe = cfg.iso_dir / SPICE_TOOLS_EXE
+        x64dbg_zip = cfg.iso_dir / X64DBG_ZIP
         missing_files = []
         for path, label in [
             (openssh_zip, "OpenSSH"), (winfsp_msi, "WinFsp"), (virtiofs_exe, "virtiofs"),
@@ -472,6 +500,8 @@ def provision_vm_disk(cfg: Config) -> None:
                 zf.write(python_exe, PYTHON_EXE)
             if spice_tools_exe.exists():
                 zf.write(spice_tools_exe, SPICE_TOOLS_EXE)
+            if x64dbg_zip.exists():
+                zf.write(x64dbg_zip, X64DBG_ZIP)
 
         # Copy bootstrap.ps1 to temp dir
         bootstrap_src = _data_file("bootstrap.ps1")
@@ -496,9 +526,12 @@ def boot_for_provisioning(cfg: Config) -> None:
     VirtIO-FS is configured in the VM definition but WinFsp isn't installed yet,
     so provisioning reads from C:\\Provision\\ (injected by virt-customize).
     The provision script installs WinFsp + VirtioFsSvc so Z: works after setup.
-    """
-    from winbox.vm import GuestAgent
 
+    After the bootstrap shutdown we boot the VM one more time and verify the
+    provision sentinel exists — bootstrap.ps1's finally-block shutdown runs
+    regardless of whether provision.ps1 parse-errored or crashed, so "VM shut
+    down cleanly" is not by itself proof that anything actually got installed.
+    """
     console.print("[blue][*][/] Booting VM for provisioning...")
     vm = VM(cfg)
     vm.start()
@@ -525,7 +558,74 @@ def boot_for_provisioning(cfg: Config) -> None:
             pass
         raise RuntimeError("Provisioning timed out")
 
+    _verify_provisioning(cfg, vm, ga)
     console.print("[green][+][/] Provisioning complete")
+
+
+def _verify_provisioning(cfg: Config, vm: VM, ga: GuestAgent) -> None:
+    """Boot the VM once more and assert provision.ps1 actually finished.
+
+    On failure, dumps the bootstrap log from inside the VM so the user sees
+    the actual PowerShell error. Shuts the VM back down before returning so
+    the caller can create the clean snapshot.
+    """
+    console.print("[blue][*][/] Booting VM to verify provisioning...")
+    vm.start()
+    try:
+        ga.wait(timeout=180)
+    except GuestAgentError as e:
+        raise RuntimeError(
+            f"VM came back up but guest agent is unreachable: {e}"
+        ) from e
+
+    sentinel_check = ga.exec(
+        f"if exist {PROVISION_SENTINEL} (echo OK) else (echo MISSING)",
+        timeout=30,
+    )
+
+    if "OK" in sentinel_check.stdout:
+        console.print("[green][+][/] Provisioning sentinel verified")
+        _shutdown_and_wait(vm, ga)
+        return
+
+    console.print("[red][-][/] Provisioning sentinel missing — provision.ps1 did not finish")
+    console.print("[blue][*][/] Dumping bootstrap log from VM:")
+    console.print("─" * 60)
+    try:
+        log = ga.exec(f"type {BOOTSTRAP_LOG}", timeout=30)
+        if log.stdout:
+            console.print(log.stdout, markup=False, highlight=False, end="")
+        else:
+            console.print("[yellow](bootstrap log is empty)[/]")
+    except GuestAgentError:
+        console.print("[yellow](could not read bootstrap log)[/]")
+    console.print("─" * 60)
+
+    # Best-effort shutdown before bailing so we don't leave a running VM behind
+    try:
+        _shutdown_and_wait(vm, ga)
+    except Exception:
+        try:
+            vm.force_stop()
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        "Provisioning did not complete — see bootstrap log above. "
+        "Fix the underlying issue and re-run `winbox setup -y`."
+    )
+
+
+def _shutdown_and_wait(vm: VM, ga: GuestAgent, timeout: int = 300) -> None:
+    """Ask the guest to shut down and wait for the VM to reach SHUTOFF."""
+    console.print("[blue][*][/] Shutting VM down...")
+    try:
+        ga.shutdown()
+    except GuestAgentError:
+        pass  # expected — VM dies before GA can reply
+    if not vm.wait_shutdown(timeout=timeout):
+        console.print("[yellow][!][/] VM did not shut down in time, force-stopping")
+        vm.force_stop()
 
 
 def create_clean_snapshot(cfg: Config) -> None:

@@ -12,6 +12,8 @@ from winbox.setup.installer import (
     PYTHON_EXE,
     PYTHON_URL,
     REQUIRED_TOOLS,
+    X64DBG_URL,
+    X64DBG_ZIP,
     check_prereqs,
     _find_mkisofs,
     create_clean_snapshot,
@@ -22,6 +24,7 @@ from winbox.setup.installer import (
     download_winfsp,
     download_python,
     download_spice_tools,
+    download_x64dbg,
     extract_virtiofs,
     build_unattend_image,
     create_disk,
@@ -283,6 +286,40 @@ class TestDownloads:
         mock_run.side_effect = fake_wget
         with pytest.raises(RuntimeError, match="truncated"):
             download_spice_tools(cfg)
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_x64dbg(self, mock_run, cfg):
+        dest = cfg.iso_dir / X64DBG_ZIP
+        def fake_wget(*a, **kw):
+            dest.write_bytes(b"\x00" * 25_000_000)
+        mock_run.side_effect = fake_wget
+        result = download_x64dbg(cfg)
+        assert result == dest
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert "wget" in args
+        assert X64DBG_URL in args
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_x64dbg_cached(self, mock_run, cfg):
+        dest = cfg.iso_dir / X64DBG_ZIP
+        dest.write_bytes(b"\x00" * 25_000_000)
+        result = download_x64dbg(cfg)
+        assert result == dest
+        mock_run.assert_not_called()
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_x64dbg_truncated(self, mock_run, cfg):
+        dest = cfg.iso_dir / X64DBG_ZIP
+        def fake_wget(*a, **kw):
+            dest.write_bytes(b"\x00" * 500)
+        mock_run.side_effect = fake_wget
+        with pytest.raises(RuntimeError, match="truncated"):
+            download_x64dbg(cfg)
+
+    def test_x64dbg_url_is_github_release(self):
+        assert X64DBG_URL.startswith("https://github.com/x64dbg/x64dbg/releases/")
+        assert X64DBG_URL.endswith(".zip")
 
     @patch("winbox.setup.installer.subprocess.run")
     def test_extract_virtiofs(self, mock_run, cfg):

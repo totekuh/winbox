@@ -1111,3 +1111,39 @@ class TestExecMidFlightGADisconnect:
 
         assert result.exit_code == 0
         mock_run.assert_called_once()
+
+
+class TestProvisionPs1NonAsciiInStrings:
+    """Bug: an em dash inside a PowerShell string literal in provision.ps1
+    broke the entire script. The file has no BOM, so PowerShell on Windows
+    read it as Windows-1252; the em dash's UTF-8 bytes (E2 80 94) decoded to
+    `â€"` and the trailing U+201D was treated as a string terminator,
+    failing to parse the whole file. Nothing in provision.ps1 ever executed,
+    but bootstrap.ps1's `finally { Stop-Computer }` still shut the VM down,
+    so setup declared success on a blank system (no Python, no VirtIO-FS,
+    no Z:\\ drive).
+
+    Guard: any non-ASCII byte outside a `#` comment in provision.ps1 is a
+    latent version of the same trap.
+    """
+
+    def test_no_non_ascii_outside_comments(self):
+        import importlib.resources
+
+        path = importlib.resources.files("winbox.data").joinpath("provision.ps1")
+        text = Path(str(path)).read_text(encoding="utf-8")
+
+        offenders = []
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            for col, ch in enumerate(line, 1):
+                if ord(ch) > 127:
+                    offenders.append(f"line {lineno} col {col}: {ch!r} (U+{ord(ch):04X})")
+                    break
+
+        assert not offenders, (
+            "provision.ps1 has non-ASCII chars outside `#` comments — "
+            "PowerShell (no BOM) will misdecode them as Windows-1252 and "
+            "may break parsing. Offenders:\n  " + "\n  ".join(offenders)
+        )
