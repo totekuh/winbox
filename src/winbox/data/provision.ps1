@@ -184,21 +184,6 @@ try {
     Write-Host "[!] Python install failed: $_"
 }
 
-# --- spice-guest-tools (QXL display driver + vdagent for clipboard sharing) ---
-Write-Host "[*] Installing spice-guest-tools..."
-$spiceExe = "$provDir\spice-guest-tools.exe"
-try {
-    if (Test-Path $spiceExe) {
-        # NSIS installer — /S = silent. Installs QXL WDDM driver + vdservice.
-        $proc = Start-Process -FilePath $spiceExe -ArgumentList "/S" -Wait -PassThru -NoNewWindow
-        Write-Host "[+] spice-guest-tools installed (exit code: $($proc.ExitCode))"
-    } else {
-        Write-Host "[!] spice-guest-tools.exe not found at $spiceExe - clipboard sharing will not work"
-    }
-} catch {
-    Write-Host "[!] spice-guest-tools install failed: $_"
-}
-
 # --- x64dbg (debugger - extract to C:\Tools\x64dbg) ---
 # PS 5.1's Expand-Archive blows up on this zip (pluginsdk/ has many small
 # files and the recovery path tries to Remove-Item files it hasn't written
