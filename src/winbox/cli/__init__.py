@@ -101,7 +101,7 @@ class GroupedCli(click.Group):
         ("Files", ["tools", "upload", "iso"]),
         ("Network", ["net", "dns", "hosts", "domain"]),
         ("Target", ["av", "applocker", "autologin"]),
-        ("Integrations", ["binfmt", "mcp", "office"]),
+        ("Integrations", ["binfmt", "mcp", "kdbg", "office"]),
     ]
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
@@ -157,6 +157,7 @@ from winbox.cli.autologin import autologin  # noqa: E402
 from winbox.cli.msi import msi  # noqa: E402
 from winbox.cli.upload import upload  # noqa: E402
 from winbox.cli.mcp import mcp_cmd  # noqa: E402
+from winbox.cli.kdbg import kdbg  # noqa: E402
 
 cli.add_command(up)
 cli.add_command(down)
@@ -186,3 +187,4 @@ cli.add_command(autologin)
 cli.add_command(msi)
 cli.add_command(upload)
 cli.add_command(mcp_cmd)
+cli.add_command(kdbg)
