@@ -7,6 +7,8 @@ $ErrorActionPreference = "Continue"
 
 Write-Host "[*] winbox provisioning started"
 
+$script:ProvisionFailed = $false
+
 # Determine where our files are (firstboot vs re-provision)
 if (Test-Path "C:\Provision\provision.ps1") {
     $provDir = "C:\Provision"
@@ -116,8 +118,26 @@ $winfspMsi = "$provDir\winfsp.msi"
 try {
     # Install WinFsp (user-mode filesystem framework required by VirtIO-FS)
     Write-Host "[*] Installing WinFsp..."
-    $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$winfspMsi`" /qn /norestart INSTALLLEVEL=1000" -Wait -PassThru -NoNewWindow
+    $winfspBat = "C:\winbox-winfsp-install.bat"
+    $winfspLog = "C:\winbox-winfsp-install.log"
+    $batLines = @(
+        "@echo off",
+        "msiexec.exe /i `"$winfspMsi`" /qn /norestart INSTALLLEVEL=1000 > `"$winfspLog`" 2>&1"
+    )
+    Set-Content -Path $winfspBat -Value $batLines -Encoding ASCII
+    $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $winfspBat `
+        -Wait -PassThru -WindowStyle Hidden
+    Remove-Item $winfspBat -Force -ErrorAction SilentlyContinue
     Write-Host "[+] WinFsp installed (exit code: $($proc.ExitCode))"
+    if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+        if (Test-Path $winfspLog) {
+            Write-Host "--- winfsp-install.log ---"
+            Get-Content $winfspLog | ForEach-Object { Write-Host $_ }
+            Write-Host "--- end winfsp-install.log ---"
+        }
+        $script:ProvisionFailed = $true
+        Write-Host "[!] WinFsp installer failed - marking provisioning as failed"
+    }
 
     # Find virtiofs.exe - bundled in provision payload or already installed
     $viofsExe = $null
@@ -160,28 +180,50 @@ try {
     Write-Host "[!] VirtIO-FS setup error: $_"
 }
 
-# --- Python (regular installer — pip, tkinter, py.exe, registry) ---
+# --- Python (regular installer - pip, py.exe, registry) ---
+# Same pipeline-stopped trap as spice-guest-tools (commit 3fef916): running the
+# Python 3.13 installer under `Start-Process -NoNewWindow -Wait` intermittently
+# kills PowerShell's transcript pipeline mid-install with
+# "TerminatingError: The pipeline has been stopped", which escapes try/catch
+# and aborts provision.ps1 before the sentinel is written.
+#
+# Fix: write a .bat wrapper in a space-free path, invoke it via a hidden
+# cmd.exe with CREATE_NEW_CONSOLE semantics (-WindowStyle Hidden, NOT
+# -NoNewWindow). The child console is fully detached from PowerShell's
+# stdin/stdout/stderr, so nothing the installer emits can race the PS
+# transcript. The .bat wrapper avoids `cmd /c`'s rule-2 quote stripping
+# (more than 2 quotes + `&`/`>` -> first and last `"` get stripped,
+# mangling the exe path) and PS 5.1's buggy ArgumentList quoting.
 Write-Host "[*] Installing Python..."
 $pythonExe = "$provDir\python-3.13.13-amd64.exe"
+$pythonLog = "C:\winbox-python-install.log"
+$pythonBat = "C:\winbox-python-install.bat"
 try {
     if (Test-Path $pythonExe) {
-        $args = @(
-            "/quiet",
-            "InstallAllUsers=1",
-            "PrependPath=1",
-            "Include_pip=1",
-            "Include_tcltk=0",
-            "Include_doc=0",
-            "Include_test=0",
-            "CompileAll=0"
+        $batLines = @(
+            "@echo off",
+            "`"$pythonExe`" /quiet InstallAllUsers=1 PrependPath=1 Include_pip=1 Include_tcltk=0 Include_doc=0 Include_test=0 CompileAll=0 > `"$pythonLog`" 2>&1"
         )
-        $proc = Start-Process -FilePath $pythonExe -ArgumentList $args -Wait -PassThru -NoNewWindow
+        Set-Content -Path $pythonBat -Value $batLines -Encoding ASCII
+        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $pythonBat `
+            -Wait -PassThru -WindowStyle Hidden
         Write-Host "[+] Python installed (exit code: $($proc.ExitCode))"
+        if ($proc.ExitCode -ne 0) {
+            if (Test-Path $pythonLog) {
+                Write-Host "--- python-install.log ---"
+                Get-Content $pythonLog | ForEach-Object { Write-Host $_ }
+                Write-Host "--- end python-install.log ---"
+            }
+            $script:ProvisionFailed = $true
+            Write-Host "[!] Python installer failed - marking provisioning as failed"
+        }
     } else {
         Write-Host "[!] Python installer not found at $pythonExe - skipping"
     }
 } catch {
     Write-Host "[!] Python install failed: $_"
+} finally {
+    Remove-Item $pythonBat -Force -ErrorAction SilentlyContinue
 }
 
 # --- x64dbg (debugger - extract to C:\Tools\x64dbg) ---
@@ -251,4 +293,9 @@ Write-Host "[+] winbox provisioning complete"
 # boot_for_provisioning in installer.py checks for this file after the
 # post-provision reboot. Without it, bootstrap.ps1's finally-block shutdown
 # would mask any parse error or crash and leave us with a broken VM.
-Set-Content -Path C:\winbox-provisioned.ok -Value "ok" -Force -ErrorAction SilentlyContinue
+if ($script:ProvisionFailed) {
+    Write-Host "[!] Provisioning had fatal failures - sentinel NOT written; _verify_provisioning will abort setup"
+} else {
+    Set-Content -Path C:\winbox-provisioned.ok -Value "ok" -Force -ErrorAction SilentlyContinue
+    Write-Host "[+] Sentinel written"
+}

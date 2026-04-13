@@ -1,4 +1,4 @@
-# winbox bootstrap — firstboot wrapper (injected by virt-customize)
+# winbox bootstrap - firstboot wrapper (injected by virt-customize)
 # Unpacks provision.zip, runs provision.ps1, cleans up, shuts down.
 # MUST always reach Stop-Computer regardless of errors.
 
