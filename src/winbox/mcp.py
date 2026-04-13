@@ -1551,6 +1551,103 @@ def pipe_close(session_id: str) -> str:
 
 # ── removed: old pipe_recv(name, size) — superseded by pipe_open/pipe_recv ───
 
+
+# ─── Tool 12: kdbg_start / kdbg_stop / kdbg_status ─────────────────────────
+
+def _kdbg_hmp(vm_name: str, command: str) -> tuple[int, str, str]:
+    """Send an HMP command to the VM's QEMU monitor via virsh."""
+    import subprocess as _sp
+    r = _sp.run(
+        ["virsh", "-c", "qemu:///system",
+         "qemu-monitor-command", vm_name, "--hmp", command],
+        capture_output=True, text=True, check=False,
+    )
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def _kdbg_probe(host: str, port: int, timeout: float = 0.5) -> bool:
+    """True if something is listening on host:port."""
+    import socket as _sk
+    try:
+        with _sk.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, _sk.timeout):
+        return False
+
+
+@mcp.tool()
+def kdbg_start(port: int = 1234, any_interface: bool = False) -> str:
+    """Start the QEMU gdb stub for hypervisor-level kernel debug.
+
+    This exposes a gdb remote-protocol endpoint on the Kali host (inside
+    the QEMU process) — completely transparent to the guest. No
+    KdDebuggerEnabled flag, no bcdedit, no guest-visible artifacts. An
+    external gdb client can then attach with `target remote :<port>`
+    and set hardware breakpoints at any guest virtual address (kernel
+    or userland). Undo with kdbg_stop().
+
+    Args:
+        port: TCP port for the gdb stub (default 1234).
+        any_interface: Bind to 0.0.0.0 instead of 127.0.0.1. Exposes
+            full r/w on guest kernel memory + registers to the LAN —
+            opt-in only. Default False (localhost).
+    """
+    cfg, vm, ga = _get_state()
+    if vm.state() != VMState.RUNNING:
+        return f"VM is not running (state: {vm.state().value})"
+
+    bind = "0.0.0.0" if any_interface else "127.0.0.1"
+
+    if _kdbg_probe("127.0.0.1", port):
+        return (
+            f"Something is already listening on 127.0.0.1:{port}. "
+            "Call kdbg_stop() first, or pick a different port."
+        )
+
+    rc, out, err = _kdbg_hmp(cfg.vm_name, f"gdbserver tcp:{bind}:{port}")
+    if rc != 0:
+        return f"Failed to start gdb stub: {err or out}"
+    if "Waiting for gdb connection" not in out:
+        return f"Unexpected HMP response: {out}"
+
+    prefix = "[WARNING: 0.0.0.0 — LAN-accessible] " if any_interface else ""
+    return (
+        f"{prefix}gdb stub listening on {bind}:{port}. "
+        f"Attach from Kali: gdb -ex 'set architecture i386:x86-64' "
+        f"-ex 'target remote :{port}'"
+    )
+
+
+@mcp.tool()
+def kdbg_stop() -> str:
+    """Stop the QEMU gdb stub. Any attached gdb session gets EOF."""
+    cfg, vm, ga = _get_state()
+    if vm.state() != VMState.RUNNING:
+        return f"VM is not running (state: {vm.state().value})"
+
+    rc, out, err = _kdbg_hmp(cfg.vm_name, "gdbserver none")
+    if rc != 0:
+        return f"Failed to stop gdb stub: {err or out}"
+    return "gdb stub stopped"
+
+
+@mcp.tool()
+def kdbg_status(port: int = 1234) -> str:
+    """Show whether the gdb stub is listening.
+
+    Probes 127.0.0.1:<port> with a TCP connect. QEMU's stub only
+    accepts one client at a time, so "listening but probe fails" is
+    the usual signal that a gdb session is already attached.
+    """
+    cfg, vm, ga = _get_state()
+    if vm.state() != VMState.RUNNING:
+        return f"VM is not running (state: {vm.state().value})"
+
+    if _kdbg_probe("127.0.0.1", port):
+        return f"gdb stub: listening on 127.0.0.1:{port}"
+    return f"gdb stub: not running (nothing on 127.0.0.1:{port})"
+
+
 # ─── Entry point ────────────────────────────────────────────────────────────
 
 def run_server() -> None:

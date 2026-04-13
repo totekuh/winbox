@@ -1310,3 +1310,194 @@ class TestPipeSession:
         import ast
         from winbox.mcp import _BROKER_SCRIPT
         ast.parse(_BROKER_SCRIPT)  # raises SyntaxError if invalid
+
+
+# ─── kdbg_start / kdbg_stop / kdbg_status tools ─────────────────────────────
+
+
+class TestKdbgTools:
+    """MCP tool wrappers around QEMU HMP gdbserver.
+
+    Patches winbox.mcp._kdbg_hmp and winbox.mcp._kdbg_probe directly so
+    we don't shell out to virsh or open real sockets during tests.
+    """
+
+    def _stub_hmp_start(self, bind="127.0.0.1", port=1234):
+        return (0, f"Waiting for gdb connection on device 'tcp:{bind}:{port}'", "")
+
+    def test_start_defaults_to_localhost(self, mock_mcp):
+        from winbox.mcp import kdbg_start
+        ga, vm, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+
+        with patch("winbox.mcp._kdbg_hmp", return_value=self._stub_hmp_start()) as hmp, \
+             patch("winbox.mcp._kdbg_probe", return_value=False):
+            result = kdbg_start()
+
+        assert "listening on 127.0.0.1:1234" in result
+        hmp.assert_called_once_with("winbox", "gdbserver tcp:127.0.0.1:1234")
+        # Attach hint is included so the agent knows how to proceed
+        assert "target remote :1234" in result
+
+    def test_start_custom_port(self, mock_mcp):
+        from winbox.mcp import kdbg_start
+        cfg = mock_mcp[2]
+        cfg.vm_name = "winbox"
+
+        with patch("winbox.mcp._kdbg_hmp",
+                   return_value=self._stub_hmp_start(port=9999)) as hmp, \
+             patch("winbox.mcp._kdbg_probe", return_value=False):
+            result = kdbg_start(port=9999)
+
+        assert "127.0.0.1:9999" in result
+        hmp.assert_called_once_with("winbox", "gdbserver tcp:127.0.0.1:9999")
+
+    def test_start_any_interface_opt_in(self, mock_mcp):
+        from winbox.mcp import kdbg_start
+        cfg = mock_mcp[2]
+        cfg.vm_name = "winbox"
+
+        with patch("winbox.mcp._kdbg_hmp",
+                   return_value=self._stub_hmp_start(bind="0.0.0.0")) as hmp, \
+             patch("winbox.mcp._kdbg_probe", return_value=False):
+            result = kdbg_start(any_interface=True)
+
+        assert "0.0.0.0:1234" in result
+        assert "WARNING" in result and "LAN-accessible" in result
+        hmp.assert_called_once_with("winbox", "gdbserver tcp:0.0.0.0:1234")
+
+    def test_start_refuses_when_port_already_in_use(self, mock_mcp):
+        from winbox.mcp import kdbg_start
+        cfg = mock_mcp[2]
+        cfg.vm_name = "winbox"
+
+        with patch("winbox.mcp._kdbg_hmp") as hmp, \
+             patch("winbox.mcp._kdbg_probe", return_value=True):
+            result = kdbg_start()
+
+        assert "already listening" in result
+        hmp.assert_not_called()
+
+    def test_start_vm_not_running(self, mock_mcp):
+        from winbox.mcp import kdbg_start
+        ga, vm, cfg = mock_mcp
+        vm.state.return_value = VMState.SHUTOFF
+
+        with patch("winbox.mcp._kdbg_hmp") as hmp:
+            result = kdbg_start()
+
+        assert "not running" in result.lower()
+        hmp.assert_not_called()
+
+    def test_start_virsh_failure(self, mock_mcp):
+        from winbox.mcp import kdbg_start
+        cfg = mock_mcp[2]
+        cfg.vm_name = "winbox"
+
+        with patch("winbox.mcp._kdbg_hmp",
+                   return_value=(1, "", "qemu agent not connected")), \
+             patch("winbox.mcp._kdbg_probe", return_value=False):
+            result = kdbg_start()
+
+        assert "Failed to start" in result
+        assert "qemu agent not connected" in result
+
+    def test_start_unexpected_hmp_response(self, mock_mcp):
+        """Unknown responses bail — silent success would mask real errors."""
+        from winbox.mcp import kdbg_start
+        cfg = mock_mcp[2]
+        cfg.vm_name = "winbox"
+
+        with patch("winbox.mcp._kdbg_hmp", return_value=(0, "Unknown command", "")), \
+             patch("winbox.mcp._kdbg_probe", return_value=False):
+            result = kdbg_start()
+
+        assert "Unexpected HMP response" in result
+
+    def test_stop_sends_gdbserver_none(self, mock_mcp):
+        from winbox.mcp import kdbg_stop
+        cfg = mock_mcp[2]
+        cfg.vm_name = "winbox"
+
+        with patch("winbox.mcp._kdbg_hmp",
+                   return_value=(0, "Disabled gdbserver", "")) as hmp:
+            result = kdbg_stop()
+
+        assert "gdb stub stopped" in result
+        hmp.assert_called_once_with("winbox", "gdbserver none")
+
+    def test_stop_vm_not_running(self, mock_mcp):
+        from winbox.mcp import kdbg_stop
+        ga, vm, cfg = mock_mcp
+        vm.state.return_value = VMState.SHUTOFF
+
+        with patch("winbox.mcp._kdbg_hmp") as hmp:
+            result = kdbg_stop()
+
+        assert "not running" in result.lower()
+        hmp.assert_not_called()
+
+    def test_stop_virsh_failure(self, mock_mcp):
+        from winbox.mcp import kdbg_stop
+        cfg = mock_mcp[2]
+        cfg.vm_name = "winbox"
+
+        with patch("winbox.mcp._kdbg_hmp", return_value=(1, "", "monitor error")):
+            result = kdbg_stop()
+
+        assert "Failed to stop" in result
+
+    def test_status_listening(self, mock_mcp):
+        from winbox.mcp import kdbg_status
+
+        with patch("winbox.mcp._kdbg_probe", return_value=True):
+            result = kdbg_status()
+
+        assert "listening" in result
+        assert "127.0.0.1:1234" in result
+
+    def test_status_not_running(self, mock_mcp):
+        from winbox.mcp import kdbg_status
+
+        with patch("winbox.mcp._kdbg_probe", return_value=False):
+            result = kdbg_status()
+
+        assert "not running" in result
+
+    def test_status_custom_port(self, mock_mcp):
+        from winbox.mcp import kdbg_status
+
+        with patch("winbox.mcp._kdbg_probe", return_value=True) as probe:
+            result = kdbg_status(port=4321)
+
+        assert "127.0.0.1:4321" in result
+        probe.assert_called_once_with("127.0.0.1", 4321)
+
+    def test_status_vm_not_running(self, mock_mcp):
+        from winbox.mcp import kdbg_status
+        ga, vm, cfg = mock_mcp
+        vm.state.return_value = VMState.SHUTOFF
+
+        with patch("winbox.mcp._kdbg_probe") as probe:
+            result = kdbg_status()
+
+        assert "not running" in result.lower()
+        probe.assert_not_called()
+
+    def test_kdbg_probe_helper_real_socket(self):
+        """Direct unit test for _kdbg_probe with a real ephemeral listener."""
+        import socket as _sk
+        from winbox.mcp import _kdbg_probe
+
+        srv = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        try:
+            assert _kdbg_probe("127.0.0.1", port) is True
+        finally:
+            srv.close()
+
+    def test_kdbg_probe_helper_closed_port(self):
+        from winbox.mcp import _kdbg_probe
+        assert _kdbg_probe("127.0.0.1", 1, timeout=0.1) is False
