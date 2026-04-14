@@ -49,6 +49,10 @@ class Config:
         return self.winbox_dir / "iso"
 
     @property
+    def symbols_dir(self) -> Path:
+        return self.winbox_dir / "symbols"
+
+    @property
     def disk_path(self) -> Path:
         return self.winbox_dir / "disk.qcow2"
 

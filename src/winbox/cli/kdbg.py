@@ -1,4 +1,4 @@
-"""Hypervisor-level kernel debug stub — start, stop, status.
+"""Hypervisor-level kernel debug stub — start, stop, status, symbols, walks.
 
 Uses QEMU's built-in gdbstub via the HMP `gdbserver` command. The stub
 runs inside the QEMU process on the Kali host; nothing ever touches the
@@ -8,18 +8,40 @@ stay pristine and in-guest anti-tamper checks don't see the debugger.
 Default bind is 127.0.0.1 — the bare `tcp::<port>` chardev form binds
 to 0.0.0.0, which would let anything on the LAN take full r/w on guest
 RAM and registers. `--any-interface` is the explicit opt-out.
+
+Beyond start/stop, this module exposes helpers that turn a raw gdbstub
+into something actually usable for Windows kernel RE: symbol loading
+from PDBs on msdl, struct offset lookups, process and module walks, and
+cross-CR3 virtual memory reads for peeking into other processes while
+halted.
 """
 
 from __future__ import annotations
 
-import socket
-import subprocess
+from pathlib import Path
 
 import click
 
-from winbox.cli import console
+from winbox.cli import console, ensure_running
 from winbox.config import Config
-from winbox.vm import VM, VMState
+from winbox.kdbg import (
+    SymbolStore,
+    SymbolStoreError,
+    WalkCache,
+    load_from_ghidra,
+    load_nt,
+    read_cpu_state,
+    read_virt_cr3,
+    resolve_nt_base,
+)
+from winbox.kdbg.hmp import HmpError, probe_port
+from winbox.kdbg.walk import list_modules, list_processes
+from winbox.vm import VM, GuestAgent, VMState
+
+# Kept as a direct subprocess call (not a thin kdbg_hmp wrapper) so the
+# start/stop/status commands can surface raw virsh/QEMU stderr to the user
+# without the generic "HMP '<cmd>' failed:" wrapper that HmpError adds.
+import subprocess  # noqa: E402
 
 
 def _hmp(vm_name: str, command: str) -> tuple[int, str, str]:
@@ -36,12 +58,7 @@ def _hmp(vm_name: str, command: str) -> tuple[int, str, str]:
 
 
 def _probe_port(host: str, port: int, timeout: float = 0.5) -> bool:
-    """True if something is listening on host:port (can accept a TCP connect)."""
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except (OSError, socket.timeout):
-        return False
+    return probe_port(host, port, timeout)
 
 
 def _cheat_sheet(port: int) -> None:
@@ -156,3 +173,316 @@ def kdbg_status(ctx: click.Context, port: int) -> None:
         console.print(f"gdb stub: [green]listening[/] on 127.0.0.1:{port}")
     else:
         console.print(f"gdb stub: [red]not running[/] (nothing on 127.0.0.1:{port})")
+
+
+# ── Symbol / struct / walker subcommands ────────────────────────────────
+
+
+def _get_store(cfg: Config) -> SymbolStore:
+    return SymbolStore(cfg.symbols_dir)
+
+
+@kdbg.command("symbols")
+@click.argument("module", default="nt")
+@click.option(
+    "--from-ghidra", "ghidra_json", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Ingest a Ghidra-exported JSON instead of pulling from msdl.",
+)
+@click.option(
+    "--base", type=str,
+    help="Override module load base (hex). Useful with --from-ghidra when the "
+    "driver is loaded at a fixed address you already know.",
+)
+@click.pass_context
+def kdbg_symbols(
+    ctx: click.Context,
+    module: str,
+    ghidra_json: Path | None,
+    base: str | None,
+) -> None:
+    """Load or refresh symbols + struct offsets for a module.
+
+    ``nt`` is the default and does the full PE+PDB dance against the
+    running VM. Any other module name with ``--from-ghidra <path>``
+    imports a user-supplied JSON.
+    """
+    cfg: Config = ctx.obj["cfg"]
+    store = _get_store(cfg)
+
+    if ghidra_json is not None:
+        base_int = int(base, 16) if base else None
+        info = load_from_ghidra(store, module, ghidra_json, base=base_int)
+        console.print(
+            f"[green][+][/] loaded {info.module} from {ghidra_json.name} — "
+            f"{info.symbol_count} symbols, {info.type_count} types"
+        )
+        return
+
+    if module != "nt":
+        console.print(
+            f"[red][-][/] automatic fetch only supported for 'nt' — "
+            f"for {module} supply --from-ghidra"
+        )
+        raise SystemExit(1)
+
+    vm = VM(cfg)
+    ga = GuestAgent(cfg)
+    ensure_running(vm, ga, cfg)
+    with console.status("[blue]Copying ntoskrnl.exe, fetching PDB, parsing..."):
+        info = load_nt(cfg, ga, store)
+
+    base_text = f"base=[bold]0x{info.base:x}[/]" if info.base else "base=[red]unresolved[/]"
+    console.print(
+        f"[green][+][/] nt ({info.build}) — {info.symbol_count} symbols, "
+        f"{info.type_count} types, {base_text}"
+    )
+    console.print(f"    stored at {info.path}")
+
+
+@kdbg.command("sym")
+@click.argument("name")
+@click.option("-c", "--count", default=1, show_default=True, help="Max matches to return for substring search.")
+@click.option("--rva", is_flag=True, help="Return RVA instead of absolute VA (no base required).")
+@click.option("--search", is_flag=True, help="Substring search instead of exact lookup.")
+@click.pass_context
+def kdbg_sym(
+    ctx: click.Context,
+    name: str,
+    count: int,
+    rva: bool,
+    search: bool,
+) -> None:
+    """Resolve a symbol to its address. Use ``mod!sym`` to pick a module.
+
+    Examples::
+
+        winbox kdbg sym nt!NtCreateFile
+        winbox kdbg sym KiSystemCall64 --rva
+        winbox kdbg sym PsActive --search -c 20
+    """
+    cfg: Config = ctx.obj["cfg"]
+    store = _get_store(cfg)
+
+    module, sym = store.parse_symbol(name)
+    try:
+        if search:
+            hits = store.search(sym, module=module, limit=count)
+            if not hits:
+                console.print(f"[red][-][/] no matches for {name}")
+                raise SystemExit(1)
+            for hit_name, hit_rva in hits:
+                if rva:
+                    console.print(f"{module}!{hit_name} 0x{hit_rva:x}")
+                else:
+                    base = store.load(module).get("base") or 0
+                    console.print(f"{module}!{hit_name} 0x{base + hit_rva:x}")
+            return
+        if rva:
+            value = store.rva(name)
+        else:
+            value = store.resolve(name)
+        console.print(f"{name} 0x{value:x}")
+    except SymbolStoreError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+
+@kdbg.command("struct")
+@click.argument("type_name")
+@click.argument("field", required=False)
+@click.option("--module", "-m", default="nt", show_default=True, help="Module to look up the type in.")
+@click.pass_context
+def kdbg_struct(
+    ctx: click.Context,
+    type_name: str,
+    field: str | None,
+    module: str,
+) -> None:
+    """Show struct layout or a single field offset.
+
+    Examples::
+
+        winbox kdbg struct _EPROCESS
+        winbox kdbg struct _EPROCESS DirectoryTableBase
+    """
+    cfg: Config = ctx.obj["cfg"]
+    store = _get_store(cfg)
+    try:
+        result = store.struct(type_name, field=field, module=module)
+    except SymbolStoreError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+    if field is not None:
+        console.print(f"{module}!{type_name}.{field} off=0x{result['off']:x} type={result.get('type', '')}")
+        return
+
+    size = result.get("size", 0)
+    console.print(f"[bold]{module}!{type_name}[/] size=0x{size:x} ({size})")
+    for fname, fdata in sorted(result.get("fields", {}).items(), key=lambda kv: kv[1]["off"]):
+        console.print(f"  +0x{fdata['off']:04x}  {fname}   [dim]{fdata.get('type','')}[/]")
+
+
+@kdbg.command("ps")
+@click.pass_context
+def kdbg_ps(ctx: click.Context) -> None:
+    """Walk ``PsActiveProcessHead`` and list all processes.
+
+    Shows PID, DirectoryTableBase (CR3), EPROCESS VA, and image name.
+    Use the DTB values as input to ``winbox kdbg read-va`` for
+    cross-process reads.
+    """
+    cfg: Config = ctx.obj["cfg"]
+    store = _get_store(cfg)
+    vm = VM(cfg)
+    if vm.state() != VMState.RUNNING:
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+
+    try:
+        procs = list_processes(cfg.vm_name, store)
+    except SymbolStoreError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+    console.print(
+        f"[dim]  PID       DTB              EPROCESS            Name[/]"
+    )
+    for p in procs:
+        console.print(
+            f"  {p.pid:5d}  0x{p.directory_table_base:012x}  "
+            f"0x{p.eprocess:016x}  {p.name}"
+        )
+    console.print(f"[dim]({len(procs)} processes)[/]")
+
+
+@kdbg.command("lm")
+@click.pass_context
+def kdbg_lm(ctx: click.Context) -> None:
+    """Walk ``PsLoadedModuleList`` and list loaded kernel modules.
+
+    Shows base VA, image size, and driver/module name.
+    """
+    cfg: Config = ctx.obj["cfg"]
+    store = _get_store(cfg)
+    vm = VM(cfg)
+    if vm.state() != VMState.RUNNING:
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+
+    try:
+        mods = list_modules(cfg.vm_name, store)
+    except SymbolStoreError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+    console.print("[dim]  Base              Size        Name[/]")
+    for m in mods:
+        console.print(f"  0x{m.base:016x}  0x{m.size:08x}  {m.name}")
+    console.print(f"[dim]({len(mods)} modules)[/]")
+
+
+@kdbg.command("read-va")
+@click.argument("pid", type=int)
+@click.argument("address", type=str)
+@click.argument("length", type=int)
+@click.option(
+    "--output", "-o", type=click.Path(dir_okay=False, path_type=Path),
+    help="Write bytes to file instead of hexdumping to stdout.",
+)
+@click.pass_context
+def kdbg_read_va(
+    ctx: click.Context,
+    pid: int,
+    address: str,
+    length: int,
+    output: Path | None,
+) -> None:
+    """Read virtual memory from a target process — the CR3-switching primitive.
+
+    Looks up the target's EPROCESS via ``kdbg ps``, grabs its
+    ``DirectoryTableBase``, and walks the page tables manually against
+    that CR3. Works regardless of which process was scheduled on the CPU
+    at halt time.
+
+    Examples::
+
+        winbox kdbg read-va 4712 0x7ff600001000 256
+        winbox kdbg read-va 4712 0x7ff600001000 4096 -o /tmp/dump.bin
+    """
+    cfg: Config = ctx.obj["cfg"]
+    store = _get_store(cfg)
+    vm = VM(cfg)
+    if vm.state() != VMState.RUNNING:
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+
+    try:
+        va = int(address, 0)
+    except ValueError:
+        console.print(f"[red][-][/] invalid address: {address}")
+        raise SystemExit(1)
+
+    cache = WalkCache()
+    procs = list_processes(cfg.vm_name, store, cache=cache)
+    target = next((p for p in procs if p.pid == pid), None)
+    if target is None:
+        console.print(f"[red][-][/] pid {pid} not found in process list")
+        raise SystemExit(1)
+
+    try:
+        data = read_virt_cr3(
+            cfg.vm_name,
+            target.directory_table_base,
+            va,
+            length,
+            cache=cache,
+        )
+    except HmpError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+    if output is not None:
+        output.write_bytes(data)
+        console.print(
+            f"[green][+][/] wrote {len(data)} bytes from pid {pid} "
+            f"@ 0x{va:x} -> {output}"
+        )
+        return
+
+    # Hexdump 16 bytes per line
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        console.print(f"  0x{va + i:016x}  {hex_part:<48}  {ascii_part}")
+
+
+@kdbg.command("base")
+@click.pass_context
+def kdbg_base(ctx: click.Context) -> None:
+    """Re-resolve and persist the nt load base from the live guest.
+
+    Use this if ``kdbg symbols`` couldn't reach the guest or the VM was
+    rebooted (ASLR re-randomizes the base each boot).
+    """
+    cfg: Config = ctx.obj["cfg"]
+    store = _get_store(cfg)
+    vm = VM(cfg)
+    if vm.state() != VMState.RUNNING:
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+
+    try:
+        data = store.load("nt")
+    except SymbolStoreError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+    try:
+        base = resolve_nt_base(cfg, data.get("symbols", {}))
+    except Exception as e:
+        console.print(f"[red][-][/] could not resolve nt base: {e}")
+        raise SystemExit(1)
+    store.set_base("nt", base)
+    console.print(f"[green][+][/] nt base = 0x{base:x}")

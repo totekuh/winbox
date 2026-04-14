@@ -21,6 +21,7 @@ classifiers = [
 dependencies = [
     "click>=8.0",
     "rich>=13.0",
+    "pefile>=2024.8.26",
 ]
 
 [project.urls]

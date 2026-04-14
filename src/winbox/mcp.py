@@ -1648,6 +1648,258 @@ def kdbg_status(port: int = 1234) -> str:
     return f"gdb stub: not running (nothing on 127.0.0.1:{port})"
 
 
+# ─── Tool 13: kdbg symbol / walker / CR3-read tools ────────────────────────
+#
+# These wrap the winbox.kdbg package so Claude can drive symbol loads,
+# process walks, and cross-CR3 memory reads without shelling out to the CLI.
+# Responses are deliberately terse: symbol/struct lookups return single
+# numbers, never the full table (30k+ entries would blow the context).
+
+from winbox.kdbg import (
+    SymbolStore as _KdbgStore,
+    SymbolStoreError as _KdbgStoreError,
+    WalkCache as _KdbgWalkCache,
+    load_from_ghidra as _kdbg_load_from_ghidra,
+    load_nt as _kdbg_load_nt,
+    read_virt_cr3 as _kdbg_read_virt_cr3,
+    resolve_nt_base as _kdbg_resolve_nt_base,
+)
+from winbox.kdbg.hmp import HmpError as _KdbgHmpError
+from winbox.kdbg.walk import list_modules as _kdbg_list_modules
+from winbox.kdbg.walk import list_processes as _kdbg_list_processes
+
+
+def _kdbg_get_store() -> _KdbgStore:
+    cfg, _, _ = _get_state()
+    return _KdbgStore(cfg.symbols_dir)
+
+
+@mcp.tool()
+def kdbg_symbols_load(module: str = "nt", from_ghidra: str = "", base: str = "") -> str:
+    """Load symbols + struct offsets for a kernel module.
+
+    For ``module='nt'`` (default), pulls ntoskrnl.exe from the running
+    VM, fetches ntkrnlmp.pdb from Microsoft's symbol server, extracts
+    public symbols and key struct layouts (EPROCESS/KPROCESS/KTHREAD/
+    LDR_DATA_TABLE_ENTRY/etc), resolves the live load base via the IDT,
+    and persists everything to ``~/.winbox/symbols/``.
+
+    For any other module, supply ``from_ghidra`` with the path to a JSON
+    symbol export and optionally ``base`` as a hex address override.
+
+    The map itself is never returned inline — use ``kdbg_sym`` and
+    ``kdbg_struct`` for lookups.
+
+    Args:
+        module: Module name (default 'nt'). Custom names require from_ghidra.
+        from_ghidra: Path to a Ghidra-exported JSON.
+        base: Optional hex base address for from_ghidra imports.
+    """
+    cfg, vm, ga = _ensure_vm_ready()
+    store = _kdbg_get_store()
+
+    if from_ghidra:
+        from pathlib import Path as _P
+        base_int = int(base, 16) if base else None
+        info = _kdbg_load_from_ghidra(store, module, _P(from_ghidra), base=base_int)
+        return (
+            f"loaded {info.module} from {from_ghidra}: "
+            f"{info.symbol_count} symbols, {info.type_count} types"
+        )
+
+    if module != "nt":
+        return f"module {module!r}: automatic fetch only supports 'nt' — supply from_ghidra"
+
+    info = _kdbg_load_nt(cfg, ga, store)
+    base_txt = f"base=0x{info.base:x}" if info.base else "base=unresolved"
+    return (
+        f"nt {info.build}: {info.symbol_count} symbols, {info.type_count} types, {base_txt}"
+    )
+
+
+@mcp.tool()
+def kdbg_sym(name: str, search: bool = False, limit: int = 16, rva: bool = False) -> str:
+    """Resolve a kernel symbol. Use ``mod!sym`` to pick a module (default nt).
+
+    By default returns the absolute virtual address. Pass ``rva=True`` to
+    get the raw RVA (no base required). Pass ``search=True`` with a
+    substring pattern to get the first ``limit`` matches.
+
+    Args:
+        name: Symbol name (e.g. 'NtCreateFile', 'nt!PsActiveProcessHead').
+        search: If True, treat ``name`` as a substring pattern.
+        limit: Max results when searching (default 16).
+        rva: Return RVA instead of absolute VA.
+    """
+    store = _kdbg_get_store()
+    try:
+        module, sym = store.parse_symbol(name)
+        if search:
+            hits = store.search(sym, module=module, limit=limit)
+            if not hits:
+                return f"no matches for {name}"
+            if rva:
+                return "\n".join(f"{module}!{n} 0x{r:x}" for n, r in hits)
+            base = store.load(module).get("base") or 0
+            return "\n".join(f"{module}!{n} 0x{base + r:x}" for n, r in hits)
+        if rva:
+            return f"{name} 0x{store.rva(name):x}"
+        return f"{name} 0x{store.resolve(name):x}"
+    except _KdbgStoreError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_struct(type_name: str, field: str = "", module: str = "nt") -> str:
+    """Return a struct layout or a single field offset from the symbol store.
+
+    Without ``field``, returns the whole struct as a compact list of
+    ``name +0xoffset type`` lines. With ``field``, returns just
+    ``off=0xN type=...`` for that one member.
+
+    Args:
+        type_name: Struct type name (e.g. '_EPROCESS').
+        field: Optional field name to look up by itself.
+        module: Module the type lives in (default 'nt').
+    """
+    store = _kdbg_get_store()
+    try:
+        result = store.struct(type_name, field=field or None, module=module)
+    except _KdbgStoreError as e:
+        return f"error: {e}"
+
+    if field:
+        return f"{module}!{type_name}.{field} off=0x{result['off']:x} type={result.get('type','')}"
+    size = result.get("size", 0)
+    lines = [f"{module}!{type_name} size=0x{size:x} ({size})"]
+    for fname, fdata in sorted(result.get("fields", {}).items(), key=lambda kv: kv[1]["off"]):
+        lines.append(f"  +0x{fdata['off']:04x}  {fname}  {fdata.get('type','')}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def kdbg_ps() -> str:
+    """Walk ``PsActiveProcessHead`` and return all running processes.
+
+    Returns one line per process: ``PID  DTB  EPROCESS  Name``. The DTB
+    is the ``DirectoryTableBase`` — feed it (or the PID) to
+    ``kdbg_read_va`` for cross-process reads.
+
+    Requires ``kdbg_symbols_load`` to have been run first.
+    """
+    cfg, vm, ga = _get_state()
+    if vm.state() != VMState.RUNNING:
+        return f"VM not running ({vm.state().value})"
+    store = _kdbg_get_store()
+    try:
+        procs = _kdbg_list_processes(cfg.vm_name, store)
+    except (_KdbgStoreError, _KdbgHmpError) as e:
+        return f"error: {e}"
+    lines = ["PID     DTB              EPROCESS            Name"]
+    for p in procs:
+        lines.append(
+            f"{p.pid:5d}  0x{p.directory_table_base:012x}  "
+            f"0x{p.eprocess:016x}  {p.name}"
+        )
+    lines.append(f"({len(procs)} processes)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def kdbg_lm() -> str:
+    """Walk ``PsLoadedModuleList`` and return all loaded kernel modules.
+
+    One line per module: ``Base Size Name``. Base is the DllBase VA,
+    Size is SizeOfImage. Use this to locate driver images when you need
+    to resolve addresses inside non-nt drivers.
+    """
+    cfg, vm, ga = _get_state()
+    if vm.state() != VMState.RUNNING:
+        return f"VM not running ({vm.state().value})"
+    store = _kdbg_get_store()
+    try:
+        mods = _kdbg_list_modules(cfg.vm_name, store)
+    except (_KdbgStoreError, _KdbgHmpError) as e:
+        return f"error: {e}"
+    lines = ["Base              Size        Name"]
+    for m in mods:
+        lines.append(f"0x{m.base:016x}  0x{m.size:08x}  {m.name}")
+    lines.append(f"({len(mods)} modules)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def kdbg_read_va(pid: int, address: str, length: int) -> str:
+    """Read virtual memory from an arbitrary process — the CR3-switching primitive.
+
+    Looks up the target's EPROCESS, grabs its ``DirectoryTableBase``,
+    and walks the page tables manually against that CR3 to read
+    ``length`` bytes at ``address``. Works regardless of which process
+    was scheduled on the CPU when the debug halt happened.
+
+    Returns a hex string of the bytes. Pair with ``kdbg_ps`` to find a
+    PID first.
+
+    Args:
+        pid: Target process ID (must be in kdbg_ps output).
+        address: Virtual address, hex string (e.g. '0x7ff600001000').
+        length: Number of bytes to read (capped at 65536).
+    """
+    cfg, vm, ga = _get_state()
+    if vm.state() != VMState.RUNNING:
+        return f"VM not running ({vm.state().value})"
+    if length <= 0:
+        return "length must be > 0"
+    if length > 65536:
+        return f"length {length} too large — cap at 65536"
+    try:
+        va = int(address, 0)
+    except ValueError:
+        return f"invalid address: {address!r}"
+
+    store = _kdbg_get_store()
+    cache = _KdbgWalkCache()
+    try:
+        procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
+    except (_KdbgStoreError, _KdbgHmpError) as e:
+        return f"error: {e}"
+    target = next((p for p in procs if p.pid == pid), None)
+    if target is None:
+        return f"pid {pid} not found"
+
+    try:
+        data = _kdbg_read_virt_cr3(
+            cfg.vm_name, target.directory_table_base, va, length, cache=cache,
+        )
+    except _KdbgHmpError as e:
+        return f"read failed: {e}"
+    return f"pid={pid} name={target.name} va=0x{va:x} len={len(data)} hex={data.hex()}"
+
+
+@mcp.tool()
+def kdbg_base_refresh() -> str:
+    """Re-resolve and persist the nt load base from the live guest.
+
+    ASLR re-randomizes the kernel base on every reboot. After a VM
+    reboot the cached symbol map still has the old base — this call
+    re-reads the IDT, computes the fresh base, and updates the store.
+    """
+    cfg, vm, ga = _get_state()
+    if vm.state() != VMState.RUNNING:
+        return f"VM not running ({vm.state().value})"
+    store = _kdbg_get_store()
+    try:
+        data = store.load("nt")
+    except _KdbgStoreError as e:
+        return f"error: {e}"
+    try:
+        base = _kdbg_resolve_nt_base(cfg, data.get("symbols", {}))
+    except Exception as e:
+        return f"could not resolve nt base: {e}"
+    store.set_base("nt", base)
+    return f"nt base = 0x{base:x}"
+
+
 # ─── Entry point ────────────────────────────────────────────────────────────
 
 def run_server() -> None:

@@ -11,7 +11,11 @@ from winbox.vm import VMState
 
 @pytest.fixture
 def kdbg_env(cfg):
-    """Mock VM + virsh/socket so kdbg commands run without a live VM."""
+    """Mock VM + virsh/socket so kdbg commands run without a live VM.
+
+    The HMP subprocess call lives in ``winbox.kdbg.hmp`` — the CLI module
+    imports a thin wrapper around it — so that's where we patch.
+    """
     vm = MagicMock()
     vm.state.return_value = VMState.RUNNING
 
