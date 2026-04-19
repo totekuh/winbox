@@ -43,8 +43,10 @@ PS C:\Windows\system32>
 - **Autologin** — persistent Administrator auto-login that survives reboots on Server 2022
 - **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
-- **MCP server** — 20 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including a session-based named-pipe broker
-- **SPICE display** — clipboard sharing and dynamic resize via virt-manager (`winbox vnc`)
+- **MCP server** — 31 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including a session-based named-pipe broker and hypervisor-level kernel debug
+- **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM, with PDB-backed symbol cache, EPROCESS/module walkers, and CR3-switching memory reads (PPL-resistant, EDR-invisible)
+- **VNC display** via virt-manager (`winbox vnc`) — plain VGA, no clipboard/resize
+- **x64dbg in the guest** — bundled in setup, extracted to `C:\Tools\x64dbg`, both x32 and x64 on PATH
 - **Python in the guest** — Python 3.13 installed during setup (pip, PATH, py.exe launcher) for MCP-driven research
 - **No VM internet needed for setup** — all tools and dependencies are staged from the host side
 
@@ -68,7 +70,7 @@ Required:
 
 Optional:
 - `sshpass` — auto-auth for `winbox ssh` (falls back to manual password entry)
-- `virt-manager` — required for `winbox vnc` (VM display — SPICE + QXL with clipboard/resize)
+- `virt-manager` — required for `winbox vnc` (VM display — plain VNC, no clipboard/resize)
 
 ## Installation
 
@@ -91,7 +93,7 @@ winbox setup -y              # builds and provisions the VM
 
 ```
 VM Lifecycle   setup  up  down  suspend  destroy  status  snapshot  restore  provision
-Execute        exec  shell  ssh  vnc  jobs  msi
+Execute        exec  shell  ssh  vnc  jobs  msi  kdbg
 Files          tools  upload  iso
 Network        net  dns  hosts  domain
 Target         av  applocker  autologin     (bidirectional — flip on to test bypass tools)
@@ -270,7 +272,9 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (20):**
+**Available tools (31):**
+
+User-mode primitives:
 
 | Tool | Description |
 |------|-------------|
@@ -279,14 +283,20 @@ claude mcp add winbox -- winbox mcp
 | `reg_query(key, value?)` | Query registry key or value |
 | `reg_set(key, value, data, value_type)` | Set registry value (creates key if needed) |
 | `reg_delete(key, value?)` | Delete registry value or entire key tree |
-| `ps(filter?)` | List processes with PID, name, path, memory usage |
+| `ps(filter?)` | List processes with PID, name, path, memory usage (JSON) |
 | `upload(src, dst?)` | Upload file from Kali to VM via VirtIO-FS (optionally copy to dst inside VM) |
 | `file_copy(src, dst)` | Copy file within the VM (DLL sideloading, staging binaries) |
-| `mem_read(pid, address, size)` | Read memory from a process (ReadProcessMemory) |
+| `mem_read(pid, address, length)` | Read memory from a process (enables SeDebugPrivilege, address as hex string, 1MB cap) |
 | `service_start(name)` | Start a Windows service |
 | `service_stop(name)` | Stop a Windows service |
 | `net_isolate()` | Disconnect VM from network (host-VM channels stay up) |
 | `net_connect()` | Reconnect VM to network (restarts adapter, renews DHCP) |
+| `net_unplug()` | Full air-gap (link down via virsh) |
+
+Named pipes:
+
+| Tool | Description |
+|------|-------------|
 | `pipe_list(filter?)` | Enumerate named pipes matching a pattern (JSON array) |
 | `pipe_info(name)` | JSON: DACL/SDDL, mode, buffer sizes, max instances for a pipe |
 | `pipe_connect(name, access?)` | One-shot pipe handle open; returns result or Win32 error |
@@ -294,6 +304,21 @@ claude mcp add winbox -- winbox mcp
 | `pipe_send(session_id, data_hex)` | WriteFile through the session broker |
 | `pipe_recv(session_id, size, timeout?)` | ReadFile through the session broker |
 | `pipe_close(session_id)` | Close session + taskkill the broker |
+
+Hypervisor-level kernel debug (via QEMU gdbstub + HMP, EDR-invisible):
+
+| Tool | Description |
+|------|-------------|
+| `kdbg_start(port?, any_interface?)` | Start the gdbstub listener |
+| `kdbg_stop()` | Stop the gdbstub listener |
+| `kdbg_status(port?)` | Show stub state + reachability |
+| `kdbg_symbols_load(module?, from_ghidra?, base?)` | Pull ntoskrnl.exe out, fetch PDB from msdl, persist symbols + struct layouts to `~/.winbox/symbols/` |
+| `kdbg_sym(name, search?, limit?, rva?)` | Resolve `mod!sym` to VA or RVA; substring search supported |
+| `kdbg_struct(type_name, field?, module?)` | Dump full struct layout or one field offset |
+| `kdbg_ps()` | Walk `PsActiveProcessHead` (JSON: pid, dtb, eprocess, name) |
+| `kdbg_lm()` | Walk `PsLoadedModuleList` (JSON: base, size, name) |
+| `kdbg_read_va(pid, address, length)` | CR3-switching arbitrary-process read; works against PPL targets (1MB cap, hex bytes) |
+| `kdbg_base_refresh()` | Re-resolve nt load base after ASLR reboot |
 
 The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker process per session (spawned as DETACHED_PROCESS | CREATE_NO_WINDOW inside the VM). IPC happens via `cmd.json`/`result.json` files on the VirtIO-FS share, so there's no VM round-trip on the polling path. This matters for protocols where a write on one handle must be answered on the same handle (stateless `send`/`recv` open fresh handles and never see each other's messages).
 
@@ -309,12 +334,12 @@ Kali Linux
 │   ├── SSH ────────────────> OpenSSH Server (interactive PowerShell)
 │   └── TCP listener ───────< ConPTY reverse shell (SYSTEM, resizable PTY)
 │
-└── Windows Server Core 2022 (headless QEMU/KVM, SPICE + QXL display)
+└── Windows Server Core 2022 (headless QEMU/KVM, plain VNC display)
     ├── QEMU Guest Agent          ← primary exec channel
     ├── VirtioFsSvc (WinFsp)      ← auto-mounts Z:\ on boot
     ├── OpenSSH Server            ← interactive sessions
     ├── Python 3.13               ← required for MCP Python/ioctl/mem_read tools
-    ├── spice-guest-tools         ← QXL WDDM driver + vdservice (clipboard/resize)
+    ├── x64dbg (C:\Tools\x64dbg)  ← in-VM user-mode debugger
     ├── Defender disabled         ← no AV interference
     ├── Firewall disabled         ← no port blocking
     └── NAT via libvirt           ← reaches anything Kali can reach
@@ -365,7 +390,7 @@ VIRTIO_ISO_URL=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
 │   ├── winfsp.msi                      # WinFsp installer
 │   ├── virtiofs.exe                    # VirtIO-FS service binary
 │   ├── python-3.13.13-amd64.exe        # Python 3.13 installer for the guest
-│   ├── spice-guest-tools.exe           # SPICE guest tools (QXL driver + vdagent)
+│   ├── x64dbg.zip                      # x64dbg snapshot (extracted to C:\Tools\x64dbg)
 │   └── unattend.img                    # built during setup
 └── shared/                             # VirtIO-FS share <=> Z:\ in VM
     ├── tools/                          # your pentest tools
