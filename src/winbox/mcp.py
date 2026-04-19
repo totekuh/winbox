@@ -1,9 +1,11 @@
-"""winbox MCP server — vuln research primitives for Windows VM."""
+"""winbox MCP server - vuln research primitives for Windows VM."""
 
 from __future__ import annotations
 
 import json as _json
+import shutil
 import textwrap
+import uuid
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -78,33 +80,40 @@ def _exec_python(
 ) -> dict:
     """Write Python code to VirtIO-FS and execute in VM.
 
-    If args is provided, writes them as a JSON file that the script can
-    read via ``json.load(open(r'Z:\\.mcp\\args.json'))``. This avoids
-    all escaping issues when embedding values like device paths.
+    Each call gets its own subdirectory under ``Z:\\.mcp\\<uuid>\\`` so
+    two concurrent tool invocations cannot clobber each other's
+    script.py / args.json. The hardcoded ``Z:\\.mcp\\args.json`` path
+    in legacy script bodies is rewritten to point at the per-call file
+    before the script is written to disk.
 
-    Both the script and args.json are removed from the share after the
-    call completes, including on timeout/exception — otherwise the
-    previous tool call's code (which may include sensitive snippets)
-    would sit on the host filesystem until the next invocation.
+    The whole per-call subdir is removed in a finally block so the
+    previous tool's code (which may include sensitive snippets) does
+    not sit on the host share until the next invocation.
 
     Returns dict with exitcode, stdout, stderr.
     """
     cfg, vm, ga = _ensure_vm_ready()
 
-    # Write script to shared filesystem
-    script_dir = cfg.shared_dir / ".mcp"
-    script_dir.mkdir(parents=True, exist_ok=True)
-    script_path = script_dir / "script.py"
-    args_path = script_dir / "args.json"
-    script_path.write_text(code, encoding="utf-8")
+    call_id = uuid.uuid4().hex
+    call_dir = cfg.shared_dir / ".mcp" / call_id
+    call_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write args as JSON for the script to read
+    vm_call_dir = f"Z:\\.mcp\\{call_id}"
+    vm_script = f"{vm_call_dir}\\script.py"
+    vm_args = f"{vm_call_dir}\\args.json"
+
+    rewritten = code.replace(r"Z:\.mcp\args.json", vm_args)
+
+    script_path = call_dir / "script.py"
+    args_path = call_dir / "args.json"
+    script_path.write_text(rewritten, encoding="utf-8")
+
     if args is not None:
         args_path.write_text(_json.dumps(args), encoding="utf-8")
 
     try:
         result = ga.exec(
-            r'python.exe Z:\.mcp\script.py',
+            f"python.exe {vm_script}",
             timeout=timeout,
         )
         return {
@@ -113,8 +122,7 @@ def _exec_python(
             "stderr": result.stderr,
         }
     finally:
-        script_path.unlink(missing_ok=True)
-        args_path.unlink(missing_ok=True)
+        shutil.rmtree(call_dir, ignore_errors=True)
 
 
 # ─── Tool 1: python ────────────────────────────────────────────────────────
@@ -1074,7 +1082,7 @@ def pipe_info(name: str) -> str:
                 "error": f"Cannot open (error {err})",
                 "sddl": None,
             }))
-            sys.exit(0)
+            sys.exit(1)
 
         try:
             # GetNamedPipeInfo
@@ -1082,11 +1090,20 @@ def pipe_info(name: str) -> str:
             out_buf = wintypes.DWORD(0)
             in_buf = wintypes.DWORD(0)
             max_inst = wintypes.DWORD(0)
-            kernel32.GetNamedPipeInfo(
+            ok = kernel32.GetNamedPipeInfo(
                 handle,
                 ctypes.byref(flags), ctypes.byref(out_buf),
                 ctypes.byref(in_buf), ctypes.byref(max_inst),
             )
+            if not ok:
+                err = ctypes.get_last_error()
+                print(json.dumps({
+                    "pipe": pipe_path,
+                    "error": f"GetNamedPipeInfo failed (error {err})",
+                    "sddl": None,
+                }))
+                kernel32.CloseHandle(handle)
+                sys.exit(1)
             PIPE_TYPE_MESSAGE = 0x4
             PIPE_SERVER_END = 0x1
             mode = "message" if (flags.value & PIPE_TYPE_MESSAGE) else "byte"

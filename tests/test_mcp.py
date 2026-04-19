@@ -148,22 +148,19 @@ class TestEnsureVmReady:
 
 class TestExecPython:
     def test_writes_script_and_executes(self, mock_mcp):
-        """_exec_python writes the script to disk, runs it, then cleans up.
-
-        We verify the cleanup and inspect the sent code via the fixture's
-        captured hook (ga.captured_code) rather than reading the file,
-        because the file is unlinked before this test body runs.
-        """
+        """_exec_python writes script under per-call uuid subdir, then cleans up."""
         from winbox.mcp import _exec_python
         ga, vm, cfg = mock_mcp
 
-        # Capture the file state at the moment ga.exec() is called — the only
-        # instant where the script still exists on disk.
         seen_script = {}
         def capture_fs(*args, **kwargs):
-            script_path = cfg.shared_dir / ".mcp" / "script.py"
-            seen_script["existed"] = script_path.exists()
-            seen_script["content"] = script_path.read_text() if script_path.exists() else None
+            mcp_root = cfg.shared_dir / ".mcp"
+            scripts = list(mcp_root.rglob("script.py"))
+            seen_script["count"] = len(scripts)
+            if scripts:
+                seen_script["path"] = scripts[0]
+                seen_script["content"] = scripts[0].read_text()
+                seen_script["parent"] = scripts[0].parent.name
             return ExecResult(exitcode=0, stdout="hello\n", stderr="")
         ga.exec.side_effect = capture_fs
 
@@ -172,17 +169,37 @@ class TestExecPython:
         assert result["exitcode"] == 0
         assert result["stdout"] == "hello\n"
 
-        # The file existed at exec time…
-        assert seen_script["existed"] is True
+        assert seen_script["count"] == 1
         assert seen_script["content"] == "print('hello')"
-        # …and has been cleaned up now (finally block).
-        assert not (cfg.shared_dir / ".mcp" / "script.py").exists()
-        assert ga.captured_code == "print('hello')"
+        # Parent dir is a uuid hex (32 lowercase hex chars).
+        assert len(seen_script["parent"]) == 32
+        assert all(c in "0123456789abcdef" for c in seen_script["parent"])
 
-        # Verify GA exec was called with correct path
+        # Subdir is removed in finally.
+        assert not seen_script["path"].exists()
+        assert not seen_script["path"].parent.exists()
+
         ga.exec.assert_called_once()
-        call_args = ga.exec.call_args
-        assert r"Z:\.mcp\script.py" in call_args[0][0]
+        cmd = ga.exec.call_args[0][0]
+        assert cmd.startswith("python.exe Z:\\.mcp\\")
+        assert cmd.endswith("\\script.py")
+
+    def test_concurrent_calls_get_unique_paths(self, mock_mcp):
+        """Two _exec_python calls must not share script.py or args.json paths."""
+        from winbox.mcp import _exec_python
+        ga, vm, cfg = mock_mcp
+
+        seen_cmds = []
+        def capture(*args, **kwargs):
+            seen_cmds.append(args[0])
+            return ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec.side_effect = capture
+
+        _exec_python("pass")
+        _exec_python("pass")
+
+        assert len(seen_cmds) == 2
+        assert seen_cmds[0] != seen_cmds[1]
 
     def test_custom_timeout(self, mock_mcp):
         from winbox.mcp import _exec_python
@@ -190,9 +207,11 @@ class TestExecPython:
         ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
 
         _exec_python("pass", timeout=60)
-        ga.exec.assert_called_once_with(
-            r'python.exe Z:\.mcp\script.py', timeout=60
-        )
+        ga.exec.assert_called_once()
+        cmd, = ga.exec.call_args[0]
+        assert cmd.startswith("python.exe Z:\\.mcp\\")
+        assert cmd.endswith("\\script.py")
+        assert ga.exec.call_args[1] == {"timeout": 60}
 
     def test_returns_stderr(self, mock_mcp):
         from winbox.mcp import _exec_python
@@ -202,6 +221,23 @@ class TestExecPython:
         result = _exec_python("bad code")
         assert result["stderr"] == "error\n"
         assert result["exitcode"] == 1
+
+    def test_args_path_rewritten_in_script(self, mock_mcp):
+        """Hardcoded Z:\\.mcp\\args.json in script bodies points at per-call file."""
+        from winbox.mcp import _exec_python
+        ga, vm, cfg = mock_mcp
+
+        seen = {}
+        def capture(*args, **kwargs):
+            scripts = list((cfg.shared_dir / ".mcp").rglob("script.py"))
+            seen["content"] = scripts[0].read_text() if scripts else None
+            return ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec.side_effect = capture
+
+        _exec_python("args = open(r'Z:\\.mcp\\args.json').read()", args={"k": "v"})
+
+        assert "Z:\\.mcp\\args.json" not in seen["content"]
+        assert "args.json" in seen["content"]
 
 
 # ─── python tool ────────────────────────────────────────────────────────────
@@ -714,9 +750,9 @@ class TestServiceTools:
 
         service_stop(name="test")
 
-        # Should NOT write a script file
-        script_path = cfg.shared_dir / ".mcp" / "script.py"
-        assert not script_path.exists()
+        mcp_root = cfg.shared_dir / ".mcp"
+        if mcp_root.exists():
+            assert list(mcp_root.rglob("script.py")) == []
 
 
 # ─── net_isolate / net_unplug / net_connect tools ───────────────────────────
@@ -950,12 +986,31 @@ class TestPipeTools:
         ga, vm, cfg = mock_mcp
         info = {"pipe": "\\\\.\\pipe\\lsass", "error": "Cannot open (error 5)", "sddl": None}
         ga.exec.return_value = ExecResult(
-            exitcode=0, stdout=json.dumps(info) + "\n", stderr=""
+            exitcode=1, stdout=json.dumps(info) + "\n", stderr=""
         )
 
         result = pipe_info(name="lsass")
         assert "error 5" in result
         assert '"sddl": null' in result
+        assert "[exit code: 1]" in result
+
+    def test_pipe_info_get_info_failure(self, mock_mcp):
+        """GetNamedPipeInfo failure is reported, not silently dropped."""
+        import json
+        from winbox.mcp import pipe_info
+        ga, vm, cfg = mock_mcp
+        info = {
+            "pipe": "\\\\.\\pipe\\svcctl",
+            "error": "GetNamedPipeInfo failed (error 6)",
+            "sddl": None,
+        }
+        ga.exec.return_value = ExecResult(
+            exitcode=1, stdout=json.dumps(info) + "\n", stderr=""
+        )
+
+        result = pipe_info(name="svcctl")
+        assert "GetNamedPipeInfo failed" in result
+        assert "[exit code: 1]" in result
 
     def test_pipe_connect_success(self, mock_mcp):
         from winbox.mcp import pipe_connect
