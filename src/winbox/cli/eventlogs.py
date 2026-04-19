@@ -68,6 +68,17 @@ from winbox.vm import GuestAgent, VM
     help="Emit raw event JSON array instead of the compact table.",
 )
 @click.option(
+    "--message-chars",
+    default=240,
+    show_default=True,
+    help="Cap Message column at N chars (0 = no cap, wrap freely).",
+)
+@click.option(
+    "--full",
+    is_flag=True,
+    help="Show full untruncated messages (wraps over multiple lines).",
+)
+@click.option(
     "--timeout",
     default=60,
     show_default=True,
@@ -83,6 +94,8 @@ def eventlogs(
     level: str | None,
     max_events: int,
     as_json: bool,
+    message_chars: int,
+    full: bool,
     timeout: int,
 ) -> None:
     """Query Windows event logs and print as a table.
@@ -155,6 +168,11 @@ def eventlogs(
     # Force a wide rendering width (terminal often 80) so column auto-sizing
     # has room. Message is already pre-truncated to a sane single-line width
     # so Rich does not have to balance a 2KB cell against 4 small ones.
-    wide = Console(width=max(console.size.width, 160), highlight=False)
-    wide.print(format_compact_table(events))
+    msg_cap = 0 if full else message_chars
+    # Total natural row width = ~80 (Time+Log+Lvl+Id+Provider+borders)
+    # plus message_chars. Set Console wider than that so Rich does not have
+    # to squash anything; terminal can scroll horizontally if needed.
+    needed = 100 + (msg_cap if msg_cap else 200)
+    wide = Console(width=max(console.size.width, needed), highlight=False)
+    wide.print(format_compact_table(events, message_chars=msg_cap))
     console.print(f"[green][+][/] {len(events)} event(s)")
