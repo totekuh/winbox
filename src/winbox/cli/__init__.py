@@ -97,7 +97,7 @@ class GroupedCli(click.Group):
 
     SECTIONS: list[tuple[str, list[str]]] = [
         ("VM Lifecycle", ["setup", "up", "down", "suspend", "destroy", "status", "snapshot", "restore", "provision"]),
-        ("Execute", ["exec", "shell", "ssh", "vnc", "jobs", "msi"]),
+        ("Execute", ["exec", "shell", "ssh", "vnc", "jobs", "msi", "eventlogs"]),
         ("Files", ["tools", "upload", "iso"]),
         ("Network", ["net", "dns", "hosts", "domain"]),
         ("Target", ["av", "applocker", "autologin"]),
@@ -156,6 +156,7 @@ from winbox.cli.applocker import applocker  # noqa: E402
 from winbox.cli.autologin import autologin  # noqa: E402
 from winbox.cli.msi import msi  # noqa: E402
 from winbox.cli.upload import upload  # noqa: E402
+from winbox.cli.eventlogs import eventlogs  # noqa: E402
 from winbox.cli.mcp import mcp_cmd  # noqa: E402
 from winbox.cli.kdbg import kdbg  # noqa: E402
 
@@ -186,5 +187,6 @@ cli.add_command(applocker)
 cli.add_command(autologin)
 cli.add_command(msi)
 cli.add_command(upload)
+cli.add_command(eventlogs)
 cli.add_command(mcp_cmd)
 cli.add_command(kdbg)

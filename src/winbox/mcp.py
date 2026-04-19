@@ -651,6 +651,84 @@ def ps(filter: str | None = None) -> str:
     return output or "(no output)"
 
 
+# ─── Tool 5b: eventlogs ────────────────────────────────────────────────────
+
+@mcp.tool()
+def eventlogs(
+    log: list[str] | str | None = None,
+    since: str = "1h",
+    ids: list[int] | None = None,
+    provider: str | None = None,
+    level: str | None = None,
+    max_events: int = 100,
+    timeout: int = 60,
+) -> str:
+    """Query Windows event logs via Get-WinEvent in the VM.
+
+    Returns a JSON array of event objects with TimeCreated, LogName, Level,
+    LevelDisplayName, Id, ProviderName, Message. Useful right after running
+    a tool to see what Defender / Sysmon / Security audit logged in
+    response.
+
+    Args:
+        log: Channel name(s). String or list. Default ['Security'].
+             Examples: 'System', 'Microsoft-Windows-Sysmon/Operational',
+             'Microsoft-Windows-Windows Defender/Operational'.
+        since: Time range. 'Nh' / 'Nm' / 'Nd' / 'Nw' or ISO 8601. Default '1h'.
+        ids: Event IDs to match (OR'd). Example [4624, 4625].
+        provider: Provider name filter.
+        level: 'Critical' | 'Error' | 'Warning' | 'Information' | 'Verbose'.
+        max_events: Cap on returned events. Default 100.
+        timeout: Seconds to wait for Get-WinEvent. Default 60.
+    """
+    from winbox.eventlogs import (
+        EventQuery,
+        build_powershell,
+        parse_events,
+        parse_since,
+    )
+
+    cfg, vm, ga = _ensure_vm_ready()
+
+    if log is None:
+        logs = ["Security"]
+    elif isinstance(log, str):
+        logs = [log]
+    else:
+        logs = list(log)
+
+    try:
+        since_dt = parse_since(since)
+    except ValueError as e:
+        return f"error: {e}"
+
+    try:
+        script = build_powershell(
+            EventQuery(
+                logs=logs,
+                since=since_dt,
+                ids=list(ids) if ids else [],
+                provider=provider,
+                level=level,
+                max_events=int(max_events),
+            )
+        )
+    except ValueError as e:
+        return f"error: {e}"
+
+    result = ga.exec_powershell(script, timeout=timeout)
+    if result.exitcode != 0:
+        msg = (result.stderr or result.stdout or "Get-WinEvent failed").strip()
+        return f"error (exit {result.exitcode}): {msg}"
+
+    try:
+        events = parse_events(result.stdout)
+    except (ValueError, _json.JSONDecodeError) as e:
+        return f"error: could not parse JSON: {e}"
+
+    return _json.dumps(events, indent=2, default=str)
+
+
 # ─── Tool 6: upload ────────────────────────────────────────────────────────
 
 @mcp.tool()

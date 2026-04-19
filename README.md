@@ -93,7 +93,7 @@ winbox setup -y              # builds and provisions the VM
 
 ```
 VM Lifecycle   setup  up  down  suspend  destroy  status  snapshot  restore  provision
-Execute        exec  shell  ssh  vnc  jobs  msi  kdbg
+Execute        exec  shell  ssh  vnc  jobs  msi  eventlogs  kdbg
 Files          tools  upload  iso
 Network        net  dns  hosts  domain
 Target         av  applocker  autologin     (bidirectional — flip on to test bypass tools)
@@ -158,6 +158,20 @@ winbox msi VMware-tools.msi ADDLOCAL=ALL /norestart   # extra args pass through 
 ```
 
 Both stage through the VirtIO-FS share and clean up on failure. `winbox msi` treats exit code 3010 (reboot required) as success.
+
+### Event Logs
+
+Query Windows event logs from inside the VM. Useful right after running a tool to see what Defender / Sysmon / Security audit logged in response.
+
+```bash
+winbox eventlogs                                              # Security log, last 1h, max 100
+winbox eventlogs --since 5m --max 20                          # last 5 minutes
+winbox eventlogs --log "Microsoft-Windows-Sysmon/Operational" # Sysmon channel
+winbox eventlogs --log Security --id 4624 --id 4625 --since 1d
+winbox eventlogs --level Error --since 1d --json | jq '.[0]'
+```
+
+Default output is a compact table. `--json` emits the raw `Get-WinEvent` JSON. `--log` is repeatable for multi-channel queries; `--id` is repeatable and OR'd inside the filter.
 
 ### Network
 
@@ -272,7 +286,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (31):**
+**Available tools (32):**
 
 User-mode primitives:
 
@@ -292,6 +306,7 @@ User-mode primitives:
 | `net_isolate()` | Disconnect VM from network (host-VM channels stay up) |
 | `net_connect()` | Reconnect VM to network (restarts adapter, renews DHCP) |
 | `net_unplug()` | Full air-gap (link down via virsh) |
+| `eventlogs(log?, since?, ids?, provider?, level?, max_events?)` | Query Windows event logs via Get-WinEvent (JSON array, defaults Security/last 1h) |
 
 Named pipes:
 
