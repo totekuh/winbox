@@ -174,6 +174,14 @@ winbox eventlogs --since 1h | csvgrep -c Id -m 4624           # pipe into csvkit
 
 Default output is CSV (RFC 4180, fields `Time,Log,Level,Id,Provider,Message`). `--json` emits the raw `Get-WinEvent` JSON. Status messages go to stderr so stdout stays clean for piping. Newlines/tabs in Message are flattened to ` | ` so each event is exactly one CSV row. `--log` is repeatable for multi-channel queries; `--id` is repeatable and OR'd inside the filter.
 
+Clear channels (destructive, prompts for confirmation unless `-y`):
+
+```bash
+winbox eventlogs clear --log Security                       # one channel
+winbox eventlogs clear --log Security --log System -y       # multiple
+winbox eventlogs clear --all -y                             # nuke (read-only / system-protected channels are skipped)
+```
+
 ### Network
 
 ```bash
@@ -287,7 +295,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (32):**
+**Available tools (33):**
 
 User-mode primitives:
 
@@ -308,6 +316,7 @@ User-mode primitives:
 | `net_connect()` | Reconnect VM to network (restarts adapter, renews DHCP) |
 | `net_unplug()` | Full air-gap (link down via virsh) |
 | `eventlogs(log?, since?, ids?, provider?, level?, max_events?)` | Query Windows event logs via Get-WinEvent (returns JSON array; CLI defaults to CSV) |
+| `eventlogs_clear(log?, all_logs?, confirm)` | Clear event channels via wevtutil cl. `confirm=True` required (destructive). |
 
 Named pipes:
 

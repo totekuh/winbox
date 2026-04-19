@@ -11,8 +11,10 @@ import pytest
 from winbox.eventlogs import (
     CSV_FIELDS,
     EventQuery,
+    build_clear_powershell,
     build_powershell,
     format_csv,
+    parse_clear_result,
     parse_events,
     parse_since,
 )
@@ -463,6 +465,212 @@ class TestEventlogsCli:
         assert "first | second | third" in data_rows[0]
 
 
+# ─── build_clear_powershell ─────────────────────────────────────────────────
+
+
+class TestBuildClearPowershell:
+    def test_single_log(self):
+        ps = build_clear_powershell(["Security"])
+        assert "@('Security')" in ps
+        assert "wevtutil cl" in ps
+        assert "wevtutil el" not in ps  # not enumerating
+
+    def test_multi_log(self):
+        ps = build_clear_powershell(["Security", "System"])
+        assert "@('Security','System')" in ps
+
+    def test_log_quote_escaped(self):
+        ps = build_clear_powershell(["foo'bar"])
+        assert "'foo''bar'" in ps
+
+    def test_all_logs(self):
+        ps = build_clear_powershell(all_logs=True)
+        assert "wevtutil el" in ps
+        assert "wevtutil cl" in ps
+
+    def test_mutex_logs_and_all(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            build_clear_powershell(["Security"], all_logs=True)
+
+    def test_neither_required(self):
+        with pytest.raises(ValueError, match="required"):
+            build_clear_powershell()
+
+    def test_emits_json(self):
+        ps = build_clear_powershell(["Security"])
+        assert "ConvertTo-Json" in ps
+        assert "cleared" in ps and "failed" in ps and "total" in ps
+
+
+# ─── parse_clear_result ─────────────────────────────────────────────────────
+
+
+class TestParseClearResult:
+    def test_full(self):
+        s = json.dumps({"cleared": 3, "failed": 1, "total": 4, "errors": ["x"]})
+        assert parse_clear_result(s) == {
+            "cleared": 3, "failed": 1, "total": 4, "errors": ["x"]
+        }
+
+    def test_empty_stdout(self):
+        out = parse_clear_result("")
+        assert out["cleared"] == 0 and out["failed"] == 0 and out["total"] == 0
+        assert out["errors"] == []
+
+    def test_missing_keys_filled(self):
+        out = parse_clear_result(json.dumps({"cleared": 2}))
+        assert out["failed"] == 0
+        assert out["total"] == 0
+        assert out["errors"] == []
+
+    def test_string_errors_normalised_to_list(self):
+        out = parse_clear_result(json.dumps({"errors": "single"}))
+        assert out["errors"] == ["single"]
+
+    def test_invalid_shape(self):
+        with pytest.raises(ValueError, match="unexpected clear result"):
+            parse_clear_result(json.dumps([1, 2, 3]))
+
+
+# ─── CLI clear subcommand ──────────────────────────────────────────────────
+
+
+class TestEventlogsClearCli:
+    def test_requires_log_or_all(self, runner, mock_env, cfg):
+        from winbox.cli import cli
+
+        result = runner.invoke(cli, ["eventlogs", "clear"])
+
+        assert result.exit_code != 0
+        assert "or --all" in result.output
+        mock_env.exec_powershell.assert_not_called()
+
+    def test_log_and_all_mutex(self, runner, mock_env, cfg):
+        from winbox.cli import cli
+
+        result = runner.invoke(
+            cli, ["eventlogs", "clear", "--log", "Security", "--all", "-y"]
+        )
+
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.output
+        mock_env.exec_powershell.assert_not_called()
+
+    def test_clear_single_log_yes(self, runner, mock_env, cfg):
+        from winbox.cli import cli
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout=json.dumps({"cleared": 1, "failed": 0, "total": 1, "errors": []}),
+            stderr="",
+        )
+
+        result = runner.invoke(
+            cli, ["eventlogs", "clear", "--log", "Security", "-y"]
+        )
+
+        assert result.exit_code == 0, result.output
+        mock_env.exec_powershell.assert_called_once()
+        script = mock_env.exec_powershell.call_args[0][0]
+        assert "@('Security')" in script
+        assert "wevtutil cl" in script
+        assert "Cleared 1" in result.output
+
+    def test_clear_multi_log(self, runner, mock_env, cfg):
+        from winbox.cli import cli
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout=json.dumps({"cleared": 2, "failed": 0, "total": 2, "errors": []}),
+            stderr="",
+        )
+
+        result = runner.invoke(
+            cli,
+            ["eventlogs", "clear", "--log", "Security", "--log", "System", "-y"],
+        )
+
+        assert result.exit_code == 0, result.output
+        script = mock_env.exec_powershell.call_args[0][0]
+        assert "@('Security','System')" in script
+
+    def test_clear_all_yes(self, runner, mock_env, cfg):
+        from winbox.cli import cli
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout=json.dumps({"cleared": 200, "failed": 50, "total": 250, "errors": []}),
+            stderr="",
+        )
+
+        result = runner.invoke(cli, ["eventlogs", "clear", "--all", "-y"])
+
+        assert result.exit_code == 0, result.output
+        script = mock_env.exec_powershell.call_args[0][0]
+        assert "wevtutil el" in script
+        # all_logs failures are expected; do not surface as error exit
+        assert "Cleared 200/250" in result.output
+
+    def test_clear_specific_log_failure_exits_nonzero(self, runner, mock_env, cfg):
+        """Per-log clear failure (e.g. ACCESS DENIED) should exit non-zero."""
+        from winbox.cli import cli
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout=json.dumps({
+                "cleared": 0, "failed": 1, "total": 1,
+                "errors": ["Security: Access is denied."],
+            }),
+            stderr="",
+        )
+
+        result = runner.invoke(
+            cli, ["eventlogs", "clear", "--log", "Security", "-y"]
+        )
+
+        assert result.exit_code != 0
+        assert "Access is denied" in result.output
+
+    def test_confirmation_required_without_yes(self, runner, mock_env, cfg):
+        from winbox.cli import cli
+
+        result = runner.invoke(
+            cli, ["eventlogs", "clear", "--log", "Security"], input="n\n"
+        )
+
+        assert result.exit_code != 0
+        mock_env.exec_powershell.assert_not_called()
+
+    def test_confirmation_y_proceeds(self, runner, mock_env, cfg):
+        from winbox.cli import cli
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout=json.dumps({"cleared": 1, "failed": 0, "total": 1, "errors": []}),
+            stderr="",
+        )
+
+        result = runner.invoke(
+            cli, ["eventlogs", "clear", "--log", "Security"], input="y\n"
+        )
+
+        assert result.exit_code == 0, result.output
+        mock_env.exec_powershell.assert_called_once()
+
+
+# ─── CLI eventlogs is now a group; default-no-subcommand still queries ──────
+
+
+class TestEventlogsGroupBackwardsCompat:
+    def test_no_subcommand_queries(self, runner, mock_env, cfg):
+        from winbox.cli import cli
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="[]", stderr=""
+        )
+
+        result = runner.invoke(cli, ["eventlogs", "--since", "1h"])
+
+        assert result.exit_code == 0, result.output
+        # CSV header row is from the query path
+        assert "Time,Log,Level,Id,Provider,Message" in result.output
+        mock_env.exec_powershell.assert_called_once()
+
+
 # ─── MCP tool ───────────────────────────────────────────────────────────────
 
 
@@ -556,3 +764,87 @@ class TestMcpEventlogs:
 
         assert result.startswith("error (exit 1):")
         assert "No events were found" in result
+
+
+# ─── MCP eventlogs_clear ────────────────────────────────────────────────────
+
+
+class TestMcpEventlogsClear:
+    def test_refuses_without_confirm(self, mock_mcp_eventlogs):
+        from winbox.mcp import eventlogs_clear
+
+        result = eventlogs_clear(log="Security")
+
+        assert "refusing" in result
+        assert "confirm=True" in result
+        mock_mcp_eventlogs.exec_powershell.assert_not_called()
+
+    def test_neither_log_nor_all(self, mock_mcp_eventlogs):
+        from winbox.mcp import eventlogs_clear
+
+        result = eventlogs_clear(confirm=True)
+
+        assert result.startswith("error:")
+        mock_mcp_eventlogs.exec_powershell.assert_not_called()
+
+    def test_log_and_all_mutex(self, mock_mcp_eventlogs):
+        from winbox.mcp import eventlogs_clear
+
+        result = eventlogs_clear(log="Security", all_logs=True, confirm=True)
+
+        assert "mutually exclusive" in result
+        mock_mcp_eventlogs.exec_powershell.assert_not_called()
+
+    def test_clear_single(self, mock_mcp_eventlogs):
+        from winbox.mcp import eventlogs_clear
+        mock_mcp_eventlogs.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout=json.dumps({"cleared": 1, "failed": 0, "total": 1, "errors": []}),
+            stderr="",
+        )
+
+        out = eventlogs_clear(log="Security", confirm=True)
+        info = json.loads(out)
+        assert info == {"cleared": 1, "failed": 0, "total": 1, "errors": []}
+
+        script = mock_mcp_eventlogs.exec_powershell.call_args[0][0]
+        assert "@('Security')" in script
+
+    def test_clear_list_arg(self, mock_mcp_eventlogs):
+        from winbox.mcp import eventlogs_clear
+        mock_mcp_eventlogs.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout=json.dumps({"cleared": 2, "failed": 0, "total": 2, "errors": []}),
+            stderr="",
+        )
+
+        eventlogs_clear(log=["Security", "System"], confirm=True)
+
+        script = mock_mcp_eventlogs.exec_powershell.call_args[0][0]
+        assert "@('Security','System')" in script
+
+    def test_clear_all(self, mock_mcp_eventlogs):
+        from winbox.mcp import eventlogs_clear
+        mock_mcp_eventlogs.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout=json.dumps({"cleared": 200, "failed": 50, "total": 250, "errors": []}),
+            stderr="",
+        )
+
+        out = eventlogs_clear(all_logs=True, confirm=True)
+        info = json.loads(out)
+        assert info["total"] == 250
+        assert info["failed"] == 50
+
+        script = mock_mcp_eventlogs.exec_powershell.call_args[0][0]
+        assert "wevtutil el" in script
+
+    def test_powershell_error(self, mock_mcp_eventlogs):
+        from winbox.mcp import eventlogs_clear
+        mock_mcp_eventlogs.exec_powershell.return_value = ExecResult(
+            exitcode=1, stdout="", stderr="boom"
+        )
+
+        out = eventlogs_clear(log="Security", confirm=True)
+        assert out.startswith("error (exit 1):")
+        assert "boom" in out

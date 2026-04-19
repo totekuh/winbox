@@ -729,6 +729,72 @@ def eventlogs(
     return _json.dumps(events, indent=2, default=str)
 
 
+@mcp.tool()
+def eventlogs_clear(
+    log: list[str] | str | None = None,
+    all_logs: bool = False,
+    confirm: bool = False,
+    timeout: int = 180,
+) -> str:
+    """Clear one or more Windows event log channels via wevtutil cl.
+
+    DESTRUCTIVE: cleared logs cannot be recovered. The ``confirm`` flag
+    must be set to True or the call is refused without touching the VM.
+    Useful for setting up a clean slate before a controlled test.
+
+    Returns a JSON object: ``{cleared, failed, total, errors}``.
+
+    Args:
+        log: Channel name(s). String or list of strings. Mutually
+             exclusive with all_logs.
+        all_logs: Clear EVERY channel reported by 'wevtutil el'. Many
+                  channels are read-only / system-protected and will
+                  fail; failures are counted but not surfaced
+                  individually.
+        confirm: Must be True to actually run. Default False is a
+                 no-op safety so an LLM cannot accidentally wipe logs.
+        timeout: Seconds to wait. Raise for all_logs on busy systems.
+    """
+    from winbox.eventlogs import build_clear_powershell, parse_clear_result
+
+    if not confirm:
+        return (
+            "error: refusing to clear logs without confirm=True. "
+            "Pass confirm=True to actually run; this is a destructive operation."
+        )
+
+    if log is None:
+        logs: list[str] = []
+    elif isinstance(log, str):
+        logs = [log]
+    else:
+        logs = list(log)
+
+    if all_logs and logs:
+        return "error: log and all_logs are mutually exclusive"
+    if not all_logs and not logs:
+        return "error: either log (channel name) or all_logs=True is required"
+
+    cfg, vm, ga = _ensure_vm_ready()
+
+    try:
+        script = build_clear_powershell(logs or None, all_logs=all_logs)
+    except ValueError as e:
+        return f"error: {e}"
+
+    result = ga.exec_powershell(script, timeout=timeout)
+    if result.exitcode != 0:
+        msg = (result.stderr or result.stdout or "wevtutil cl failed").strip()
+        return f"error (exit {result.exitcode}): {msg}"
+
+    try:
+        info = parse_clear_result(result.stdout)
+    except (ValueError, _json.JSONDecodeError) as e:
+        return f"error: could not parse JSON: {e}"
+
+    return _json.dumps(info, indent=2)
+
+
 # ─── Tool 6: upload ────────────────────────────────────────────────────────
 
 @mcp.tool()

@@ -152,6 +152,75 @@ def _normalize_ps_date(value: Any) -> Any:
         return value
 
 
+def build_clear_powershell(
+    logs: list[str] | None = None,
+    *,
+    all_logs: bool = False,
+) -> str:
+    """Build a PowerShell script that clears one or more event channels.
+
+    For specific channels: clears each via 'wevtutil cl <name>', collects
+    success/failure counts and per-channel error messages.
+
+    For all_logs=True: enumerates with 'wevtutil el' and clears each;
+    many channels are read-only or system-protected and fail - failures
+    are counted but not surfaced individually (would be hundreds of lines
+    on a typical Windows install). Total/cleared/failed reported.
+
+    Returns a script that emits a JSON object on stdout:
+      {"cleared": int, "failed": int, "total": int, "errors": [str, ...]}
+    """
+    if all_logs and logs:
+        raise ValueError("logs and all_logs are mutually exclusive")
+    if not all_logs and not logs:
+        raise ValueError("either logs or all_logs is required")
+
+    if all_logs:
+        return (
+            "$ErrorActionPreference='Continue';"
+            "$names = wevtutil el;"
+            "$ok = 0; $fail = 0;"
+            "foreach ($n in $names) {"
+            " wevtutil cl $n 2>$null;"
+            " if ($LASTEXITCODE -eq 0) { $ok++ } else { $fail++ }"
+            "}"
+            "[pscustomobject]@{cleared=$ok;failed=$fail;total=$names.Count;errors=@()}"
+            " | ConvertTo-Json -Compress"
+        )
+
+    arr = "@(" + ",".join(f"'{_ps_quote(l)}'" for l in logs) + ")"
+    return (
+        "$ErrorActionPreference='Continue';"
+        f"$names = {arr};"
+        "$ok = 0; $fail = 0; $errs = @();"
+        "foreach ($n in $names) {"
+        " $out = wevtutil cl $n 2>&1;"
+        " if ($LASTEXITCODE -eq 0) { $ok++ }"
+        " else { $fail++; $errs += \"$($n): $out\" }"
+        "}"
+        "[pscustomobject]@{cleared=$ok;failed=$fail;total=$names.Count;errors=$errs}"
+        " | ConvertTo-Json -Compress"
+    )
+
+
+def parse_clear_result(stdout: str) -> dict[str, Any]:
+    """Parse the JSON object returned by a clear script. Tolerant of empty."""
+    s = (stdout or "").strip()
+    if not s:
+        return {"cleared": 0, "failed": 0, "total": 0, "errors": []}
+    data = json.loads(s)
+    if not isinstance(data, dict):
+        raise ValueError(f"unexpected clear result shape: {type(data).__name__}")
+    data.setdefault("cleared", 0)
+    data.setdefault("failed", 0)
+    data.setdefault("total", 0)
+    errs = data.get("errors") or []
+    if isinstance(errs, str):
+        errs = [errs]
+    data["errors"] = list(errs)
+    return data
+
+
 def parse_events(stdout: str) -> list[dict[str, Any]]:
     """Parse Get-WinEvent JSON output.
 
