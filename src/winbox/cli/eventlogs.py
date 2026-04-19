@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import click
+from rich.console import Console
 
 from winbox.cli import console, ensure_running
 from winbox.config import Config
@@ -151,5 +152,9 @@ def eventlogs(
         console.print("[yellow][!][/] No matching events.")
         return
 
-    console.print(format_compact_table(events))
+    # Force a wide rendering width (terminal often 80) so column auto-sizing
+    # has room. Message is already pre-truncated to a sane single-line width
+    # so Rich does not have to balance a 2KB cell against 4 small ones.
+    wide = Console(width=max(console.size.width, 160), highlight=False)
+    wide.print(format_compact_table(events))
     console.print(f"[green][+][/] {len(events)} event(s)")

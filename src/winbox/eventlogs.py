@@ -158,20 +158,23 @@ def _level_abbrev(level: int | str | None, display: str | None) -> str:
         return "Inf"
 
 
-def _flatten_message(msg: str | None) -> str:
+def _flatten_message(msg: str | None, max_chars: int = 80) -> str:
     if not msg:
         return ""
-    return " | ".join(line.strip() for line in str(msg).splitlines() if line.strip())
+    flat = " | ".join(line.strip() for line in str(msg).splitlines() if line.strip())
+    if len(flat) > max_chars:
+        return flat[: max_chars - 1] + "\u2026"
+    return flat
 
 
 def format_compact_table(events: list[dict[str, Any]]) -> Table:
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("Time", width=19, no_wrap=True)
-    table.add_column("Log", max_width=20, overflow="ellipsis")
-    table.add_column("Lvl", width=3)
-    table.add_column("Id", justify="right", width=6)
-    table.add_column("Provider", max_width=32, overflow="ellipsis")
-    table.add_column("Message", overflow="ellipsis", no_wrap=True)
+    table = Table(show_header=True, header_style="bold", expand=False)
+    table.add_column("Time", min_width=19, no_wrap=True)
+    table.add_column("Log", no_wrap=True)
+    table.add_column("Lvl", min_width=3, no_wrap=True)
+    table.add_column("Id", justify="right", min_width=4, no_wrap=True)
+    table.add_column("Provider", no_wrap=True)
+    table.add_column("Message", no_wrap=True, max_width=80, overflow="ellipsis")
 
     for ev in events:
         table.add_row(
