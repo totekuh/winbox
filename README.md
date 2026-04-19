@@ -277,7 +277,7 @@ claude mcp add winbox -- winbox mcp
 | `python(code)` | Execute Python code in the VM (ctypes, winreg, COM, WMI — full Win32 access) |
 | `ioctl(device, code, input_hex, output_size)` | Send DeviceIoControl to a driver — no ctypes boilerplate |
 | `reg_query(key, value?)` | Query registry key or value |
-| `reg_set(key, value, data, type)` | Set registry value (creates key if needed) |
+| `reg_set(key, value, data, value_type)` | Set registry value (creates key if needed) |
 | `reg_delete(key, value?)` | Delete registry value or entire key tree |
 | `ps(filter?)` | List processes with PID, name, path, memory usage |
 | `upload(src, dst?)` | Upload file from Kali to VM via VirtIO-FS (optionally copy to dst inside VM) |

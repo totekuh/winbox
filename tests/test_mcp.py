@@ -1595,3 +1595,119 @@ class TestKdbgTools:
     def test_kdbg_probe_helper_closed_port(self):
         from winbox.mcp import _kdbg_probe
         assert _kdbg_probe("127.0.0.1", 1, timeout=0.1) is False
+
+
+class TestKdbgListTools:
+    """JSON output contract for kdbg_ps / kdbg_lm and auto-resume on paused VMs."""
+
+    def test_kdbg_ps_returns_json_array(self, mock_mcp):
+        import json as _json
+        from winbox.kdbg.walk import ProcessRecord
+        from winbox.mcp import kdbg_ps
+
+        ga, vm, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+
+        procs = [
+            ProcessRecord(pid=4, name="System",
+                          eprocess=0xffffae0012345000,
+                          directory_table_base=0x1ad000),
+            ProcessRecord(pid=1234, name="explorer.exe",
+                          eprocess=0xffffae00abcdef00,
+                          directory_table_base=0x7fa000),
+        ]
+
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_list_processes", return_value=procs):
+            result = kdbg_ps()
+
+        parsed = _json.loads(result)
+        assert isinstance(parsed, list)
+        assert len(parsed) == 2
+        assert parsed[0] == {
+            "pid": 4,
+            "dtb": "0x0000001ad000",
+            "eprocess": "0xffffae0012345000",
+            "name": "System",
+        }
+        assert parsed[1]["pid"] == 1234
+        assert parsed[1]["name"] == "explorer.exe"
+        for entry in parsed:
+            assert entry["dtb"].startswith("0x")
+            assert entry["eprocess"].startswith("0x")
+
+    def test_kdbg_lm_returns_json_array(self, mock_mcp):
+        import json as _json
+        from winbox.kdbg.walk import ModuleRecord
+        from winbox.mcp import kdbg_lm
+
+        ga, vm, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+
+        mods = [
+            ModuleRecord(name="ntoskrnl.exe", base=0xfffff80012000000,
+                         size=0x00a00000, entry=0xffffae0011110000),
+            ModuleRecord(name="hal.dll", base=0xfffff80012a00000,
+                         size=0x00080000, entry=0xffffae0011120000),
+        ]
+
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_list_modules", return_value=mods):
+            result = kdbg_lm()
+
+        parsed = _json.loads(result)
+        assert isinstance(parsed, list)
+        assert len(parsed) == 2
+        assert parsed[0] == {
+            "base": "0xfffff80012000000",
+            "size": "0x00a00000",
+            "name": "ntoskrnl.exe",
+        }
+        assert parsed[1]["name"] == "hal.dll"
+        for entry in parsed:
+            assert entry["base"].startswith("0x")
+            assert entry["size"].startswith("0x")
+
+    def test_kdbg_ps_auto_resumes_paused_vm(self, mock_mcp):
+        import json as _json
+        from winbox.kdbg.walk import ProcessRecord
+        from winbox.mcp import kdbg_ps
+
+        ga, vm, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+        vm.state.return_value = VMState.PAUSED
+
+        procs = [ProcessRecord(pid=4, name="System",
+                               eprocess=0xffffae0012345000,
+                               directory_table_base=0x1ad000)]
+
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_list_processes", return_value=procs):
+            result = kdbg_ps()
+
+        vm.resume.assert_called_once()
+        assert "VM not running" not in result
+        parsed = _json.loads(result)
+        assert parsed[0]["pid"] == 4
+
+    def test_kdbg_read_va_auto_resumes_paused_vm(self, mock_mcp):
+        from winbox.kdbg.walk import ProcessRecord
+        from winbox.mcp import kdbg_read_va
+
+        ga, vm, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+        vm.state.return_value = VMState.PAUSED
+
+        procs = [ProcessRecord(pid=1234, name="target.exe",
+                               eprocess=0xffffae00abcdef00,
+                               directory_table_base=0x7fa000)]
+        payload = b"\xde\xad\xbe\xef"
+
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_list_processes", return_value=procs), \
+             patch("winbox.mcp._kdbg_read_virt_cr3", return_value=payload):
+            result = kdbg_read_va(pid=1234, address="0x7ff600001000", length=4)
+
+        vm.resume.assert_called_once()
+        assert "VM not running" not in result
+        assert result == "deadbeef"

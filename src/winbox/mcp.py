@@ -1929,9 +1929,7 @@ def kdbg_read_va(pid: int, address: str, length: int) -> str:
         address: Virtual address, hex string (e.g. '0x7ff600001000').
         length: Number of bytes to read (capped at 1MB).
     """
-    cfg, vm, ga = _get_state()
-    if vm.state() != VMState.RUNNING:
-        return f"VM not running ({vm.state().value})"
+    cfg, vm, ga = _ensure_vm_ready()
     if length <= 0:
         return "length must be > 0"
     if length > 1024 * 1024:
@@ -1968,9 +1966,7 @@ def kdbg_base_refresh() -> str:
     reboot the cached symbol map still has the old base — this call
     re-reads the IDT, computes the fresh base, and updates the store.
     """
-    cfg, vm, ga = _get_state()
-    if vm.state() != VMState.RUNNING:
-        return f"VM not running ({vm.state().value})"
+    cfg, vm, ga = _ensure_vm_ready()
     store = _kdbg_get_store()
     try:
         data = store.load("nt")
