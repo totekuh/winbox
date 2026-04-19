@@ -1,19 +1,19 @@
 """Windows event-log query primitives - shared between CLI and MCP.
 
 Pure functions: time-range parsing, PowerShell FilterHashtable construction,
-JSON parsing, and table formatting. No I/O, no VM access. The CLI and MCP
-wrappers handle the GuestAgent call.
+JSON parsing, CSV formatting. No I/O, no VM access. The CLI and MCP wrappers
+handle the GuestAgent call.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
-
-from rich.table import Table
 
 
 _DURATION_RE = re.compile(r"^(\d+)([smhdw])$")
@@ -95,7 +95,13 @@ def _ps_int_array(items: list[int]) -> str:
 
 
 def build_powershell(q: EventQuery) -> str:
-    """Build the Get-WinEvent PowerShell script for a parsed query."""
+    """Build the Get-WinEvent PowerShell script for a parsed query.
+
+    Wraps the call in try/catch so 'No events were found that match the
+    specified selection criteria' returns an empty array rather than a
+    non-zero exit. Real errors (missing channel, bad filter) still
+    propagate.
+    """
     parts = [f"LogName={_ps_string_array(q.logs)}"]
     parts.append(
         "StartTime=[datetime]'" + q.since.strftime("%Y-%m-%dT%H:%M:%S") + "'"
@@ -112,10 +118,17 @@ def build_powershell(q: EventQuery) -> str:
     max_events = int(q.max_events)
     return (
         "$ErrorActionPreference='Stop';"
+        "try {"
         f"Get-WinEvent -FilterHashtable @{{{hashtable}}} -MaxEvents {max_events} "
         "| Select-Object TimeCreated,LogName,LevelDisplayName,Level,Id,"
         "ProviderName,Message "
         "| ConvertTo-Json -Depth 4 -Compress"
+        "} catch ["
+        "System.Exception"
+        "] {"
+        "if ($_.Exception.Message -match 'No events were found') { '[]' }"
+        " else { throw }"
+        "}"
     )
 
 
@@ -158,43 +171,35 @@ def _level_abbrev(level: int | str | None, display: str | None) -> str:
         return "Inf"
 
 
-def _flatten_message(msg: str | None, max_chars: int = 240) -> str:
+CSV_FIELDS = ("Time", "Log", "Level", "Id", "Provider", "Message")
+
+
+def _flatten_message(msg: str | None) -> str:
+    """Collapse newlines and tabs to ' | ' and ' ' so events are one CSV row."""
     if not msg:
         return ""
-    flat = " | ".join(line.strip() for line in str(msg).splitlines() if line.strip())
-    if max_chars and len(flat) > max_chars:
-        return flat[: max_chars - 1] + "\u2026"
-    return flat
+    s = str(msg).replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+    return " | ".join(line.strip() for line in s.split("\n") if line.strip())
 
 
-def format_compact_table(
-    events: list[dict[str, Any]],
-    *,
-    message_chars: int = 240,
-) -> Table:
-    table = Table(show_header=True, header_style="bold", expand=False)
-    table.add_column("Time", min_width=19, no_wrap=True)
-    table.add_column("Log", no_wrap=True)
-    table.add_column("Lvl", min_width=3, no_wrap=True)
-    table.add_column("Id", justify="right", min_width=4, no_wrap=True)
-    table.add_column("Provider", no_wrap=True)
-    if message_chars:
-        table.add_column(
-            "Message",
-            no_wrap=True,
-            max_width=message_chars,
-            overflow="ellipsis",
-        )
-    else:
-        table.add_column("Message", overflow="fold")
+def format_csv(events: list[dict[str, Any]]) -> str:
+    """Render events as CSV (RFC 4180, quoted where needed) with a header row.
 
+    Newlines and tabs in Message are flattened so each event is exactly one
+    CSV row - safe to pipe into csvkit, awk, miller, etc.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
+    writer.writerow(CSV_FIELDS)
     for ev in events:
-        table.add_row(
-            _short_time(ev.get("TimeCreated")),
-            str(ev.get("LogName", "")),
-            _level_abbrev(ev.get("Level"), ev.get("LevelDisplayName")),
-            str(ev.get("Id", "")),
-            str(ev.get("ProviderName", "")),
-            _flatten_message(ev.get("Message"), max_chars=message_chars),
+        writer.writerow(
+            (
+                _short_time(ev.get("TimeCreated")),
+                str(ev.get("LogName", "")),
+                ev.get("LevelDisplayName") or _level_abbrev(ev.get("Level"), None),
+                str(ev.get("Id", "")),
+                str(ev.get("ProviderName", "")),
+                _flatten_message(ev.get("Message")),
+            )
         )
-    return table
+    return buf.getvalue()

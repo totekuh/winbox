@@ -164,14 +164,15 @@ Both stage through the VirtIO-FS share and clean up on failure. `winbox msi` tre
 Query Windows event logs from inside the VM. Useful right after running a tool to see what Defender / Sysmon / Security audit logged in response.
 
 ```bash
-winbox eventlogs                                              # Security log, last 1h, max 100
+winbox eventlogs                                              # Security log, last 1h, max 100 (CSV)
 winbox eventlogs --since 5m --max 20                          # last 5 minutes
 winbox eventlogs --log "Microsoft-Windows-Sysmon/Operational" # Sysmon channel
 winbox eventlogs --log Security --id 4624 --id 4625 --since 1d
 winbox eventlogs --level Error --since 1d --json | jq '.[0]'
+winbox eventlogs --since 1h | csvgrep -c Id -m 4624           # pipe into csvkit
 ```
 
-Default output is a compact table. `--json` emits the raw `Get-WinEvent` JSON. `--log` is repeatable for multi-channel queries; `--id` is repeatable and OR'd inside the filter.
+Default output is CSV (RFC 4180, fields `Time,Log,Level,Id,Provider,Message`). `--json` emits the raw `Get-WinEvent` JSON. Status messages go to stderr so stdout stays clean for piping. Newlines/tabs in Message are flattened to ` | ` so each event is exactly one CSV row. `--log` is repeatable for multi-channel queries; `--id` is repeatable and OR'd inside the filter.
 
 ### Network
 
@@ -306,7 +307,7 @@ User-mode primitives:
 | `net_isolate()` | Disconnect VM from network (host-VM channels stay up) |
 | `net_connect()` | Reconnect VM to network (restarts adapter, renews DHCP) |
 | `net_unplug()` | Full air-gap (link down via virsh) |
-| `eventlogs(log?, since?, ids?, provider?, level?, max_events?)` | Query Windows event logs via Get-WinEvent (JSON array, defaults Security/last 1h) |
+| `eventlogs(log?, since?, ids?, provider?, level?, max_events?)` | Query Windows event logs via Get-WinEvent (returns JSON array; CLI defaults to CSV) |
 
 Named pipes:
 

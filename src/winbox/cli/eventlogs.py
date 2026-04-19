@@ -3,21 +3,29 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import click
 from rich.console import Console
 
-from winbox.cli import console, ensure_running
+from winbox.cli import ensure_running
 from winbox.config import Config
 from winbox.eventlogs import (
     LEVEL_CHOICES,
     EventQuery,
     build_powershell,
-    format_compact_table,
+    format_csv,
     parse_events,
     parse_since,
 )
 from winbox.vm import GuestAgent, VM
+
+
+_stderr = Console(stderr=True, highlight=False)
+
+
+def _err(msg: str) -> None:
+    _stderr.print(msg)
 
 
 @click.command("eventlogs")
@@ -65,18 +73,7 @@ from winbox.vm import GuestAgent, VM
     "--json",
     "as_json",
     is_flag=True,
-    help="Emit raw event JSON array instead of the compact table.",
-)
-@click.option(
-    "--message-chars",
-    default=240,
-    show_default=True,
-    help="Cap Message column at N chars (0 = no cap, wrap freely).",
-)
-@click.option(
-    "--full",
-    is_flag=True,
-    help="Show full untruncated messages (wraps over multiple lines).",
+    help="Emit raw event JSON array (default is CSV).",
 )
 @click.option(
     "--timeout",
@@ -94,11 +91,12 @@ def eventlogs(
     level: str | None,
     max_events: int,
     as_json: bool,
-    message_chars: int,
-    full: bool,
     timeout: int,
 ) -> None:
-    """Query Windows event logs and print as a table.
+    """Query Windows event logs and print as CSV (default) or JSON.
+
+    Status messages go to stderr so stdout stays clean for piping into
+    csvkit / jq / awk / miller / your favourite tool.
 
     Examples:
 
@@ -106,6 +104,7 @@ def eventlogs(
       winbox eventlogs --log "Microsoft-Windows-Sysmon/Operational" --since 1h
       winbox eventlogs --log Security --id 4624 --id 4625 --since 1d
       winbox eventlogs --level Error --since 1d --json | jq '.[0]'
+      winbox eventlogs --since 1h | csvgrep -c Id -m 4624
     """
     cfg: Config = ctx.obj["cfg"]
 
@@ -134,45 +133,31 @@ def eventlogs(
     ga = GuestAgent(cfg)
     ensure_running(vm, ga, cfg)
 
-    console.print(
-        f"[blue][*][/] Querying {','.join(query.logs)} since {since_dt:%Y-%m-%d %H:%M:%S} (max {max_events})..."
+    _err(
+        f"[blue][*][/] Querying {','.join(query.logs)} since "
+        f"{since_dt:%Y-%m-%d %H:%M:%S} (max {max_events})..."
     )
     result = ga.exec_powershell(script, timeout=timeout)
 
     if result.exitcode != 0:
-        console.print("[red][-][/] Get-WinEvent failed:")
+        _err("[red][-][/] Get-WinEvent failed:")
         if result.stderr:
-            console.print(result.stderr.strip(), markup=False, highlight=False, style="red")
+            _err(result.stderr.strip())
         if result.stdout:
-            console.print(result.stdout.strip(), markup=False, highlight=False)
+            _err(result.stdout.strip())
         raise SystemExit(result.exitcode or 1)
 
     try:
         events = parse_events(result.stdout)
     except (ValueError, json.JSONDecodeError) as e:
-        console.print(f"[red][-][/] Could not parse Get-WinEvent JSON: {e}")
+        _err(f"[red][-][/] Could not parse Get-WinEvent JSON: {e}")
         if result.stdout:
-            console.print(result.stdout.strip(), markup=False, highlight=False)
+            _err(result.stdout.strip())
         raise SystemExit(1)
 
     if as_json:
-        console.print(
-            json.dumps(events, indent=2, default=str), markup=False, highlight=False
-        )
-        return
+        click.echo(json.dumps(events, indent=2, default=str))
+    else:
+        click.echo(format_csv(events), nl=False)
 
-    if not events:
-        console.print("[yellow][!][/] No matching events.")
-        return
-
-    # Force a wide rendering width (terminal often 80) so column auto-sizing
-    # has room. Message is already pre-truncated to a sane single-line width
-    # so Rich does not have to balance a 2KB cell against 4 small ones.
-    msg_cap = 0 if full else message_chars
-    # Total natural row width = ~80 (Time+Log+Lvl+Id+Provider+borders)
-    # plus message_chars. Set Console wider than that so Rich does not have
-    # to squash anything; terminal can scroll horizontally if needed.
-    needed = 100 + (msg_cap if msg_cap else 200)
-    wide = Console(width=max(console.size.width, needed), highlight=False)
-    wide.print(format_compact_table(events, message_chars=msg_cap))
-    console.print(f"[green][+][/] {len(events)} event(s)")
+    _err(f"[green][+][/] {len(events)} event(s)")

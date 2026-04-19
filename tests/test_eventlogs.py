@@ -9,9 +9,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from winbox.eventlogs import (
+    CSV_FIELDS,
     EventQuery,
     build_powershell,
-    format_compact_table,
+    format_csv,
     parse_events,
     parse_since,
 )
@@ -159,49 +160,81 @@ class TestParseEvents:
             parse_events("{not json")
 
 
-# ─── format_compact_table ───────────────────────────────────────────────────
+# ─── format_csv ─────────────────────────────────────────────────────────────
 
 
-class TestFormatCompactTable:
-    def test_columns(self):
-        table = format_compact_table([])
-        headers = [c.header for c in table.columns]
-        assert headers == ["Time", "Log", "Lvl", "Id", "Provider", "Message"]
+class TestFormatCsv:
+    def test_header_and_empty(self):
+        out = format_csv([])
+        assert out.strip() == "Time,Log,Level,Id,Provider,Message"
 
-    def test_row_count(self):
-        events = [
-            {"TimeCreated": "2026-04-19T12:34:56", "LogName": "Security",
-             "Level": 4, "LevelDisplayName": "Information", "Id": 4624,
-             "ProviderName": "Microsoft-Windows-Security-Auditing",
-             "Message": "Logon"},
-            {"TimeCreated": "2026-04-19T12:35:00", "LogName": "System",
-             "Level": 3, "LevelDisplayName": "Warning", "Id": 1,
-             "ProviderName": "Foo", "Message": "x"},
-        ]
-        table = format_compact_table(events)
-        assert table.row_count == 2
+    def test_fields_constant(self):
+        assert CSV_FIELDS == ("Time", "Log", "Level", "Id", "Provider", "Message")
 
-    def test_message_newlines_collapse(self):
+    def test_basic_row(self):
         events = [{
-            "TimeCreated": "2026-04-19T12:34:56",
-            "LogName": "Security", "Level": 4, "LevelDisplayName": "Information",
-            "Id": 1, "ProviderName": "x",
-            "Message": "line one\nline two\n\nline three",
+            "TimeCreated": "2026-04-19T12:34:56", "LogName": "Security",
+            "Level": 4, "LevelDisplayName": "Information", "Id": 4624,
+            "ProviderName": "Microsoft-Windows-Security-Auditing",
+            "Message": "An account was successfully logged on.",
         }]
-        table = format_compact_table(events)
-        # The message cell ends up in the underlying row tuple
-        cells = list(table.columns[-1].cells)
-        assert "line one | line two | line three" in cells[0]
+        out = format_csv(events).splitlines()
+        assert out[0] == "Time,Log,Level,Id,Provider,Message"
+        assert out[1] == (
+            "2026-04-19 12:34:56,Security,Information,4624,"
+            "Microsoft-Windows-Security-Auditing,"
+            "An account was successfully logged on."
+        )
 
-    def test_level_abbrev(self):
+    def test_message_with_comma_quoted(self):
+        events = [{
+            "TimeCreated": "2026-04-19T12:34:56", "LogName": "Security",
+            "Level": 4, "LevelDisplayName": "Information", "Id": 1,
+            "ProviderName": "p", "Message": "a, b, c",
+        }]
+        out = format_csv(events).splitlines()
+        assert '"a, b, c"' in out[1]
+
+    def test_message_with_quote_escaped(self):
+        events = [{
+            "TimeCreated": "2026-04-19T12:34:56", "LogName": "Security",
+            "Level": 4, "LevelDisplayName": "Information", "Id": 1,
+            "ProviderName": "p", "Message": 'he said "hi"',
+        }]
+        out = format_csv(events).splitlines()
+        assert '"he said ""hi"""' in out[1]
+
+    def test_message_newlines_flatten(self):
+        events = [{
+            "TimeCreated": "2026-04-19T12:34:56", "LogName": "Security",
+            "Level": 4, "LevelDisplayName": "Information", "Id": 1,
+            "ProviderName": "p",
+            "Message": "line one\r\nline two\n\nline three\ttab",
+        }]
+        out = format_csv(events).splitlines()
+        # Tabs become single spaces, newlines become " | ", no embedded \n
+        assert len(out) == 2
+        assert "line one | line two | line three tab" in out[1]
+
+    def test_no_truncation(self):
+        big = "x" * 5000
+        events = [{
+            "TimeCreated": "2026-04-19T12:34:56", "LogName": "Security",
+            "Level": 4, "LevelDisplayName": "Information", "Id": 1,
+            "ProviderName": "p", "Message": big,
+        }]
+        out = format_csv(events)
+        assert big in out
+
+    def test_level_falls_back_to_numeric_abbrev(self):
         events = [{
             "TimeCreated": "2026-04-19T12:34:56", "LogName": "x",
-            "Level": 2, "LevelDisplayName": "Error", "Id": 1,
+            "Level": 2, "LevelDisplayName": None, "Id": 1,
             "ProviderName": "p", "Message": "m",
         }]
-        table = format_compact_table(events)
-        cells = list(table.columns[2].cells)
-        assert cells[0] == "Err"
+        out = format_csv(events).splitlines()
+        # No LevelDisplayName -> abbreviation from numeric Level=2 (Err)
+        assert ",Err," in out[1]
 
 
 # ─── CLI integration ────────────────────────────────────────────────────────
@@ -217,6 +250,8 @@ class TestEventlogsCli:
         result = runner.invoke(cli, ["eventlogs"])
 
         assert result.exit_code == 0, result.output
+        # Default output is CSV with header row
+        assert "Time,Log,Level,Id,Provider,Message" in result.output
         mock_env.exec_powershell.assert_called_once()
         script = mock_env.exec_powershell.call_args[0][0]
         assert "LogName='Security'" in script
@@ -307,9 +342,9 @@ class TestEventlogsCli:
         result = runner.invoke(cli, ["eventlogs", "--json"])
 
         assert result.exit_code == 0
-        # Output contains JSON, not a Rich table
+        # JSON, not CSV
         assert '"Id": 4624' in result.output
-        assert "Time " not in result.output  # no header row
+        assert "Time,Log,Level" not in result.output
 
     def test_empty_results(self, runner, mock_env, cfg):
         from winbox.cli import cli
@@ -320,7 +355,14 @@ class TestEventlogsCli:
         result = runner.invoke(cli, ["eventlogs"])
 
         assert result.exit_code == 0
-        assert "No matching events" in result.output
+        # CSV header still emitted, no data rows
+        assert "Time,Log,Level,Id,Provider,Message" in result.output
+        # Just header + trailing newline; no data row
+        data_rows = [
+            line for line in result.output.splitlines()
+            if line and not line.startswith("Time,") and not line.startswith("[")
+        ]
+        assert data_rows == []
 
     def test_powershell_failure_surfaces(self, runner, mock_env, cfg):
         from winbox.cli import cli
@@ -366,6 +408,30 @@ class TestEventlogsCli:
 
         assert result.exit_code == 0
         assert "1 event(s)" in result.output
+        assert "4624" in result.output
+
+    def test_csv_message_is_single_row_even_with_newlines(self, runner, mock_env, cfg):
+        """Long multi-line Message must collapse to one CSV row, no embedded newlines."""
+        from winbox.cli import cli
+        ev = {
+            "TimeCreated": "2026-04-19T12:34:56",
+            "LogName": "Security", "Level": 4, "LevelDisplayName": "Information",
+            "Id": 4672, "ProviderName": "Microsoft-Windows-Security-Auditing",
+            "Message": "first\r\nsecond\r\nthird",
+        }
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout=json.dumps(ev), stderr=""
+        )
+
+        result = runner.invoke(cli, ["eventlogs"])
+
+        assert result.exit_code == 0
+        data_rows = [
+            line for line in result.output.splitlines()
+            if line.startswith("2026-04-19")
+        ]
+        assert len(data_rows) == 1
+        assert "first | second | third" in data_rows[0]
 
 
 # ─── MCP tool ───────────────────────────────────────────────────────────────
