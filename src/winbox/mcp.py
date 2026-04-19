@@ -413,7 +413,7 @@ def reg_set(
     key: str,
     value: str,
     data: str,
-    type: str = "REG_SZ",
+    value_type: str = "REG_SZ",
 ) -> str:
     """Set a Windows registry value.
 
@@ -422,7 +422,7 @@ def reg_set(
         value: Value name to set.
         data: Data to write. For REG_DWORD/REG_QWORD pass the integer as a string.
               For REG_BINARY pass hex. For REG_MULTI_SZ pass items separated by '\\n'.
-        type: Registry type — REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ.
+        value_type: Registry type - REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ.
     """
     script = textwrap.dedent(f"""\
         import winreg
@@ -431,7 +431,7 @@ def reg_set(
         key_path = {key!r}
         value_name = {value!r}
         raw_data = {data!r}
-        reg_type_name = {type!r}
+        reg_type_name = {value_type!r}
 
         hive_map = {{
             'HKLM': winreg.HKEY_LOCAL_MACHINE,
@@ -1031,14 +1031,14 @@ def net_connect() -> str:
 # ─── Tool 10: pipe_list / pipe_info / pipe_connect ──────────────────────────
 
 @mcp.tool()
-def pipe_list(filter: str = "") -> str:
+def pipe_list(filter: str | None = None) -> str:
     """Enumerate named pipes in the Windows VM matching a pattern.
 
     Uses Get-ChildItem on \\\\.\\pipe\\ via PowerShell. Returns a JSON array
     of pipe names, sorted alphabetically.
 
     Args:
-        filter: Optional substring filter (case-insensitive). Empty = all pipes.
+        filter: Optional substring filter (case-insensitive). None = all pipes.
     """
     script = textwrap.dedent("""\
         import json
@@ -1046,7 +1046,7 @@ def pipe_list(filter: str = "") -> str:
         import sys
 
         args = json.load(open(r'Z:\\.mcp\\args.json'))
-        filter_str = args.get('filter', '').lower()
+        filter_str = (args.get('filter') or '').lower()
 
         r = subprocess.run(
             ['powershell', '-NoProfile', '-Command',
@@ -1752,7 +1752,11 @@ def _kdbg_get_store() -> _KdbgStore:
 
 
 @mcp.tool()
-def kdbg_symbols_load(module: str = "nt", from_ghidra: str = "", base: str = "") -> str:
+def kdbg_symbols_load(
+    module: str = "nt",
+    from_ghidra: str | None = None,
+    base: str | None = None,
+) -> str:
     """Load symbols + struct offsets for a kernel module.
 
     For ``module='nt'`` (default), pulls ntoskrnl.exe from the running
@@ -1764,20 +1768,20 @@ def kdbg_symbols_load(module: str = "nt", from_ghidra: str = "", base: str = "")
     For any other module, supply ``from_ghidra`` with the path to a JSON
     symbol export and optionally ``base`` as a hex address override.
 
-    The map itself is never returned inline — use ``kdbg_sym`` and
+    The map itself is never returned inline - use ``kdbg_sym`` and
     ``kdbg_struct`` for lookups.
 
     Args:
         module: Module name (default 'nt'). Custom names require from_ghidra.
         from_ghidra: Path to a Ghidra-exported JSON.
-        base: Optional hex base address for from_ghidra imports.
+        base: Optional base address for from_ghidra imports (hex or decimal).
     """
     cfg, vm, ga = _ensure_vm_ready()
     store = _kdbg_get_store()
 
     if from_ghidra:
         from pathlib import Path as _P
-        base_int = int(base, 16) if base else None
+        base_int = int(base, 0) if base else None
         info = _kdbg_load_from_ghidra(store, module, _P(from_ghidra), base=base_int)
         return (
             f"loaded {info.module} from {from_ghidra}: "
@@ -1858,77 +1862,80 @@ def kdbg_struct(type_name: str, field: str = "", module: str = "nt") -> str:
 def kdbg_ps() -> str:
     """Walk ``PsActiveProcessHead`` and return all running processes.
 
-    Returns one line per process: ``PID  DTB  EPROCESS  Name``. The DTB
-    is the ``DirectoryTableBase`` — feed it (or the PID) to
-    ``kdbg_read_va`` for cross-process reads.
+    Returns a JSON array of ``{pid, dtb, eprocess, name}``. ``dtb`` is
+    the ``DirectoryTableBase`` (feed it or the pid to ``kdbg_read_va``
+    for cross-process reads). Addresses are hex strings.
 
     Requires ``kdbg_symbols_load`` to have been run first.
     """
-    cfg, vm, ga = _get_state()
-    if vm.state() != VMState.RUNNING:
-        return f"VM not running ({vm.state().value})"
+    cfg, vm, ga = _ensure_vm_ready()
     store = _kdbg_get_store()
     try:
         procs = _kdbg_list_processes(cfg.vm_name, store)
     except (_KdbgStoreError, _KdbgHmpError) as e:
         return f"error: {e}"
-    lines = ["PID     DTB              EPROCESS            Name"]
-    for p in procs:
-        lines.append(
-            f"{p.pid:5d}  0x{p.directory_table_base:012x}  "
-            f"0x{p.eprocess:016x}  {p.name}"
-        )
-    lines.append(f"({len(procs)} processes)")
-    return "\n".join(lines)
+    out = [
+        {
+            "pid": p.pid,
+            "dtb": f"0x{p.directory_table_base:012x}",
+            "eprocess": f"0x{p.eprocess:016x}",
+            "name": p.name,
+        }
+        for p in procs
+    ]
+    return _json.dumps(out, indent=2)
 
 
 @mcp.tool()
 def kdbg_lm() -> str:
     """Walk ``PsLoadedModuleList`` and return all loaded kernel modules.
 
-    One line per module: ``Base Size Name``. Base is the DllBase VA,
-    Size is SizeOfImage. Use this to locate driver images when you need
-    to resolve addresses inside non-nt drivers.
+    Returns a JSON array of ``{base, size, name}``. ``base`` is the
+    DllBase VA and ``size`` is SizeOfImage, both hex strings. Use this
+    to locate driver images when you need to resolve addresses inside
+    non-nt drivers.
     """
-    cfg, vm, ga = _get_state()
-    if vm.state() != VMState.RUNNING:
-        return f"VM not running ({vm.state().value})"
+    cfg, vm, ga = _ensure_vm_ready()
     store = _kdbg_get_store()
     try:
         mods = _kdbg_list_modules(cfg.vm_name, store)
     except (_KdbgStoreError, _KdbgHmpError) as e:
         return f"error: {e}"
-    lines = ["Base              Size        Name"]
-    for m in mods:
-        lines.append(f"0x{m.base:016x}  0x{m.size:08x}  {m.name}")
-    lines.append(f"({len(mods)} modules)")
-    return "\n".join(lines)
+    out = [
+        {
+            "base": f"0x{m.base:016x}",
+            "size": f"0x{m.size:08x}",
+            "name": m.name,
+        }
+        for m in mods
+    ]
+    return _json.dumps(out, indent=2)
 
 
 @mcp.tool()
 def kdbg_read_va(pid: int, address: str, length: int) -> str:
-    """Read virtual memory from an arbitrary process — the CR3-switching primitive.
+    """Read virtual memory from an arbitrary process - the CR3-switching primitive.
 
     Looks up the target's EPROCESS, grabs its ``DirectoryTableBase``,
     and walks the page tables manually against that CR3 to read
     ``length`` bytes at ``address``. Works regardless of which process
     was scheduled on the CPU when the debug halt happened.
 
-    Returns a hex string of the bytes. Pair with ``kdbg_ps`` to find a
-    PID first.
+    Returns a bare hex string of the bytes. Pair with ``kdbg_ps`` to
+    find a PID first.
 
     Args:
         pid: Target process ID (must be in kdbg_ps output).
         address: Virtual address, hex string (e.g. '0x7ff600001000').
-        length: Number of bytes to read (capped at 65536).
+        length: Number of bytes to read (capped at 1MB).
     """
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
         return f"VM not running ({vm.state().value})"
     if length <= 0:
         return "length must be > 0"
-    if length > 65536:
-        return f"length {length} too large — cap at 65536"
+    if length > 1024 * 1024:
+        return f"length {length} too large - cap at 1MB"
     try:
         va = int(address, 0)
     except ValueError:
@@ -1950,7 +1957,7 @@ def kdbg_read_va(pid: int, address: str, length: int) -> str:
         )
     except _KdbgHmpError as e:
         return f"read failed: {e}"
-    return f"pid={pid} name={target.name} va=0x{va:x} len={len(data)} hex={data.hex()}"
+    return data.hex()
 
 
 @mcp.tool()

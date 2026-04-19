@@ -414,7 +414,7 @@ class TestRegSetTool:
             key=r"HKLM\SOFTWARE\Test",
             value="Num",
             data="1",
-            type="REG_DWORD",
+            value_type="REG_DWORD",
         )
         assert "REG_DWORD" in result
 
@@ -427,7 +427,7 @@ class TestRegSetTool:
             key=r"HKLM\SOFTWARE\Test",
             value="Bin",
             data="deadbeef",
-            type="REG_BINARY",
+            value_type="REG_BINARY",
         )
         script = ga.captured_code
         assert "REG_BINARY" in script
