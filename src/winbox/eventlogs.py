@@ -132,17 +132,50 @@ def build_powershell(q: EventQuery) -> str:
     )
 
 
+_PS_DATE_RE = re.compile(r"^/Date\((-?\d+)(?:[+-]\d+)?\)/$")
+
+
+def _normalize_ps_date(value: Any) -> Any:
+    """Convert PowerShell's '/Date(ms)/' serialisation to ISO 8601.
+
+    Returns the original value if it does not match the PS date format.
+    """
+    if not isinstance(value, str):
+        return value
+    m = _PS_DATE_RE.match(value)
+    if not m:
+        return value
+    try:
+        ts = int(m.group(1)) / 1000.0
+        return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+    except (ValueError, OSError):
+        return value
+
+
 def parse_events(stdout: str) -> list[dict[str, Any]]:
-    """Parse Get-WinEvent JSON output, normalising the single-vs-array quirk."""
+    """Parse Get-WinEvent JSON output.
+
+    Normalises two quirks:
+      - PowerShell ConvertTo-Json returns a bare object (not an array) when
+        there is exactly one event.
+      - TimeCreated comes back as the .NET serialised form '/Date(ms)/';
+        rewrite to ISO 8601 so agents do not have to.
+    """
     s = (stdout or "").strip()
     if not s:
         return []
     data = json.loads(s)
     if isinstance(data, dict):
-        return [data]
-    if isinstance(data, list):
-        return data
-    raise ValueError(f"unexpected event JSON shape: {type(data).__name__}")
+        events = [data]
+    elif isinstance(data, list):
+        events = data
+    else:
+        raise ValueError(f"unexpected event JSON shape: {type(data).__name__}")
+
+    for ev in events:
+        if isinstance(ev, dict) and "TimeCreated" in ev:
+            ev["TimeCreated"] = _normalize_ps_date(ev["TimeCreated"])
+    return events
 
 
 def _short_time(s: str | None) -> str:

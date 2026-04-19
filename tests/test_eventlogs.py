@@ -159,6 +159,35 @@ class TestParseEvents:
         with pytest.raises(json.JSONDecodeError):
             parse_events("{not json")
 
+    def test_normalises_ps_date_in_array(self):
+        """PowerShell /Date(ms)/ serialisation gets rewritten to ISO 8601."""
+        ev = {"TimeCreated": "/Date(1776612031632)/", "Id": 1}
+        out = parse_events(json.dumps([ev]))
+        # 1776612031632 ms == 2026-04-19T17:20:31 local time
+        assert out[0]["TimeCreated"].startswith("2026-")
+        assert "T" in out[0]["TimeCreated"]
+        assert "/Date(" not in out[0]["TimeCreated"]
+
+    def test_normalises_ps_date_in_single_object(self):
+        ev = {"TimeCreated": "/Date(1776612031632)/", "Id": 1}
+        out = parse_events(json.dumps(ev))
+        assert "/Date(" not in out[0]["TimeCreated"]
+
+    def test_normalises_ps_date_with_tz_offset(self):
+        ev = {"TimeCreated": "/Date(1776612031632+0200)/", "Id": 1}
+        out = parse_events(json.dumps([ev]))
+        assert "/Date(" not in out[0]["TimeCreated"]
+
+    def test_passes_through_iso_unchanged(self):
+        ev = {"TimeCreated": "2026-04-19T17:20:31", "Id": 1}
+        out = parse_events(json.dumps([ev]))
+        assert out[0]["TimeCreated"] == "2026-04-19T17:20:31"
+
+    def test_passes_through_missing_timecreated(self):
+        ev = {"Id": 1}
+        out = parse_events(json.dumps([ev]))
+        assert out[0] == {"Id": 1}
+
 
 # ─── format_csv ─────────────────────────────────────────────────────────────
 
