@@ -658,12 +658,51 @@ class TestMemReadTool:
             exitcode=0, stdout="4d5a9000\n", stderr=""
         )
 
-        result = mem_read(pid=672, address=0x7FF600000000, size=4)
+        result = mem_read(pid=672, address="0x7FF600000000", length=4)
         assert "4d5a9000" in result
 
         script = ga.captured_code
         assert "ReadProcessMemory" in script
+        assert "SeDebugPrivilege" in script
+        assert "AdjustTokenPrivileges" in script
         assert "672" in script
+        assert str(0x7FF600000000) in script
+
+    def test_kernel_address_precision(self, mock_mcp):
+        """Address above 2^53 must survive without losing low bits."""
+        from winbox.mcp import mem_read
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+
+        big = 0xfffff80012345678
+        mem_read(pid=4, address=hex(big), length=8)
+
+        assert str(big) in ga.captured_code
+
+    def test_decimal_address_accepted(self, mock_mcp):
+        from winbox.mcp import mem_read
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+
+        mem_read(pid=4, address="65536", length=4)
+
+        assert "address = 65536" in ga.captured_code
+
+    def test_invalid_address_string(self, mock_mcp):
+        from winbox.mcp import mem_read
+        ga, vm, cfg = mock_mcp
+
+        result = mem_read(pid=4, address="not-a-number", length=4)
+        assert "invalid address" in result
+        ga.exec.assert_not_called()
+
+    def test_length_too_large(self, mock_mcp):
+        from winbox.mcp import mem_read
+        ga, vm, cfg = mock_mcp
+
+        result = mem_read(pid=4, address="0x1000", length=2 * 1024 * 1024)
+        assert "max 1MB" in result
+        ga.exec.assert_not_called()
 
     def test_open_process_failure(self, mock_mcp):
         from winbox.mcp import mem_read
@@ -672,7 +711,7 @@ class TestMemReadTool:
             exitcode=1, stdout="", stderr="OpenProcess failed: error 5\n"
         )
 
-        result = mem_read(pid=4, address=0, size=16)
+        result = mem_read(pid=4, address="0x0", length=16)
         assert "error 5" in result
 
     def test_read_failure(self, mock_mcp):
@@ -682,7 +721,7 @@ class TestMemReadTool:
             exitcode=1, stdout="", stderr="ReadProcessMemory failed: error 299\n"
         )
 
-        result = mem_read(pid=672, address=0xDEAD, size=4096)
+        result = mem_read(pid=672, address="0xDEAD", length=4096)
         assert "error 299" in result
 
 

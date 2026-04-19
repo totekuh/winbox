@@ -768,34 +768,46 @@ def file_copy(src: str, dst: str) -> str:
 # ─── Tool 7: mem_read ──────────────────────────────────────────────────────
 
 @mcp.tool()
-def mem_read(pid: int, address: int, size: int) -> str:
+def mem_read(pid: int, address: str, length: int) -> str:
     """Read memory from a process in the Windows VM.
 
-    Opens the process with PROCESS_VM_READ and calls ReadProcessMemory.
-    Returns the data as a hex string.
+    Enables SeDebugPrivilege, opens the process with PROCESS_VM_READ,
+    and calls ReadProcessMemory. Returns the data as a hex string.
+
+    Address is a string (hex like '0x7ff600001000' or decimal) so kernel
+    pointers above 2^53 do not lose precision on the JSON wire.
+    PPL processes (lsass+RunAsPPL, MsMpEng) still cannot be opened from
+    user-mode even with SeDebugPrivilege - use kdbg_read_va for those.
 
     Args:
         pid: Target process ID.
-        address: Memory address to read from (integer).
-        size: Number of bytes to read.
+        address: Memory address (hex like '0x...' or decimal).
+        length: Number of bytes to read (capped at 1MB).
     """
-    if size <= 0:
-        return f"Invalid size: {size} (must be > 0)"
-    if size > 100 * 1024 * 1024:
-        return f"Invalid size: {size} (max 100MB per read)"
-    if address < 0:
-        return f"Invalid address: {address} (must be >= 0)"
+    if length <= 0:
+        return f"invalid length: {length} (must be > 0)"
+    if length > 1024 * 1024:
+        return f"invalid length: {length} (max 1MB per read)"
+    try:
+        addr_int = int(address, 0)
+    except (ValueError, TypeError):
+        return f"invalid address: {address!r}"
+    if addr_int < 0:
+        return f"invalid address: {addr_int} (must be >= 0)"
+
     script = textwrap.dedent(f"""\
         import ctypes
         from ctypes import wintypes
         import sys
 
         pid = {pid}
-        address = {address}
-        size = {size}
+        address = {addr_int}
+        size = {length}
 
         kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        advapi32 = ctypes.WinDLL('advapi32', use_last_error=True)
 
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
         kernel32.OpenProcess.restype = wintypes.HANDLE
         kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         kernel32.ReadProcessMemory.restype = wintypes.BOOL
@@ -806,6 +818,54 @@ def mem_read(pid: int, address: int, size: int) -> str:
         ]
         kernel32.CloseHandle.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        class LUID(ctypes.Structure):
+            _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+        class LUID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+        class TOKEN_PRIVILEGES(ctypes.Structure):
+            _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
+        advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+        advapi32.AdjustTokenPrivileges.restype = wintypes.BOOL
+        advapi32.AdjustTokenPrivileges.argtypes = [
+            wintypes.HANDLE, wintypes.BOOL,
+            ctypes.POINTER(TOKEN_PRIVILEGES), wintypes.DWORD,
+            ctypes.POINTER(TOKEN_PRIVILEGES), ctypes.POINTER(wintypes.DWORD),
+        ]
+
+        TOKEN_ADJUST_PRIVILEGES = 0x0020
+        TOKEN_QUERY = 0x0008
+        SE_PRIVILEGE_ENABLED = 0x00000002
+
+        token = wintypes.HANDLE(0)
+        if advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            ctypes.byref(token),
+        ):
+            try:
+                luid = LUID()
+                if advapi32.LookupPrivilegeValueW(None, "SeDebugPrivilege", ctypes.byref(luid)):
+                    tp = TOKEN_PRIVILEGES()
+                    tp.PrivilegeCount = 1
+                    tp.Privileges[0].Luid = luid
+                    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+                    advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
+                    err = ctypes.get_last_error()
+                    if err == 1300:
+                        print("warn: SeDebugPrivilege not held (ERROR_NOT_ALL_ASSIGNED)", file=sys.stderr)
+                else:
+                    print(f"warn: LookupPrivilegeValueW failed: {{ctypes.get_last_error()}}", file=sys.stderr)
+            finally:
+                kernel32.CloseHandle(token)
+        else:
+            print(f"warn: OpenProcessToken failed: {{ctypes.get_last_error()}}", file=sys.stderr)
 
         PROCESS_VM_READ = 0x0010
         PROCESS_QUERY_INFORMATION = 0x0400
