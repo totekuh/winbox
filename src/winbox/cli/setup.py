@@ -138,6 +138,12 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool, desktop: bool)
     installer.boot_for_provisioning(cfg)
     console.print("[green][+][/] Phase 3 complete — VM provisioned")
 
+    # Pre-register the libvirt nwfilter used by `winbox net isolate`, then
+    # attach it to the persistent domain config so the VM boots isolated by
+    # default. Runs while the VM is shut down (end of Phase 3).
+    installer.register_nwfilter(cfg)
+    installer.attach_default_filter(cfg)
+
     # Phase 4: Snapshot
     installer.create_clean_snapshot(cfg)
 

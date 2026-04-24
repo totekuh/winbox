@@ -608,3 +608,48 @@ def create_clean_snapshot(cfg: Config) -> None:
         console.print("[green][+][/] Snapshot 'clean' created")
     except (RuntimeError, subprocess.CalledProcessError) as e:
         console.print(f"[yellow][!][/] Could not create snapshot: {e}")
+
+
+def register_nwfilter(cfg: Config) -> None:
+    """Register the 'winbox-isolate' libvirt nwfilter (idempotent).
+
+    Ensures `winbox net isolate` can attach the filter without needing
+    a separate registration step. Safe to re-run.
+    """
+    from winbox.nwfilter import ensure_filter_defined, FILTER_NAME
+
+    console.print(f"[blue][*][/] Registering libvirt nwfilter '{FILTER_NAME}'...")
+    try:
+        ensure_filter_defined()
+        console.print(f"[green][+][/] nwfilter '{FILTER_NAME}' registered")
+    except RuntimeError as e:
+        console.print(f"[yellow][!][/] Could not register nwfilter: {e}")
+        console.print("    `winbox net isolate` will retry on first use.")
+
+
+def attach_default_filter(cfg: Config) -> None:
+    """Attach 'winbox-isolate' to the persistent domain config at setup time.
+
+    The VM is shut down at this point (end of Phase 3), so we pass
+    ``live=False, config=True`` — libvirt rejects ``--live`` on a stopped
+    domain. On the VM's next boot the filter is active; the Phase 4 snapshot
+    captures the already-filtered config so ``winbox restore clean`` stays
+    isolated too.
+
+    Idempotent. Failures are a warning, not a hard abort — the user can
+    always `winbox net isolate` manually later.
+    """
+    from winbox.nwfilter import attach_filter, FILTER_NAME
+
+    vm = VM(cfg)
+    console.print(f"[blue][*][/] Isolating VM by default (attaching '{FILTER_NAME}')...")
+    try:
+        changed = attach_filter(vm.name, live=False, config=True)
+        if changed:
+            console.print("[green][+][/] VM boots isolated by default")
+        else:
+            console.print("[green][+][/] VM already isolated by default")
+        console.print("    Run [bold]winbox net connect[/] when you need internet.")
+    except RuntimeError as e:
+        console.print(f"[yellow][!][/] Could not attach default filter: {e}")
+        console.print("    Use `winbox net isolate` manually after first boot.")

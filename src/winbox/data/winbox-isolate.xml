@@ -1,0 +1,21 @@
+<filter name='winbox-isolate' chain='root'>
+  <!-- ARP: needed for host <-> VM L2 discovery on virbr0. -->
+  <rule action='accept' direction='inout' priority='100'>
+    <mac protocolid='arp'/>
+  </rule>
+
+  <!-- Delegate IPv4 handling to the 'ipv4' chain sub-filter.
+       libvirt dispatches by EtherType, so rules matching <ip>/<udp>
+       MUST live in a chain='ipv4' filter; they never fire from the
+       root chain. -->
+  <filterref filter='winbox-isolate-ipv4'/>
+
+  <!-- IPv6: drop entirely. Server Core does not need it; a dual-stack
+       link would otherwise leak IPv6 egress past the IPv4 filter. -->
+  <rule action='drop' direction='inout' priority='900'>
+    <mac protocolid='ipv6'/>
+  </rule>
+
+  <!-- Default drop for any other L2 traffic. -->
+  <rule action='drop' direction='inout' priority='1000'/>
+</filter>

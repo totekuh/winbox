@@ -10,6 +10,7 @@ from pathlib import Path
 
 import click
 
+from winbox import nwfilter
 from winbox.cli import console, ensure_running, _ensure_z_drive
 from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
@@ -28,28 +29,39 @@ def net() -> None:
 @net.command("isolate")
 @click.pass_context
 def net_isolate(ctx: click.Context) -> None:
-    """Block internet by removing the default gateway.
+    """Block internet via libvirt nwfilter (guest-proof).
 
-    The NIC stays up, so Kali <-> VM on the libvirt subnet (guest agent,
-    VirtIO-FS, SSH, any IP-based tooling against 192.168.122.x targets)
-    still works. Only traffic via the default gateway is blocked.
+    Attaches a host-side bridge filter that only permits intra-subnet
+    (192.168.122.0/24) IPv4 plus ARP and DHCPv4. Enforcement happens
+    below the VM, so DHCP renewals, route changes, or anything else
+    the guest does cannot defeat it. Kali <-> VM traffic (guest agent,
+    VirtIO-FS, SSH, 192.168.122.x targets) stays up.
     For a full air-gap use `winbox net unplug` instead.
     Undo with: winbox net connect
     """
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
-    ga = GuestAgent(cfg)
 
     if vm.state() != VMState.RUNNING:
         console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
         raise SystemExit(1)
 
-    ga.exec_powershell(
-        "Remove-NetRoute -DestinationPrefix '0.0.0.0/0' -Confirm:$false "
-        "-ErrorAction SilentlyContinue",
-        timeout=15,
-    )
-    console.print("[green][+][/] Internet isolated — default gateway removed")
+    try:
+        nwfilter.ensure_filter_defined()
+        changed = nwfilter.attach_filter(vm.name)
+    except RuntimeError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+    # Isolate means "network but blocked" — bring link up if unplugged.
+    if vm.net_link_state() == "down":
+        vm.net_set_link("up")
+
+    if changed:
+        console.print("[green][+][/] Internet isolated — nwfilter enforced at host bridge")
+    else:
+        console.print("[green][+][/] Already isolated — nwfilter already attached")
+    console.print("    Guest-proof: DHCP renewals and route changes cannot defeat it.")
     console.print("    Undo with: [bold]winbox net connect[/]")
 
 
@@ -90,6 +102,16 @@ def net_connect(ctx: click.Context) -> None:
     if vm.state() != VMState.RUNNING:
         console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
         raise SystemExit(1)
+
+    # Detach the nwfilter if attached. Idempotent — safe from any prior state.
+    # Broad except: `net connect` is a best-effort recovery command. Any
+    # failure (virsh missing, tmpfile IO, bad XML, etc.) should degrade to a
+    # warning so the rest of the link/DHCP cycle still runs.
+    try:
+        if nwfilter.detach_filter(vm.name):
+            console.print("[blue][*][/] Detaching nwfilter 'winbox-isolate'...")
+    except Exception as e:
+        console.print(f"[yellow][!][/] Could not detach nwfilter: {e}")
 
     # If the NIC was unplugged, plug it back in first. Otherwise skip —
     # `net isolate` leaves the link up so there's nothing to re-plug.
@@ -148,9 +170,25 @@ def net_status(ctx: click.Context) -> None:
         link_color = "green" if link == "up" else "red"
         console.print(f"Link:     [{link_color}]{link}[/]")
 
-    # Can't probe routes if the link is down or GA is unreachable
-    if link != "up" or not ga.ping():
+    filter_on = nwfilter.has_filter(vm.name)
+    if filter_on:
+        console.print(f"Filter:   [red]{nwfilter.FILTER_NAME}[/] (isolated)")
+    else:
+        console.print("Filter:   [green]none[/]")
+
+    # Link down => no packets at all.
+    if link != "up":
         console.print("Internet: [red]blocked[/] (link down)")
+        return
+
+    # Filter attached => the default route inside the VM may still exist,
+    # but packets die at the bridge. Trust the filter, skip the GA probe.
+    if filter_on:
+        console.print("Internet: [red]isolated[/] (nwfilter active)")
+        return
+
+    if not ga.ping():
+        console.print("Internet: [yellow]unknown[/] (GA unreachable)")
         return
 
     # @(...) forces a collection so .Count works even when Get-NetRoute

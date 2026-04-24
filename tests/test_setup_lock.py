@@ -18,7 +18,11 @@ class TestSetupLock:
 
         assert result.exit_code == 1
         assert "Another" in result.output and "setup" in result.output.lower()
-        assert ".setup.lock" in result.output
+        # Click wraps output on narrow terminals and can insert newlines inside
+        # the lock-file path (e.g. split between '.' and 'setup.lock'). Strip
+        # all whitespace to match the path regardless of wrap.
+        unwrapped = "".join(result.output.split())
+        assert ".setup.lock" in unwrapped
         # Must not have progressed into the actual setup pipeline.
         mock_env._vm.destroy.assert_not_called()
 

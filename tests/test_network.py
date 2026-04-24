@@ -1,11 +1,189 @@
-"""Tests for winbox.cli.network — dns and hosts commands."""
+"""Tests for winbox.cli.network — net, dns, and hosts commands."""
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
+
+import pytest
 
 from winbox.cli import cli
 from winbox.vm import VMState
 from winbox.vm.guest import ExecResult
+
+
+@pytest.fixture
+def mock_nwfilter():
+    """Patch winbox.cli.network.nwfilter with sensible defaults."""
+    with patch("winbox.cli.network.nwfilter") as m:
+        m.FILTER_NAME = "winbox-isolate"
+        m.ensure_filter_defined.return_value = None
+        m.attach_filter.return_value = True
+        m.detach_filter.return_value = False
+        m.has_filter.return_value = False
+        yield m
+
+
+# ─── net isolate ──────────────────────────────────────────────────────────────
+
+
+class TestNetIsolate:
+    def test_isolate_attaches_filter(self, runner, mock_env, mock_nwfilter):
+        mock_env._vm.net_link_state.return_value = "up"
+        mock_env._vm.name = "winbox"
+        result = runner.invoke(cli, ["net", "isolate"])
+
+        assert result.exit_code == 0, result.output
+        mock_nwfilter.ensure_filter_defined.assert_called_once()
+        mock_nwfilter.attach_filter.assert_called_once_with("winbox")
+        assert "nwfilter" in result.output.lower()
+        # Old PS route removal must not be invoked anymore.
+        mock_env.exec_powershell.assert_not_called()
+
+    def test_isolate_brings_link_up_when_unplugged(self, runner, mock_env, mock_nwfilter):
+        mock_env._vm.net_link_state.return_value = "down"
+        mock_env._vm.name = "winbox"
+        result = runner.invoke(cli, ["net", "isolate"])
+
+        assert result.exit_code == 0, result.output
+        mock_env._vm.net_set_link.assert_called_with("up")
+        mock_nwfilter.attach_filter.assert_called_once()
+
+    def test_isolate_idempotent_when_already_attached(
+        self, runner, mock_env, mock_nwfilter,
+    ):
+        mock_nwfilter.attach_filter.return_value = False
+        mock_env._vm.net_link_state.return_value = "up"
+        result = runner.invoke(cli, ["net", "isolate"])
+
+        assert result.exit_code == 0
+        assert "already" in result.output.lower()
+
+    def test_isolate_surfaces_nwfilter_error(self, runner, mock_env, mock_nwfilter):
+        mock_nwfilter.attach_filter.side_effect = RuntimeError("libvirt refused")
+        result = runner.invoke(cli, ["net", "isolate"])
+
+        assert result.exit_code != 0
+        assert "libvirt refused" in result.output
+
+    def test_isolate_vm_not_running(self, runner, mock_env, mock_nwfilter):
+        mock_env._vm.state.return_value = VMState.SHUTOFF
+        result = runner.invoke(cli, ["net", "isolate"])
+
+        assert result.exit_code != 0
+        assert "not running" in result.output
+        mock_nwfilter.attach_filter.assert_not_called()
+
+
+# ─── net connect ──────────────────────────────────────────────────────────────
+
+
+class TestNetConnect:
+    def test_connect_detaches_filter(self, runner, mock_env, mock_nwfilter):
+        mock_nwfilter.detach_filter.return_value = True
+        mock_env._vm.net_link_state.return_value = "up"
+        mock_env._vm.ip.return_value = "192.168.122.203"
+        mock_env._vm.name = "winbox"
+        mock_env.exec_powershell.return_value = ExecResult(0, "", "")
+        mock_env.exec.return_value = ExecResult(0, "", "")
+        result = runner.invoke(cli, ["net", "connect"])
+
+        assert result.exit_code == 0, result.output
+        mock_nwfilter.detach_filter.assert_called_once_with("winbox")
+
+    def test_connect_also_brings_link_up(self, runner, mock_env, mock_nwfilter):
+        mock_env._vm.net_link_state.return_value = "down"
+        mock_env._vm.ip.return_value = "192.168.122.203"
+        mock_env._vm.name = "winbox"
+        mock_env.exec_powershell.return_value = ExecResult(0, "", "")
+        mock_env.exec.return_value = ExecResult(0, "", "")
+        result = runner.invoke(cli, ["net", "connect"])
+
+        assert result.exit_code == 0
+        mock_env._vm.net_set_link.assert_any_call("up")
+        mock_nwfilter.detach_filter.assert_called_once()
+
+    def test_connect_tolerates_detach_failure(self, runner, mock_env, mock_nwfilter):
+        """Detach failure is a warning, not a hard error — connect should still run."""
+        mock_nwfilter.detach_filter.side_effect = RuntimeError("busted")
+        mock_env._vm.net_link_state.return_value = "up"
+        mock_env._vm.name = "winbox"
+        mock_env.exec.return_value = ExecResult(0, "", "")
+        result = runner.invoke(cli, ["net", "connect"])
+
+        assert result.exit_code == 0
+        assert "busted" in result.output
+
+
+# ─── net status ───────────────────────────────────────────────────────────────
+
+
+class TestNetStatus:
+    def test_status_connected(self, runner, mock_env, mock_nwfilter):
+        mock_nwfilter.has_filter.return_value = False
+        mock_env._vm.net_link_state.return_value = "up"
+        mock_env._vm.name = "winbox"
+        mock_env.exec_powershell.return_value = ExecResult(0, "1\n", "")
+        result = runner.invoke(cli, ["net", "status"])
+
+        assert result.exit_code == 0
+        assert "Filter:" in result.output
+        assert "none" in result.output
+        assert "reachable" in result.output
+
+    def test_status_isolated_by_filter(self, runner, mock_env, mock_nwfilter):
+        mock_nwfilter.has_filter.return_value = True
+        mock_env._vm.net_link_state.return_value = "up"
+        mock_env._vm.name = "winbox"
+        result = runner.invoke(cli, ["net", "status"])
+
+        assert result.exit_code == 0
+        assert "winbox-isolate" in result.output
+        assert "nwfilter active" in result.output
+        # Must NOT probe Get-NetRoute when filter is attached.
+        mock_env.exec_powershell.assert_not_called()
+
+    def test_status_unplugged(self, runner, mock_env, mock_nwfilter):
+        mock_env._vm.net_link_state.return_value = "down"
+        mock_env._vm.name = "winbox"
+        result = runner.invoke(cli, ["net", "status"])
+
+        assert result.exit_code == 0
+        assert "link down" in result.output
+
+
+# ─── net unplug (sanity — unchanged semantics) ────────────────────────────────
+
+
+class TestNetUnplug:
+    def test_unplug_calls_set_link_down(self, runner, mock_env, mock_nwfilter):
+        mock_env._vm.net_set_link.return_value = True
+        result = runner.invoke(cli, ["net", "unplug"])
+
+        assert result.exit_code == 0
+        mock_env._vm.net_set_link.assert_called_with("down")
+        # unplug leaves filter state alone.
+        mock_nwfilter.attach_filter.assert_not_called()
+        mock_nwfilter.detach_filter.assert_not_called()
+
+    def test_unplug_fails_when_set_link_fails(self, runner, mock_env, mock_nwfilter):
+        mock_env._vm.net_set_link.return_value = False
+        result = runner.invoke(cli, ["net", "unplug"])
+
+        assert result.exit_code != 0
+        assert "Failed" in result.output or "no interface" in result.output
+
+
+# ─── net connect (set-link failure branch) ────────────────────────────────────
+
+
+class TestNetConnectLinkFailure:
+    def test_connect_fails_when_set_link_up_fails(self, runner, mock_env, mock_nwfilter):
+        mock_env._vm.net_link_state.return_value = "down"
+        mock_env._vm.net_set_link.return_value = False
+        mock_env._vm.name = "winbox"
+        result = runner.invoke(cli, ["net", "connect"])
+
+        assert result.exit_code != 0
+        assert "Failed" in result.output or "no interface" in result.output
 
 
 # ─── dns set ──────────────────────────────────────────────────────────────────

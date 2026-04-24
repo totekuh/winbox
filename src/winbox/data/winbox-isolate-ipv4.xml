@@ -1,0 +1,19 @@
+<filter name='winbox-isolate-ipv4' chain='ipv4'>
+  <!-- DHCPv4 client: allow renewals so Windows doesn't mark the NIC
+       "unidentified" or strip the IP. -->
+  <rule action='accept' direction='out' priority='100'>
+    <udp srcportstart='68' dstportstart='67'/>
+  </rule>
+  <rule action='accept' direction='in' priority='100'>
+    <udp srcportstart='67' dstportstart='68'/>
+  </rule>
+
+  <!-- Intra-subnet (Kali 192.168.122.1 <-> VM 192.168.122.x). -->
+  <rule action='accept' direction='inout' priority='200'>
+    <ip srcipaddr='192.168.122.0' srcipmask='24'
+        dstipaddr='192.168.122.0' dstipmask='24'/>
+  </rule>
+
+  <!-- Default drop for IPv4. -->
+  <rule action='drop' direction='inout' priority='1000'/>
+</filter>
