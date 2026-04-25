@@ -27,9 +27,38 @@ def cfg(tmp_path):
     return c
 
 
-# CLI modules that need VM/GA/ensure_running patched
-# network module has net group which uses VM directly (no ensure_running)
-_CLI_MODULES = ["vm", "network", "exec", "jobs", "av", "applocker", "autologin", "msi", "upload", "eventlogs"]
+# CLI modules that need VM/GA/ensure_running patched. Derived from the
+# REGISTER auto-discovery introduced for `cli` so adding a new command
+# stops requiring a manual edit here. Modules without REGISTER (the
+# private _ps helper, mcp, kdbg) are correctly skipped because either
+# they don't talk to VM/GA or have their own bespoke fixtures.
+def _discover_cli_modules() -> list[str]:
+    import importlib
+    import pkgutil
+
+    import winbox.cli as cli_pkg
+
+    found: list[str] = []
+    for _finder, mod_name, ispkg in pkgutil.iter_modules(cli_pkg.__path__):
+        if ispkg or mod_name.startswith("_"):
+            continue
+        try:
+            module = importlib.import_module(f"winbox.cli.{mod_name}")
+        except Exception:
+            continue
+        if not hasattr(module, "REGISTER"):
+            continue
+        # Only patch modules that actually import VM / GuestAgent /
+        # ensure_running -- the names referenced by mock_env. Modules like
+        # `mcp` and `binfmt` whose CLI side doesn't talk to GA are skipped.
+        for attr in ("VM", "GuestAgent", "ensure_running"):
+            if hasattr(module, attr):
+                found.append(mod_name)
+                break
+    return found
+
+
+_CLI_MODULES = _discover_cli_modules()
 
 
 @pytest.fixture

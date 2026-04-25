@@ -454,6 +454,17 @@ def provision_vm_disk(cfg: Config) -> None:
                 "Missing critical provisioning files (re-run setup):\n  "
                 + "\n  ".join(missing_files)
             )
+
+        # Sanity-check the zip-shaped downloads beyond size > N (the previous
+        # check would happily reuse a partial download stuck above the
+        # threshold — captive portal interstitial, MITM error page, etc.).
+        for zpath, label in [(openssh_zip, "OpenSSH"), (x64dbg_zip, "x64dbg")]:
+            if zpath.exists() and not zipfile.is_zipfile(zpath):
+                raise RuntimeError(
+                    f"{label} download at {zpath} is not a valid zip "
+                    "(probably truncated or an HTML error page). "
+                    f"Delete it and re-run winbox setup."
+                )
         zip_path = tmpdir_path / "provision.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(_data_file("provision.ps1"), "provision.ps1")
@@ -510,7 +521,7 @@ def boot_for_provisioning(cfg: Config) -> None:
 
     console.print("[blue][*][/] Running bootstrap.ps1 via guest agent...")
     console.print("    This may take 5-10 minutes.")
-    ga.exec_detached(
+    bootstrap_pid = ga.exec_detached(
         'powershell.exe -ExecutionPolicy Bypass -NoProfile -File C:\\bootstrap.ps1',
     )
 
@@ -549,8 +560,20 @@ def boot_for_provisioning(cfg: Config) -> None:
 
     console.print("[blue][*][/] Waiting for VM to shut down...")
     if not vm.wait_shutdown(timeout=600):
-        console.print("[yellow][!][/] Provisioning timed out (VM did not shut down in 600s)")
-        console.print(f"    Check with: virsh console {cfg.vm_name}")
+        console.print(
+            f"[yellow][!][/] Provisioning timed out (VM did not shut down in 600s)"
+        )
+        console.print(
+            f"    bootstrap.ps1 PID inside VM: {bootstrap_pid} "
+            f"(check with: virsh console {cfg.vm_name})"
+        )
+        # Try a clean kill before force-stopping the whole VM, so the user
+        # can grep the bootstrap log on the share without worrying about
+        # the VM having been hard-yanked mid-write.
+        try:
+            ga.exec(f"taskkill /pid {bootstrap_pid} /f", timeout=10)
+        except Exception:
+            pass
         console.print("[blue][*][/] Force-stopping hung VM...")
         try:
             vm.force_stop()
