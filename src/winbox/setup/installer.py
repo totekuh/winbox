@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.resources
 import os
 import shutil
 import subprocess
@@ -14,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
+from winbox import data as _data
 from winbox.vm import VM, VMState, GuestAgent, GuestAgentError, virsh_run
 
 if TYPE_CHECKING:
@@ -23,8 +23,8 @@ console = Console()
 
 
 def _data_file(name: str) -> Path:
-    """Get path to a bundled data file."""
-    return importlib.resources.files("winbox.data").joinpath(name)  # type: ignore[return-value]
+    """Bundled data file. Thin alias for winbox.data.path."""
+    return _data.path(name)
 
 
 def run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.CompletedProcess[str]:

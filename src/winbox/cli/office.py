@@ -2,21 +2,17 @@
 
 from __future__ import annotations
 
-import importlib.resources
 import subprocess
 from pathlib import Path
 
 import click
 
+from winbox import data as _data
 from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
 from winbox.vm import GuestAgent, VM
 
 ODT_URL = "https://officecdn.microsoft.com/pr/wsus/setup.exe"
-
-
-def _data_file(name: str) -> Path:
-    return importlib.resources.files("winbox.data").joinpath(name)  # type: ignore[return-value]
 
 
 @click.command()
@@ -31,10 +27,8 @@ def office(cfg: Config, vm: VM, ga: GuestAgent) -> None:
         )
 
     # Copy config XML to shared dir so VM can read it as Z:\office-config.xml
-    src = _data_file("office-config.xml")
     dst = cfg.shared_dir / "office-config.xml"
-    with importlib.resources.as_file(src) as src_path:
-        dst.write_bytes(src_path.read_bytes())
+    dst.write_bytes(_data.read_bytes("office-config.xml"))
 
     # Download ODT on host, copy to shared dir for VM access
     odt_path = cfg.shared_dir / "odt-setup.exe"

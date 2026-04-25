@@ -12,7 +12,7 @@ import struct
 import sys
 import termios
 import tty
-from importlib import resources
+from winbox import data as _data
 from typing import TYPE_CHECKING
 
 from rich.console import Console
@@ -35,9 +35,7 @@ RESIZE_MAGIC = b"\x00RSIZ"
 def _ensure_conpty_on_share(cfg: Config) -> None:
     """Copy Invoke-ConPtyShell.ps1 from package data to share root (always refreshed)."""
     dest = cfg.shared_dir / CONPTY_SCRIPT
-    src = resources.files("winbox.data").joinpath(CONPTY_SCRIPT)
-    with resources.as_file(src) as src_path:
-        shutil.copy2(src_path, dest)
+    shutil.copy2(_data.path(CONPTY_SCRIPT), dest)
 
 
 def open_shell(

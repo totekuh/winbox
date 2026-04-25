@@ -18,11 +18,11 @@ the persistent config only (used at setup time against a stopped VM).
 
 from __future__ import annotations
 
-import importlib.resources
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from winbox import data as _data
 from winbox.vm import virsh_run
 
 
@@ -33,7 +33,8 @@ FILTER_IPV4_XML = "winbox-isolate-ipv4.xml"
 
 
 def _filter_path(filename: str) -> Path:
-    return Path(str(importlib.resources.files("winbox.data").joinpath(filename)))
+    """Bundled-resource Path. Kept for tests that patch this name."""
+    return _data.path(filename)
 
 
 def _define_one(filename: str, name: str, render_kwargs: dict | None = None) -> None:
@@ -45,10 +46,8 @@ def _define_one(filename: str, name: str, render_kwargs: dict | None = None) -> 
     second copy of ``192.168.122.0`` in ``data/`` that can drift from
     ``Config.vm_subnet``.
     """
-    path = _filter_path(filename)
-
     if render_kwargs:
-        body = path.read_text().format(**render_kwargs)
+        body = _data.render(filename, **render_kwargs)
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".xml", delete=False, encoding="utf-8",
         ) as tmp:
@@ -62,7 +61,7 @@ def _define_one(filename: str, name: str, render_kwargs: dict | None = None) -> 
             except OSError:
                 pass
     else:
-        result = virsh_run("nwfilter-define", str(path), check=False)
+        result = virsh_run("nwfilter-define", str(_data.path(filename)), check=False)
 
     if result.returncode != 0:
         msg = result.stderr.strip() or result.stdout.strip() or f"virsh exit {result.returncode}"

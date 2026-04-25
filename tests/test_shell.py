@@ -36,17 +36,13 @@ class TestConstants:
 
 class TestEnsureConptyOnShare:
     @patch("winbox.exec.shell.shutil.copy2")
-    @patch("winbox.exec.shell.resources")
-    def test_copies_script(self, mock_resources, mock_copy2, cfg):
-        mock_file = MagicMock()
-        mock_resources.files.return_value.joinpath.return_value = mock_file
-        mock_resources.as_file.return_value.__enter__ = MagicMock(return_value="/tmp/script.ps1")
-        mock_resources.as_file.return_value.__exit__ = MagicMock(return_value=False)
+    @patch("winbox.exec.shell._data")
+    def test_copies_script(self, mock_data, mock_copy2, cfg):
+        mock_data.path.return_value = "/tmp/Invoke-ConPtyShell.ps1"
 
         _ensure_conpty_on_share(cfg)
 
-        mock_resources.files.assert_called_with("winbox.data")
-        mock_resources.files.return_value.joinpath.assert_called_with(CONPTY_SCRIPT)
+        mock_data.path.assert_called_with(CONPTY_SCRIPT)
         mock_copy2.assert_called_once()
         dest = mock_copy2.call_args[0][1]
         assert str(dest).endswith(CONPTY_SCRIPT)

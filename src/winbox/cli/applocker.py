@@ -2,33 +2,24 @@
 
 from __future__ import annotations
 
-import importlib.resources
 import time
 from pathlib import Path
 
 import click
 
+from winbox import data as _data
 from winbox.cli import console, ensure_running, needs_vm, _ensure_z_drive
 from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM
 
-# AppLocker policy XMLs live in src/winbox/data/applocker/ -- the previous
-# inlined-as-Python-strings approach made the rule layout unsearchable and
-# unlintable. Loaded lazily so unit tests don't need importlib.resources
-# stubbing.
-
-def _read_data(*parts: str) -> str:
-    res = importlib.resources.files("winbox.data").joinpath(*parts)
-    return Path(str(res)).read_text(encoding="utf-8")
-
 
 def _default_policy_xml() -> str:
-    return _read_data("applocker", "default-policy.xml")
+    return _data.read("applocker", "default-policy.xml")
 
 
 def _clear_policy_xml() -> str:
-    return _read_data("applocker", "clear-policy.xml")
+    return _data.read("applocker", "clear-policy.xml")
 
 # Enable/disable scripts read the policy XML from Z:\ (VirtIO-FS share)
 # to avoid command-line length limits with -EncodedCommand.

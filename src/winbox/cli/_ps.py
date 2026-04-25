@@ -19,19 +19,17 @@ the placeholders the renderer fills in.
 
 from __future__ import annotations
 
-import importlib.resources
-from pathlib import Path
+from winbox import data as _data
 
 
 def load_ps(name: str) -> str:
-    """Read a bundled .ps1 template from ``winbox.data.ps``."""
-    res = importlib.resources.files("winbox.data").joinpath("ps", f"{name}.ps1")
-    return Path(str(res)).read_text(encoding="utf-8")
+    """Read a bundled .ps1 template from ``winbox/data/ps/``."""
+    return _data.read("ps", f"{name}.ps1")
 
 
 def render_ps(name: str, **params: str) -> str:
     """Load ``name``.ps1 and format it with ``params``."""
-    return load_ps(name).format(**params)
+    return _data.render("ps", f"{name}.ps1", **params)
 
 
 def ps_quote(s: str) -> str:
