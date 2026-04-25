@@ -126,6 +126,14 @@ def handler_path(cfg: Config) -> Path:
 
 def _sudo_write(path: Path, content: str) -> None:
     """Write content to path via sudo tee."""
+    if shutil.which("sudo") is None:
+        # Without this guard, subprocess.run raises FileNotFoundError as a
+        # raw traceback — confusing for a user on a system with no sudo.
+        raise PermissionError(
+            f"Failed to write to {path}: 'sudo' is not installed. "
+            "binfmt_misc registration requires sudo (or root) to write "
+            "under /proc/sys/fs/binfmt_misc/."
+        )
     result = subprocess.run(
         ["sudo", "tee", str(path)],
         input=content.encode(),

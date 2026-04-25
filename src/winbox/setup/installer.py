@@ -332,7 +332,24 @@ def build_unattend_image(cfg: Config, *, desktop: bool = False) -> None:
         try:
             cfg.unattend_img.unlink()
         except PermissionError:
-            subprocess.run(["rm", "-f", str(cfg.unattend_img)], check=False)
+            # Fallback: previously called `rm -f` here on the assumption
+            # that user-mode rm could remove a file owned by libvirt-qemu.
+            # That's wrong -- rm needs the same FS-level perms as
+            # Path.unlink, so it would fail too. Try `sudo rm -f` instead;
+            # if sudo isn't available, surface the original PermissionError
+            # so the user can clean up manually with explicit guidance.
+            if shutil.which("sudo"):
+                subprocess.run(
+                    ["sudo", "rm", "-f", str(cfg.unattend_img)],
+                    check=False,
+                )
+            if cfg.unattend_img.exists():
+                raise PermissionError(
+                    f"{cfg.unattend_img} is owned by another user "
+                    "(probably libvirt-qemu from a previous setup) and "
+                    "couldn't be removed.\n"
+                    f"    Manual cleanup: sudo rm -f {cfg.unattend_img}"
+                )
 
     edition = "Desktop Experience" if desktop else "Server Core"
     console.print(f"[blue][*][/] Building unattend image ({edition})...")

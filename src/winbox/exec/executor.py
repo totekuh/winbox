@@ -85,19 +85,27 @@ def run_command(
     result: ExecResult | None = None
     for attempt in range(max_retries):
         try:
-            result = ga.exec(full_cmd, timeout=timeout)
-        except GuestAgentError as e:
+            attempt_result = ga.exec(full_cmd, timeout=timeout)
+        except GuestAgentError:
             if attempt < max_retries - 1:
                 console.print(f"[yellow][!][/] GA error, retrying ({attempt + 1}/{max_retries})...")
                 time.sleep(0.5)
                 continue
             raise
+        # Only commit `result` once we have a fresh one for this attempt
+        # — keeps the loop free of "did `result` come from this iteration
+        # or a stale prior one?" ambiguity.
+        result = attempt_result
         if "handle is invalid" not in result.stdout.lower() + result.stderr.lower():
             break
         if attempt < max_retries - 1:
             console.print(f"[yellow][!][/] GA pipe race detected, retrying ({attempt + 1}/{max_retries})...")
             time.sleep(0.5)
-    assert result is not None
+    if result is None:
+        # Defensive: this can only happen if every attempt raised GuestAgentError
+        # AND the final attempt's `raise` was somehow swallowed (shouldn't be
+        # possible). Surface explicitly rather than letting the next access fail.
+        raise GuestAgentError(f"exec failed after {max_retries} retries with no result")
 
     # Print stdout/stderr
     if result.stdout:

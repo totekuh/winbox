@@ -165,14 +165,29 @@ class GuestAgent:
         if pid is None:
             raise GuestAgentError("Failed to start process — no PID returned")
 
-        # Poll for completion
+        # Poll for completion. Tolerate up to N consecutive transient
+        # errors -- a brief virtio-serial hiccup mid-poll used to abort
+        # a long-running command immediately, even though the in-VM
+        # process was still chugging along just fine.
         status_payload = {
             "execute": "guest-exec-status",
             "arguments": {"pid": pid},
         }
         deadline = time.monotonic() + timeout
+        consecutive_errors = 0
+        max_transient_errors = 5
         while True:
-            status = self._raw_command(status_payload)
+            try:
+                status = self._raw_command(status_payload)
+                consecutive_errors = 0
+            except GuestAgentError:
+                consecutive_errors += 1
+                if consecutive_errors > max_transient_errors:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(poll_interval)
+                continue
             ret = status.get("return", {})
             if ret.get("exited"):
                 break

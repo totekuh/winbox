@@ -62,16 +62,19 @@ def open_shell(
     except OSError:
         rows, cols = 24, 80
 
-    # Start TCP listener on virbr0
+    # Start TCP listener on virbr0. The whole bind+listen sequence goes
+    # through one try/except so a socket leak isn't possible if `listen()`
+    # or anything else raises -- the previous code only caught OSError on
+    # bind, leaving the socket open if listen() raised something exotic.
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((cfg.host_ip, port))
-    except OSError as e:
+        server.listen(1)
+    except Exception as e:
         server.close()
         console.print(f"[red][-][/] Cannot bind {cfg.host_ip}:{port}: {e}")
         return
-    server.listen(1)
     console.print(f"[blue][*][/] Listening on {cfg.host_ip}:{port}")
 
     # Build PowerShell command — read script from Z:\ (VirtIO-FS share root)
