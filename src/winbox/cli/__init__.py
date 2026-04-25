@@ -83,8 +83,13 @@ def needs_vm(*, auto_start: bool = True):
             else:
                 state = vm.state()
                 if state != VMState.RUNNING:
+                    # auto_start=False is for diagnostic commands like kdbg
+                    # and net status. The VM being off isn't a problem we
+                    # caused — it's just a precondition the user has to
+                    # meet — so red[-] (genuine error blocking the action).
                     console.print(
-                        f"[yellow][!][/] VM is not running (state: {state.value})"
+                        f"[red][-][/] VM is not running (state: {state.value}). "
+                        "Run [bold]winbox up[/] first."
                     )
                     raise SystemExit(1)
             return fn(cfg, vm, ga, *args, **kwargs)

@@ -46,8 +46,6 @@ def virsh_run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str
     return result
 
 
-# Backward-compat alias. New code should use ``virsh_run``.
-_virsh = virsh_run
 
 
 class VM:

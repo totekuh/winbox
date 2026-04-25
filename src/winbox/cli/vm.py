@@ -115,6 +115,10 @@ def destroy(ctx: click.Context, yes: bool) -> None:
     # the next setup. missing_ok=True makes this safe if the file was already
     # gone (race with a concurrent process, or never existed).
     cfg.jobs_file.unlink(missing_ok=True)
+    # The flock sibling file (added with the JobStore lock work) accumulates
+    # if not cleaned up alongside jobs.json itself.
+    jobs_lock = cfg.jobs_file.parent / (cfg.jobs_file.name + ".lock")
+    jobs_lock.unlink(missing_ok=True)
 
     console.print("[green][+][/] VM destroyed")
 
