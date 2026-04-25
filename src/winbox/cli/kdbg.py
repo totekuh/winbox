@@ -125,7 +125,7 @@ def kdbg_start(ctx: click.Context, port: int, any_interface: bool) -> None:
 
     if any_interface:
         console.print(
-            f"[red][!][/] [bold]Bound to 0.0.0.0:{port}[/] — "
+            f"[yellow][!][/] [bold]Bound to 0.0.0.0:{port}[/] — "
             "anyone on this LAN can attach and control the guest kernel."
         )
     console.print(f"[green][+][/] gdb stub listening on {bind}:{port}")

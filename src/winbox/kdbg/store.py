@@ -195,12 +195,20 @@ class SymbolStore:
         *,
         module: str = "nt",
         limit: int = 64,
+        case_sensitive: bool = False,
     ) -> list[tuple[str, int]]:
-        """Case-sensitive substring match on symbol names. Returns [(name, rva)]."""
+        """Substring match on symbol names. Returns [(name, rva)].
+
+        Defaults to case-insensitive — pentest users typically remember
+        ``KiSystemCall`` vs ``kisystemcall`` only loosely. Pass
+        ``case_sensitive=True`` for exact matching.
+        """
         data = self.load(module)
         hits: list[tuple[str, int]] = []
+        needle = pattern if case_sensitive else pattern.lower()
         for name, rva in data.get("symbols", {}).items():
-            if pattern in name:
+            haystack = name if case_sensitive else name.lower()
+            if needle in haystack:
                 hits.append((name, rva))
                 if len(hits) >= limit:
                     break

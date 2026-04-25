@@ -84,27 +84,32 @@ def binfmt_status(ctx: click.Context) -> None:
     handler_exists = handler.exists()
     persistent = binfmt_mod.BINFMT_PERSIST.exists()
 
+    # Status convention: green[+] for ON state, dim for OFF state (neutral
+    # — not an error or warning). yellow[!] is reserved for genuine
+    # inconsistencies the user should fix (e.g. registered but handler
+    # missing).
     if registered:
         console.print("[green][+][/] Registered: enabled")
     else:
-        console.print("[yellow][!][/] Registered: no")
+        console.print("[dim]·[/] Registered: no")
 
     if handler_exists:
         console.print(f"[green][+][/] Handler: {handler}")
-    else:
+    elif registered:
         console.print("[yellow][!][/] Handler: not found")
-        if registered:
-            console.print("    [yellow]Warning: registered but handler missing — re-run [bold]winbox binfmt enable[/][/]")
+        console.print("    [yellow]Warning: registered but handler missing — re-run [bold]winbox binfmt enable[/][/]")
+    else:
+        console.print("[dim]·[/] Handler: not found")
 
     if persistent:
         console.print(f"[green][+][/] Persistent: {binfmt_mod.BINFMT_PERSIST}")
     else:
-        console.print("[yellow][!][/] Persistent: no")
+        console.print("[dim]·[/] Persistent: no")
 
     tools_dir = cfg.tools_dir
     path_dirs = os.environ.get("PATH", "").split(":")
     if str(tools_dir) in path_dirs:
         console.print(f"[green][+][/] PATH: tools dir included ({tools_dir})")
     else:
-        console.print(f"[yellow][!][/] PATH: tools dir not included")
+        console.print(f"[dim]·[/] PATH: tools dir not included")
         console.print(f'    export PATH="{tools_dir}:$PATH"')

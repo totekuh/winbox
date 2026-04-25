@@ -1,4 +1,18 @@
-"""winbox CLI — click entry point."""
+"""winbox CLI — click entry point.
+
+Output color contract (used across every cli/*.py module):
+
+    [green][+][/]  -- success / positive state / completed action
+    [red][-][/]    -- error / failure
+    [yellow][!][/] -- warning / inconsistent state the user should fix
+    [blue][*][/]   -- action in progress ("Doing X...")
+    [dim]·[/]      -- neutral status info (e.g. "Registered: no" — not on,
+                       but also not a problem; user just hasn't enabled it)
+
+Reserve [yellow][!][/] for actual problems. A status command reporting
+"feature not enabled" should use [dim]·[/], not yellow — yellow implies
+something is wrong, and routine off-states are not.
+"""
 
 from __future__ import annotations
 

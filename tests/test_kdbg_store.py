@@ -103,6 +103,22 @@ def test_search_substring(tmp_path):
     assert ("PsActiveProcessHead", 0xC263A0) in hits
 
 
+def test_search_default_case_insensitive(tmp_path):
+    store = SymbolStore(tmp_path)
+    _save_nt(store)
+    # Default is case-insensitive — lowercase pattern still matches.
+    hits = store.search("psactive")
+    assert ("PsActiveProcessHead", 0xC263A0) in hits
+
+
+def test_search_case_sensitive_opt_in(tmp_path):
+    store = SymbolStore(tmp_path)
+    _save_nt(store)
+    # Opt-in case-sensitive: lowercase needle no longer matches CamelCase name.
+    hits = store.search("psactive", case_sensitive=True)
+    assert hits == []
+
+
 def test_search_limit(tmp_path):
     store = SymbolStore(tmp_path)
     store.save(
