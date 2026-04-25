@@ -47,8 +47,14 @@ def open_shell(
 ) -> None:
     """Open an interactive SYSTEM shell via ConPTY reverse connection."""
     if cfg.host_ip == "0.0.0.0":
-        console.print(
-            "[yellow][!][/] Warning: host_ip is 0.0.0.0 — shell listener exposed on all interfaces"
+        # Hard-fail: a typo'd HOST_IP=0.0.0.0 in ~/.winbox/config would
+        # otherwise expose a SYSTEM-shell listener to the entire LAN
+        # every single `winbox shell` invocation. The previous yellow
+        # warning was easily missed in noisy output.
+        raise click.ClickException(
+            "host_ip is 0.0.0.0 — refusing to bind a SYSTEM-shell listener "
+            "on all interfaces. Fix HOST_IP in ~/.winbox/config (e.g. "
+            "192.168.122.1) or comment it out to use the default."
         )
 
     _ensure_conpty_on_share(cfg)
@@ -136,6 +142,20 @@ def open_shell(
         return
     finally:
         server.close()
+
+    # TCP keepalive on the relay socket so a half-open connection (VM
+    # suspended, network hiccup) eventually surfaces as a recv error
+    # instead of leaving the user wedged forever waiting on stdin.
+    try:
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 30)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except OSError:
+        pass  # keepalive is a nice-to-have, not a hard requirement
 
     # Validate connecting IP matches expected VM
     vm = VM(cfg)

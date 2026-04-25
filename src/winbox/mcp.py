@@ -24,17 +24,26 @@ mcp = FastMCP(
 
 # ─── Shared state ───────────────────────────────────────────────────────────
 
+import threading as _threading
+
 _cfg: Config | None = None
 _vm: VM | None = None
 _ga: GuestAgent | None = None
+# Guards the lazy init so two concurrent first-calls don't both build
+# a Config / VM / GuestAgent. FastMCP can dispatch concurrent tool calls;
+# while construction is idempotent today, the pattern is fragile.
+_state_lock = _threading.Lock()
 
 
 def _get_state() -> tuple[Config, VM, GuestAgent]:
     global _cfg, _vm, _ga
     if _cfg is None:
-        _cfg = Config.load()
-        _vm = VM(_cfg)
-        _ga = GuestAgent(_cfg)
+        with _state_lock:
+            # Re-check inside the lock; another thread may have raced us here.
+            if _cfg is None:
+                _cfg = Config.load()
+                _vm = VM(_cfg)
+                _ga = GuestAgent(_cfg)
     return _cfg, _vm, _ga
 
 

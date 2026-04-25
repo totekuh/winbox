@@ -139,16 +139,45 @@ class VM:
                 ) from e
 
     def ip(self) -> str | None:
+        """Return the VM's IPv4 address on the libvirt default network.
+
+        ``virsh domifaddr`` can list multiple NICs / leases; if the user has
+        added a second network for testing, the first IPv4 line is no longer
+        guaranteed to be the libvirt-default-network address. Filter to
+        leases on the interface returned by ``self.interface()`` so the
+        ConPTY listener doesn't reject "the wrong" IP later.
+        """
         result = virsh_run("domifaddr", self.name, check=False)
         if result.returncode != 0:
             return None
+        target_iface = self.interface()
+        # `domifaddr` output (Linux/libvirt) looks like:
+        #   Name       MAC address       Protocol   Address
+        #   ----------------------------------------------------
+        #   vnet0      52:54:00:aa:bb    ipv4       192.168.122.10/24
+        # The Name field is set on the row that introduces an interface
+        # and blank on subsequent rows belonging to the same iface.
+        current_iface: str | None = None
+        first_seen_ip: str | None = None
         for line in result.stdout.splitlines():
-            if "ipv4" in line:
-                parts = line.split()
+            stripped = line.strip()
+            if not stripped or stripped.startswith("Name") or stripped.startswith("-"):
+                continue
+            parts = stripped.split()
+            # 4-column row: NEW interface; 3-column row: continuation.
+            if len(parts) >= 4 and not parts[0].startswith("0x") and "ipv4" in parts:
+                current_iface = parts[0]
+            if "ipv4" in parts:
                 for part in parts:
                     if "/" in part and "." in part:
-                        return part.split("/")[0]
-        return None
+                        ip_addr = part.split("/")[0]
+                        if first_seen_ip is None:
+                            first_seen_ip = ip_addr
+                        if target_iface and current_iface == target_iface:
+                            return ip_addr
+        # Fall back to the first IPv4 we saw if interface filtering didn't
+        # pin one (single-NIC case, or if we couldn't determine the iface).
+        return first_seen_ip
 
     def interface(self) -> str | None:
         """Get the VM's network interface name (e.g. 'vnet0')."""
