@@ -107,7 +107,7 @@ class TestEnsureFilterDefined:
             calls.append(args)
             return _proc(0)
 
-        with patch("winbox.nwfilter._virsh", side_effect=fake_virsh):
+        with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
             nwfilter.ensure_filter_defined()
 
         assert len(calls) == 2
@@ -117,7 +117,7 @@ class TestEnsureFilterDefined:
         assert calls[1][1].endswith("winbox-isolate.xml")
 
     def test_failure_raises_with_stderr(self):
-        with patch("winbox.nwfilter._virsh") as mock_virsh:
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(1, stderr="error: unexpected XML")
             with pytest.raises(RuntimeError, match="unexpected XML"):
                 nwfilter.ensure_filter_defined()
@@ -158,7 +158,7 @@ class TestAttachFilter:
                 return _proc(0)
             raise AssertionError(f"unexpected virsh call: {args}")
 
-        with patch("winbox.nwfilter._virsh", side_effect=fake_virsh):
+        with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
             changed = nwfilter.attach_filter("winbox")
 
         assert changed is True
@@ -168,7 +168,7 @@ class TestAttachFilter:
         assert update[1] == "winbox"
 
     def test_idempotent_when_already_attached(self):
-        with patch("winbox.nwfilter._virsh") as mock_virsh:
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(0, stdout=DOMXML_WITH_FILTER)
             changed = nwfilter.attach_filter("winbox")
 
@@ -190,7 +190,7 @@ class TestAttachFilter:
                 return _proc(0)
             raise AssertionError(f"unexpected: {args}")
 
-        with patch("winbox.nwfilter._virsh", side_effect=fake_virsh):
+        with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
             nwfilter.attach_filter("winbox")
 
         assert written_xml is not None
@@ -217,7 +217,7 @@ class TestAttachFilter:
                 return _proc(0)
             raise AssertionError(f"unexpected: {args}")
 
-        with patch("winbox.nwfilter._virsh", side_effect=fake_virsh):
+        with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
             changed = nwfilter.attach_filter("winbox")
 
         assert changed is True
@@ -230,12 +230,12 @@ class TestAttachFilter:
                 return _proc(0, stdout=DOMXML_NO_FILTER)
             return _proc(1, stderr="device busy")
 
-        with patch("winbox.nwfilter._virsh", side_effect=fake_virsh):
+        with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
             with pytest.raises(RuntimeError, match="device busy"):
                 nwfilter.attach_filter("winbox")
 
     def test_no_interface_raises(self):
-        with patch("winbox.nwfilter._virsh") as mock_virsh:
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(0, stdout=DOMXML_NO_IFACE)
             with pytest.raises(RuntimeError, match="no <interface>"):
                 nwfilter.attach_filter("winbox")
@@ -250,7 +250,7 @@ class TestAttachFilter:
                 return _proc(0, stdout=DOMXML_NO_FILTER)
             return _proc(0)
 
-        with patch("winbox.nwfilter._virsh", side_effect=fake_virsh):
+        with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
             nwfilter.attach_filter("winbox", live=False, config=True)
 
         update = next(c for c in virsh_calls if c[0] == "update-device")
@@ -278,7 +278,7 @@ class TestDetachFilter:
                 return _proc(0)
             raise AssertionError(f"unexpected: {args}")
 
-        with patch("winbox.nwfilter._virsh", side_effect=fake_virsh):
+        with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
             changed = nwfilter.detach_filter("winbox")
 
         assert changed is True
@@ -286,7 +286,7 @@ class TestDetachFilter:
         assert root.find("filterref[@filter='winbox-isolate']") is None
 
     def test_idempotent_when_absent(self):
-        with patch("winbox.nwfilter._virsh") as mock_virsh:
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(0, stdout=DOMXML_NO_FILTER)
             changed = nwfilter.detach_filter("winbox")
 
@@ -296,7 +296,7 @@ class TestDetachFilter:
 
     def test_preserves_other_filterrefs(self):
         """Only 'winbox-isolate' is removed; other filterrefs stay in place."""
-        with patch("winbox.nwfilter._virsh") as mock_virsh:
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(0, stdout=DOMXML_WITH_OTHER_FILTER)
             changed = nwfilter.detach_filter("winbox")
 
@@ -317,7 +317,7 @@ class TestDetachFilter:
                 return _proc(0)
             raise AssertionError(f"unexpected: {args}")
 
-        with patch("winbox.nwfilter._virsh", side_effect=fake_virsh):
+        with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
             changed = nwfilter.detach_filter("winbox")
 
         assert changed is True
@@ -330,32 +330,32 @@ class TestDetachFilter:
 
 class TestHasFilter:
     def test_true_when_attached(self):
-        with patch("winbox.nwfilter._virsh") as mock_virsh:
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(0, stdout=DOMXML_WITH_FILTER)
             assert nwfilter.has_filter("winbox") is True
 
     def test_false_when_absent(self):
-        with patch("winbox.nwfilter._virsh") as mock_virsh:
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(0, stdout=DOMXML_NO_FILTER)
             assert nwfilter.has_filter("winbox") is False
 
     def test_false_when_other_filter_attached(self):
-        with patch("winbox.nwfilter._virsh") as mock_virsh:
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(0, stdout=DOMXML_WITH_OTHER_FILTER)
             assert nwfilter.has_filter("winbox") is False
 
     def test_false_on_dumpxml_failure(self):
-        with patch("winbox.nwfilter._virsh") as mock_virsh:
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(1, stderr="domain not found")
             assert nwfilter.has_filter("winbox") is False
 
     def test_false_when_no_interface(self):
-        with patch("winbox.nwfilter._virsh") as mock_virsh:
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(0, stdout=DOMXML_NO_IFACE)
             assert nwfilter.has_filter("winbox") is False
 
     def test_false_on_parse_error(self):
         """Garbage XML must not crash net_status with ET.ParseError."""
-        with patch("winbox.nwfilter._virsh") as mock_virsh:
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(0, stdout="<not valid xml")
             assert nwfilter.has_filter("winbox") is False

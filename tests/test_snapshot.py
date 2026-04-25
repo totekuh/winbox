@@ -99,7 +99,7 @@ class TestSnapshotErrorSurfacing:
                       "disk vda unsupported for storage type raw",
         })()
 
-        with patch("winbox.vm.lifecycle._virsh", return_value=fake_result):
+        with patch("winbox.vm.lifecycle.virsh_run", return_value=fake_result):
             with pytest.raises(RuntimeError, match="internal snapshot.*unsupported"):
                 vm.snapshot_create("bad")
 

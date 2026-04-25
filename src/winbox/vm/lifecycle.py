@@ -20,14 +20,34 @@ class VMState(Enum):
     UNKNOWN = "unknown"
 
 
-def _virsh(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    """Run a virsh command and return the result."""
-    return subprocess.run(
+def virsh_run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    """Run ``virsh -c qemu:///system <args>`` and return the result.
+
+    Always returns a :class:`subprocess.CompletedProcess`. With
+    ``check=True``, raises :class:`RuntimeError` (with stderr) on a
+    non-zero exit instead of the stdlib's :class:`CalledProcessError` —
+    the rest of the codebase already raises ``RuntimeError`` for virsh
+    failures (e.g. ``snapshot_create``), so a single error type avoids
+    callers having to ``except (RuntimeError, CalledProcessError)``.
+    """
+    result = subprocess.run(
         ["virsh", "-c", "qemu:///system", *args],
         capture_output=True,
         text=True,
-        check=check,
+        check=False,
     )
+    if check and result.returncode != 0:
+        msg = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or f"virsh exit {result.returncode}"
+        )
+        raise RuntimeError(f"virsh {' '.join(args)} failed: {msg}")
+    return result
+
+
+# Backward-compat alias. New code should use ``virsh_run``.
+_virsh = virsh_run
 
 
 class VM:
@@ -38,7 +58,7 @@ class VM:
         self.name = cfg.vm_name
 
     def state(self) -> VMState:
-        result = _virsh("domstate", self.name, check=False)
+        result = virsh_run("domstate", self.name, check=False)
         if result.returncode != 0:
             return VMState.NOT_FOUND
         raw = result.stdout.strip().lower()
@@ -57,20 +77,20 @@ class VM:
         return self.state() == VMState.RUNNING
 
     def start(self) -> None:
-        _virsh("start", self.name)
+        virsh_run("start", self.name)
 
     def shutdown(self) -> None:
-        _virsh("shutdown", self.name, check=False)
+        virsh_run("shutdown", self.name, check=False)
 
     def force_stop(self) -> None:
-        _virsh("destroy", self.name, check=False)
+        virsh_run("destroy", self.name, check=False)
 
     def resume(self) -> None:
-        _virsh("resume", self.name)
+        virsh_run("resume", self.name)
 
     def suspend(self) -> None:
         """Save VM state to disk (managedsave) for instant resume."""
-        _virsh("managedsave", self.name)
+        virsh_run("managedsave", self.name)
 
     def destroy(self) -> None:
         """Completely remove the VM, snapshots, NVRAM, and disk (but not ISOs)."""
@@ -85,7 +105,7 @@ class VM:
             ["--managed-save", "--snapshots-metadata"],
             [],
         ]:
-            result = _virsh("undefine", self.name, *flags, check=False)
+            result = virsh_run("undefine", self.name, *flags, check=False)
             if result.returncode == 0:
                 undefine_ok = True
                 break
@@ -107,7 +127,7 @@ class VM:
                 ) from e
 
     def ip(self) -> str | None:
-        result = _virsh("domifaddr", self.name, check=False)
+        result = virsh_run("domifaddr", self.name, check=False)
         if result.returncode != 0:
             return None
         for line in result.stdout.splitlines():
@@ -120,7 +140,7 @@ class VM:
 
     def interface(self) -> str | None:
         """Get the VM's network interface name (e.g. 'vnet0')."""
-        result = _virsh("domiflist", self.name, check=False)
+        result = virsh_run("domiflist", self.name, check=False)
         if result.returncode != 0:
             return None
         for line in result.stdout.splitlines():
@@ -134,7 +154,7 @@ class VM:
         iface = self.interface()
         if not iface:
             return False
-        result = _virsh("domif-setlink", self.name, iface, state, check=False)
+        result = virsh_run("domif-setlink", self.name, iface, state, check=False)
         return result.returncode == 0
 
     def net_link_state(self) -> str | None:
@@ -142,7 +162,7 @@ class VM:
         iface = self.interface()
         if not iface:
             return None
-        result = _virsh("domif-getlink", self.name, iface, check=False)
+        result = virsh_run("domif-getlink", self.name, iface, check=False)
         if result.returncode != 0:
             return None
         # Output like: "vnet0 up" or "vnet0 down"
@@ -152,7 +172,7 @@ class VM:
         return None
 
     def snapshot_create(self, name: str) -> None:
-        result = _virsh(
+        result = virsh_run(
             "snapshot-create-as", self.name, name,
             "--description", f"winbox snapshot: {name}",
             check=False,
@@ -162,10 +182,10 @@ class VM:
             raise RuntimeError(msg)
 
     def snapshot_revert(self, name: str) -> None:
-        _virsh("snapshot-revert", self.name, name)
+        virsh_run("snapshot-revert", self.name, name)
 
     def snapshot_list(self) -> list[str]:
-        result = _virsh("snapshot-list", self.name, "--name", check=False)
+        result = virsh_run("snapshot-list", self.name, "--name", check=False)
         if result.returncode != 0:
             return []
         return [s.strip() for s in result.stdout.splitlines() if s.strip()]

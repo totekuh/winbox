@@ -331,13 +331,6 @@ class TestCreateCleanSnapshot:
         # Must not raise — the exception must be caught and turned into a warning.
         create_clean_snapshot(cfg)
 
-    @patch("winbox.setup.installer.VM")
-    def test_called_process_error_still_caught(self, mock_vm_cls, cfg):
-        """The old CalledProcessError path stays catchable for safety."""
-        vm = MagicMock()
-        vm.snapshot_create.side_effect = subprocess.CalledProcessError(1, "virsh")
-        mock_vm_cls.return_value = vm
-        create_clean_snapshot(cfg)
 
 
 # ─── build_unattend_image ────────────────────────────────────────────────────

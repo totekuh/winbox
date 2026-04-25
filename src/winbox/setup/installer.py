@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from winbox.vm import VM, GuestAgent, GuestAgentError
+from winbox.vm import VM, GuestAgent, GuestAgentError, virsh_run
 
 if TYPE_CHECKING:
     from winbox.config import Config
@@ -62,23 +62,14 @@ def check_prereqs() -> list[str]:
 def ensure_default_network() -> None:
     """Ensure the libvirt 'default' network exists and is active."""
     # Check if network is active
-    result = subprocess.run(
-        ["virsh", "-c", "qemu:///system", "net-list", "--name"],
-        capture_output=True, text=True, check=False,
-    )
+    result = virsh_run("net-list", "--name", check=False)
     if result.returncode == 0 and "default" in result.stdout.split():
         return
 
     # Try to start it (might be defined but inactive)
-    start = subprocess.run(
-        ["virsh", "-c", "qemu:///system", "net-start", "default"],
-        capture_output=True, text=True, check=False,
-    )
+    start = virsh_run("net-start", "default", check=False)
     if start.returncode == 0:
-        subprocess.run(
-            ["virsh", "-c", "qemu:///system", "net-autostart", "default"],
-            capture_output=True, text=True, check=False,
-        )
+        virsh_run("net-autostart", "default", check=False)
         console.print("[green][+][/] Started libvirt default network")
         return
 
@@ -91,10 +82,7 @@ def ensure_default_network() -> None:
             "&& sudo virsh net-start default && sudo virsh net-autostart default"
         )
 
-    define = subprocess.run(
-        ["virsh", "-c", "qemu:///system", "net-define", str(default_xml)],
-        capture_output=True, text=True, check=False,
-    )
+    define = virsh_run("net-define", str(default_xml), check=False)
     if define.returncode != 0:
         raise RuntimeError(
             f"Failed to define default network: {define.stderr.strip()}\n"
@@ -102,14 +90,8 @@ def ensure_default_network() -> None:
             "&& sudo virsh net-start default && sudo virsh net-autostart default"
         )
 
-    subprocess.run(
-        ["virsh", "-c", "qemu:///system", "net-start", "default"],
-        capture_output=True, text=True, check=True,
-    )
-    subprocess.run(
-        ["virsh", "-c", "qemu:///system", "net-autostart", "default"],
-        capture_output=True, text=True, check=False,
-    )
+    virsh_run("net-start", "default")
+    virsh_run("net-autostart", "default", check=False)
     console.print("[green][+][/] Created and started libvirt default network")
 
 
@@ -426,10 +408,7 @@ def run_virt_install(cfg: Config, windows_iso: str) -> None:
     console.print("[blue][*][/] Sending boot keystroke...")
     for _ in range(5):
         time.sleep(3)
-        result = subprocess.run(
-            ["virsh", "-c", "qemu:///system", "send-key", cfg.vm_name, "KEY_ENTER"],
-            capture_output=True, text=True, check=False,
-        )
+        result = virsh_run("send-key", cfg.vm_name, "KEY_ENTER", check=False)
         if result.returncode != 0:
             break
 
@@ -606,7 +585,7 @@ def create_clean_snapshot(cfg: Config) -> None:
     try:
         vm.snapshot_create("clean")
         console.print("[green][+][/] Snapshot 'clean' created")
-    except (RuntimeError, subprocess.CalledProcessError) as e:
+    except RuntimeError as e:
         console.print(f"[yellow][!][/] Could not create snapshot: {e}")
 
 

@@ -19,12 +19,11 @@ the persistent config only (used at setup time against a stopped VM).
 from __future__ import annotations
 
 import importlib.resources
-import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from winbox.vm.lifecycle import _virsh
+from winbox.vm import virsh_run
 
 
 FILTER_NAME = "winbox-isolate"
@@ -39,7 +38,7 @@ def _filter_path(filename: str) -> Path:
 
 def _define_one(filename: str, name: str) -> None:
     path = _filter_path(filename)
-    result = _virsh("nwfilter-define", str(path), check=False)
+    result = virsh_run("nwfilter-define", str(path), check=False)
     if result.returncode != 0:
         msg = result.stderr.strip() or result.stdout.strip() or f"virsh exit {result.returncode}"
         raise RuntimeError(f"Failed to define nwfilter '{name}': {msg}")
@@ -55,7 +54,7 @@ def ensure_filter_defined() -> None:
 
 
 def _dumpxml(vm_name: str) -> ET.Element:
-    result = _virsh("dumpxml", vm_name, check=False)
+    result = virsh_run("dumpxml", vm_name, check=False)
     if result.returncode != 0:
         msg = result.stderr.strip() or f"virsh exit {result.returncode}"
         raise RuntimeError(f"virsh dumpxml {vm_name} failed: {msg}")
@@ -120,7 +119,7 @@ def _update_device(
             tmp.write(xml_bytes)
             tmp_path = tmp.name
 
-        result = _virsh(
+        result = virsh_run(
             "update-device", vm_name, tmp_path, *flags,
             check=False,
         )

@@ -782,14 +782,14 @@ class TestEnsureRunningCatchesGAError:
 
 
 class TestSnapshotRestoreCatchesError:
-    """C2: vm.snapshot_revert(name) calls _virsh with check=True. If snapshot
-    doesn't exist, CalledProcessError bubbles up as a raw traceback."""
+    """C2: vm.snapshot_revert(name) calls virsh_run with check=True. If snapshot
+    doesn't exist, the error bubbles up as a raw traceback unless caught."""
 
     def test_nonexistent_snapshot_raises_systemexit(self, runner, mock_env):
         from winbox.cli import cli
 
-        mock_env._vm.snapshot_revert.side_effect = subprocess.CalledProcessError(
-            1, "virsh", stderr="domain 'winbox' has no snapshot named 'bogus'"
+        mock_env._vm.snapshot_revert.side_effect = RuntimeError(
+            "domain 'winbox' has no snapshot named 'bogus'"
         )
 
         result = runner.invoke(cli, ["restore", "bogus"])
