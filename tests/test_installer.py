@@ -16,6 +16,7 @@ from winbox.setup.installer import (
     X64DBG_ZIP,
     check_prereqs,
     _find_mkisofs,
+    boot_for_provisioning,
     create_clean_snapshot,
     create_directories,
     generate_ssh_keypair,
@@ -402,3 +403,81 @@ class TestCreateDisk:
         assert "create" in args
         assert str(cfg.disk_path) in args
         assert f"{cfg.vm_disk}G" in args
+
+
+# --- boot_for_provisioning -----------------------------------------------
+
+
+class TestBootForProvisioningLaunchProbe:
+    """B3: if bootstrap.ps1 doesn't start, surface in 30s instead of 600."""
+
+    @patch("winbox.setup.installer.time.sleep")
+    @patch("winbox.setup.installer.GuestAgent")
+    @patch("winbox.setup.installer.VM")
+    def test_bails_when_log_never_appears(
+        self, mock_vm_cls, mock_ga_cls, mock_sleep, cfg,
+    ):
+        from winbox.vm.guest import ExecResult
+        from winbox.vm.lifecycle import VMState
+
+        vm = MagicMock()
+        vm.state.return_value = VMState.RUNNING
+        mock_vm_cls.return_value = vm
+
+        ga = MagicMock()
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="MISSING\r\n", stderr="")
+        mock_ga_cls.return_value = ga
+
+        with pytest.raises(RuntimeError, match="bootstrap.ps1 did not start"):
+            boot_for_provisioning(cfg)
+
+        # exec_detached was called once to launch the script.
+        ga.exec_detached.assert_called_once()
+        # We never reached wait_shutdown — that would be the 600s wait we're avoiding.
+        vm.wait_shutdown.assert_not_called()
+
+    @patch("winbox.setup.installer._verify_provisioning")
+    @patch("winbox.setup.installer.time.sleep")
+    @patch("winbox.setup.installer.GuestAgent")
+    @patch("winbox.setup.installer.VM")
+    def test_proceeds_when_log_appears(
+        self, mock_vm_cls, mock_ga_cls, mock_sleep, mock_verify, cfg,
+    ):
+        from winbox.vm.guest import ExecResult
+        from winbox.vm.lifecycle import VMState
+
+        vm = MagicMock()
+        vm.state.return_value = VMState.RUNNING
+        vm.wait_shutdown.return_value = True
+        mock_vm_cls.return_value = vm
+
+        ga = MagicMock()
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="OK\r\n", stderr="")
+        mock_ga_cls.return_value = ga
+
+        boot_for_provisioning(cfg)
+
+        ga.exec_detached.assert_called_once()
+        vm.wait_shutdown.assert_called_once()
+        mock_verify.assert_called_once()
+
+    @patch("winbox.setup.installer._verify_provisioning")
+    @patch("winbox.setup.installer.time.sleep")
+    @patch("winbox.setup.installer.GuestAgent")
+    @patch("winbox.setup.installer.VM")
+    def test_proceeds_when_vm_already_shut_down(
+        self, mock_vm_cls, mock_ga_cls, mock_sleep, mock_verify, cfg,
+    ):
+        """Race: bootstrap finishes faster than the probe loop starts."""
+        from winbox.vm.lifecycle import VMState
+
+        vm = MagicMock()
+        vm.state.side_effect = [VMState.RUNNING, VMState.SHUTOFF]
+        vm.wait_shutdown.return_value = True
+        mock_vm_cls.return_value = vm
+
+        ga = MagicMock()
+        mock_ga_cls.return_value = ga
+
+        boot_for_provisioning(cfg)
+        # No need to assert on wait_shutdown — the test just must not raise.

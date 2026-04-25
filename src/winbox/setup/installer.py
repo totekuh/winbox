@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from winbox.vm import VM, GuestAgent, GuestAgentError, virsh_run
+from winbox.vm import VM, VMState, GuestAgent, GuestAgentError, virsh_run
 
 if TYPE_CHECKING:
     from winbox.config import Config
@@ -496,6 +496,39 @@ def boot_for_provisioning(cfg: Config) -> None:
     ga.exec_detached(
         'powershell.exe -ExecutionPolicy Bypass -NoProfile -File C:\\bootstrap.ps1',
     )
+
+    # Sanity probe: bootstrap.ps1's first action is `Start-Transcript -Path
+    # C:\winbox-bootstrap.log -Force`, so the file appears within seconds of
+    # PowerShell loading the script. If it doesn't show up in 30s, something
+    # blocked the launch (corrupt file, ExecutionPolicy, no PowerShell on
+    # PATH) and waiting the full 600s for shutdown is wasted time.
+    console.print("[blue][*][/] Probing bootstrap launch...")
+    launched = False
+    for _ in range(15):
+        time.sleep(2)
+        if vm.state() == VMState.SHUTOFF:
+            launched = True
+            break
+        try:
+            probe = ga.exec(
+                "if exist C:\\winbox-bootstrap.log (echo OK) else (echo MISSING)",
+                timeout=10,
+            )
+        except GuestAgentError:
+            # VM may be rebooting or GA may be momentarily unreachable
+            # mid-provision; keep polling.
+            continue
+        if "OK" in probe.stdout:
+            launched = True
+            break
+
+    if not launched:
+        raise RuntimeError(
+            "bootstrap.ps1 did not start within 30s — no transcript log appeared.\n"
+            f"    Check with: virsh console {cfg.vm_name}\n"
+            "    Common causes: ExecutionPolicy block, corrupt provision.zip,\n"
+            "    or PowerShell missing/broken in the install image."
+        )
 
     console.print("[blue][*][/] Waiting for VM to shut down...")
     if not vm.wait_shutdown(timeout=600):
