@@ -22,13 +22,12 @@ from pathlib import Path
 
 import click
 
-from winbox.cli import console, ensure_running
+from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
 from winbox.kdbg import (
     SymbolStore,
     SymbolStoreError,
     WalkCache,
-    load_from_ghidra,
     load_nt,
     read_cpu_state,
     read_virt_cr3,
@@ -168,54 +167,15 @@ def _get_store(cfg: Config) -> SymbolStore:
 
 
 @kdbg.command("symbols")
-@click.argument("module", default="nt")
-@click.option(
-    "--from-ghidra", "ghidra_json", type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help="Ingest a Ghidra-exported JSON instead of pulling from msdl.",
-)
-@click.option(
-    "--base", type=str,
-    help="Override module load base (hex). Useful with --from-ghidra when the "
-    "driver is loaded at a fixed address you already know.",
-)
-@click.pass_context
-def kdbg_symbols(
-    ctx: click.Context,
-    module: str,
-    ghidra_json: Path | None,
-    base: str | None,
-) -> None:
-    """Load or refresh symbols + struct offsets for a module.
+@needs_vm()
+def kdbg_symbols(cfg: Config, vm: VM, ga: GuestAgent) -> None:
+    """Load or refresh symbols + struct offsets for nt.
 
-    ``nt`` is the default and does the full PE+PDB dance against the
-    running VM. Any other module name with ``--from-ghidra <path>``
-    imports a user-supplied JSON.
+    Does the full PE+PDB dance against the running VM: pulls
+    ntoskrnl.exe out via VirtIO-FS, fetches the matching PDB from msdl,
+    parses with llvm-pdbutil, persists per-build under ``~/.winbox/symbols/``.
     """
-    cfg: Config = ctx.obj["cfg"]
     store = _get_store(cfg)
-
-    if ghidra_json is not None:
-        base_int = int(base, 16) if base else None
-        info = load_from_ghidra(store, module, ghidra_json, base=base_int)
-        console.print(
-            f"[green][+][/] loaded {info.module} from {ghidra_json.name} — "
-            f"{info.symbol_count} symbols, {info.type_count} types"
-        )
-        return
-
-    if module != "nt":
-        console.print(
-            f"[red][-][/] automatic fetch only supported for 'nt' — "
-            f"for {module} supply --from-ghidra"
-        )
-        raise SystemExit(1)
-
-    # Stays raw (no @needs_vm): --from-ghidra above returns without touching
-    # the VM. Decorating the function would boot the VM unnecessarily for
-    # offline imports.
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-    ensure_running(vm, ga, cfg)
     with console.status("[blue]Copying ntoskrnl.exe, fetching PDB, parsing..."):
         info = load_nt(cfg, ga, store)
 

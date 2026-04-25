@@ -7,7 +7,7 @@ import json
 import click
 from rich.console import Console
 
-from winbox.cli import ensure_running, needs_vm
+from winbox.cli import needs_vm
 from winbox.config import Config
 from winbox.eventlogs import (
     LEVEL_CHOICES,
@@ -69,7 +69,7 @@ def _query_options(fn):
 
 
 def _do_query(
-    cfg: Config,
+    ga: GuestAgent,
     logs: tuple[str, ...],
     since: str,
     ids: tuple[int, ...],
@@ -99,10 +99,6 @@ def _do_query(
         max_events=max_events,
     )
     script = build_powershell(query)
-
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-    ensure_running(vm, ga, cfg)
 
     _err(
         f"[blue][*][/] Querying {','.join(query.logs)} since "
@@ -136,9 +132,11 @@ def _do_query(
 
 @click.group("eventlogs", invoke_without_command=True)
 @_query_options
-@click.pass_context
+@needs_vm()
 def eventlogs(
-    ctx: click.Context,
+    cfg: Config,
+    vm: VM,
+    ga: GuestAgent,
     logs: tuple[str, ...],
     since: str,
     ids: tuple[int, ...],
@@ -162,16 +160,12 @@ def eventlogs(
       winbox eventlogs clear --log Security
       winbox eventlogs clear --all -y
     """
-    # Stays raw (no @needs_vm): invoke_without_command=True means this
-    # function runs even when a subcommand is dispatched. The decorator
-    # would call ensure_running unconditionally, including for `eventlogs
-    # clear` where the subcommand has its own @needs_vm. Keep the
-    # subcommand-dispatch short-circuit here, ensure_running lives in
-    # _do_query for the no-subcommand path.
-    if ctx.invoked_subcommand is not None:
+    # Both paths (default query + clear subcommand) need the VM running.
+    # The decorator ensures that once; the subcommand short-circuit below
+    # avoids running the query when a subcommand is being dispatched.
+    if click.get_current_context().invoked_subcommand is not None:
         return
-    cfg: Config = ctx.obj["cfg"]
-    _do_query(cfg, logs, since, ids, provider, level, max_events, as_json, timeout)
+    _do_query(ga, logs, since, ids, provider, level, max_events, as_json, timeout)
 
 
 @eventlogs.command("clear")

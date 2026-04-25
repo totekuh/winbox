@@ -31,7 +31,6 @@ from winbox.kdbg.store import ModuleInfo, SymbolStore, SymbolStoreError
 from winbox.kdbg.symbols import (
     LoadedModule,
     SymbolLoadError,
-    load_from_ghidra,
     load_nt,
     resolve_nt_base,
 )
@@ -49,7 +48,6 @@ __all__ = [
     "build_type_map",
     "fetch_pdb",
     "hmp",
-    "load_from_ghidra",
     "load_nt",
     "load_publics",
     "load_section_headers",

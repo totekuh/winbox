@@ -4,7 +4,6 @@ Layout under ``~/.winbox/symbols/``::
 
     index.json                    # { module_name: active_file, ... }
     nt_<pdb_guid><age>.json       # per-build file (content below)
-    cyverak_ghidra.json           # user-supplied, via kdbg_symbols_load --from-ghidra
 
 Per-module file content::
 

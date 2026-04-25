@@ -7,7 +7,6 @@ resolution together. The caller is the only place that talks to the VM
 
 from __future__ import annotations
 
-import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -173,69 +172,6 @@ def load_nt(
     return LoadedModule(
         module="nt",
         build=ref.build_key,
-        base=base,
-        path=info.path,
-        symbol_count=info.symbol_count,
-        type_count=info.type_count,
-    )
-
-
-# ── Ghidra-sourced module loader ────────────────────────────────────────
-
-
-def load_from_ghidra(
-    store: SymbolStore,
-    module: str,
-    ghidra_json: Path,
-    *,
-    base: int | None = None,
-) -> LoadedModule:
-    """Ingest a Ghidra-exported symbol JSON.
-
-    Expected format (whatever the user's Ghidra export script produces,
-    loosely)::
-
-        {
-          "symbols": { "name": 0xrva, ... },
-          "types":   { "_STRUCT": { "size": N, "fields": { ... } } }
-        }
-
-    Both keys are optional — a symbol-only export is fine. The ``base``
-    argument overrides any file-supplied base.
-    """
-    if not ghidra_json.exists():
-        raise SymbolLoadError(f"file not found: {ghidra_json}")
-    data = json.loads(ghidra_json.read_text(encoding="utf-8"))
-
-    symbols_in = data.get("symbols") or {}
-    types_in = data.get("types") or {}
-    # Normalize symbol values: accept hex strings or ints.
-    symbols: dict[str, int] = {}
-    for name, value in symbols_in.items():
-        if isinstance(value, str):
-            symbols[name] = int(value, 16) if value.lower().startswith("0x") else int(value)
-        else:
-            symbols[name] = int(value)
-
-    file_base = data.get("base")
-    if base is None and file_base is not None:
-        if isinstance(file_base, str):
-            base = int(file_base, 16) if file_base.lower().startswith("0x") else int(file_base)
-        else:
-            base = int(file_base)
-
-    store.save(
-        module=module,
-        build=f"ghidra_{ghidra_json.stem}",
-        image=ghidra_json.name,
-        symbols=symbols,
-        types=types_in,
-        base=base,
-    )
-    info = store.info(module)
-    return LoadedModule(
-        module=module,
-        build=info.build,
         base=base,
         path=info.path,
         symbol_count=info.symbol_count,

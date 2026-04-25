@@ -1801,7 +1801,6 @@ from winbox.kdbg import (
     SymbolStore as _KdbgStore,
     SymbolStoreError as _KdbgStoreError,
     WalkCache as _KdbgWalkCache,
-    load_from_ghidra as _kdbg_load_from_ghidra,
     load_nt as _kdbg_load_nt,
     read_virt_cr3 as _kdbg_read_virt_cr3,
     resolve_nt_base as _kdbg_resolve_nt_base,
@@ -1817,45 +1816,20 @@ def _kdbg_get_store() -> _KdbgStore:
 
 
 @mcp.tool()
-def kdbg_symbols_load(
-    module: str = "nt",
-    from_ghidra: str | None = None,
-    base: str | None = None,
-) -> str:
-    """Load symbols + struct offsets for a kernel module.
+def kdbg_symbols_load() -> str:
+    """Load symbols + struct offsets for nt.
 
-    For ``module='nt'`` (default), pulls ntoskrnl.exe from the running
-    VM, fetches ntkrnlmp.pdb from Microsoft's symbol server, extracts
-    public symbols and key struct layouts (EPROCESS/KPROCESS/KTHREAD/
-    LDR_DATA_TABLE_ENTRY/etc), resolves the live load base via the IDT,
-    and persists everything to ``~/.winbox/symbols/``.
-
-    For any other module, supply ``from_ghidra`` with the path to a JSON
-    symbol export and optionally ``base`` as a hex address override.
+    Pulls ntoskrnl.exe from the running VM, fetches ntkrnlmp.pdb from
+    Microsoft's symbol server, extracts public symbols and key struct
+    layouts (EPROCESS/KPROCESS/KTHREAD/LDR_DATA_TABLE_ENTRY/etc),
+    resolves the live load base via the IDT, and persists everything
+    to ``~/.winbox/symbols/``.
 
     The map itself is never returned inline - use ``kdbg_sym`` and
     ``kdbg_struct`` for lookups.
-
-    Args:
-        module: Module name (default 'nt'). Custom names require from_ghidra.
-        from_ghidra: Path to a Ghidra-exported JSON.
-        base: Optional base address for from_ghidra imports (hex or decimal).
     """
     cfg, vm, ga = _ensure_vm_ready()
     store = _kdbg_get_store()
-
-    if from_ghidra:
-        from pathlib import Path as _P
-        base_int = int(base, 0) if base else None
-        info = _kdbg_load_from_ghidra(store, module, _P(from_ghidra), base=base_int)
-        return (
-            f"loaded {info.module} from {from_ghidra}: "
-            f"{info.symbol_count} symbols, {info.type_count} types"
-        )
-
-    if module != "nt":
-        return f"module {module!r}: automatic fetch only supports 'nt' — supply from_ghidra"
-
     info = _kdbg_load_nt(cfg, ga, store)
     base_txt = f"base=0x{info.base:x}" if info.base else "base=unresolved"
     return (
