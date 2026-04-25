@@ -201,3 +201,6 @@ def jobs_kill(ctx: click.Context, job_id: int) -> None:
     job.exitcode = -1
     store.update(job)
     console.print(f"[green][+][/] Job {job_id} killed (PID {job.pid})")
+
+
+REGISTER = ("Execute", [jobs])

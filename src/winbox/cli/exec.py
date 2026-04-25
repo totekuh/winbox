@@ -125,3 +125,6 @@ def ssh(ctx: click.Context) -> None:
         os.execvpe("sshpass", ssh_args, env)
     else:
         os.execvp("ssh", ssh_args)
+
+
+REGISTER = ("Execute", [exec_cmd, shell, ssh])

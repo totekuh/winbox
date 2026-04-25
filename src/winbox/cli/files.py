@@ -76,3 +76,6 @@ def iso_status(ctx: click.Context) -> None:
     else:
         console.print("[yellow][!][/] ISO not downloaded")
         console.print("    Run: [bold]winbox iso download[/]")
+
+
+REGISTER = ("Files", [tools, iso])

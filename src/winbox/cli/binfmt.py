@@ -113,3 +113,6 @@ def binfmt_status(ctx: click.Context) -> None:
     else:
         console.print(f"[dim]·[/] PATH: tools dir not included")
         console.print(f'    export PATH="{tools_dir}:$PATH"')
+
+
+REGISTER = ("Integrations", [binfmt])

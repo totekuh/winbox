@@ -255,3 +255,6 @@ def vnc(ctx: click.Context) -> None:
         stderr=subprocess.DEVNULL,
     )
     console.print("[green][+][/] virt-manager launched")
+
+
+REGISTER = ("VM Lifecycle", [up, down, suspend, destroy, status, snapshot, restore, vnc])

@@ -651,3 +651,6 @@ def domain_leave(ctx: click.Context) -> None:
         console.print(f"    Check with: virsh console {cfg.vm_name}")
         raise SystemExit(1)
     console.print("[green][+][/] Domain left — back to workgroup, all files intact")
+
+
+REGISTER = ("Network", [net, dns, hosts, domain])

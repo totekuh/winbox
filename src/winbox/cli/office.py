@@ -83,3 +83,6 @@ foreach ($app in $apps) {
         # Clean up host-side files from shared dir
         for f in ["odt-setup.exe", "office-config.xml"]:
             (cfg.shared_dir / f).unlink(missing_ok=True)
+
+
+REGISTER = ("Integrations", [office])

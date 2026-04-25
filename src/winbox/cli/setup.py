@@ -208,3 +208,6 @@ def provision(ctx: click.Context) -> None:
     else:
         console.print(f"[yellow][!][/] Provisioning exited with code {result.exitcode}")
         raise SystemExit(result.exitcode)
+
+
+REGISTER = ("VM Lifecycle", [setup, provision])

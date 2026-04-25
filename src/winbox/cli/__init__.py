@@ -173,14 +173,9 @@ class GroupedCli(click.Group):
     bucket — that's a loud signal to add them here rather than a silent drop.
     """
 
-    SECTIONS: list[tuple[str, list[str]]] = [
-        ("VM Lifecycle", ["setup", "up", "down", "suspend", "destroy", "status", "snapshot", "restore", "provision"]),
-        ("Execute", ["exec", "shell", "ssh", "vnc", "jobs", "msi", "eventlogs"]),
-        ("Files", ["tools", "upload", "iso"]),
-        ("Network", ["net", "dns", "hosts", "domain"]),
-        ("Target", ["av", "applocker", "autologin"]),
-        ("Integrations", ["binfmt", "mcp", "kdbg", "office"]),
-    ]
+    # Filled by _discover_and_register() below; placeholder so the help
+    # formatter's reference is well-defined even before discovery runs.
+    SECTIONS: list[tuple[str, list[str]]] = []
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         commands: dict[str, click.Command] = {}
@@ -219,52 +214,43 @@ def cli(ctx: click.Context) -> None:
     ctx.obj["cfg"] = Config.load()
 
 
-# ─── Register subcommands ────────────────────────────────────────────────────
+# ─── Register subcommands (auto-discovered) ──────────────────────────────────
+#
+# Each cli/<module>.py exports REGISTER = (section_name, [click_cmd, ...]).
+# We import every module in this package and pull its REGISTER tuple. Adding
+# a new command becomes one edit (drop the file in cli/) instead of four
+# (import + add_command + SECTIONS + conftest._CLI_MODULES).
 
-from winbox.cli.vm import up, down, suspend, destroy, status, snapshot, restore, vnc  # noqa: E402
-from winbox.cli.setup import setup, provision  # noqa: E402
-from winbox.cli.exec import exec_cmd, shell, ssh  # noqa: E402
-from winbox.cli.network import dns, domain, hosts, net  # noqa: E402
-from winbox.cli.files import tools, iso  # noqa: E402
-from winbox.cli.binfmt import binfmt  # noqa: E402
-from winbox.cli.jobs import jobs  # noqa: E402
-from winbox.cli.office import office  # noqa: E402
-from winbox.cli.av import av  # noqa: E402
-from winbox.cli.applocker import applocker  # noqa: E402
-from winbox.cli.autologin import autologin  # noqa: E402
-from winbox.cli.msi import msi  # noqa: E402
-from winbox.cli.upload import upload  # noqa: E402
-from winbox.cli.eventlogs import eventlogs  # noqa: E402
-from winbox.cli.mcp import mcp_cmd  # noqa: E402
-from winbox.cli.kdbg import kdbg  # noqa: E402
+import importlib  # noqa: E402
+import pkgutil  # noqa: E402
 
-cli.add_command(up)
-cli.add_command(down)
-cli.add_command(suspend)
-cli.add_command(destroy)
-cli.add_command(status)
-cli.add_command(snapshot)
-cli.add_command(restore)
-cli.add_command(setup)
-cli.add_command(provision)
-cli.add_command(exec_cmd)
-cli.add_command(shell)
-cli.add_command(ssh)
-cli.add_command(dns)
-cli.add_command(domain)
-cli.add_command(hosts)
-cli.add_command(net)
-cli.add_command(tools)
-cli.add_command(iso)
-cli.add_command(binfmt)
-cli.add_command(jobs)
-cli.add_command(vnc)
-cli.add_command(office)
-cli.add_command(av)
-cli.add_command(applocker)
-cli.add_command(autologin)
-cli.add_command(msi)
-cli.add_command(upload)
-cli.add_command(eventlogs)
-cli.add_command(mcp_cmd)
-cli.add_command(kdbg)
+
+def _discover_and_register() -> None:
+    sections: dict[str, list[str]] = {}
+    package_path = __path__  # type: ignore[name-defined]
+    for finder, mod_name, ispkg in pkgutil.iter_modules(package_path):
+        if ispkg or mod_name.startswith("_"):
+            continue
+        module = importlib.import_module(f"{__name__}.{mod_name}")
+        register = getattr(module, "REGISTER", None)
+        if register is None:
+            continue
+        section, commands = register
+        for cmd in commands:
+            cli.add_command(cmd)
+            sections.setdefault(section, []).append(cmd.name)
+
+    # Re-build GroupedCli.SECTIONS in the canonical display order so the
+    # `--help` output groups stay stable regardless of file-system traversal
+    # order.
+    section_order = [
+        "VM Lifecycle", "Execute", "Files", "Network", "Target", "Integrations",
+    ]
+    GroupedCli.SECTIONS = [
+        (s, sections[s]) for s in section_order if s in sections
+    ] + [
+        (s, sections[s]) for s in sections if s not in section_order
+    ]
+
+
+_discover_and_register()

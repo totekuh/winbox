@@ -258,3 +258,6 @@ def clear(
             raise SystemExit(1)
     else:
         _err(f"[green][+][/] Cleared {cleared} channel(s)")
+
+
+REGISTER = ("Execute", [eventlogs])

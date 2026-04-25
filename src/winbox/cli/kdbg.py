@@ -461,3 +461,6 @@ def kdbg_base(ctx: click.Context) -> None:
         raise SystemExit(1)
     store.set_base("nt", base)
     console.print(f"[green][+][/] nt base = 0x{base:x}")
+
+
+REGISTER = ("Integrations", [kdbg])

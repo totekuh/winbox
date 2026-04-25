@@ -200,3 +200,7 @@ def av_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
         raise SystemExit(1)
 
     console.print(result.stdout.strip(), markup=False, highlight=False)
+
+
+# Auto-discovery hook for cli/__init__.py.
+REGISTER = ("Target", [av])

@@ -22,3 +22,6 @@ def mcp_cmd() -> None:
         raise SystemExit(1)
 
     run_server()
+
+
+REGISTER = ("Integrations", [mcp_cmd])

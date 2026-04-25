@@ -99,3 +99,6 @@ def msi(
         staged.unlink(missing_ok=True)
 
     raise SystemExit(exit_status)
+
+
+REGISTER = ("Execute", [msi])

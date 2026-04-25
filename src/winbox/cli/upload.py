@@ -89,3 +89,6 @@ def upload(
     console.print(
         f"[green][+][/] Uploaded [bold]{basename}[/] -> {dst} ({size} bytes)"
     )
+
+
+REGISTER = ("Files", [upload])
