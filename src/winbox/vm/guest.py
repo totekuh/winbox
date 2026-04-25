@@ -194,8 +194,12 @@ class GuestAgent:
                 )
             time.sleep(poll_interval)
 
-        # Decode output
-        exitcode = ret.get("exitcode", 1)
+        # Decode output. Use -1 as the missing-exitcode sentinel to match
+        # exec_status() — a real exit 1 should not be indistinguishable from
+        # "guest-exec-status didn't include exitcode". Today neither callers
+        # rely on the difference, but the inconsistency was already a footgun
+        # noted in code review.
+        exitcode = ret.get("exitcode", -1)
         stdout = _decode_b64(ret.get("out-data", ""))
         stderr = _decode_b64(ret.get("err-data", ""))
 

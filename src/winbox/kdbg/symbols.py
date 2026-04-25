@@ -126,13 +126,19 @@ def load_nt(
     ga: GuestAgent,
     store: SymbolStore,
     *,
-    reuse_cached_pe: bool = True,
+    reuse_cached_pe: bool = False,
 ) -> LoadedModule:
     """Copy ntoskrnl out of the VM, fetch PDB, extract, compute base, save.
 
-    Passing ``reuse_cached_pe=True`` skips the in-VM Copy-Item if the
-    cached PE still exists — useful for re-runs after provisioning where
-    the kernel binary hasn't changed.
+    ``reuse_cached_pe=True`` skips the in-VM Copy-Item if the cached PE
+    still exists — fast, but UNSAFE if the kernel changed (e.g., after a
+    Windows Update). The cached PE is not keyed by build, so a stale PE
+    pairs the live kernel's RVAs against the old kernel's PDB ref, with
+    no error and silent symbol corruption. Default is False; the extra
+    ~1s Copy-Item is the right trade-off vs surprising the user with
+    bad symbols. Re-enable explicitly only on hot paths where you know
+    the kernel is unchanged (e.g., consecutive `kdbg_ps` calls inside
+    one session).
     """
     cached_pe = cfg.symbols_dir / "ntoskrnl.exe"
     if reuse_cached_pe and cached_pe.exists():

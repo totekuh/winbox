@@ -20,8 +20,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from winbox.kdbg.hmp import read_cpu_state
-from winbox.kdbg.memory import WalkCache, read_virt_cr3
+import logging
+
+from winbox.kdbg.hmp import HmpError, read_cpu_state
+from winbox.kdbg.memory import PageWalkError, WalkCache, read_virt_cr3
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from winbox.kdbg.store import SymbolStore
@@ -141,7 +145,15 @@ def list_processes(
             pid = _read_u64(vm_name, cr3, eproc + pid_off, cache)
             dtb = _read_u64(vm_name, cr3, eproc + dtb_off, cache)
             name = _read_cstr(vm_name, cr3, eproc + img_off, 15, cache)
-        except Exception:
+        except (HmpError, PageWalkError) as e:
+            # Bare `except Exception` here used to silently truncate the walk
+            # mid-list — callers thought they had the full process table.
+            # Surface the partial-truncation reason in logs (still partial
+            # data is returned so the UI shows what we did get).
+            logger.warning(
+                "list_processes: walk truncated at EPROCESS 0x%x (%d returned): %s",
+                eproc, len(results), e,
+            )
             break
         results.append(ProcessRecord(
             pid=pid, name=name, eprocess=eproc, directory_table_base=dtb,
@@ -204,7 +216,11 @@ def list_modules(
             base = _read_u64(vm_name, cr3, entry + dll_base_off, cache)
             size = _read_u32(vm_name, cr3, entry + size_off, cache)
             name = _read_unicode_string(vm_name, cr3, entry + base_name_off, store, cache)
-        except Exception:
+        except (HmpError, PageWalkError) as e:
+            logger.warning(
+                "list_modules: walk truncated at LDR_DATA_TABLE_ENTRY 0x%x (%d returned): %s",
+                entry, len(results), e,
+            )
             break
         results.append(ModuleRecord(name=name, base=base, size=size, entry=entry))
         flink = _read_u64(vm_name, cr3, flink, cache)
