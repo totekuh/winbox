@@ -40,7 +40,10 @@ def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int, bg: boo
     args = command[1:]
 
     if log and not bg:
-        console.print("[yellow][!][/] --log has no effect without --bg, ignoring")
+        # Previously a yellow-warning-and-ignore. The user explicitly asked
+        # for log mode; silently dropping it violated least-surprise and
+        # masked typos. Hard-fail with the standard Click "Error:" prefix.
+        raise click.UsageError("--log requires --bg")
 
     if bg:
         from winbox.jobs import JobMode

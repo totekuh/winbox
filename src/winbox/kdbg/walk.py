@@ -156,6 +156,11 @@ def list_processes(
             pid=pid, name=name, eprocess=eproc, directory_table_base=dtb,
         ))
         flink = _read_u64(vm_name, cr3, flink, cache)
+    if len(results) >= MAX_PROCESSES:
+        logger.warning(
+            "list_processes: hit MAX_PROCESSES=%d cap; result is truncated",
+            MAX_PROCESSES,
+        )
     return results
 
 
@@ -221,4 +226,9 @@ def list_modules(
             break
         results.append(ModuleRecord(name=name, base=base, size=size, entry=entry))
         flink = _read_u64(vm_name, cr3, flink, cache)
+    if len(results) >= MAX_MODULES:
+        logger.warning(
+            "list_modules: hit MAX_MODULES=%d cap; result is truncated",
+            MAX_MODULES,
+        )
     return results

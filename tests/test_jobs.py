@@ -203,13 +203,13 @@ class TestExecBg:
         result = runner.invoke(cli, ["exec", "--bg", "b.exe"])
         assert "Job 2 started" in result.output
 
-    def test_log_without_bg_warns(self, runner, cfg, mock_env):
-        """--log without --bg runs synchronously and warns."""
+    def test_log_without_bg_errors(self, runner, cfg, mock_env):
+        """--log without --bg now errors via Click's UsageError -- silently
+        ignoring the user's explicit flag was a footgun."""
         mock_env.exec.return_value = ExecResult(exitcode=0, stdout="ok\n", stderr="")
         result = runner.invoke(cli, ["exec", "--log", "cmd.exe", "/c", "echo", "hi"])
-        # Should run normally (not bg) but warn
-        assert "Job" not in result.output
-        assert "--log has no effect without --bg" in result.output
+        assert result.exit_code != 0
+        assert "--log requires --bg" in result.output
 
 
 # ─── jobs list ────────────────────────────────────────────────────────────────

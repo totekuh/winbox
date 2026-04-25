@@ -62,12 +62,26 @@ class VM:
         if result.returncode != 0:
             return VMState.NOT_FOUND
         raw = result.stdout.strip().lower()
-        # Handle managedsave indicator
+        # virsh emits 8 well-known states; map the transient ones to the
+        # nearest stable one rather than collapsing them all to UNKNOWN
+        # (which callers like _ensure_vm_ready treat as fatal). "saved"
+        # comes from managedsave indicator on running VMs.
         if "saved" in raw:
             return VMState.SAVED
+        # Direct match against canonical values first.
         for s in VMState:
             if s.value == raw:
                 return s
+        # Transient / nearby states virsh can emit:
+        #   "in shutdown" — heading to SHUTOFF, not interesting to most callers
+        #   "dying"       — heading to SHUTOFF
+        #   "crashed"     — VM died; treat as off so callers offer winbox up
+        #   "pmsuspended" — ACPI-suspended, equivalent to a saved state
+        #   "idle"        — defined-but-not-running on some libvirt builds
+        if raw in ("in shutdown", "dying", "crashed", "idle"):
+            return VMState.SHUTOFF
+        if raw == "pmsuspended":
+            return VMState.SAVED
         return VMState.UNKNOWN
 
     def exists(self) -> bool:

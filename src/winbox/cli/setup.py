@@ -34,11 +34,10 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool, desktop: bool)
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
 
-    # Serialize concurrent `winbox setup` runs. We hit a race earlier where a
-    # backgrounded setup fought a manual one over disk.qcow2 — this lock makes
-    # that impossible. The lock is held for the entire setup lifetime by keeping
-    # lock_fh alive as a local; Python releases it when setup() returns (normal
-    # exit) or when the stack unwinds (exception propagation).
+    # Serialize concurrent `winbox setup` runs. The lock is held for the
+    # entire setup lifetime via an explicit try/finally — relying on
+    # garbage collection to close the fd worked in CPython but leaked
+    # under repeated failures from a long-lived caller (test runners).
     cfg.winbox_dir.mkdir(parents=True, exist_ok=True)
     lock_path = cfg.winbox_dir / ".setup.lock"
     lock_fh = open(lock_path, "w")
@@ -53,6 +52,20 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool, desktop: bool)
         )
         raise SystemExit(1)
 
+    try:
+        _setup_inner(ctx, cfg, vm, windows_iso, yes, desktop)
+    finally:
+        lock_fh.close()
+
+
+def _setup_inner(
+    ctx: click.Context,
+    cfg: Config,
+    vm: VM,
+    windows_iso: str | None,
+    yes: bool,
+    desktop: bool,
+) -> None:
     console.print("[bold]winbox setup[/] — building Windows VM\n")
     t0 = time.monotonic()
 

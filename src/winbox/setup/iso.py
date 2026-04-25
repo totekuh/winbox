@@ -103,8 +103,10 @@ def download_iso(
                 f"({human_size(remote_size)}). Delete {dest} and re-download, "
                 f"or use --force."
             )
-        elif not remote_size and local_size > 1_000_000_000:
-            # Can't verify size but file looks complete (>1GB)
+        elif not remote_size and local_size >= 4_500_000_000:
+            # Can't verify size against remote, but ~4.7GB is the actual
+            # eval-ISO size; anything below this is a partial that previous
+            # ">1GB" leniency would have happily reused.
             console.print(f"[green][+][/] ISO already downloaded: {dest}")
             return dest
 

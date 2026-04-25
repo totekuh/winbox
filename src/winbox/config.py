@@ -141,13 +141,23 @@ class Config:
                 continue
             if attr in int_fields:
                 try:
-                    setattr(cfg, attr, int(value))
+                    parsed = int(value)
                 except ValueError:
                     logger.warning(
                         "%s:%d: %s expects an integer, got %r — keeping default",
                         path, lineno, key, value,
                     )
                     continue
+                if parsed <= 0:
+                    # virt-install would otherwise fail much later with a
+                    # confusing error like "Memory amount must be greater
+                    # than 0". Reject upfront.
+                    logger.warning(
+                        "%s:%d: %s must be > 0 (got %d) — keeping default",
+                        path, lineno, key, parsed,
+                    )
+                    continue
+                setattr(cfg, attr, parsed)
             elif attr in path_fields:
                 setattr(cfg, attr, Path(value))
             else:
