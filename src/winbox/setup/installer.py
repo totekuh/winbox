@@ -22,9 +22,6 @@ if TYPE_CHECKING:
 console = Console()
 
 
-def _data_file(name: str) -> Path:
-    """Bundled data file. Thin alias for winbox.data.path."""
-    return _data.path(name)
 
 
 def run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.CompletedProcess[str]:
@@ -310,7 +307,7 @@ def generate_ssh_keypair(cfg: Config) -> None:
 
 def copy_setup_files(cfg: Config) -> None:
     """Copy provisioning files to shared tools directory (for re-provisioning)."""
-    src = _data_file("provision.ps1")
+    src = _data.path("provision.ps1")
     dst = cfg.tools_dir / "provision.ps1"
     dst.write_bytes(Path(src).read_bytes())
     # Copy SSH pubkey so provision.ps1 can find it at Z:\tools\.ssh_pubkey
@@ -354,7 +351,7 @@ def build_unattend_image(cfg: Config, *, desktop: bool = False) -> None:
     edition = "Desktop Experience" if desktop else "Server Core"
     console.print(f"[blue][*][/] Building unattend image ({edition})...")
     with tempfile.TemporaryDirectory() as tmpdir:
-        src = _data_file("unattend.xml")
+        src = _data.path("unattend.xml")
         dst = Path(tmpdir) / "autounattend.xml"
         xml = Path(src).read_text()
         if desktop:
@@ -467,7 +464,7 @@ def provision_vm_disk(cfg: Config) -> None:
                 )
         zip_path = tmpdir_path / "provision.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(_data_file("provision.ps1"), "provision.ps1")
+            zf.write(_data.path("provision.ps1"), "provision.ps1")
             if cfg.ssh_pubkey.exists():
                 zf.write(cfg.ssh_pubkey, ".ssh_pubkey")
             if openssh_zip.exists():
@@ -482,7 +479,7 @@ def provision_vm_disk(cfg: Config) -> None:
                 zf.write(x64dbg_zip, X64DBG_ZIP)
 
         # Copy bootstrap.ps1 to temp dir
-        bootstrap_src = _data_file("bootstrap.ps1")
+        bootstrap_src = _data.path("bootstrap.ps1")
         bootstrap_tmp = tmpdir_path / "bootstrap.ps1"
         bootstrap_tmp.write_bytes(Path(bootstrap_src).read_bytes())
 

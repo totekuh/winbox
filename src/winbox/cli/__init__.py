@@ -267,6 +267,8 @@ import pkgutil  # noqa: E402
 
 def _discover_and_register() -> None:
     sections: dict[str, list[str]] = {}
+    import warnings as _warnings
+
     package_path = __path__  # type: ignore[name-defined]
     for finder, mod_name, ispkg in pkgutil.iter_modules(package_path):
         if ispkg or mod_name.startswith("_"):
@@ -274,6 +276,23 @@ def _discover_and_register() -> None:
         module = importlib.import_module(f"{__name__}.{mod_name}")
         register = getattr(module, "REGISTER", None)
         if register is None:
+            # If a CLI module defines a click.command/click.group but no
+            # REGISTER, the discovery would silently drop it -- the
+            # contributor would only notice when their command failed
+            # to appear in `winbox --help`. Warn instead.
+            has_click_command = any(
+                isinstance(getattr(module, name, None), click.BaseCommand)
+                for name in dir(module)
+                if not name.startswith("_")
+            )
+            if has_click_command:
+                _warnings.warn(
+                    f"winbox.cli.{mod_name}: defines click commands but no "
+                    "REGISTER tuple — commands will not appear in `--help` "
+                    "or be wired to the CLI. Add `REGISTER = (section, [cmd, ...])`.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             continue
         section, commands = register
         for cmd in commands:
