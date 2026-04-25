@@ -258,3 +258,68 @@ def read_virt_cr3(
         cursor += take
         remaining -= take
     return bytes(out)
+
+
+# ── Typed read shortcuts (used by walkers) ──────────────────────────────
+
+# Live in memory.py instead of walk.py so any future walker (handle table,
+# DPC queue, etc.) doesn't have to reinvent them.
+
+def read_u64(vm_name: str, cr3: int, va: int, cache: WalkCache | None = None) -> int:
+    """Read 8 little-endian bytes from VA in CR3 and return the unsigned int."""
+    return int.from_bytes(read_virt_cr3(vm_name, cr3, va, 8, cache=cache), "little")
+
+
+def read_u32(vm_name: str, cr3: int, va: int, cache: WalkCache | None = None) -> int:
+    """Read 4 little-endian bytes from VA in CR3 and return the unsigned int."""
+    return int.from_bytes(read_virt_cr3(vm_name, cr3, va, 4, cache=cache), "little")
+
+
+def read_cstr(
+    vm_name: str,
+    cr3: int,
+    va: int,
+    length: int,
+    cache: WalkCache | None = None,
+) -> str:
+    """Read up to ``length`` bytes and decode as Latin-1 up to the first NUL.
+
+    Used for fixed-size kernel name fields like EPROCESS.ImageFileName
+    (15 bytes + NUL). Latin-1 because the field can contain arbitrary bytes
+    on corrupted/truncated entries; 'replace' would mask them.
+    """
+    raw = read_virt_cr3(vm_name, cr3, va, length, cache=cache)
+    return raw.split(b"\x00", 1)[0].decode("latin-1", errors="replace")
+
+
+def read_unicode_string(
+    vm_name: str,
+    cr3: int,
+    va: int,
+    length_off: int,
+    buffer_off: int,
+    cache: WalkCache | None = None,
+    *,
+    max_length: int = 1024,
+) -> str:
+    """Read a Windows ``_UNICODE_STRING`` and return its text.
+
+    Layout: ``USHORT Length; USHORT MaximumLength; PWSTR Buffer;`` -- where
+    Length is in bytes and Buffer points at UTF-16LE chars.
+
+    Pass the field offsets explicitly (callers already have a SymbolStore
+    in scope and can look them up once per walk) so this primitive doesn't
+    depend on the symbol-store layer.
+    """
+    length = int.from_bytes(
+        read_virt_cr3(vm_name, cr3, va + length_off, 2, cache=cache), "little"
+    )
+    if length == 0:
+        return ""
+    # Cap absurd values so a bogus read can't hang the walker.
+    length = min(length, max_length)
+    buffer_va = read_u64(vm_name, cr3, va + buffer_off, cache)
+    if buffer_va == 0:
+        return ""
+    raw = read_virt_cr3(vm_name, cr3, buffer_va, length, cache=cache)
+    return raw.decode("utf-16-le", errors="replace").rstrip("\x00")

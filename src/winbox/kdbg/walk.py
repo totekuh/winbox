@@ -23,7 +23,15 @@ from typing import TYPE_CHECKING
 import logging
 
 from winbox.kdbg.hmp import HmpError, read_cpu_state
-from winbox.kdbg.memory import PageWalkError, WalkCache, read_virt_cr3
+from winbox.kdbg.memory import (
+    PageWalkError,
+    WalkCache,
+    read_cstr,
+    read_u32,
+    read_u64,
+    read_unicode_string,
+    read_virt_cr3,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +66,15 @@ def _cpu_cr3(vm_name: str) -> int:
     return read_cpu_state(vm_name)["CR3"]
 
 
+# Thin compat shims so the rest of this module reads as it did pre-K3.
+# Concrete primitives now live in winbox.kdbg.memory.
+
 def _read_u64(vm_name: str, cr3: int, va: int, cache: WalkCache) -> int:
-    return int.from_bytes(read_virt_cr3(vm_name, cr3, va, 8, cache=cache), "little")
+    return read_u64(vm_name, cr3, va, cache)
 
 
 def _read_u32(vm_name: str, cr3: int, va: int, cache: WalkCache) -> int:
-    return int.from_bytes(read_virt_cr3(vm_name, cr3, va, 4, cache=cache), "little")
+    return read_u32(vm_name, cr3, va, cache)
 
 
 def _read_cstr(
@@ -73,8 +84,7 @@ def _read_cstr(
     length: int,
     cache: WalkCache,
 ) -> str:
-    raw = read_virt_cr3(vm_name, cr3, va, length, cache=cache)
-    return raw.split(b"\x00", 1)[0].decode("latin-1", errors="replace")
+    return read_cstr(vm_name, cr3, va, length, cache)
 
 
 def _read_unicode_string(
@@ -84,28 +94,15 @@ def _read_unicode_string(
     store: SymbolStore,
     cache: WalkCache,
 ) -> str:
-    """Read a Windows ``_UNICODE_STRING`` and return its text.
-
-    Layout: ``USHORT Length; USHORT MaximumLength; PWSTR Buffer;`` —
-    Length is in bytes, Buffer is a pointer to UTF-16LE chars.
-    """
-    us = store.struct("_UNICODE_STRING")
-    fields = us["fields"]
-    length_off = fields["Length"]["off"]
-    buffer_off = fields["Buffer"]["off"]
-
-    length = int.from_bytes(
-        read_virt_cr3(vm_name, cr3, va + length_off, 2, cache=cache), "little"
+    """Read a ``_UNICODE_STRING`` at ``va``, looking up field offsets from
+    the symbol store and delegating the actual reads to memory.read_unicode_string."""
+    fields = store.struct("_UNICODE_STRING")["fields"]
+    return read_unicode_string(
+        vm_name, cr3, va,
+        length_off=fields["Length"]["off"],
+        buffer_off=fields["Buffer"]["off"],
+        cache=cache,
     )
-    if length == 0:
-        return ""
-    # Cap absurd values so a bogus read can't hang the walker.
-    length = min(length, 1024)
-    buffer_va = _read_u64(vm_name, cr3, va + buffer_off, cache)
-    if buffer_va == 0:
-        return ""
-    raw = read_virt_cr3(vm_name, cr3, buffer_va, length, cache=cache)
-    return raw.decode("utf-16-le", errors="replace").rstrip("\x00")
 
 
 # ── Process list ────────────────────────────────────────────────────────
