@@ -29,6 +29,7 @@ Exit-path contract:
 
 from __future__ import annotations
 
+import functools
 import time
 
 import click
@@ -39,6 +40,56 @@ from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM, VMState
 
 console = Console()
+
+
+def needs_vm(*, auto_start: bool = True):
+    """Decorator: inject ``(cfg, vm, ga)`` and gate on VM state.
+
+    Replaces the four lines every command used to repeat::
+
+        cfg: Config = ctx.obj["cfg"]
+        vm = VM(cfg)
+        ga = GuestAgent(cfg)
+        ensure_running(vm, ga, cfg)
+
+    Two flavors:
+
+      * ``auto_start=True`` (default) -- the previous ``ensure_running``
+        path: starts/resumes the VM if it's down, mounts Z:, brings up
+        sshd. Use for commands that perform actions and don't mind
+        modifying VM state to do their work.
+
+      * ``auto_start=False`` -- just checks ``vm.state() == RUNNING`` and
+        bails with a clean error otherwise. Use for diagnostic-only
+        commands that should NOT silently boot the VM (kdbg, net
+        status, status read-outs).
+
+    Usage::
+
+        @cli.command()
+        @needs_vm(auto_start=True)
+        def my_command(cfg, vm, ga):
+            ...
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        @click.pass_context
+        def wrapped(ctx, *args, **kwargs):
+            cfg: Config = ctx.obj["cfg"]
+            vm = VM(cfg)
+            ga = GuestAgent(cfg)
+            if auto_start:
+                ensure_running(vm, ga, cfg)
+            else:
+                state = vm.state()
+                if state != VMState.RUNNING:
+                    console.print(
+                        f"[yellow][!][/] VM is not running (state: {state.value})"
+                    )
+                    raise SystemExit(1)
+            return fn(cfg, vm, ga, *args, **kwargs)
+        return wrapped
+    return decorator
 
 
 def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:

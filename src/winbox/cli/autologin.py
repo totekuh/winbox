@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import click
 
-from winbox.cli import console, ensure_running
+from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
 from winbox.vm import GuestAgent
 from winbox.vm import VM
@@ -82,19 +82,13 @@ def autologin() -> None:
 
 
 @autologin.command("enable")
-@click.pass_context
-def autologin_enable(ctx: click.Context) -> None:
+@needs_vm()
+def autologin_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Enable persistent auto-login for the configured VM user.
 
     Writes Winlogon credentials plus the Server 2022 PasswordLess gate.
     Undo with: winbox autologin disable
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     console.print(f"[blue][*][/] Enabling autologin for {cfg.vm_user}...")
     for args in _enable_argv(cfg.vm_user, cfg.vm_password):
         result = ga.exec_argv("reg.exe", args, timeout=15)
@@ -108,15 +102,9 @@ def autologin_enable(ctx: click.Context) -> None:
 
 
 @autologin.command("disable")
-@click.pass_context
-def autologin_disable(ctx: click.Context) -> None:
+@needs_vm()
+def autologin_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Disable auto-login — clears DefaultPassword and ForceAutoLogon."""
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     console.print("[blue][*][/] Disabling autologin...")
     for args in _DISABLE_ARGV:
         result = ga.exec_argv("reg.exe", args, timeout=15)
@@ -130,15 +118,9 @@ def autologin_disable(ctx: click.Context) -> None:
 
 
 @autologin.command("status")
-@click.pass_context
-def autologin_status(ctx: click.Context) -> None:
+@needs_vm()
+def autologin_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Show current autologin status."""
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     result = ga.exec_powershell(_STATUS_SCRIPT, timeout=15)
     if result.exitcode != 0:
         console.print(f"[red][-][/] Failed to query status: {result.stderr.strip()}")

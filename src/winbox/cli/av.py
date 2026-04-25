@@ -6,7 +6,7 @@ import time
 
 import click
 
-from winbox.cli import console, ensure_running, _ensure_z_drive
+from winbox.cli import console, ensure_running, needs_vm, _ensure_z_drive
 from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM
@@ -113,20 +113,14 @@ def av() -> None:
 
 
 @av.command("enable")
-@click.pass_context
-def av_enable(ctx: click.Context) -> None:
+@needs_vm()
+def av_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Re-enable Defender real-time protection and AMSI.
 
     Persists across reboots. Adds exclusions for the QEMU guest agent
     and VirtIO-FS share so winbox commands keep working.
     Undo with: winbox av disable
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     # Step 1: Remove registry blocks (best-effort — keys may already be gone)
     console.print("[blue][*][/] Removing registry overrides...")
     ga.exec_powershell(_ENABLE_SCRIPT, timeout=15)
@@ -159,20 +153,14 @@ def av_enable(ctx: click.Context) -> None:
 
 
 @av.command("disable")
-@click.pass_context
-def av_disable(ctx: click.Context) -> None:
+@needs_vm()
+def av_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Disable Defender completely — service stopped, all protections off.
 
     Sets GP registry keys then reboots the VM. WinDefend is a protected process
     (PPL) that cannot be stopped by any user-mode process including SYSTEM —
     only a reboot with the right registry keys will actually kill it.
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     # Step 1: Set GP registry keys (only way to kill WinDefend — it's PPL)
     console.print("[blue][*][/] Setting registry keys...")
     for args in _DISABLE_REG_ARGS:
@@ -203,15 +191,9 @@ def av_disable(ctx: click.Context) -> None:
 
 
 @av.command("status")
-@click.pass_context
-def av_status(ctx: click.Context) -> None:
+@needs_vm()
+def av_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Show current Defender and AMSI status."""
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     result = ga.exec_powershell(_STATUS_SCRIPT, timeout=15)
     if result.exitcode != 0:
         console.print(f"[red][-][/] Failed to query status: {result.stderr.strip()}")

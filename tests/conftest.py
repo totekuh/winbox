@@ -58,6 +58,13 @@ def mock_env(cfg):
             stack.enter_context(patch(f"winbox.cli.{mod}.GuestAgent", return_value=ga))
             stack.enter_context(patch(f"winbox.cli.{mod}.VM", return_value=vm))
 
+        # The @needs_vm decorator (in cli/__init__.py) resolves VM /
+        # GuestAgent / ensure_running through its own module namespace,
+        # so commands using @needs_vm need this patched too.
+        stack.enter_context(patch("winbox.cli.ensure_running"))
+        stack.enter_context(patch("winbox.cli.GuestAgent", return_value=ga))
+        stack.enter_context(patch("winbox.cli.VM", return_value=vm))
+
         stack.enter_context(patch("winbox.cli.network.VMState", VMState))
         stack.enter_context(patch("winbox.cli.setup.VM", return_value=vm))
         stack.enter_context(patch("winbox.cli.Config.load", return_value=cfg))

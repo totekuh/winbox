@@ -7,7 +7,7 @@ from pathlib import Path
 
 import click
 
-from winbox.cli import console, ensure_running, _ensure_z_drive
+from winbox.cli import console, ensure_running, needs_vm, _ensure_z_drive
 from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM
@@ -190,20 +190,14 @@ def applocker() -> None:
 
 
 @applocker.command("enable")
-@click.pass_context
-def applocker_enable(ctx: click.Context) -> None:
+@needs_vm()
+def applocker_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Enable AppLocker with default rules (Exe, Script, MSI, Appx).
 
     Standard corporate/exam config: allow C:\\Windows\\* and C:\\Program Files\\*
     for Everyone, Administrators can run anything. No DLL rules.
     Undo with: winbox applocker disable
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     # Write policy XML to VirtIO-FS share (avoids command-line length limits)
     policy_file = Path(cfg.shared_dir) / ".applocker-policy.xml"
     console.print("[blue][*][/] Applying default AppLocker policy...")
@@ -246,19 +240,13 @@ def applocker_enable(ctx: click.Context) -> None:
 
 
 @applocker.command("disable")
-@click.pass_context
-def applocker_disable(ctx: click.Context) -> None:
+@needs_vm()
+def applocker_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Disable AppLocker — clear policy, stop stack, reboot.
 
     Reboot is required because appid.sys caches rules in kernel memory
     and continues enforcing even after AppIDSvc is stopped.
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     policy_file = Path(cfg.shared_dir) / ".applocker-policy.xml"
     console.print("[blue][*][/] Clearing AppLocker policies...")
     policy_file.write_text(_CLEAR_POLICY_XML, encoding="utf-8")
@@ -287,15 +275,9 @@ def applocker_disable(ctx: click.Context) -> None:
 
 
 @applocker.command("status")
-@click.pass_context
-def applocker_status(ctx: click.Context) -> None:
+@needs_vm()
+def applocker_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Show current AppLocker enforcement status."""
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     result = ga.exec_powershell(_STATUS_SCRIPT, timeout=15)
     if result.exitcode != 0:
         console.print(f"[red][-][/] Failed to query status: {result.stderr.strip()}")
