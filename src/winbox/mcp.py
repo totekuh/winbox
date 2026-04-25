@@ -286,6 +286,57 @@ def ioctl(
     return _format_exec_result(result)
 
 
+# ─── Registry helpers (shared across reg_query / reg_set / reg_delete) ────
+
+# Each `reg_*` tool sends an in-VM Python script. The hive-lookup and
+# type-table snippets below used to be inlined five times across the
+# three tools; one fix to the hive map (e.g. adding HKCC) had to happen
+# in five places. Extracted as concatenable string blocks so each tool
+# composes its body from these + tool-specific logic.
+
+_REG_HIVE_LOOKUP = '''\
+hive_map = {
+    'HKLM': winreg.HKEY_LOCAL_MACHINE,
+    'HKEY_LOCAL_MACHINE': winreg.HKEY_LOCAL_MACHINE,
+    'HKCU': winreg.HKEY_CURRENT_USER,
+    'HKEY_CURRENT_USER': winreg.HKEY_CURRENT_USER,
+    'HKCR': winreg.HKEY_CLASSES_ROOT,
+    'HKEY_CLASSES_ROOT': winreg.HKEY_CLASSES_ROOT,
+    'HKU': winreg.HKEY_USERS,
+    'HKEY_USERS': winreg.HKEY_USERS,
+}
+parts = key_path.split('\\\\', 1)
+hive_name = parts[0].rstrip(':')
+subkey = parts[1] if len(parts) > 1 else ''
+hive = hive_map.get(hive_name.upper())
+if hive is None:
+    print(f"Unknown hive: {hive_name}", file=sys.stderr)
+    sys.exit(1)
+'''
+
+_REG_TYPE_NAMES = '''\
+type_names = {
+    winreg.REG_SZ: 'REG_SZ',
+    winreg.REG_EXPAND_SZ: 'REG_EXPAND_SZ',
+    winreg.REG_DWORD: 'REG_DWORD',
+    winreg.REG_QWORD: 'REG_QWORD',
+    winreg.REG_BINARY: 'REG_BINARY',
+    winreg.REG_MULTI_SZ: 'REG_MULTI_SZ',
+}
+'''
+
+_REG_TYPE_MAP = '''\
+type_map = {
+    'REG_SZ':        (winreg.REG_SZ,        lambda d: d),
+    'REG_EXPAND_SZ': (winreg.REG_EXPAND_SZ, lambda d: d),
+    'REG_DWORD':     (winreg.REG_DWORD,     lambda d: int(d)),
+    'REG_QWORD':     (winreg.REG_QWORD,     lambda d: int(d)),
+    'REG_BINARY':    (winreg.REG_BINARY,    lambda d: bytes.fromhex(d)),
+    'REG_MULTI_SZ':  (winreg.REG_MULTI_SZ,  lambda d: d.split('\\n')),
+}
+'''
+
+
 # ─── Tool 3: reg_query ─────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -297,124 +348,72 @@ def reg_query(key: str, value: str | None = None) -> str:
         value: Specific value name to query. If omitted, lists all values under the key.
     """
     if value is not None:
-        script = textwrap.dedent(f"""\
-            import winreg
-            import sys
-
-            key_path = {key!r}
-            value_name = {value!r}
-
-            # Parse hive
-            hive_map = {{
-                'HKLM': winreg.HKEY_LOCAL_MACHINE,
-                'HKEY_LOCAL_MACHINE': winreg.HKEY_LOCAL_MACHINE,
-                'HKCU': winreg.HKEY_CURRENT_USER,
-                'HKEY_CURRENT_USER': winreg.HKEY_CURRENT_USER,
-                'HKCR': winreg.HKEY_CLASSES_ROOT,
-                'HKEY_CLASSES_ROOT': winreg.HKEY_CLASSES_ROOT,
-                'HKU': winreg.HKEY_USERS,
-                'HKEY_USERS': winreg.HKEY_USERS,
-            }}
-            parts = key_path.split('\\\\', 1)
-            hive_name = parts[0].rstrip(':')
-            subkey = parts[1] if len(parts) > 1 else ''
-            hive = hive_map.get(hive_name.upper())
-            if hive is None:
-                print(f"Unknown hive: {{hive_name}}", file=sys.stderr)
-                sys.exit(1)
-
-            try:
-                with winreg.OpenKey(hive, subkey) as k:
-                    data, reg_type = winreg.QueryValueEx(k, value_name)
-                    type_names = {{
-                        winreg.REG_SZ: 'REG_SZ',
-                        winreg.REG_EXPAND_SZ: 'REG_EXPAND_SZ',
-                        winreg.REG_DWORD: 'REG_DWORD',
-                        winreg.REG_QWORD: 'REG_QWORD',
-                        winreg.REG_BINARY: 'REG_BINARY',
-                        winreg.REG_MULTI_SZ: 'REG_MULTI_SZ',
-                    }}
-                    type_name = type_names.get(reg_type, f'type({{reg_type}})')
-                    if reg_type == winreg.REG_BINARY:
-                        print(f"{{value_name}} ({{type_name}}): {{data.hex()}}")
-                    elif reg_type == winreg.REG_MULTI_SZ:
-                        print(f"{{value_name}} ({{type_name}}):")
-                        for item in data:
-                            print(f"  {{item}}")
-                    else:
-                        print(f"{{value_name}} ({{type_name}}): {{data}}")
-            except FileNotFoundError:
-                print(f"Not found: {{key_path}}\\\\{{value_name}}", file=sys.stderr)
-                sys.exit(1)
-        """)
+        script = (
+            f"import winreg\nimport sys\n\n"
+            f"key_path = {key!r}\nvalue_name = {value!r}\n\n"
+            + _REG_HIVE_LOOKUP
+            + _REG_TYPE_NAMES
+            + textwrap.dedent('''\
+                try:
+                    with winreg.OpenKey(hive, subkey) as k:
+                        data, reg_type = winreg.QueryValueEx(k, value_name)
+                        type_name = type_names.get(reg_type, f'type({reg_type})')
+                        if reg_type == winreg.REG_BINARY:
+                            print(f"{value_name} ({type_name}): {data.hex()}")
+                        elif reg_type == winreg.REG_MULTI_SZ:
+                            print(f"{value_name} ({type_name}):")
+                            for item in data:
+                                print(f"  {item}")
+                        else:
+                            print(f"{value_name} ({type_name}): {data}")
+                except FileNotFoundError:
+                    print(f"Not found: {key_path}\\\\{value_name}", file=sys.stderr)
+                    sys.exit(1)
+            ''')
+        )
     else:
-        script = textwrap.dedent(f"""\
-            import winreg
-            import sys
+        script = (
+            f"import winreg\nimport sys\n\n"
+            f"key_path = {key!r}\n\n"
+            + _REG_HIVE_LOOKUP
+            + _REG_TYPE_NAMES
+            + textwrap.dedent('''\
+                try:
+                    with winreg.OpenKey(hive, subkey) as k:
+                        # Enumerate values
+                        i = 0
+                        while True:
+                            try:
+                                name, data, reg_type = winreg.EnumValue(k, i)
+                                type_name = type_names.get(reg_type, f'type({reg_type})')
+                                if reg_type == winreg.REG_BINARY:
+                                    print(f"{name} ({type_name}): {data.hex()}")
+                                else:
+                                    print(f"{name} ({type_name}): {data}")
+                                i += 1
+                            except OSError:
+                                break
+                        if i == 0:
+                            print("(no values)")
 
-            key_path = {key!r}
-
-            hive_map = {{
-                'HKLM': winreg.HKEY_LOCAL_MACHINE,
-                'HKEY_LOCAL_MACHINE': winreg.HKEY_LOCAL_MACHINE,
-                'HKCU': winreg.HKEY_CURRENT_USER,
-                'HKEY_CURRENT_USER': winreg.HKEY_CURRENT_USER,
-                'HKCR': winreg.HKEY_CLASSES_ROOT,
-                'HKEY_CLASSES_ROOT': winreg.HKEY_CLASSES_ROOT,
-                'HKU': winreg.HKEY_USERS,
-                'HKEY_USERS': winreg.HKEY_USERS,
-            }}
-            parts = key_path.split('\\\\', 1)
-            hive_name = parts[0].rstrip(':')
-            subkey = parts[1] if len(parts) > 1 else ''
-            hive = hive_map.get(hive_name.upper())
-            if hive is None:
-                print(f"Unknown hive: {{hive_name}}", file=sys.stderr)
-                sys.exit(1)
-
-            try:
-                with winreg.OpenKey(hive, subkey) as k:
-                    # Enumerate values
-                    i = 0
-                    type_names = {{
-                        winreg.REG_SZ: 'REG_SZ',
-                        winreg.REG_EXPAND_SZ: 'REG_EXPAND_SZ',
-                        winreg.REG_DWORD: 'REG_DWORD',
-                        winreg.REG_QWORD: 'REG_QWORD',
-                        winreg.REG_BINARY: 'REG_BINARY',
-                        winreg.REG_MULTI_SZ: 'REG_MULTI_SZ',
-                    }}
-                    while True:
-                        try:
-                            name, data, reg_type = winreg.EnumValue(k, i)
-                            type_name = type_names.get(reg_type, f'type({{reg_type}})')
-                            if reg_type == winreg.REG_BINARY:
-                                print(f"{{name}} ({{type_name}}): {{data.hex()}}")
-                            else:
-                                print(f"{{name}} ({{type_name}}): {{data}}")
-                            i += 1
-                        except OSError:
-                            break
-                    if i == 0:
-                        print("(no values)")
-
-                    # Enumerate subkeys
-                    j = 0
-                    subkeys = []
-                    while True:
-                        try:
-                            subkeys.append(winreg.EnumKey(k, j))
-                            j += 1
-                        except OSError:
-                            break
-                    if subkeys:
-                        print(f"\\nSubkeys ({{j}}):")
-                        for sk in subkeys:
-                            print(f"  {{sk}}")
-            except FileNotFoundError:
-                print(f"Key not found: {{key_path}}", file=sys.stderr)
-                sys.exit(1)
-        """)
+                        # Enumerate subkeys
+                        j = 0
+                        subkeys = []
+                        while True:
+                            try:
+                                subkeys.append(winreg.EnumKey(k, j))
+                                j += 1
+                            except OSError:
+                                break
+                        if subkeys:
+                            print(f"\\nSubkeys ({j}):")
+                            for sk in subkeys:
+                                print(f"  {sk}")
+                except FileNotFoundError:
+                    print(f"Key not found: {key_path}", file=sys.stderr)
+                    sys.exit(1)
+            ''')
+        )
 
     result = _exec_python(script)
     return _format_exec_result(result)
@@ -438,53 +437,25 @@ def reg_set(
               For REG_BINARY pass hex. For REG_MULTI_SZ pass items separated by '\\n'.
         value_type: Registry type - REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ.
     """
-    script = textwrap.dedent(f"""\
-        import winreg
-        import sys
+    script = (
+        f"import winreg\nimport sys\n\n"
+        f"key_path = {key!r}\nvalue_name = {value!r}\n"
+        f"raw_data = {data!r}\nreg_type_name = {value_type!r}\n\n"
+        + _REG_HIVE_LOOKUP
+        + _REG_TYPE_MAP
+        + textwrap.dedent('''\
+            if reg_type_name not in type_map:
+                print(f"Unknown type: {reg_type_name}", file=sys.stderr)
+                sys.exit(1)
 
-        key_path = {key!r}
-        value_name = {value!r}
-        raw_data = {data!r}
-        reg_type_name = {value_type!r}
+            reg_type, converter = type_map[reg_type_name]
+            converted = converter(raw_data)
 
-        hive_map = {{
-            'HKLM': winreg.HKEY_LOCAL_MACHINE,
-            'HKEY_LOCAL_MACHINE': winreg.HKEY_LOCAL_MACHINE,
-            'HKCU': winreg.HKEY_CURRENT_USER,
-            'HKEY_CURRENT_USER': winreg.HKEY_CURRENT_USER,
-            'HKCR': winreg.HKEY_CLASSES_ROOT,
-            'HKEY_CLASSES_ROOT': winreg.HKEY_CLASSES_ROOT,
-            'HKU': winreg.HKEY_USERS,
-            'HKEY_USERS': winreg.HKEY_USERS,
-        }}
-        type_map = {{
-            'REG_SZ': (winreg.REG_SZ, lambda d: d),
-            'REG_EXPAND_SZ': (winreg.REG_EXPAND_SZ, lambda d: d),
-            'REG_DWORD': (winreg.REG_DWORD, lambda d: int(d)),
-            'REG_QWORD': (winreg.REG_QWORD, lambda d: int(d)),
-            'REG_BINARY': (winreg.REG_BINARY, lambda d: bytes.fromhex(d)),
-            'REG_MULTI_SZ': (winreg.REG_MULTI_SZ, lambda d: d.split('\\n')),
-        }}
-
-        parts = key_path.split('\\\\', 1)
-        hive_name = parts[0].rstrip(':')
-        subkey = parts[1] if len(parts) > 1 else ''
-        hive = hive_map.get(hive_name.upper())
-        if hive is None:
-            print(f"Unknown hive: {{hive_name}}", file=sys.stderr)
-            sys.exit(1)
-
-        if reg_type_name not in type_map:
-            print(f"Unknown type: {{reg_type_name}}", file=sys.stderr)
-            sys.exit(1)
-
-        reg_type, converter = type_map[reg_type_name]
-        converted = converter(raw_data)
-
-        with winreg.CreateKey(hive, subkey) as k:
-            winreg.SetValueEx(k, value_name, 0, reg_type, converted)
-        print(f"Set {{key_path}}\\\\{{value_name}} = {{raw_data}} ({{reg_type_name}})")
-    """)
+            with winreg.CreateKey(hive, subkey) as k:
+                winreg.SetValueEx(k, value_name, 0, reg_type, converted)
+            print(f"Set {key_path}\\\\{value_name} = {raw_data} ({reg_type_name})")
+        ''')
+    )
 
     result = _exec_python(script)
     return _format_exec_result(result)
@@ -504,88 +475,51 @@ def reg_delete(key: str, value: str | None = None) -> str:
         value: Specific value name to delete. If omitted, deletes the entire key tree.
     """
     if value is not None:
-        script = textwrap.dedent(f"""\
-            import winreg
-            import sys
-
-            key_path = {key!r}
-            value_name = {value!r}
-
-            hive_map = {{
-                'HKLM': winreg.HKEY_LOCAL_MACHINE,
-                'HKEY_LOCAL_MACHINE': winreg.HKEY_LOCAL_MACHINE,
-                'HKCU': winreg.HKEY_CURRENT_USER,
-                'HKEY_CURRENT_USER': winreg.HKEY_CURRENT_USER,
-                'HKCR': winreg.HKEY_CLASSES_ROOT,
-                'HKEY_CLASSES_ROOT': winreg.HKEY_CLASSES_ROOT,
-                'HKU': winreg.HKEY_USERS,
-                'HKEY_USERS': winreg.HKEY_USERS,
-            }}
-            parts = key_path.split('\\\\', 1)
-            hive_name = parts[0].rstrip(':')
-            subkey = parts[1] if len(parts) > 1 else ''
-            hive = hive_map.get(hive_name.upper())
-            if hive is None:
-                print(f"Unknown hive: {{hive_name}}", file=sys.stderr)
-                sys.exit(1)
-
-            try:
-                with winreg.OpenKey(hive, subkey, 0, winreg.KEY_SET_VALUE) as k:
-                    winreg.DeleteValue(k, value_name)
-                print(f"Deleted value {{key_path}}\\\\{{value_name}}")
-            except FileNotFoundError:
-                print(f"Not found: {{key_path}}\\\\{{value_name}}", file=sys.stderr)
-                sys.exit(1)
-            except PermissionError:
-                print(f"Access denied: {{key_path}}\\\\{{value_name}}", file=sys.stderr)
-                sys.exit(1)
-        """)
-    else:
-        script = textwrap.dedent(f"""\
-            import winreg
-            import sys
-
-            key_path = {key!r}
-
-            hive_map = {{
-                'HKLM': winreg.HKEY_LOCAL_MACHINE,
-                'HKEY_LOCAL_MACHINE': winreg.HKEY_LOCAL_MACHINE,
-                'HKCU': winreg.HKEY_CURRENT_USER,
-                'HKEY_CURRENT_USER': winreg.HKEY_CURRENT_USER,
-                'HKCR': winreg.HKEY_CLASSES_ROOT,
-                'HKEY_CLASSES_ROOT': winreg.HKEY_CLASSES_ROOT,
-                'HKU': winreg.HKEY_USERS,
-                'HKEY_USERS': winreg.HKEY_USERS,
-            }}
-            parts = key_path.split('\\\\', 1)
-            hive_name = parts[0].rstrip(':')
-            subkey = parts[1] if len(parts) > 1 else ''
-            hive = hive_map.get(hive_name.upper())
-            if hive is None:
-                print(f"Unknown hive: {{hive_name}}", file=sys.stderr)
-                sys.exit(1)
-
-            def delete_key_tree(hive, subkey):
+        script = (
+            f"import winreg\nimport sys\n\n"
+            f"key_path = {key!r}\nvalue_name = {value!r}\n\n"
+            + _REG_HIVE_LOOKUP
+            + textwrap.dedent('''\
                 try:
-                    with winreg.OpenKey(hive, subkey, 0,
-                                        winreg.KEY_ALL_ACCESS) as k:
-                        while True:
-                            try:
-                                child = winreg.EnumKey(k, 0)
-                                delete_key_tree(hive, f"{{subkey}}\\\\{{child}}")
-                            except OSError:
-                                break
-                    winreg.DeleteKey(hive, subkey)
+                    with winreg.OpenKey(hive, subkey, 0, winreg.KEY_SET_VALUE) as k:
+                        winreg.DeleteValue(k, value_name)
+                    print(f"Deleted value {key_path}\\\\{value_name}")
                 except FileNotFoundError:
-                    print(f"Not found: {{key_path}}", file=sys.stderr)
+                    print(f"Not found: {key_path}\\\\{value_name}", file=sys.stderr)
                     sys.exit(1)
                 except PermissionError:
-                    print(f"Access denied: {{key_path}}", file=sys.stderr)
+                    print(f"Access denied: {key_path}\\\\{value_name}", file=sys.stderr)
                     sys.exit(1)
+            ''')
+        )
+    else:
+        script = (
+            f"import winreg\nimport sys\n\n"
+            f"key_path = {key!r}\n\n"
+            + _REG_HIVE_LOOKUP
+            + textwrap.dedent('''\
+                def delete_key_tree(hive, subkey):
+                    try:
+                        with winreg.OpenKey(hive, subkey, 0,
+                                            winreg.KEY_ALL_ACCESS) as k:
+                            while True:
+                                try:
+                                    child = winreg.EnumKey(k, 0)
+                                    delete_key_tree(hive, f"{subkey}\\\\{child}")
+                                except OSError:
+                                    break
+                        winreg.DeleteKey(hive, subkey)
+                    except FileNotFoundError:
+                        print(f"Not found: {key_path}", file=sys.stderr)
+                        sys.exit(1)
+                    except PermissionError:
+                        print(f"Access denied: {key_path}", file=sys.stderr)
+                        sys.exit(1)
 
-            delete_key_tree(hive, subkey)
-            print(f"Deleted key {{key_path}}")
-        """)
+                delete_key_tree(hive, subkey)
+                print(f"Deleted key {key_path}")
+            ''')
+        )
 
     result = _exec_python(script)
     return _format_exec_result(result)
