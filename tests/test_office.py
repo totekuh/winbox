@@ -23,6 +23,11 @@ def office_env(cfg):
         patch("winbox.cli.office.ensure_running"),
         patch("winbox.cli.office.GuestAgent", return_value=ga),
         patch("winbox.cli.office.VM", return_value=vm),
+        # @needs_vm resolves through cli/__init__.py's namespace, so
+        # patch those names too.
+        patch("winbox.cli.ensure_running"),
+        patch("winbox.cli.GuestAgent", return_value=ga),
+        patch("winbox.cli.VM", return_value=vm),
         patch("winbox.cli.Config.load", return_value=cfg),
     ):
         ga._vm = vm

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import click
 
-from winbox.cli import console, ensure_running
+from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
 from winbox.vm import GuestAgent, VM
 
@@ -20,15 +20,9 @@ def _data_file(name: str) -> Path:
 
 
 @click.command()
-@click.pass_context
-def office(ctx: click.Context) -> None:
+@needs_vm()
+def office(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Install Microsoft Office with macros enabled (needs --desktop VM)."""
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     # Verify Desktop Experience is available (Office needs it)
     result = ga.exec("where explorer.exe", timeout=30)
     if result.exitcode != 0:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import click
 
-from winbox.cli import console, ensure_running
+from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
 from winbox.vm import GuestAgent
 from winbox.vm import VM
@@ -29,8 +29,11 @@ _SUCCESS_EXITCODES = {0, 3010}
 @click.argument("msi_path", type=click.Path(exists=True, dir_okay=False))
 @click.argument("extra", nargs=-1, type=click.UNPROCESSED)
 @click.option("--timeout", default=600, help="Install timeout in seconds.")
-@click.pass_context
-def msi(ctx: click.Context, msi_path: str, extra: tuple[str, ...], timeout: int) -> None:
+@needs_vm()
+def msi(
+    cfg: Config, vm: VM, ga: GuestAgent,
+    msi_path: str, extra: tuple[str, ...], timeout: int,
+) -> None:
     """Install an MSI package on the VM.
 
     Copies the MSI into C:\\Windows\\Temp via the VirtIO-FS share, runs
@@ -40,12 +43,6 @@ def msi(ctx: click.Context, msi_path: str, extra: tuple[str, ...], timeout: int)
 
     Exit codes 0 and 3010 (reboot required) are treated as success.
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     src = Path(msi_path).resolve()
     basename = src.name
     staging_dir = cfg.shared_dir / _STAGING_SUBDIR

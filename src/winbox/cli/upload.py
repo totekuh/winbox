@@ -17,7 +17,7 @@ from pathlib import Path
 
 import click
 
-from winbox.cli import console, ensure_running
+from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
 from winbox.vm import GuestAgent
 from winbox.vm import VM
@@ -32,8 +32,11 @@ def _ps_quote(s: str) -> str:
 @click.argument("src", type=click.Path(exists=True, dir_okay=False, readable=True))
 @click.argument("dst", required=False)
 @click.option("--timeout", default=60, help="VM-side copy timeout in seconds.")
-@click.pass_context
-def upload(ctx: click.Context, src: str, dst: str | None, timeout: int) -> None:
+@needs_vm()
+def upload(
+    cfg: Config, vm: VM, ga: GuestAgent,
+    src: str, dst: str | None, timeout: int,
+) -> None:
     """Upload a file from Kali to the Windows VM.
 
     Without DST, the file lands at Z:\\<basename> on the VirtIO-FS share
@@ -43,12 +46,6 @@ def upload(ctx: click.Context, src: str, dst: str | None, timeout: int) -> None:
     Use ``winbox tools add`` instead if you want the file to live in the
     shared tools dir permanently.
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     src_path = Path(src).resolve()
     basename = src_path.name
     staged = cfg.shared_dir / basename
