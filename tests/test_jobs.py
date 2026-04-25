@@ -79,6 +79,47 @@ class TestJobStore:
         store = JobStore(cfg)
         assert store.vm_log_path(1, "stderr") == "Z:\\loot\\.jobs\\1.stderr"
 
+    def test_corrupt_json_is_backed_up(self, cfg):
+        """Corrupt jobs.json must be preserved as `.bad-<ts>` for forensics
+        rather than silently overwritten."""
+        cfg.jobs_file.write_text("not json!!!")
+        JobStore(cfg)
+        backups = list(cfg.jobs_file.parent.glob("jobs.json.bad-*"))
+        assert len(backups) == 1
+        assert backups[0].read_text() == "not json!!!"
+
+    def test_claim_atomically_allocates_unique_ids(self, cfg):
+        """The race we're guarding against: two callers claim() at the same
+        time. With locking + re-load each must see the other's reservation
+        and pick a fresh ID."""
+        store_a = JobStore(cfg)
+        store_b = JobStore(cfg)
+
+        job_a = store_a.claim(
+            lambda jid: Job(id=jid, pid=100, command="a", mode=JobMode.BUFFERED)
+        )
+        # store_b's in-memory view is stale (loaded at __init__ time, before
+        # store_a wrote). claim() must re-read inside the lock.
+        job_b = store_b.claim(
+            lambda jid: Job(id=jid, pid=200, command="b", mode=JobMode.BUFFERED)
+        )
+
+        assert job_a.id == 1
+        assert job_b.id == 2
+        # Both jobs persisted, neither overwrote the other.
+        reloaded = JobStore(cfg)
+        assert {j.id for j in reloaded.all()} == {1, 2}
+
+    def test_claim_rejects_mismatched_id(self, cfg):
+        import pytest
+        store = JobStore(cfg)
+        with pytest.raises(ValueError, match="must return Job with id"):
+            store.claim(
+                lambda jid: Job(id=999, pid=1, command="x", mode=JobMode.BUFFERED)
+            )
+        # Failed claim must not leave any junk in the store.
+        assert store.all() == []
+
 
 # ─── Job dataclass ────────────────────────────────────────────────────────────
 

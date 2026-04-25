@@ -131,22 +131,25 @@ def run_command_bg(
         full_cmd += f" {args_str}"
 
     store = JobStore(cfg)
-    job_id = store.next_id()
 
-    if log:
-        cfg.jobs_log_dir.mkdir(parents=True, exist_ok=True)
-        stdout_path = store.vm_log_path(job_id, "stdout")
-        stderr_path = store.vm_log_path(job_id, "stderr")
-        wrapped = f"{full_cmd} > {stdout_path} 2> {stderr_path}"
-        pid = ga.exec_detached(wrapped)
-        mode = JobMode.LOG
-    else:
-        pid = ga.exec_background(full_cmd)
-        mode = JobMode.BUFFERED
+    def _spawn(job_id: int) -> Job:
+        if log:
+            cfg.jobs_log_dir.mkdir(parents=True, exist_ok=True)
+            stdout_path = store.vm_log_path(job_id, "stdout")
+            stderr_path = store.vm_log_path(job_id, "stderr")
+            wrapped = f"{full_cmd} > {stdout_path} 2> {stderr_path}"
+            pid = ga.exec_detached(wrapped)
+            mode = JobMode.LOG
+        else:
+            pid = ga.exec_background(full_cmd)
+            mode = JobMode.BUFFERED
+        return Job(
+            id=job_id, pid=pid,
+            command=f"{resolved} {args_str}".strip(),
+            mode=mode,
+        )
 
-    job = Job(id=job_id, pid=pid, command=f"{resolved} {args_str}".strip(), mode=mode)
-    store.add(job)
-    return job
+    return store.claim(_spawn)
 
 
 def _show_new_files(loot_dir: Path, since: float) -> None:

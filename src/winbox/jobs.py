@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Iterator
 
 if TYPE_CHECKING:
     from winbox.config import Config
@@ -87,7 +89,14 @@ class JobStore:
             data = json.loads(self._path.read_text())
             self._jobs = {j["id"]: Job.from_dict(j) for j in data}
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            logger.warning("Corrupt jobs.json, resetting")
+            # Preserve the bad file for forensics — losing job state silently
+            # is worse than carrying around a `.bad-<ts>` file.
+            try:
+                bad = self._path.parent / f"{self._path.name}.bad-{int(time.time())}"
+                self._path.rename(bad)
+                logger.warning("Corrupt jobs.json moved to %s; resetting", bad)
+            except OSError:
+                logger.warning("Corrupt jobs.json (could not back up); resetting")
             self._jobs = {}
 
     def _save(self) -> None:
@@ -108,21 +117,66 @@ class JobStore:
                 pass
             raise
 
+    @contextmanager
+    def _exclusive(self) -> Iterator[None]:
+        """Hold an exclusive `fcntl.flock` for the load → mutate → save window.
+
+        Two concurrent ``winbox exec --bg`` invocations would otherwise read
+        stale state, allocate the same ID, and overwrite each other (the last
+        writer wins, the first job is silently lost). All mutating methods
+        acquire this lock and re-load inside it.
+        """
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+        with open(lock_path, "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                # flock is released when the file descriptor closes.
+                pass
+
     def next_id(self) -> int:
         if not self._jobs:
             return 1
         return max(self._jobs) + 1
 
     def add(self, job: Job) -> None:
-        self._jobs[job.id] = job
-        self._save()
+        with self._exclusive():
+            self._load()
+            self._jobs[job.id] = job
+            self._save()
+
+    def claim(self, build: Callable[[int], Job]) -> Job:
+        """Allocate the next ID + run ``build(id)`` to construct/spawn the
+        Job + persist, all under one exclusive flock.
+
+        ``build`` is responsible for any side effects (e.g. spawning the
+        VM-side process). It must return a Job whose ``id`` matches the
+        allocated value. Holding the lock during spawn serializes
+        concurrent background launches — for a single-user dev tool that's
+        the desired trade-off vs losing a job to an ID collision.
+        """
+        with self._exclusive():
+            self._load()
+            job_id = max(self._jobs, default=0) + 1
+            job = build(job_id)
+            if job.id != job_id:
+                raise ValueError(
+                    f"build() must return Job with id={job_id}, got {job.id}"
+                )
+            self._jobs[job.id] = job
+            self._save()
+        return job
 
     def get(self, job_id: int) -> Job | None:
         return self._jobs.get(job_id)
 
     def update(self, job: Job) -> None:
-        self._jobs[job.id] = job
-        self._save()
+        with self._exclusive():
+            self._load()
+            self._jobs[job.id] = job
+            self._save()
 
     def all(self) -> list[Job]:
         return list(self._jobs.values())
