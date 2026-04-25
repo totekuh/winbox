@@ -125,6 +125,34 @@ def _exec_python(
         shutil.rmtree(call_dir, ignore_errors=True)
 
 
+def _format_exec_result(result: dict) -> str:
+    """Flatten an _exec_python result into the prose blob the MCP tool wrappers
+    return today.
+
+    13 wrappers used to inline the same six lines; one helper means a future
+    formatting tweak (or a switch to structured JSON) is one change point.
+    Accepts either the dict returned by _exec_python or any object with
+    ``stdout`` / ``stderr`` / ``exitcode`` attributes (subprocess.run-style).
+    """
+    if isinstance(result, dict):
+        stdout = result.get("stdout", "") or ""
+        stderr = result.get("stderr", "") or ""
+        exitcode = result.get("exitcode", 0)
+    else:
+        stdout = getattr(result, "stdout", "") or ""
+        stderr = getattr(result, "stderr", "") or ""
+        exitcode = getattr(result, "exitcode", 0)
+
+    parts: list[str] = []
+    if stdout:
+        parts.append(stdout)
+    if stderr:
+        parts.append(f"\n[stderr]\n{stderr}")
+    if exitcode != 0:
+        parts.append(f"\n[exit code: {exitcode}]")
+    return "".join(parts) or "(no output)"
+
+
 # ─── Tool 1: python ────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -140,14 +168,7 @@ def python(code: str, timeout: int = 300) -> str:
         timeout: Execution timeout in seconds (default 300).
     """
     result = _exec_python(code, timeout=timeout)
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 # ─── Tool 2: ioctl ─────────────────────────────────────────────────────────
@@ -255,14 +276,7 @@ def ioctl(
         timeout=timeout,
         args={"device": device, "code": code, "input_hex": input_hex, "output_size": output_size},
     )
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 # ─── Tool 3: reg_query ─────────────────────────────────────────────────────
@@ -396,14 +410,7 @@ def reg_query(key: str, value: str | None = None) -> str:
         """)
 
     result = _exec_python(script)
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 # ─── Tool 4: reg_set ───────────────────────────────────────────────────────
@@ -473,14 +480,7 @@ def reg_set(
     """)
 
     result = _exec_python(script)
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 # ─── Tool 5: reg_delete ─────────────────────────────────────────────────────
@@ -581,14 +581,7 @@ def reg_delete(key: str, value: str | None = None) -> str:
         """)
 
     result = _exec_python(script)
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 # ─── Tool 6: ps ────────────────────────────────────────────────────────────
@@ -641,14 +634,7 @@ def ps(filter: str | None = None) -> str:
     """)
 
     result = _exec_python(script)
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 # ─── Tool 5b: eventlogs ────────────────────────────────────────────────────
@@ -899,14 +885,7 @@ def file_copy(src: str, dst: str) -> str:
         script,
         args={"src": src, "dst": dst},
     )
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 # ─── Tool 7: mem_read ──────────────────────────────────────────────────────
@@ -1042,14 +1021,7 @@ def mem_read(pid: int, address: str, length: int) -> str:
     """)
 
     result = _exec_python(script)
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 # ─── Tool 8: service_stop / service_start ───────────────────────────────────
@@ -1066,14 +1038,7 @@ def service_stop(name: str) -> str:
     """
     cfg, vm, ga = _ensure_vm_ready()
     result = ga.exec(f"sc.exe stop {name}", timeout=30)
-    output = ""
-    if result.stdout:
-        output += result.stdout
-    if result.stderr:
-        output += f"\n[stderr]\n{result.stderr}"
-    if result.exitcode != 0:
-        output += f"\n[exit code: {result.exitcode}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 @mcp.tool()
@@ -1088,14 +1053,7 @@ def service_start(name: str) -> str:
     """
     cfg, vm, ga = _ensure_vm_ready()
     result = ga.exec(f"sc.exe start {name}", timeout=30)
-    output = ""
-    if result.stdout:
-        output += result.stdout
-    if result.stderr:
-        output += f"\n[stderr]\n{result.stderr}"
-    if result.exitcode != 0:
-        output += f"\n[exit code: {result.exitcode}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 # ─── Tool 9: net_isolate / net_unplug / net_connect ─────────────────────────
@@ -1208,14 +1166,7 @@ def pipe_list(filter: str | None = None) -> str:
     """)
 
     result = _exec_python(script, args={"filter": filter})
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 @mcp.tool()
@@ -1354,14 +1305,7 @@ def pipe_info(name: str) -> str:
     """)
 
     result = _exec_python(script, args={"name": name})
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 @mcp.tool()
@@ -1432,14 +1376,7 @@ def pipe_connect(name: str, access: str = "read") -> str:
     """)
 
     result = _exec_python(script, args={"name": name, "access": access})
-    output = ""
-    if result["stdout"]:
-        output += result["stdout"]
-    if result["stderr"]:
-        output += f"\n[stderr]\n{result['stderr']}"
-    if result["exitcode"] != 0:
-        output += f"\n[exit code: {result['exitcode']}]"
-    return output or "(no output)"
+    return _format_exec_result(result)
 
 
 # ─── Pipe session broker ────────────────────────────────────────────────────
