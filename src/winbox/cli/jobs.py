@@ -144,7 +144,10 @@ def jobs_output(ctx: click.Context, job_id: int) -> None:
         console.print("[red][-][/] Job lost — VM was unavailable, output not recoverable")
         raise SystemExit(1)
 
-    # Try fetching from GA
+    # Try fetching from GA. Stays raw (no @needs_vm): LOG-mode jobs and
+    # buffered jobs with cached output above already returned without
+    # touching the VM. Decorating the function would boot the VM for every
+    # `jobs output` call, even ones that just read host files.
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
@@ -191,6 +194,8 @@ def jobs_kill(ctx: click.Context, job_id: int) -> None:
         console.print(f"[yellow][!][/] Job {job_id} is not running ({job.status.value})")
         return
 
+    # Stays raw (no @needs_vm): the early-return for non-RUNNING jobs above
+    # is the common case. Decorating would boot the VM just to bail.
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 

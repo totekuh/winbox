@@ -8,7 +8,7 @@ import time
 
 import click
 
-from winbox.cli import console, ensure_running
+from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM, VMState
@@ -39,6 +39,9 @@ def _graceful_shutdown(vm: VM, ga: GuestAgent, *, timeout: int = 60) -> None:
 @click.pass_context
 def up(ctx: click.Context, reboot: bool) -> None:
     """Start or resume the VM."""
+    # Stays raw (no @needs_vm): --reboot must inspect state and shut the VM
+    # down BEFORE the auto-start path runs. The decorator runs ensure_running
+    # first, which would defeat the reboot semantics.
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
@@ -239,18 +242,12 @@ def restore(ctx: click.Context, name: str) -> None:
 
 
 @click.command()
-@click.pass_context
-def vnc(ctx: click.Context) -> None:
+@needs_vm()
+def vnc(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Open the VM display in virt-manager."""
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
     if not shutil.which("virt-manager"):
         console.print("[red][-][/] virt-manager not found. Install with: [bold]apt install virt-manager[/]")
         raise SystemExit(1)
-
-    ensure_running(vm, ga, cfg)
 
     console.print(f"[blue][*][/] Opening virt-manager console for {cfg.vm_name}")
     subprocess.Popen(

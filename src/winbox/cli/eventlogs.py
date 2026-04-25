@@ -7,7 +7,7 @@ import json
 import click
 from rich.console import Console
 
-from winbox.cli import ensure_running
+from winbox.cli import ensure_running, needs_vm
 from winbox.config import Config
 from winbox.eventlogs import (
     LEVEL_CHOICES,
@@ -162,6 +162,12 @@ def eventlogs(
       winbox eventlogs clear --log Security
       winbox eventlogs clear --all -y
     """
+    # Stays raw (no @needs_vm): invoke_without_command=True means this
+    # function runs even when a subcommand is dispatched. The decorator
+    # would call ensure_running unconditionally, including for `eventlogs
+    # clear` where the subcommand has its own @needs_vm. Keep the
+    # subcommand-dispatch short-circuit here, ensure_running lives in
+    # _do_query for the no-subcommand path.
     if ctx.invoked_subcommand is not None:
         return
     cfg: Config = ctx.obj["cfg"]
@@ -185,9 +191,11 @@ def eventlogs(
     "--timeout", default=180, show_default=True,
     help="Clear timeout in seconds (raise for --all on busy systems).",
 )
-@click.pass_context
+@needs_vm()
 def clear(
-    ctx: click.Context,
+    cfg: Config,
+    vm: VM,
+    ga: GuestAgent,
     logs: tuple[str, ...],
     all_logs: bool,
     yes: bool,
@@ -201,8 +209,6 @@ def clear(
       winbox eventlogs clear --log Security --log System
       winbox eventlogs clear --all -y
     """
-    cfg: Config = ctx.obj["cfg"]
-
     if all_logs and logs:
         raise click.UsageError("--log and --all are mutually exclusive")
     if not all_logs and not logs:
@@ -217,10 +223,6 @@ def clear(
         script = build_clear_powershell(list(logs) if logs else None, all_logs=all_logs)
     except ValueError as e:
         raise click.UsageError(str(e))
-
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-    ensure_running(vm, ga, cfg)
 
     _err(f"[blue][*][/] Clearing {target}...")
     result = ga.exec_powershell(script, timeout=timeout)

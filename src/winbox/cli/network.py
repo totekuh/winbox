@@ -11,7 +11,7 @@ from pathlib import Path
 import click
 
 from winbox import nwfilter
-from winbox.cli import console, ensure_running, reboot_and_wait, _ensure_z_drive
+from winbox.cli import console, ensure_running, needs_vm, reboot_and_wait, _ensure_z_drive
 from winbox.cli._ps import ps_array, render_ps
 from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
@@ -221,17 +221,12 @@ def dns() -> None:
 
 @dns.command("set")
 @click.argument("ip")
-@click.pass_context
-def dns_set(ctx: click.Context, ip: str) -> None:
+@needs_vm()
+def dns_set(cfg: Config, vm: VM, ga: GuestAgent, ip: str) -> None:
     """Set a DNS nameserver on the VM.
 
     Example: winbox dns set 192.168.56.11
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
     _validate_ip(ip)
 
     console.print(f"[blue][*][/] Setting DNS to {ip}...")
@@ -247,13 +242,9 @@ def dns_set(ctx: click.Context, ip: str) -> None:
 
 
 @dns.command("sync")
-@click.pass_context
-def dns_sync(ctx: click.Context) -> None:
+@needs_vm()
+def dns_sync(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Push Kali's /etc/resolv.conf nameservers to the VM."""
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
     resolv = Path("/etc/resolv.conf")
     if not resolv.exists():
         console.print("[red][-][/] /etc/resolv.conf not found")
@@ -274,8 +265,6 @@ def dns_sync(ctx: click.Context) -> None:
     if not nameservers:
         console.print("[red][-][/] No nameservers found in /etc/resolv.conf")
         raise SystemExit(1)
-
-    ensure_running(vm, ga, cfg)
 
     ns_joined = ", ".join(nameservers)
     console.print(f"[blue][*][/] Setting DNS to {ns_joined}...")
@@ -368,15 +357,9 @@ def hosts() -> None:
 
 
 @hosts.command("view")
-@click.pass_context
-def hosts_view(ctx: click.Context) -> None:
+@needs_vm()
+def hosts_view(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Show the VM hosts file."""
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     result = ga.exec_powershell(f"Get-Content '{HOSTS_PATH}'", timeout=15)
     if result.exitcode != 0:
         console.print(f"[red][-][/] {result.stderr.strip()}")
@@ -396,17 +379,12 @@ def hosts_view(ctx: click.Context) -> None:
 @hosts.command("add")
 @click.argument("ip")
 @click.argument("hostname")
-@click.pass_context
-def hosts_add(ctx: click.Context, ip: str, hostname: str) -> None:
+@needs_vm()
+def hosts_add(cfg: Config, vm: VM, ga: GuestAgent, ip: str, hostname: str) -> None:
     """Append an entry to the VM hosts file.
 
     Example: winbox hosts add 10.0.0.5 dc01.corp.local
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
     _validate_ip(ip)
     _validate_hostname(hostname)
 
@@ -422,17 +400,12 @@ def hosts_add(ctx: click.Context, ip: str, hostname: str) -> None:
 @hosts.command("set")
 @click.argument("ip")
 @click.argument("hostname")
-@click.pass_context
-def hosts_set(ctx: click.Context, ip: str, hostname: str) -> None:
+@needs_vm()
+def hosts_set(cfg: Config, vm: VM, ga: GuestAgent, ip: str, hostname: str) -> None:
     """Set a hosts entry (replaces existing entry for hostname, or adds new).
 
     Example: winbox hosts set 10.0.0.5 dc01.corp.local
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
     _validate_ip(ip)
     _validate_hostname(hostname)
 
@@ -454,17 +427,12 @@ def hosts_set(ctx: click.Context, ip: str, hostname: str) -> None:
 
 @hosts.command("delete")
 @click.argument("hostname")
-@click.pass_context
-def hosts_delete(ctx: click.Context, hostname: str) -> None:
+@needs_vm()
+def hosts_delete(cfg: Config, vm: VM, ga: GuestAgent, hostname: str) -> None:
     """Remove all entries for a hostname from the VM hosts file.
 
     Example: winbox hosts delete dc01.corp.local
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
     _validate_hostname(hostname)
 
     hostname_escaped = hostname.replace('.', '\\.').replace('-', '\\-')
@@ -499,9 +467,11 @@ def domain() -> None:
     "--password", prompt=True, hide_input=True,
     help="Domain user password (prompted if not given).",
 )
-@click.pass_context
+@needs_vm()
 def domain_join(
-    ctx: click.Context,
+    cfg: Config,
+    vm: VM,
+    ga: GuestAgent,
     name: str,
     ns_ip: str,
     user: str,
@@ -511,11 +481,6 @@ def domain_join(
 
     Undo with: winbox domain leave
     """
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
     _validate_domain(name)
     _validate_ip(ns_ip)
     _validate_user(user)
@@ -595,15 +560,9 @@ def domain_join(
 
 
 @domain.command("leave")
-@click.pass_context
-def domain_leave(ctx: click.Context) -> None:
+@needs_vm()
+def domain_leave(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Leave the domain and return to workgroup (preserves all files)."""
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     # Remove from domain
     console.print("[blue][*][/] Leaving domain...")
     leave_script = "Remove-Computer -WorkgroupName WORKGROUP -Force"

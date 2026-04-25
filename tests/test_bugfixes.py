@@ -409,15 +409,19 @@ def mock_env(cfg):
     vm.disk_usage.return_value = "6.5 GB"
     vm.snapshot_list.return_value = ["clean"]
 
+    # exec.py and setup.py dropped their direct ensure_running import after
+    # the @needs_vm migration -- @needs_vm resolves it through cli/__init__.py.
+    # Patch the canonical name to cover both decorated and raw call sites.
     with (
+        patch("winbox.cli.ensure_running"),
+        patch("winbox.cli.GuestAgent", return_value=ga),
+        patch("winbox.cli.VM", return_value=vm),
         patch("winbox.cli.vm.ensure_running"),
         patch("winbox.cli.vm.GuestAgent", return_value=ga),
         patch("winbox.cli.vm.VM", return_value=vm),
-        patch("winbox.cli.network.ensure_running"),
         patch("winbox.cli.network.GuestAgent", return_value=ga),
         patch("winbox.cli.network.VM", return_value=vm),
         patch("winbox.cli.network.VMState", VMState),
-        patch("winbox.cli.exec.ensure_running"),
         patch("winbox.cli.exec.GuestAgent", return_value=ga),
         patch("winbox.cli.exec.VM", return_value=vm),
         patch("winbox.cli.setup.VM", return_value=vm),

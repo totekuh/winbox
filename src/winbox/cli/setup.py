@@ -10,7 +10,7 @@ from pathlib import Path
 import click
 
 from winbox.setup import installer
-from winbox.cli import console, ensure_running
+from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
 from winbox.vm import GuestAgent
 from winbox.setup.iso import ISO_FILENAME, download_iso
@@ -192,15 +192,9 @@ def _setup_inner(
 
 
 @click.command()
-@click.pass_context
-def provision(ctx: click.Context) -> None:
+@needs_vm()
+def provision(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Re-run the provisioning script inside the VM."""
-    cfg: Config = ctx.obj["cfg"]
-    vm = VM(cfg)
-    ga = GuestAgent(cfg)
-
-    ensure_running(vm, ga, cfg)
-
     # Copy latest provision files to shared dir for guest access
     installer.copy_setup_files(cfg)
 

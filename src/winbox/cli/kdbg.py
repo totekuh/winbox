@@ -210,6 +210,9 @@ def kdbg_symbols(
         )
         raise SystemExit(1)
 
+    # Stays raw (no @needs_vm): --from-ghidra above returns without touching
+    # the VM. Decorating the function would boot the VM unnecessarily for
+    # offline imports.
     vm = VM(cfg)
     ga = GuestAgent(cfg)
     ensure_running(vm, ga, cfg)

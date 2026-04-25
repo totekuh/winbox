@@ -81,11 +81,20 @@ def mock_env(cfg):
     vm.disk_usage.return_value = "6.5 GB"
     vm.snapshot_list.return_value = ["clean"]
 
+    import importlib
+
     with ExitStack() as stack:
         for mod in _CLI_MODULES:
-            stack.enter_context(patch(f"winbox.cli.{mod}.ensure_running"))
-            stack.enter_context(patch(f"winbox.cli.{mod}.GuestAgent", return_value=ga))
-            stack.enter_context(patch(f"winbox.cli.{mod}.VM", return_value=vm))
+            module = importlib.import_module(f"winbox.cli.{mod}")
+            # ensure_running is only re-imported by modules that still call it
+            # directly (vm, jobs, kdbg, eventlogs after the @needs_vm migration).
+            # Skip the patch for modules that delegate fully to @needs_vm.
+            if hasattr(module, "ensure_running"):
+                stack.enter_context(patch(f"winbox.cli.{mod}.ensure_running"))
+            if hasattr(module, "GuestAgent"):
+                stack.enter_context(patch(f"winbox.cli.{mod}.GuestAgent", return_value=ga))
+            if hasattr(module, "VM"):
+                stack.enter_context(patch(f"winbox.cli.{mod}.VM", return_value=vm))
 
         # The @needs_vm decorator (in cli/__init__.py) resolves VM /
         # GuestAgent / ensure_running through its own module namespace,
