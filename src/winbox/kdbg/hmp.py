@@ -19,8 +19,26 @@ class HmpError(RuntimeError):
     pass
 
 
-def hmp(vm_name: str, command: str, *, timeout: int = 15) -> str:
-    """Send an HMP command to the VM, return stdout, raise on failure."""
+def hmp(
+    vm_name: str,
+    command: str,
+    *,
+    timeout: int = 15,
+    mode: str = "raise",
+):
+    """Send an HMP command to the VM via virsh ``qemu-monitor-command --hmp``.
+
+    Two return shapes:
+      * ``mode='raise'`` (default) -- returns stdout (str). Non-zero exit
+        raises :class:`HmpError` with stderr or stdout in the message.
+      * ``mode='tuple'`` -- returns ``(rc, stdout.strip(), stderr.strip())``
+        and never raises on a non-zero exit. Use this when the caller
+        wants to render virsh's own error text directly (e.g. the
+        ``kdbg start/stop`` CLI commands and the matching MCP tools).
+
+    Both old in-tree wrappers (``cli/kdbg._hmp`` and ``mcp._kdbg_hmp``)
+    routed through this — keep them out of new code.
+    """
     result = subprocess.run(
         [
             "virsh", "-c", "qemu:///system",
@@ -29,6 +47,10 @@ def hmp(vm_name: str, command: str, *, timeout: int = 15) -> str:
         ],
         capture_output=True, text=True, check=False, timeout=timeout,
     )
+    if mode == "tuple":
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+    if mode != "raise":
+        raise ValueError(f"hmp(mode={mode!r}): expected 'raise' or 'tuple'")
     if result.returncode != 0:
         raise HmpError(
             f"HMP {command!r} failed: {result.stderr.strip() or result.stdout.strip()}"

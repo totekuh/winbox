@@ -1688,24 +1688,16 @@ def pipe_close(session_id: str) -> str:
 # ─── Tool 12: kdbg_start / kdbg_stop / kdbg_status ─────────────────────────
 
 def _kdbg_hmp(vm_name: str, command: str) -> tuple[int, str, str]:
-    """Send an HMP command to the VM's QEMU monitor via virsh."""
-    import subprocess as _sp
-    r = _sp.run(
-        ["virsh", "-c", "qemu:///system",
-         "qemu-monitor-command", vm_name, "--hmp", command],
-        capture_output=True, text=True, check=False,
-    )
-    return r.returncode, r.stdout.strip(), r.stderr.strip()
+    """Tuple-mode HMP wrapper — defers to the canonical hmp() in
+    winbox.kdbg.hmp. Kept as a 1-line shim so call sites stay readable."""
+    from winbox.kdbg.hmp import hmp as _hmp_call
+    return _hmp_call(vm_name, command, mode="tuple")
 
 
 def _kdbg_probe(host: str, port: int, timeout: float = 0.5) -> bool:
-    """True if something is listening on host:port."""
-    import socket as _sk
-    try:
-        with _sk.create_connection((host, port), timeout=timeout):
-            return True
-    except (OSError, _sk.timeout):
-        return False
+    """True if something is listening on host:port. Defers to canonical."""
+    from winbox.kdbg.hmp import probe_port as _probe
+    return _probe(host, port, timeout)
 
 
 @mcp.tool()

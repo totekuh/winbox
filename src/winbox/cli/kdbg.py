@@ -34,31 +34,15 @@ from winbox.kdbg import (
     read_virt_cr3,
     resolve_nt_base,
 )
-from winbox.kdbg.hmp import HmpError, probe_port
+from winbox.kdbg.hmp import HmpError, hmp as hmp_call, probe_port
 from winbox.kdbg.walk import list_modules, list_processes
 from winbox.vm import VM, GuestAgent, VMState
 
-# Kept as a direct subprocess call (not a thin kdbg_hmp wrapper) so the
-# start/stop/status commands can surface raw virsh/QEMU stderr to the user
-# without the generic "HMP '<cmd>' failed:" wrapper that HmpError adds.
-import subprocess  # noqa: E402
-
-
+# Use the canonical HMP wrapper in tuple-mode for start/stop/status so the
+# raw virsh stderr lands in the user's terminal verbatim — the default
+# raising mode would wrap it in "HMP '<cmd>' failed: ...".
 def _hmp(vm_name: str, command: str) -> tuple[int, str, str]:
-    """Send an HMP command to the VM and return (rc, stdout, stderr)."""
-    result = subprocess.run(
-        [
-            "virsh", "-c", "qemu:///system",
-            "qemu-monitor-command", vm_name,
-            "--hmp", command,
-        ],
-        capture_output=True, text=True, check=False,
-    )
-    return result.returncode, result.stdout.strip(), result.stderr.strip()
-
-
-def _probe_port(host: str, port: int, timeout: float = 0.5) -> bool:
-    return probe_port(host, port, timeout)
+    return hmp_call(vm_name, command, mode="tuple")
 
 
 def _cheat_sheet(port: int) -> None:
@@ -108,7 +92,7 @@ def kdbg_start(ctx: click.Context, port: int, any_interface: bool) -> None:
 
     # Refuse to double-start — QEMU will happily try to bind again and error
     # in HMP output, which is ugly. Fail fast with a clearer message.
-    if _probe_port("127.0.0.1", port):
+    if probe_port("127.0.0.1", port):
         console.print(f"[yellow][!][/] Something is already listening on 127.0.0.1:{port}")
         console.print("    Run [bold]winbox kdbg stop[/] first, or pick a different [bold]--port[/].")
         raise SystemExit(1)
@@ -168,7 +152,7 @@ def kdbg_status(ctx: click.Context, port: int) -> None:
         console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
         return
 
-    listening = _probe_port("127.0.0.1", port)
+    listening = probe_port("127.0.0.1", port)
     if listening:
         console.print(f"gdb stub: [green]listening[/] on 127.0.0.1:{port}")
     else:

@@ -21,8 +21,8 @@ def kdbg_env(cfg):
 
     with patch("winbox.cli.kdbg.VM", return_value=vm), \
          patch("winbox.cli.Config.load", return_value=cfg), \
-         patch("winbox.cli.kdbg.subprocess.run") as mock_run, \
-         patch("winbox.cli.kdbg._probe_port", return_value=False) as mock_probe:
+         patch("winbox.kdbg.hmp.subprocess.run") as mock_run, \
+         patch("winbox.cli.kdbg.probe_port", return_value=False) as mock_probe:
         # Default: virsh succeeds and the HMP output looks like a real start
         mock_run.return_value = MagicMock(
             returncode=0,
@@ -188,7 +188,7 @@ class TestProbePortHelper:
 
     def test_probe_returns_true_when_port_open(self):
         import socket as _socket
-        from winbox.cli.kdbg import _probe_port
+        from winbox.kdbg.hmp import probe_port as _probe_port
 
         # Open a real listener on an ephemeral port
         srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
@@ -201,7 +201,7 @@ class TestProbePortHelper:
             srv.close()
 
     def test_probe_returns_false_when_port_closed(self):
-        from winbox.cli.kdbg import _probe_port
+        from winbox.kdbg.hmp import probe_port as _probe_port
 
         # Ephemeral port that's definitely not bound
         assert _probe_port("127.0.0.1", 1, timeout=0.1) is False
