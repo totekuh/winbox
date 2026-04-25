@@ -244,31 +244,55 @@ class TestExecPython:
 
 
 class TestPythonTool:
-    def test_success(self, mock_mcp):
+    def test_returns_structured_json(self, mock_mcp):
+        import json
         from winbox.mcp import python
         ga, vm, cfg = mock_mcp
         ga.exec.return_value = ExecResult(exitcode=0, stdout="42\n", stderr="")
 
         result = python("print(42)")
-        assert "42" in result
+        parsed = json.loads(result)
+        assert parsed == {"stdout": "42\n", "stderr": "", "exitcode": 0}
 
-    def test_stderr_included(self, mock_mcp):
+    def test_stderr_kept_separate_from_stdout(self, mock_mcp):
+        """Regression: prose-blob format used to concatenate stdout+stderr,
+        which corrupted callers that expected json.loads(stdout)."""
+        import json
+        from winbox.mcp import python
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(
+            exitcode=0,
+            stdout='{"answer": 42}',
+            stderr="DeprecationWarning: foo\n",
+        )
+
+        result = python("...")
+        parsed = json.loads(result)
+        # Caller can json.loads(parsed["stdout"]) cleanly — stderr does not bleed in.
+        assert parsed["stdout"] == '{"answer": 42}'
+        assert parsed["stderr"] == "DeprecationWarning: foo\n"
+        assert json.loads(parsed["stdout"]) == {"answer": 42}
+
+    def test_failure_carries_exitcode(self, mock_mcp):
+        import json
         from winbox.mcp import python
         ga, vm, cfg = mock_mcp
         ga.exec.return_value = ExecResult(exitcode=1, stdout="", stderr="NameError\n")
 
         result = python("bad")
-        assert "[stderr]" in result
-        assert "NameError" in result
-        assert "[exit code: 1]" in result
+        parsed = json.loads(result)
+        assert parsed["exitcode"] == 1
+        assert parsed["stderr"] == "NameError\n"
 
     def test_no_output(self, mock_mcp):
+        import json
         from winbox.mcp import python
         ga, vm, cfg = mock_mcp
         ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
 
         result = python("pass")
-        assert result == "(no output)"
+        parsed = json.loads(result)
+        assert parsed == {"stdout": "", "stderr": "", "exitcode": 0}
 
 
 # ─── ioctl tool ─────────────────────────────────────────────────────────────

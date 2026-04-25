@@ -161,14 +161,21 @@ def python(code: str, timeout: int = 300) -> str:
 
     The code runs as Administrator with full access to Win32 APIs via ctypes,
     the registry via winreg, WMI, COM, and everything else Python can do.
-    Output is captured from stdout/stderr.
+
+    Returns a JSON-encoded ``{"stdout": str, "stderr": str, "exitcode": int}``.
+    Structured (not prose) so a script that prints valid JSON to stdout can be
+    safely json.loads-ed by the caller without stderr/exitcode noise mixing in.
 
     Args:
         code: Python source code to execute.
         timeout: Execution timeout in seconds (default 300).
     """
     result = _exec_python(code, timeout=timeout)
-    return _format_exec_result(result)
+    return _json.dumps({
+        "stdout": result["stdout"],
+        "stderr": result["stderr"],
+        "exitcode": result["exitcode"],
+    })
 
 
 # ─── Tool 2: ioctl ─────────────────────────────────────────────────────────
