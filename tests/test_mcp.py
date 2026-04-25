@@ -822,20 +822,49 @@ class TestServiceTools:
 
 
 class TestNetTools:
-    def test_isolate_removes_default_route(self, mock_mcp):
+    def test_isolate_attaches_nwfilter(self, mock_mcp):
+        """net_isolate now uses libvirt nwfilter (guest-proof) instead of
+        the old Remove-NetRoute approach that DHCP renewal could undo."""
         from winbox.mcp import net_isolate
         ga, vm, cfg = mock_mcp
+        vm.name = "winbox"
+        vm.net_link_state = MagicMock(return_value="up")
         vm.net_set_link = MagicMock()
 
-        result = net_isolate()
+        with patch("winbox.nwfilter.ensure_filter_defined") as mock_define, \
+             patch("winbox.nwfilter.attach_filter", return_value=True) as mock_attach:
+            result = net_isolate()
+
         assert "isolated" in result.lower()
-        # isolate must NOT touch the link — the whole point is to keep
-        # Kali <-> VM same-subnet traffic alive
-        vm.net_set_link.assert_not_called()
-        ga.exec_powershell.assert_called_once()
-        script = ga.exec_powershell.call_args[0][0]
-        assert "Remove-NetRoute" in script
-        assert "0.0.0.0/0" in script
+        mock_define.assert_called_once()
+        mock_attach.assert_called_once_with("winbox")
+        # The legacy Remove-NetRoute path must NOT be invoked anymore.
+        ga.exec_powershell.assert_not_called()
+
+    def test_isolate_idempotent_when_already_attached(self, mock_mcp):
+        from winbox.mcp import net_isolate
+        ga, vm, cfg = mock_mcp
+        vm.name = "winbox"
+        vm.net_link_state = MagicMock(return_value="up")
+
+        with patch("winbox.nwfilter.ensure_filter_defined"), \
+             patch("winbox.nwfilter.attach_filter", return_value=False):
+            result = net_isolate()
+
+        assert "already" in result.lower()
+
+    def test_isolate_surfaces_nwfilter_error(self, mock_mcp):
+        from winbox.mcp import net_isolate
+        ga, vm, cfg = mock_mcp
+        vm.name = "winbox"
+
+        with patch("winbox.nwfilter.ensure_filter_defined"), \
+             patch("winbox.nwfilter.attach_filter",
+                   side_effect=RuntimeError("libvirt refused")):
+            result = net_isolate()
+
+        assert "failed" in result.lower()
+        assert "libvirt refused" in result
 
     def test_isolate_vm_not_running(self, mock_mcp):
         from winbox.mcp import net_isolate
@@ -872,15 +901,19 @@ class TestNetTools:
         assert "failed" in result.lower()
 
     def test_connect_from_isolated_link_up(self, mock_mcp):
-        """Undo `net isolate`: link is already up, just re-DHCP."""
+        """Undo `net isolate`: link is already up, detach filter, re-DHCP."""
         from winbox.mcp import net_connect
         ga, vm, cfg = mock_mcp
+        vm.name = "winbox"
         vm.net_link_state = MagicMock(return_value="up")
         vm.net_set_link = MagicMock()
         vm.ip.return_value = "192.168.122.42"
 
-        result = net_connect()
+        with patch("winbox.nwfilter.detach_filter", return_value=True) as mock_detach:
+            result = net_connect()
+
         assert "192.168.122.42" in result
+        mock_detach.assert_called_once_with("winbox")
         # link is up → no need to flip it
         vm.net_set_link.assert_not_called()
         # Full release + renew cycle
@@ -892,11 +925,14 @@ class TestNetTools:
         """Undo `net unplug`: link is down, must flip it first."""
         from winbox.mcp import net_connect
         ga, vm, cfg = mock_mcp
+        vm.name = "winbox"
         vm.net_link_state = MagicMock(return_value="down")
         vm.net_set_link = MagicMock(return_value=True)
         vm.ip.return_value = "192.168.122.42"
 
-        result = net_connect()
+        with patch("winbox.nwfilter.detach_filter", return_value=False):
+            result = net_connect()
+
         assert "192.168.122.42" in result
         vm.net_set_link.assert_called_once_with("up")
         # Restart-NetAdapter after link-up so DHCP re-queries
@@ -908,10 +944,12 @@ class TestNetTools:
     def test_connect_unplug_link_up_fails(self, mock_mcp):
         from winbox.mcp import net_connect
         ga, vm, cfg = mock_mcp
+        vm.name = "winbox"
         vm.net_link_state = MagicMock(return_value="down")
         vm.net_set_link = MagicMock(return_value=False)
 
-        result = net_connect()
+        with patch("winbox.nwfilter.detach_filter", return_value=False):
+            result = net_connect()
         assert "failed" in result.lower()
         ga.exec.assert_not_called()
 

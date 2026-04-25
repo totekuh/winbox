@@ -340,12 +340,13 @@ type_map = {
 # ─── Tool 3: reg_query ─────────────────────────────────────────────────────
 
 @mcp.tool()
-def reg_query(key: str, value: str | None = None) -> str:
+def reg_query(key: str, value: str | None = None, timeout: int = 30) -> str:
     """Query a Windows registry key or value.
 
     Args:
         key: Registry key path (e.g. 'HKLM\\\\SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion').
         value: Specific value name to query. If omitted, lists all values under the key.
+        timeout: Execution timeout in seconds (default 30).
     """
     if value is not None:
         script = (
@@ -415,7 +416,7 @@ def reg_query(key: str, value: str | None = None) -> str:
             ''')
         )
 
-    result = _exec_python(script)
+    result = _exec_python(script, timeout=timeout)
     return _format_exec_result(result)
 
 
@@ -427,6 +428,7 @@ def reg_set(
     value: str,
     data: str,
     value_type: str = "REG_SZ",
+    timeout: int = 30,
 ) -> str:
     """Set a Windows registry value.
 
@@ -436,6 +438,7 @@ def reg_set(
         data: Data to write. For REG_DWORD/REG_QWORD pass the integer as a string.
               For REG_BINARY pass hex. For REG_MULTI_SZ pass items separated by '\\n'.
         value_type: Registry type - REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ.
+        timeout: Execution timeout in seconds (default 30).
     """
     script = (
         f"import winreg\nimport sys\n\n"
@@ -457,14 +460,14 @@ def reg_set(
         ''')
     )
 
-    result = _exec_python(script)
+    result = _exec_python(script, timeout=timeout)
     return _format_exec_result(result)
 
 
 # ─── Tool 5: reg_delete ─────────────────────────────────────────────────────
 
 @mcp.tool()
-def reg_delete(key: str, value: str | None = None) -> str:
+def reg_delete(key: str, value: str | None = None, timeout: int = 30) -> str:
     """Delete a Windows registry value or entire key.
 
     If value is provided, deletes that specific value. If omitted,
@@ -473,6 +476,7 @@ def reg_delete(key: str, value: str | None = None) -> str:
     Args:
         key: Registry key path (e.g. 'HKLM\\\\SOFTWARE\\\\MyKey').
         value: Specific value name to delete. If omitted, deletes the entire key tree.
+        timeout: Execution timeout in seconds (default 30).
     """
     if value is not None:
         script = (
@@ -521,19 +525,20 @@ def reg_delete(key: str, value: str | None = None) -> str:
             ''')
         )
 
-    result = _exec_python(script)
+    result = _exec_python(script, timeout=timeout)
     return _format_exec_result(result)
 
 
 # ─── Tool 6: ps ────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def ps(filter: str | None = None) -> str:
+def ps(filter: str | None = None, timeout: int = 60) -> str:
     """List processes in the Windows VM with PID, name, path, and memory usage.
 
     Args:
         filter: Optional filter string. Matches against process name (case-insensitive).
                 Example: 'svc' matches svchost.exe, 'lsass' matches lsass.exe.
+        timeout: Execution timeout in seconds (default 60).
     """
     filter_repr = repr(filter) if filter else "None"
     script = textwrap.dedent(f"""\
@@ -574,7 +579,7 @@ def ps(filter: str | None = None) -> str:
         print(json.dumps(procs, indent=2))
     """)
 
-    result = _exec_python(script)
+    result = _exec_python(script, timeout=timeout)
     return _format_exec_result(result)
 
 
@@ -725,7 +730,7 @@ def eventlogs_clear(
 # ─── Tool 6: upload ────────────────────────────────────────────────────────
 
 @mcp.tool()
-def upload(src: str, dst: str | None = None) -> str:
+def upload(src: str, dst: str | None = None, timeout: int = 60) -> str:
     """Upload a file from Kali to the Windows VM via VirtIO-FS.
 
     Copies the file to the shared directory on Kali, which is mounted
@@ -736,6 +741,7 @@ def upload(src: str, dst: str | None = None) -> str:
         src: Linux path on Kali (e.g. '/tmp/payload.dll' or '/opt/tools/mimikatz.exe').
         dst: Optional Windows destination path inside the VM. If omitted, the file
              stays at Z:\\<filename>. If provided, the file is copied from Z:\\ to dst.
+        timeout: Execution timeout in seconds for the in-VM copy step (default 60).
     """
     import shutil
 
@@ -775,6 +781,7 @@ def upload(src: str, dst: str | None = None) -> str:
     vm_src = f"Z:\\{src_path.name}"
     result = _exec_python(
         script,
+        timeout=timeout,
         args={"src": vm_src, "dst": dst},
     )
     if result["exitcode"] != 0:
@@ -787,7 +794,7 @@ def upload(src: str, dst: str | None = None) -> str:
 # ─── Tool 7: file_copy ─────────────────────────────────────────────────────
 
 @mcp.tool()
-def file_copy(src: str, dst: str) -> str:
+def file_copy(src: str, dst: str, timeout: int = 60) -> str:
     """Copy a file within the Windows VM.
 
     Use for DLL sideloading, planting payloads, staging binaries, etc.
@@ -797,6 +804,7 @@ def file_copy(src: str, dst: str) -> str:
     Args:
         src: Source path (e.g. 'Z:\\\\tools\\\\cytool.exe' or 'C:\\\\Windows\\\\System32\\\\cmd.exe').
         dst: Destination path (e.g. 'C:\\\\temp\\\\cytool.exe').
+        timeout: Execution timeout in seconds (default 60).
     """
     script = textwrap.dedent("""\
         import json
@@ -824,6 +832,7 @@ def file_copy(src: str, dst: str) -> str:
 
     result = _exec_python(
         script,
+        timeout=timeout,
         args={"src": src, "dst": dst},
     )
     return _format_exec_result(result)
@@ -832,7 +841,7 @@ def file_copy(src: str, dst: str) -> str:
 # ─── Tool 7: mem_read ──────────────────────────────────────────────────────
 
 @mcp.tool()
-def mem_read(pid: int, address: str, length: int) -> str:
+def mem_read(pid: int, address: str, length: int, timeout: int = 30) -> str:
     """Read memory from a process in the Windows VM.
 
     Enables SeDebugPrivilege, opens the process with PROCESS_VM_READ,
@@ -847,6 +856,7 @@ def mem_read(pid: int, address: str, length: int) -> str:
         pid: Target process ID.
         address: Memory address (hex like '0x...' or decimal).
         length: Number of bytes to read (capped at 1MB).
+        timeout: Execution timeout in seconds (default 30).
     """
     if length <= 0:
         return f"invalid length: {length} (must be > 0)"
@@ -961,14 +971,14 @@ def mem_read(pid: int, address: str, length: int) -> str:
             kernel32.CloseHandle(handle)
     """)
 
-    result = _exec_python(script)
+    result = _exec_python(script, timeout=timeout)
     return _format_exec_result(result)
 
 
 # ─── Tool 8: service_stop / service_start ───────────────────────────────────
 
 @mcp.tool()
-def service_stop(name: str) -> str:
+def service_stop(name: str, timeout: int = 30) -> str:
     """Stop a Windows service.
 
     Uses sc.exe to stop the service. Useful for unloading drivers,
@@ -976,14 +986,15 @@ def service_stop(name: str) -> str:
 
     Args:
         name: Service name (e.g. 'CyProtectDrv' or 'WinDefend').
+        timeout: Execution timeout in seconds (default 30).
     """
     cfg, vm, ga = _ensure_vm_ready()
-    result = ga.exec(f"sc.exe stop {name}", timeout=30)
+    result = ga.exec(f"sc.exe stop {name}", timeout=timeout)
     return _format_exec_result(result)
 
 
 @mcp.tool()
-def service_start(name: str) -> str:
+def service_start(name: str, timeout: int = 30) -> str:
     """Start a Windows service.
 
     Uses sc.exe to start the service. Useful for loading drivers,
@@ -991,9 +1002,10 @@ def service_start(name: str) -> str:
 
     Args:
         name: Service name (e.g. 'CyProtectDrv' or 'WinDefend').
+        timeout: Execution timeout in seconds (default 30).
     """
     cfg, vm, ga = _ensure_vm_ready()
-    result = ga.exec(f"sc.exe start {name}", timeout=30)
+    result = ga.exec(f"sc.exe start {name}", timeout=timeout)
     return _format_exec_result(result)
 
 
@@ -1001,22 +1013,32 @@ def service_start(name: str) -> str:
 
 @mcp.tool()
 def net_isolate() -> str:
-    """Block internet on the VM by removing the default gateway.
+    """Block internet on the VM via libvirt nwfilter (guest-proof).
 
-    The NIC stays up, so Kali <-> VM on the libvirt subnet still works
-    (guest agent, VirtIO-FS, same-subnet IP traffic). Only traffic via
-    the default gateway is blocked. For a full NIC disconnect, use
-    net_unplug() instead. Undo with net_connect().
+    Attaches the 'winbox-isolate' nwfilter to the VM's interface so only
+    intra-192.168.122.0/24 IPv4, ARP, and DHCPv4 traffic is allowed.
+    Enforcement is at the host bridge -- DHCP renewals or in-guest route
+    changes cannot defeat it. Kali <-> VM (guest agent, VirtIO-FS, SSH)
+    stays up. For a full NIC disconnect, use net_unplug(). Undo with
+    net_connect().
     """
+    from winbox import nwfilter
+
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
-    ga.exec_powershell(
-        "Remove-NetRoute -DestinationPrefix '0.0.0.0/0' -Confirm:$false "
-        "-ErrorAction SilentlyContinue",
-        timeout=15,
-    )
-    return "Internet isolated — default gateway removed"
+    try:
+        nwfilter.ensure_filter_defined()
+        changed = nwfilter.attach_filter(vm.name)
+    except RuntimeError as e:
+        return f"Failed to attach nwfilter: {e}"
+
+    if vm.net_link_state() == "down":
+        vm.net_set_link("up")
+
+    if changed:
+        return "Internet isolated — nwfilter enforced at host bridge"
+    return "Already isolated — nwfilter already attached"
 
 
 @mcp.tool()
@@ -1039,14 +1061,23 @@ def net_unplug() -> str:
 def net_connect() -> str:
     """Restore full network access (undo net_isolate or net_unplug).
 
-    Brings the NIC link up if needed, then runs a full DHCP cycle
-    (release + renew) to re-add the default gateway.
+    Detaches the 'winbox-isolate' nwfilter (idempotent), brings the NIC
+    link up if needed, then runs a full DHCP cycle (release + renew)
+    to re-add the default gateway.
     """
     import time
+    from winbox import nwfilter
 
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
+
+    # Detach is best-effort: any failure is logged-style but doesn't
+    # block the link / DHCP recovery path.
+    try:
+        nwfilter.detach_filter(vm.name)
+    except Exception:
+        pass
 
     if vm.net_link_state() == "down":
         if not vm.net_set_link("up"):
@@ -1074,7 +1105,7 @@ def net_connect() -> str:
 # ─── Tool 10: pipe_list / pipe_info / pipe_connect ──────────────────────────
 
 @mcp.tool()
-def pipe_list(filter: str | None = None) -> str:
+def pipe_list(filter: str | None = None, timeout: int = 30) -> str:
     """Enumerate named pipes in the Windows VM matching a pattern.
 
     Uses Get-ChildItem on \\\\.\\pipe\\ via PowerShell. Returns a JSON array
@@ -1082,6 +1113,7 @@ def pipe_list(filter: str | None = None) -> str:
 
     Args:
         filter: Optional substring filter (case-insensitive). None = all pipes.
+        timeout: Execution timeout in seconds (default 30).
     """
     script = textwrap.dedent("""\
         import json
@@ -1106,12 +1138,12 @@ def pipe_list(filter: str | None = None) -> str:
         print(json.dumps(pipes))
     """)
 
-    result = _exec_python(script, args={"filter": filter})
+    result = _exec_python(script, timeout=timeout, args={"filter": filter})
     return _format_exec_result(result)
 
 
 @mcp.tool()
-def pipe_info(name: str) -> str:
+def pipe_info(name: str, timeout: int = 30) -> str:
     """Get security and configuration details for a named pipe.
 
     Returns a JSON object with keys: pipe, mode, end, out_buf, in_buf,
@@ -1119,6 +1151,7 @@ def pipe_info(name: str) -> str:
 
     Args:
         name: Pipe name without prefix (e.g. 'lsass' not '\\\\\\\\.\\\\pipe\\\\lsass').
+        timeout: Execution timeout in seconds (default 30).
     """
     script = textwrap.dedent("""\
         import ctypes
@@ -1245,12 +1278,12 @@ def pipe_info(name: str) -> str:
             kernel32.CloseHandle(handle)
     """)
 
-    result = _exec_python(script, args={"name": name})
+    result = _exec_python(script, timeout=timeout, args={"name": name})
     return _format_exec_result(result)
 
 
 @mcp.tool()
-def pipe_connect(name: str, access: str = "read") -> str:
+def pipe_connect(name: str, access: str = "read", timeout: int = 30) -> str:
     """Open a handle to a named pipe and return the result.
 
     Attempts to connect to the pipe with the specified access. Useful for
@@ -1260,6 +1293,7 @@ def pipe_connect(name: str, access: str = "read") -> str:
     Args:
         name: Pipe name without prefix (e.g. 'lsass').
         access: Access mode — 'read', 'write', or 'readwrite' (default: 'read').
+        timeout: Execution timeout in seconds (default 30).
     """
     script = textwrap.dedent("""\
         import ctypes
@@ -1316,7 +1350,7 @@ def pipe_connect(name: str, access: str = "read") -> str:
         print(f"OK: opened {pipe_path} [{access_str}] successfully")
     """)
 
-    result = _exec_python(script, args={"name": name, "access": access})
+    result = _exec_python(script, timeout=timeout, args={"name": name, "access": access})
     return _format_exec_result(result)
 
 
