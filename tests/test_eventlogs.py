@@ -80,16 +80,15 @@ def _mk(**overrides):
 class TestBuildPowershell:
     def test_single_log(self):
         ps = build_powershell(_mk(logs=["Security"]))
-        assert "LogName='Security'" in ps
-        assert "@(" not in ps.split("LogName=")[1].split(";")[0]
+        assert "LogName=@('Security')" in ps
 
     def test_multi_log(self):
         ps = build_powershell(_mk(logs=["Security", "System"]))
-        assert "LogName=@('Security','System')" in ps
+        assert "LogName=@('Security', 'System')" in ps
 
     def test_log_with_quote_escaped(self):
         ps = build_powershell(_mk(logs=["foo'bar"]))
-        assert "LogName='foo''bar'" in ps
+        assert "LogName=@('foo''bar')" in ps
 
     def test_starttime_iso(self):
         ps = build_powershell(_mk(since=datetime(2026, 4, 19, 11, 30, 5)))
@@ -97,11 +96,11 @@ class TestBuildPowershell:
 
     def test_single_id(self):
         ps = build_powershell(_mk(ids=[4624]))
-        assert "Id=4624" in ps
+        assert "Id=@(4624)" in ps
 
     def test_multi_id(self):
         ps = build_powershell(_mk(ids=[4624, 4625, 4634]))
-        assert "Id=@(4624,4625,4634)" in ps
+        assert "Id=@(4624, 4625, 4634)" in ps
 
     def test_provider(self):
         ps = build_powershell(_mk(provider="Microsoft-Windows-Sysmon"))
@@ -285,7 +284,7 @@ class TestEventlogsCli:
         assert "Time,Log,Level,Id,Provider,Message" in result.output
         mock_env.exec_powershell.assert_called_once()
         script = mock_env.exec_powershell.call_args[0][0]
-        assert "LogName='Security'" in script
+        assert "LogName=@('Security')" in script
         assert "-MaxEvents 100" in script
 
     def test_multi_log_and_ids(self, runner, mock_env, cfg):
@@ -302,8 +301,8 @@ class TestEventlogsCli:
 
         assert result.exit_code == 0, result.output
         script = mock_env.exec_powershell.call_args[0][0]
-        assert "LogName=@('Security','System')" in script
-        assert "Id=@(4624,4625)" in script
+        assert "LogName=@('Security', 'System')" in script
+        assert "Id=@(4624, 4625)" in script
         assert "-MaxEvents 10" in script
 
     def test_since_relative(self, runner, mock_env, cfg):
@@ -477,7 +476,7 @@ class TestBuildClearPowershell:
 
     def test_multi_log(self):
         ps = build_clear_powershell(["Security", "System"])
-        assert "@('Security','System')" in ps
+        assert "@('Security', 'System')" in ps
 
     def test_log_quote_escaped(self):
         ps = build_clear_powershell(["foo'bar"])
@@ -590,7 +589,7 @@ class TestEventlogsClearCli:
 
         assert result.exit_code == 0, result.output
         script = mock_env.exec_powershell.call_args[0][0]
-        assert "@('Security','System')" in script
+        assert "@('Security', 'System')" in script
 
     def test_clear_all_yes(self, runner, mock_env, cfg):
         from winbox.cli import cli
@@ -706,7 +705,7 @@ class TestMcpEventlogs:
         parsed = json.loads(result)
         assert parsed == events
         script = mock_mcp_eventlogs.exec_powershell.call_args[0][0]
-        assert "LogName='Security'" in script
+        assert "LogName=@('Security')" in script
 
     def test_string_log_arg(self, mock_mcp_eventlogs):
         from winbox.mcp import eventlogs
@@ -717,7 +716,7 @@ class TestMcpEventlogs:
         eventlogs(log="System")
 
         script = mock_mcp_eventlogs.exec_powershell.call_args[0][0]
-        assert "LogName='System'" in script
+        assert "LogName=@('System')" in script
 
     def test_list_args(self, mock_mcp_eventlogs):
         from winbox.mcp import eventlogs
@@ -733,8 +732,8 @@ class TestMcpEventlogs:
         )
 
         script = mock_mcp_eventlogs.exec_powershell.call_args[0][0]
-        assert "LogName='Microsoft-Windows-Sysmon/Operational'" in script
-        assert "Id=@(1,3,7)" in script
+        assert "LogName=@('Microsoft-Windows-Sysmon/Operational')" in script
+        assert "Id=@(1, 3, 7)" in script
         assert "Level=4" in script
         assert "-MaxEvents 50" in script
 
@@ -821,7 +820,7 @@ class TestMcpEventlogsClear:
         eventlogs_clear(log=["Security", "System"], confirm=True)
 
         script = mock_mcp_eventlogs.exec_powershell.call_args[0][0]
-        assert "@('Security','System')" in script
+        assert "@('Security', 'System')" in script
 
     def test_clear_all(self, mock_mcp_eventlogs):
         from winbox.mcp import eventlogs_clear

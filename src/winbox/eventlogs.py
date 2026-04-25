@@ -77,21 +77,11 @@ def parse_since(s: str, *, now: datetime | None = None) -> datetime:
         ) from e
 
 
-def _ps_quote(s: str) -> str:
-    return s.replace("'", "''")
-
-
-def _ps_string_array(items: list[str]) -> str:
-    if len(items) == 1:
-        return f"'{_ps_quote(items[0])}'"
-    quoted = ",".join(f"'{_ps_quote(x)}'" for x in items)
-    return f"@({quoted})"
-
-
-def _ps_int_array(items: list[int]) -> str:
-    if len(items) == 1:
-        return str(items[0])
-    return "@(" + ",".join(str(int(x)) for x in items) + ")"
+# PowerShell escaping helpers live in winbox.ps; re-exported here for the
+# existing call sites in this module.
+from winbox.ps import ps_array as _ps_string_array
+from winbox.ps import ps_int_array as _ps_int_array
+from winbox.ps import ps_quote as _ps_quote
 
 
 def build_powershell(q: EventQuery) -> str:
@@ -188,10 +178,9 @@ def build_clear_powershell(
             " | ConvertTo-Json -Compress"
         )
 
-    arr = "@(" + ",".join(f"'{_ps_quote(l)}'" for l in logs) + ")"
     return (
         "$ErrorActionPreference='Continue';"
-        f"$names = {arr};"
+        f"$names = {_ps_string_array(logs)};"
         "$ok = 0; $fail = 0; $errs = @();"
         "foreach ($n in $names) {"
         " $out = wevtutil cl $n 2>&1;"

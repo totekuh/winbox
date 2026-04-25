@@ -23,9 +23,7 @@ from winbox.vm import GuestAgent
 from winbox.vm import VM
 
 
-def _ps_quote(s: str) -> str:
-    """Escape a string for inclusion inside a PowerShell single-quoted literal."""
-    return s.replace("'", "''")
+from winbox.ps import ps_quote as _ps_quote  # canonical, no local copy
 
 
 @click.command("upload")
