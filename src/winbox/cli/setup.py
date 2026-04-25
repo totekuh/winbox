@@ -108,44 +108,66 @@ def setup(ctx: click.Context, windows_iso: str | None, yes: bool, desktop: bool)
         console.print(f"[red][-][/] ISO not found: {windows_iso}")
         raise SystemExit(1)
 
-    # Phase 1: ISO install
-    installer.create_directories(cfg)
-    installer.grant_libvirt_access(cfg)
-    installer.download_virtio_iso(cfg)
-    installer.download_openssh(cfg)
-    installer.download_winfsp(cfg)
-    installer.download_python(cfg)
-    installer.download_x64dbg(cfg)
-    installer.extract_virtiofs(cfg)
-    installer.generate_ssh_keypair(cfg)
-    installer.build_unattend_image(cfg, desktop=desktop)
-    installer.create_disk(cfg)
-    installer.run_virt_install(cfg, windows_iso)
+    # The four-phase pipeline. If any phase fails (or the user hits Ctrl-C),
+    # the VM, disk, and unattend image may be in a half-built state that
+    # would confuse the next run. Wrap the whole pipeline so we surface a
+    # clean error and a single recovery command instead of a CalledProcessError
+    # traceback or worse, a partially-defined libvirt domain.
+    try:
+        # Phase 1: ISO install
+        installer.create_directories(cfg)
+        installer.grant_libvirt_access(cfg)
+        installer.download_virtio_iso(cfg)
+        installer.download_openssh(cfg)
+        installer.download_winfsp(cfg)
+        installer.download_python(cfg)
+        installer.download_x64dbg(cfg)
+        installer.extract_virtiofs(cfg)
+        installer.generate_ssh_keypair(cfg)
+        installer.build_unattend_image(cfg, desktop=desktop)
+        installer.create_disk(cfg)
+        installer.run_virt_install(cfg, windows_iso)
 
-    console.print("[blue][*][/] Waiting for Windows installation to complete...")
-    console.print("    The VM will shut down automatically when done.")
-    if not vm.wait_shutdown(timeout=1200):
-        console.print("[yellow][!][/] Installation timed out (VM did not shut down).")
-        console.print(f"    Check with: virsh console {cfg.vm_name}")
+        console.print("[blue][*][/] Waiting for Windows installation to complete...")
+        console.print("    The VM will shut down automatically when done.")
+        if not vm.wait_shutdown(timeout=1200):
+            console.print("[yellow][!][/] Installation timed out (VM did not shut down).")
+            console.print(f"    Check with: virsh console {cfg.vm_name}")
+            raise SystemExit(1)
+        console.print("[green][+][/] Phase 1 complete — Windows installed")
+
+        # Phase 2: Offline provisioning via virt-customize
+        installer.provision_vm_disk(cfg)
+        console.print("[green][+][/] Phase 2 complete — provision files injected")
+
+        # Phase 3: Provisioning via guest agent
+        installer.boot_for_provisioning(cfg)
+        console.print("[green][+][/] Phase 3 complete — VM provisioned")
+
+        # Pre-register the libvirt nwfilter used by `winbox net isolate`, then
+        # attach it to the persistent domain config so the VM boots isolated by
+        # default. Runs while the VM is shut down (end of Phase 3).
+        installer.register_nwfilter(cfg)
+        installer.attach_default_filter(cfg)
+
+        # Phase 4: Snapshot
+        installer.create_clean_snapshot(cfg)
+    except KeyboardInterrupt:
+        console.print()
+        console.print("[yellow][!][/] Setup interrupted by user.")
+        console.print(
+            f"    Partial state may remain. Clean up with "
+            f"[bold]winbox destroy -y[/], then re-run [bold]winbox setup[/]."
+        )
+        raise SystemExit(130)
+    except (subprocess.CalledProcessError, RuntimeError) as e:
+        console.print()
+        console.print(f"[red][-][/] Setup failed: {e}")
+        console.print(
+            f"    The VM may be partially built. Clean up with "
+            f"[bold]winbox destroy -y[/] before re-running [bold]winbox setup[/]."
+        )
         raise SystemExit(1)
-    console.print("[green][+][/] Phase 1 complete — Windows installed")
-
-    # Phase 2: Offline provisioning via virt-customize
-    installer.provision_vm_disk(cfg)
-    console.print("[green][+][/] Phase 2 complete — provision files injected")
-
-    # Phase 3: Provisioning via guest agent
-    installer.boot_for_provisioning(cfg)
-    console.print("[green][+][/] Phase 3 complete — VM provisioned")
-
-    # Pre-register the libvirt nwfilter used by `winbox net isolate`, then
-    # attach it to the persistent domain config so the VM boots isolated by
-    # default. Runs while the VM is shut down (end of Phase 3).
-    installer.register_nwfilter(cfg)
-    installer.attach_default_filter(cfg)
-
-    # Phase 4: Snapshot
-    installer.create_clean_snapshot(cfg)
 
     elapsed = time.monotonic() - t0
     minutes, seconds = divmod(int(elapsed), 60)
