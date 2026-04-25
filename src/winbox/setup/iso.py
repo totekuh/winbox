@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -127,53 +128,70 @@ def download_iso(
         existing_size = 0
         mode = "wb"
 
+    # Force a socket-level default timeout for the duration of the download
+    # so chunked reads can't hang indefinitely. The `timeout=` arg to
+    # urlopen is meant to propagate to subsequent recv() calls, but some
+    # Python versions / proxy setups silently lose it; setdefaulttimeout
+    # is belt-and-suspenders. Restored in finally.
+    READ_TIMEOUT = 60
+    old_default = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(READ_TIMEOUT)
     try:
-        resp = urllib.request.urlopen(req, timeout=60)
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Download failed: {e}") from e
+        try:
+            resp = urllib.request.urlopen(req, timeout=READ_TIMEOUT)
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Download failed: {e}") from e
 
-    # If we requested a Range but server returned 200 (not 206), it sent
-    # the full file — switch to overwrite mode to avoid doubling content.
-    if existing_size > 0 and resp.status == 200:
-        mode = "wb"
-        existing_size = 0
+        # If we requested a Range but server returned 200 (not 206), it sent
+        # the full file — switch to overwrite mode to avoid doubling content.
+        if existing_size > 0 and resp.status == 200:
+            mode = "wb"
+            existing_size = 0
 
-    try:
-        # Determine total for progress bar
-        content_length = resp.headers.get("Content-Length")
-        if content_length:
-            download_size = int(content_length)
-        elif total_size:
-            download_size = total_size - existing_size
-        else:
-            download_size = 0
+        try:
+            # Determine total for progress bar
+            content_length = resp.headers.get("Content-Length")
+            if content_length:
+                download_size = int(content_length)
+            elif total_size:
+                download_size = total_size - existing_size
+            else:
+                download_size = 0
 
-        progress_total = existing_size + download_size if download_size else None
+            progress_total = existing_size + download_size if download_size else None
 
-        with Progress(
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(
-                ISO_FILENAME,
-                total=progress_total,
-                completed=existing_size,
-            )
+            with Progress(
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                DownloadColumn(),
+                TransferSpeedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task(
+                    ISO_FILENAME,
+                    total=progress_total,
+                    completed=existing_size,
+                )
 
-            chunk_size = 1024 * 1024  # 1MB chunks
-            with open(dest, mode) as f:
-                while True:
-                    chunk = resp.read(chunk_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    progress.update(task, advance=len(chunk))
+                chunk_size = 1024 * 1024  # 1MB chunks
+                with open(dest, mode) as f:
+                    while True:
+                        try:
+                            chunk = resp.read(chunk_size)
+                        except (socket.timeout, TimeoutError) as e:
+                            raise RuntimeError(
+                                f"Download stalled (no data for >{READ_TIMEOUT}s). "
+                                f"Re-run to resume. {e}"
+                            ) from e
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        progress.update(task, advance=len(chunk))
+        finally:
+            resp.close()
     finally:
-        resp.close()
+        socket.setdefaulttimeout(old_default)
 
     final_size = dest.stat().st_size
     # Sanity check — Windows Server 2022 eval ISO is ~4.7GB
