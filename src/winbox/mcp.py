@@ -1703,10 +1703,7 @@ def _kdbg_hmp(vm_name: str, command: str) -> tuple[int, str, str]:
     return _hmp_call(vm_name, command, mode="tuple")
 
 
-def _kdbg_probe(host: str, port: int, timeout: float = 0.5) -> bool:
-    """True if something is listening on host:port. Defers to canonical."""
-    from winbox.kdbg.hmp import probe_port as _probe
-    return _probe(host, port, timeout)
+from winbox.kdbg.hmp import probe_port as _kdbg_probe  # canonical, no shim needed
 
 
 @mcp.tool()

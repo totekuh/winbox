@@ -10,9 +10,8 @@ import click
 from winbox.cli import console, ensure_running
 from winbox.config import Config
 from winbox.exec import run_command, run_command_bg
-from winbox.vm import GuestAgent, GuestAgentError
+from winbox.vm import GuestAgent, GuestAgentError, VM, VMState
 from winbox.exec import open_shell
-from winbox.vm import VM
 
 
 @click.command("exec", context_settings=dict(
@@ -67,7 +66,6 @@ def exec_cmd(ctx: click.Context, command: tuple[str, ...], timeout: int, bg: boo
         # instead of letting the traceback escape.
         console.print("[red][-][/] Guest agent disconnected mid-execution:")
         console.print(f"    {e}", markup=False, highlight=False)
-        from winbox.vm import VMState
         state = vm.state()
         if state != VMState.RUNNING:
             console.print(f"    VM state: [yellow]{state.value}[/] — try [bold]winbox up[/] and re-run")
