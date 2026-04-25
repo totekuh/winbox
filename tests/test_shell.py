@@ -91,18 +91,50 @@ class TestOpenShell:
     @patch("winbox.exec.shell.os.get_terminal_size")
     @patch("winbox.exec.shell.socket.socket")
     def test_timeout_waiting_for_connection(self, mock_socket_cls, mock_termsize,
-                                            mock_ensure, mock_relay, cfg):
-        """open_shell handles socket.timeout when no connection arrives."""
+                                            mock_ensure, mock_relay, cfg, capsys):
+        """open_shell handles socket.timeout and surfaces guest-side diagnostic."""
         mock_termsize.return_value = MagicMock(lines=24, columns=80)
         mock_sock = MagicMock()
         mock_sock.accept.side_effect = socket.timeout("timed out")
         mock_socket_cls.return_value = mock_sock
         ga = MagicMock()
+        ga.exec_detached.return_value = 9999
+        ga.exec_status.return_value = {
+            "exited": True, "exitcode": 1,
+            "stdout": "", "stderr": "Z:\\Invoke-ConPtyShell.ps1 not found",
+        }
 
         open_shell(cfg, ga)
 
         mock_relay.assert_not_called()
         mock_sock.close.assert_called()
+        # Diagnostic from exec_status should be surfaced.
+        out = capsys.readouterr().out
+        assert "Timed out" in out
+        # Either the exit-rc info or the stderr tail must be in the output.
+        assert "9999" in out or "ConPtyShell" in out
+
+    @patch("winbox.exec.shell._relay")
+    @patch("winbox.exec.shell._ensure_conpty_on_share")
+    @patch("winbox.exec.shell.os.get_terminal_size")
+    @patch("winbox.exec.shell.socket.socket")
+    def test_timeout_with_running_pid_suggests_firewall(
+        self, mock_socket_cls, mock_termsize, mock_ensure, mock_relay, cfg, capsys,
+    ):
+        """If exec_status says the shell is still running, point at firewall."""
+        mock_termsize.return_value = MagicMock(lines=24, columns=80)
+        mock_sock = MagicMock()
+        mock_sock.accept.side_effect = socket.timeout("timed out")
+        mock_socket_cls.return_value = mock_sock
+        ga = MagicMock()
+        ga.exec_detached.return_value = 9999
+        ga.exec_status.return_value = {
+            "exited": False, "exitcode": -1, "stdout": "", "stderr": "",
+        }
+
+        open_shell(cfg, ga)
+        out = capsys.readouterr().out
+        assert "firewall" in out.lower()
 
     @patch("winbox.exec.shell.VM")
     @patch("winbox.exec.shell._relay")

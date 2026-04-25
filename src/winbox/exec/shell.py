@@ -100,13 +100,38 @@ def open_shell(
     try:
         client, addr = server.accept()
     except socket.timeout:
-        # Kill orphaned shell process in VM
+        # Probe the launched PowerShell to surface its stderr/exitcode
+        # instead of the opaque "timed out" the user used to see. If the
+        # in-guest script crashed (Z: not mounted, ConPTY module missing,
+        # firewall block, etc.) the diagnostic is right here.
+        diag = None
         if shell_pid:
+            try:
+                status = ga.exec_status(shell_pid)
+                if status.get("exited"):
+                    diag = (
+                        f"shell process (PID {shell_pid}) exited "
+                        f"rc={status.get('exitcode')!r}"
+                    )
+                    stderr = (status.get("stderr") or "").strip()
+                    if stderr:
+                        diag += f"; stderr: {stderr.splitlines()[-1][:200]}"
+                else:
+                    diag = (
+                        f"shell process (PID {shell_pid}) is still running "
+                        "but never connected back — likely a firewall block "
+                        f"on {cfg.host_ip}:{port}"
+                    )
+            except Exception:
+                diag = None
+            # Best-effort kill the orphan regardless of probe outcome.
             try:
                 ga.exec(f"taskkill /PID {shell_pid} /F", timeout=10)
             except Exception:
                 pass
         console.print("[red][-][/] Timed out waiting for connection")
+        if diag:
+            console.print(f"    {diag}")
         return
     finally:
         server.close()
