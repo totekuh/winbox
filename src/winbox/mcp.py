@@ -754,7 +754,11 @@ def upload(src: str, dst: str | None = None, timeout: int = 60) -> str:
     """
     import shutil
 
-    cfg, vm, ga = _get_state()
+    # The host-side staging copy works regardless of VM state, but the
+    # in-VM copy step needs a running VM + GA. _ensure_vm_ready surfaces
+    # a clear "VM not running" error instead of letting a later
+    # ga.exec timeout look like a network problem.
+    cfg, vm, ga = _ensure_vm_ready() if dst is not None else _get_state()
     src_path = Path(src)
 
     if not src_path.exists():
@@ -1081,12 +1085,15 @@ def net_connect() -> str:
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
 
-    # Detach is best-effort: any failure is logged-style but doesn't
-    # block the link / DHCP recovery path.
+    # Detach is best-effort -- a libvirt error here is rare but if it
+    # happens silently the user thinks they're un-isolated when they're
+    # not. Capture the error and surface it in the return string so the
+    # agent sees it.
+    detach_warning: str | None = None
     try:
         nwfilter.detach_filter(vm.name)
-    except Exception:
-        pass
+    except Exception as e:
+        detach_warning = f"detach_filter failed: {e}"
 
     if vm.net_link_state() == "down":
         if not vm.net_set_link("up"):
@@ -1103,12 +1110,13 @@ def net_connect() -> str:
         pass
     ga.exec("ipconfig /renew", timeout=30)
 
+    suffix = f" (warning: {detach_warning})" if detach_warning else ""
     for _ in range(15):
         ip = vm.ip()
         if ip:
-            return f"Network connected — IP: {ip}"
+            return f"Network connected — IP: {ip}{suffix}"
         time.sleep(1)
-    return "Network connected (DHCP pending)"
+    return f"Network connected (DHCP pending){suffix}"
 
 
 # ─── Tool 10: pipe_list / pipe_info / pipe_connect ──────────────────────────
@@ -1495,8 +1503,10 @@ def _session_dir(session_id: str) -> Path:
 def _poll_result(result_file: Path, timeout: int) -> dict | None:
     """Poll for result.json on the Kali side (VirtIO-FS). Returns parsed dict or None on timeout."""
     import time as _time
-    deadline = _time.time() + timeout
-    while _time.time() < deadline:
+    # monotonic so an NTP step (forward or backward) during the poll
+    # can't cause a premature timeout or an infinite hang.
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
         if result_file.exists():
             try:
                 data = _json.loads(result_file.read_text())
@@ -1595,10 +1605,11 @@ def pipe_open(name: str, access: str = "readwrite", timeout: int = 10) -> str:
         shutil.rmtree(session_dir, ignore_errors=True)
         return reason
 
-    # Poll status.json on Kali side via VirtIO-FS
+    # Poll status.json on Kali side via VirtIO-FS. monotonic so a clock
+    # step during the poll can't break the deadline.
     status_file = session_dir / "status.json"
-    deadline = _time.time() + timeout
-    while _time.time() < deadline:
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
         if status_file.exists():
             try:
                 status = _json.loads(status_file.read_text())

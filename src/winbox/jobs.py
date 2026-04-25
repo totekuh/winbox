@@ -178,6 +178,24 @@ class JobStore:
             self._jobs[job.id] = job
             self._save()
 
+    def update_many(self, jobs: list[Job]) -> None:
+        """Atomically apply a batch of updates under one flock.
+
+        ``[update(j) for j in jobs]`` would acquire / release the flock
+        per job, with each invocation re-loading whatever the disk
+        currently has — losing a concurrent writer's interleaved updates
+        in the gap. update_many takes the lock once, re-loads under it,
+        and replaces only the ids in ``jobs`` (other ids remain whatever
+        the disk says).
+        """
+        if not jobs:
+            return
+        with self._exclusive():
+            self._load()
+            for job in jobs:
+                self._jobs[job.id] = job
+            self._save()
+
     def all(self) -> list[Job]:
         return list(self._jobs.values())
 

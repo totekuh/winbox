@@ -9,7 +9,7 @@ from rich.table import Table
 
 from winbox.cli import console, ensure_running
 from winbox.config import Config
-from winbox.jobs import JobMode, JobStatus, JobStore
+from winbox.jobs import Job, JobMode, JobStatus, JobStore
 from winbox.vm import GuestAgent, GuestAgentError, VM
 
 
@@ -42,7 +42,11 @@ def jobs_list(ctx: click.Context) -> None:
     except Exception:
         ga = None
 
-    updated = False
+    # Collect just the jobs we actually mutated and commit them in one
+    # locked sweep -- writing each job individually would let another
+    # concurrent `winbox jobs list` overwrite our updates with its own
+    # stale snapshot in between locks.
+    mutated: list[Job] = []
     for job in all_jobs:
         if job.status not in (JobStatus.RUNNING, JobStatus.LOST):
             continue
@@ -55,14 +59,12 @@ def jobs_list(ctx: click.Context) -> None:
                 job.stdout = status["stdout"]
                 job.stderr = status["stderr"]
                 job.status = JobStatus.DONE if job.exitcode == 0 else JobStatus.FAILED
-                updated = True
+                mutated.append(job)
         except GuestAgentError:
             job.status = JobStatus.LOST
-            updated = True
+            mutated.append(job)
 
-    if updated:
-        for job in all_jobs:
-            store.update(job)
+    store.update_many(mutated)
 
     table = Table(show_header=True)
     table.add_column("ID", style="bold")
@@ -73,7 +75,10 @@ def jobs_list(ctx: click.Context) -> None:
     table.add_column("Age")
 
     for job in all_jobs:
-        age = int(time.time() - job.started)
+        # Wall-clock age — Job.started is `time.time()` so an NTP step
+        # between then and now can produce a negative delta. Guard
+        # against negative values so the table doesn't print "-3000s".
+        age = max(0, int(time.time() - job.started))
         if age < 60:
             age_str = f"{age}s"
         elif age < 3600:
