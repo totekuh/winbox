@@ -12,6 +12,19 @@ Output color contract (used across every cli/*.py module):
 Reserve [yellow][!][/] for actual problems. A status command reporting
 "feature not enabled" should use [dim]·[/], not yellow — yellow implies
 something is wrong, and routine off-states are not.
+
+Exit-path contract:
+
+    click.BadParameter / click.UsageError / click.ClickException
+        for ARGUMENT-SHAPE problems (bad address, missing required input,
+        mutually exclusive flags). Click renders them with "Error: " and
+        the standard usage hint -- the right UX for a user typo.
+
+    raise SystemExit(rc)
+        for RUNTIME failures (VM not running, GA unreachable, action failed
+        on the guest) and for propagating a guest exit code (exec, msi).
+        SystemExit is silent -- we've already printed our own [red][-][/]
+        line with the diagnostic.
 """
 
 from __future__ import annotations

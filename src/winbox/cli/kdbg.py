@@ -394,8 +394,9 @@ def kdbg_read_va(
     try:
         va = int(address, 0)
     except ValueError:
-        console.print(f"[red][-][/] invalid address: {address}")
-        raise SystemExit(1)
+        # Argument-shape problem (not a runtime VM failure) -> Click exception
+        # so the user gets the standard "Error: ..." prefix.
+        raise click.BadParameter(f"invalid address: {address}")
 
     cache = WalkCache()
     procs = list_processes(cfg.vm_name, store, cache=cache)
