@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.resources
 import time
 from pathlib import Path
 
@@ -12,99 +13,22 @@ from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM
 
-# Default AppLocker policy XML — Exe, Script, MSI, Appx (no DLL).
-# Standard corporate/exam config: allow C:\Windows\* and C:\Program Files\*
-# for Everyone, Administrators can run anything.
-_DEFAULT_POLICY_XML = r"""<AppLockerPolicy Version="1">
+# AppLocker policy XMLs live in src/winbox/data/applocker/ -- the previous
+# inlined-as-Python-strings approach made the rule layout unsearchable and
+# unlintable. Loaded lazily so unit tests don't need importlib.resources
+# stubbing.
 
-  <RuleCollection Type="Exe" EnforcementMode="Enabled">
-    <FilePathRule Id="921cc481-6e17-4653-8f75-050b80acca20"
-      Name="(Default Rule) All files"
-      Description="Allows Administrators to run all applications."
-      UserOrGroupSid="S-1-5-32-544" Action="Allow">
-      <Conditions><FilePathCondition Path="*" /></Conditions>
-    </FilePathRule>
-    <FilePathRule Id="a61c8b2c-a319-4cd0-9690-d2177cad7b51"
-      Name="(Default Rule) All files located in the Windows folder"
-      Description="Allows Everyone to run applications in the Windows folder."
-      UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions><FilePathCondition Path="%WINDIR%\*" /></Conditions>
-    </FilePathRule>
-    <FilePathRule Id="fd686d83-a829-4351-8ff4-27c7de5755d2"
-      Name="(Default Rule) All files located in the Program Files folder"
-      Description="Allows Everyone to run applications in the Program Files folder."
-      UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions><FilePathCondition Path="%PROGRAMFILES%\*" /></Conditions>
-    </FilePathRule>
-  </RuleCollection>
+def _read_data(*parts: str) -> str:
+    res = importlib.resources.files("winbox.data").joinpath(*parts)
+    return Path(str(res)).read_text(encoding="utf-8")
 
-  <RuleCollection Type="Script" EnforcementMode="Enabled">
-    <FilePathRule Id="ed97d0cb-15ff-430f-b82c-8d7832957725"
-      Name="(Default Rule) All scripts"
-      Description="Allows Administrators to run all scripts."
-      UserOrGroupSid="S-1-5-32-544" Action="Allow">
-      <Conditions><FilePathCondition Path="*" /></Conditions>
-    </FilePathRule>
-    <FilePathRule Id="06dce67b-934c-454f-a263-2515c8796bc5"
-      Name="(Default Rule) All scripts located in the Windows folder"
-      Description="Allows Everyone to run scripts in the Windows folder."
-      UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions><FilePathCondition Path="%WINDIR%\*" /></Conditions>
-    </FilePathRule>
-    <FilePathRule Id="9428c672-5fc3-47f4-808a-a0011f36dd2c"
-      Name="(Default Rule) All scripts located in the Program Files folder"
-      Description="Allows Everyone to run scripts in the Program Files folder."
-      UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions><FilePathCondition Path="%PROGRAMFILES%\*" /></Conditions>
-    </FilePathRule>
-  </RuleCollection>
 
-  <RuleCollection Type="Msi" EnforcementMode="Enabled">
-    <FilePathRule Id="5b290184-345a-4453-b184-45305f6d9a54"
-      Name="(Default Rule) All Windows Installer files"
-      Description="Allows Administrators to run all Windows Installer files."
-      UserOrGroupSid="S-1-5-32-544" Action="Allow">
-      <Conditions><FilePathCondition Path="*" /></Conditions>
-    </FilePathRule>
-    <FilePublisherRule Id="b7af7102-efde-4369-8a89-7a6a392d1473"
-      Name="(Default Rule) All digitally signed Windows Installer files"
-      Description="Allows Everyone to run digitally signed Windows Installer files."
-      UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions>
-        <FilePublisherCondition PublisherName="*" ProductName="*" BinaryName="*">
-          <BinaryVersionRange LowSection="0.0.0.0" HighSection="*" />
-        </FilePublisherCondition>
-      </Conditions>
-    </FilePublisherRule>
-    <FilePathRule Id="64ad46ff-0d71-4fa0-a30b-3f3d30c5433d"
-      Name="(Default Rule) All Windows Installer files in %systemdrive%\Windows\Installer"
-      Description="Allows Everyone to run Windows Installer files in %systemdrive%\Windows\Installer."
-      UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions><FilePathCondition Path="%WINDIR%\Installer\*" /></Conditions>
-    </FilePathRule>
-  </RuleCollection>
+def _default_policy_xml() -> str:
+    return _read_data("applocker", "default-policy.xml")
 
-  <RuleCollection Type="Appx" EnforcementMode="Enabled">
-    <FilePublisherRule Id="a9e18c21-ff8f-43cf-b9fc-db40eed693ba"
-      Name="(Default Rule) All signed packaged apps"
-      Description="Allows Everyone to run signed packaged apps."
-      UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions>
-        <FilePublisherCondition PublisherName="*" ProductName="*" BinaryName="*">
-          <BinaryVersionRange LowSection="0.0.0.0" HighSection="*" />
-        </FilePublisherCondition>
-      </Conditions>
-    </FilePublisherRule>
-  </RuleCollection>
 
-</AppLockerPolicy>"""
-
-_CLEAR_POLICY_XML = """<AppLockerPolicy Version="1">
-  <RuleCollection Type="Exe" EnforcementMode="NotConfigured" />
-  <RuleCollection Type="Script" EnforcementMode="NotConfigured" />
-  <RuleCollection Type="Msi" EnforcementMode="NotConfigured" />
-  <RuleCollection Type="Appx" EnforcementMode="NotConfigured" />
-</AppLockerPolicy>"""
+def _clear_policy_xml() -> str:
+    return _read_data("applocker", "clear-policy.xml")
 
 # Enable/disable scripts read the policy XML from Z:\ (VirtIO-FS share)
 # to avoid command-line length limits with -EncodedCommand.
@@ -201,7 +125,7 @@ def applocker_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     # Write policy XML to VirtIO-FS share (avoids command-line length limits)
     policy_file = Path(cfg.shared_dir) / ".applocker-policy.xml"
     console.print("[blue][*][/] Applying default AppLocker policy...")
-    policy_file.write_text(_DEFAULT_POLICY_XML, encoding="utf-8")
+    policy_file.write_text(_default_policy_xml(), encoding="utf-8")
     try:
         result = ga.exec_powershell(_SET_POLICY_SCRIPT, timeout=30)
     finally:
@@ -249,7 +173,7 @@ def applocker_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """
     policy_file = Path(cfg.shared_dir) / ".applocker-policy.xml"
     console.print("[blue][*][/] Clearing AppLocker policies...")
-    policy_file.write_text(_CLEAR_POLICY_XML, encoding="utf-8")
+    policy_file.write_text(_clear_policy_xml(), encoding="utf-8")
     try:
         ga.exec_powershell(_DISABLE_APPLY_SCRIPT, timeout=30)
     finally:

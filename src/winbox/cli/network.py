@@ -12,6 +12,7 @@ import click
 
 from winbox import nwfilter
 from winbox.cli import console, ensure_running, _ensure_z_drive
+from winbox.cli._ps import ps_array, render_ps
 from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM, VMState
@@ -234,14 +235,10 @@ def dns_set(ctx: click.Context, ip: str) -> None:
     _validate_ip(ip)
 
     console.print(f"[blue][*][/] Setting DNS to {ip}...")
-    dns_script = (
-        "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
-        "| Select-Object -First 1\n"
-        f"Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex "
-        f"-ServerAddresses {ip}\n"
-        "Clear-DnsClientCache"
+    result = ga.exec_powershell(
+        render_ps("set_dns", servers=ip),
+        timeout=30,
     )
-    result = ga.exec_powershell(dns_script, timeout=30)
     if result.exitcode != 0:
         console.print(f"[red][-][/] Failed: {result.stderr.strip()}")
         raise SystemExit(1)
@@ -282,15 +279,10 @@ def dns_sync(ctx: click.Context) -> None:
 
     ns_joined = ", ".join(nameservers)
     console.print(f"[blue][*][/] Setting DNS to {ns_joined}...")
-    ns_ps_array = ", ".join(f"'{ns}'" for ns in nameservers)
-    dns_script = (
-        "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
-        "| Select-Object -First 1\n"
-        f"Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex "
-        f"-ServerAddresses @({ns_ps_array})\n"
-        "Clear-DnsClientCache"
+    result = ga.exec_powershell(
+        render_ps("set_dns", servers=ps_array(nameservers)),
+        timeout=30,
     )
-    result = ga.exec_powershell(dns_script, timeout=30)
     if result.exitcode != 0:
         console.print(f"[red][-][/] Failed: {result.stderr.strip()}")
         raise SystemExit(1)
@@ -530,14 +522,10 @@ def domain_join(
 
     # Set DNS to domain name server
     console.print(f"[blue][*][/] Setting DNS to {ns_ip}...")
-    dns_script = (
-        "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
-        "| Select-Object -First 1\n"
-        f"Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex "
-        f"-ServerAddresses {ns_ip}\n"
-        "Clear-DnsClientCache"
+    result = ga.exec_powershell(
+        render_ps("set_dns", servers=ns_ip),
+        timeout=30,
     )
-    result = ga.exec_powershell(dns_script, timeout=30)
     if result.exitcode != 0:
         console.print(f"[red][-][/] Failed to set DNS: {result.stderr}")
         raise SystemExit(1)
@@ -644,12 +632,7 @@ def domain_leave(ctx: click.Context) -> None:
 
     # Reset DNS back to DHCP
     console.print("[blue][*][/] Resetting DNS to DHCP...")
-    dns_script = (
-        "$a = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } "
-        "| Select-Object -First 1\n"
-        "Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses"
-    )
-    ga.exec_powershell(dns_script, timeout=15)
+    ga.exec_powershell(render_ps("reset_dns"), timeout=15)
 
     # Reboot
     console.print("[blue][*][/] Rebooting...")

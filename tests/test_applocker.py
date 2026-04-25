@@ -4,10 +4,14 @@ from unittest.mock import patch
 
 from winbox.cli import cli
 from winbox.cli.applocker import (
-    _CLEAR_POLICY_XML,
-    _DEFAULT_POLICY_XML,
+    _clear_policy_xml,
+    _default_policy_xml,
     _STATUS_SCRIPT,
 )
+
+# Module-level constants the tests assert against — reading from disk once.
+_DEFAULT_POLICY_XML = _default_policy_xml()
+_CLEAR_POLICY_XML = _clear_policy_xml()
 from winbox.vm.guest import ExecResult
 
 
