@@ -8,10 +8,10 @@
     <udp srcportstart='67' dstportstart='68'/>
   </rule>
 
-  <!-- Intra-subnet (Kali 192.168.122.1 <-> VM 192.168.122.x). -->
+  <!-- Intra-subnet (rendered from cfg.vm_subnet / cfg.vm_subnet_mask). -->
   <rule action='accept' direction='inout' priority='200'>
-    <ip srcipaddr='192.168.122.0' srcipmask='24'
-        dstipaddr='192.168.122.0' dstipmask='24'/>
+    <ip srcipaddr='{subnet}' srcipmask='{mask}'
+        dstipaddr='{subnet}' dstipmask='{mask}'/>
   </rule>
 
   <!-- Default drop for IPv4. -->

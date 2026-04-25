@@ -1028,7 +1028,7 @@ def net_isolate() -> str:
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
     try:
-        nwfilter.ensure_filter_defined()
+        nwfilter.ensure_filter_defined(cfg)
         changed = nwfilter.attach_filter(vm.name)
     except RuntimeError as e:
         return f"Failed to attach nwfilter: {e}"

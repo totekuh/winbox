@@ -100,11 +100,23 @@ DOMXML_FALLBACK_IFACE = """\
 class TestEnsureFilterDefined:
     def test_defines_both_filters_ipv4_first(self):
         """The root filter references the ipv4 sub-filter, so sub-filter must
-        be defined first or libvirt could reject the reference."""
+        be defined first or libvirt could reject the reference. The ipv4
+        filter is rendered from a template so the path is a tempfile."""
         calls = []
+        rendered_xml = None
 
         def fake_virsh(*args, check=True):
+            nonlocal rendered_xml
             calls.append(args)
+            if args[0] == "nwfilter-define" and args[1].endswith(".xml") and "isolate-ipv4" not in args[1]:
+                # First call's path is a tempfile holding the rendered ipv4 filter.
+                # Second call's path is the bundled root filter.
+                pass
+            if rendered_xml is None and args[0] == "nwfilter-define":
+                try:
+                    rendered_xml = open(args[1]).read()
+                except OSError:
+                    pass
             return _proc(0)
 
         with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
@@ -113,8 +125,39 @@ class TestEnsureFilterDefined:
         assert len(calls) == 2
         assert calls[0][0] == "nwfilter-define"
         assert calls[1][0] == "nwfilter-define"
-        assert calls[0][1].endswith("winbox-isolate-ipv4.xml")
+        # Second call must be the bundled root filter (no rendering).
         assert calls[1][1].endswith("winbox-isolate.xml")
+        # First call must be a rendered tempfile with the ipv4 sub-filter
+        # body containing the configured subnet.
+        assert rendered_xml is not None
+        assert "winbox-isolate-ipv4" in rendered_xml
+        assert "192.168.122.0" in rendered_xml  # default Config.vm_subnet
+        assert "srcipmask='24'" in rendered_xml
+
+    def test_ipv4_filter_picks_up_custom_subnet(self):
+        """If Config.vm_subnet/_mask change, the rendered filter changes too."""
+        from winbox.config import Config
+
+        cfg = Config(vm_subnet="10.0.5.0", vm_subnet_mask=22)
+        rendered_xml = None
+
+        def fake_virsh(*args, check=True):
+            nonlocal rendered_xml
+            if rendered_xml is None and args[0] == "nwfilter-define":
+                try:
+                    rendered_xml = open(args[1]).read()
+                except OSError:
+                    pass
+            return _proc(0)
+
+        with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
+            nwfilter.ensure_filter_defined(cfg)
+
+        assert rendered_xml is not None
+        assert "10.0.5.0" in rendered_xml
+        assert "srcipmask='22'" in rendered_xml
+        # Default subnet must NOT appear
+        assert "192.168.122.0" not in rendered_xml
 
     def test_failure_raises_with_stderr(self):
         with patch("winbox.nwfilter.virsh_run") as mock_virsh:

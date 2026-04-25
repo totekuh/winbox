@@ -21,6 +21,11 @@ class Config:
     vm_cpus: int = 4
     vm_disk: int = 30
     host_ip: str = "192.168.122.1"
+    # libvirt's default network. If you ever change this, the nwfilter
+    # XMLs are rendered from these so isolation continues to allow only
+    # intra-subnet traffic.
+    vm_subnet: str = "192.168.122.0"
+    vm_subnet_mask: int = 24
     winbox_dir: Path = field(default_factory=lambda: Path.home() / ".winbox")
     virtio_iso_url: str = (
         "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/"

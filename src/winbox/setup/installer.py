@@ -632,7 +632,7 @@ def register_nwfilter(cfg: Config) -> None:
 
     console.print(f"[blue][*][/] Registering libvirt nwfilter '{FILTER_NAME}'...")
     try:
-        ensure_filter_defined()
+        ensure_filter_defined(cfg)
         console.print(f"[green][+][/] nwfilter '{FILTER_NAME}' registered")
     except RuntimeError as e:
         console.print(f"[yellow][!][/] Could not register nwfilter: {e}")

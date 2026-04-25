@@ -36,20 +36,56 @@ def _filter_path(filename: str) -> Path:
     return Path(str(importlib.resources.files("winbox.data").joinpath(filename)))
 
 
-def _define_one(filename: str, name: str) -> None:
+def _define_one(filename: str, name: str, render_kwargs: dict | None = None) -> None:
+    """Run ``virsh nwfilter-define`` against a bundled XML.
+
+    If ``render_kwargs`` is given, the XML is treated as a ``str.format``
+    template, rendered to a tempfile, and defined from there. This is how
+    the IPv4 sub-filter picks up the configured subnet without keeping a
+    second copy of ``192.168.122.0`` in ``data/`` that can drift from
+    ``Config.vm_subnet``.
+    """
     path = _filter_path(filename)
-    result = virsh_run("nwfilter-define", str(path), check=False)
+
+    if render_kwargs:
+        body = path.read_text().format(**render_kwargs)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".xml", delete=False, encoding="utf-8",
+        ) as tmp:
+            tmp.write(body)
+            tmp_path = tmp.name
+        try:
+            result = virsh_run("nwfilter-define", tmp_path, check=False)
+        finally:
+            try:
+                Path(tmp_path).unlink()
+            except OSError:
+                pass
+    else:
+        result = virsh_run("nwfilter-define", str(path), check=False)
+
     if result.returncode != 0:
         msg = result.stderr.strip() or result.stdout.strip() or f"virsh exit {result.returncode}"
         raise RuntimeError(f"Failed to define nwfilter '{name}': {msg}")
 
 
-def ensure_filter_defined() -> None:
+def ensure_filter_defined(cfg=None) -> None:
     """Define both libvirt nwfilters. Idempotent (libvirt overwrites on re-define).
 
     Sub-filter is defined first so the root filter's ``<filterref>`` resolves.
+    The IPv4 sub-filter is rendered with ``cfg.vm_subnet`` / ``cfg.vm_subnet_mask``
+    so the allowed range tracks the configured libvirt network. ``cfg`` is
+    optional for backwards compatibility -- when omitted, the package
+    defaults (192.168.122.0/24) are used.
     """
-    _define_one(FILTER_IPV4_XML, FILTER_IPV4_NAME)
+    if cfg is None:
+        from winbox.config import Config
+        cfg = Config()
+
+    _define_one(
+        FILTER_IPV4_XML, FILTER_IPV4_NAME,
+        render_kwargs={"subnet": cfg.vm_subnet, "mask": cfg.vm_subnet_mask},
+    )
     _define_one(FILTER_XML, FILTER_NAME)
 
 

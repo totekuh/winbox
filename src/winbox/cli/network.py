@@ -47,7 +47,7 @@ def net_isolate(ctx: click.Context) -> None:
         raise SystemExit(1)
 
     try:
-        nwfilter.ensure_filter_defined()
+        nwfilter.ensure_filter_defined(cfg)
         changed = nwfilter.attach_filter(vm.name)
     except RuntimeError as e:
         console.print(f"[red][-][/] {e}")
