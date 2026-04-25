@@ -10,6 +10,7 @@ import click
 from winbox import data as _data
 from winbox.cli import console, ensure_running, needs_vm, reboot_and_wait, _ensure_z_drive
 from winbox.config import Config
+from winbox.ps import render_ps
 from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM
 
@@ -25,38 +26,8 @@ def _clear_policy_xml() -> str:
 # to avoid command-line length limits with -EncodedCommand.
 _POLICY_PATH = r"Z:\.applocker-policy.xml"
 
-_SET_POLICY_SCRIPT = r"""
-$xmlPath = '{path}'
-if (-not (Test-Path $xmlPath)) {{
-    Write-Error "Policy file not found: $xmlPath"
-    exit 1
-}}
-Set-AppLockerPolicy -XmlPolicy $xmlPath
-""".format(path=_POLICY_PATH)
-
-_DISABLE_APPLY_SCRIPT = r"""
-$xmlPath = '{path}'
-if (-not (Test-Path $xmlPath)) {{
-    Write-Error "Policy file not found: $xmlPath"
-    exit 1
-}}
-# Clear policy while service is running (service must be up to process the change)
-Set-AppLockerPolicy -XmlPolicy $xmlPath
-Remove-Item $xmlPath -ErrorAction SilentlyContinue
-
-# Restart service so it processes the empty policy and notifies appid.sys
-Restart-Service -Name AppIDSvc -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-
-# Delete compiled rule cache
-Remove-Item 'C:\Windows\System32\AppLocker\*.AppLocker' -Force -ErrorAction SilentlyContinue
-
-# Stop the service
-appidtel.exe stop
-Stop-Service -Name AppIDSvc -Force -ErrorAction SilentlyContinue
-Stop-Service -Name AppIDSvc -Force -ErrorAction SilentlyContinue
-Set-Service -Name AppIDSvc -StartupType Manual -ErrorAction SilentlyContinue
-""".format(path=_POLICY_PATH)
+_SET_POLICY_SCRIPT = render_ps("applocker_apply", path=_POLICY_PATH)
+_DISABLE_APPLY_SCRIPT = render_ps("applocker_clear", path=_POLICY_PATH)
 
 _STATUS_SCRIPT = r"""
 $svc = Get-Service AppIDSvc -ErrorAction SilentlyContinue

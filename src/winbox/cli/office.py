@@ -10,6 +10,7 @@ import click
 from winbox import data as _data
 from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
+from winbox.ps import render_ps
 from winbox.vm import GuestAgent, VM
 
 ODT_URL = "https://officecdn.microsoft.com/pr/wsus/setup.exe"
@@ -60,14 +61,7 @@ def office(cfg: Config, vm: VM, ga: GuestAgent) -> None:
 
         # Enable macros for Word, Excel, PowerPoint
         console.print("[blue][*][/] Enabling macros...")
-        result = ga.exec_powershell("""
-$apps = @('Word', 'Excel', 'PowerPoint')
-foreach ($app in $apps) {
-    $p = "HKCU:\\Software\\Microsoft\\Office\\16.0\\$app\\Security"
-    New-Item -Path $p -Force | Out-Null
-    Set-ItemProperty -Path $p -Name VBAWarnings -Value 1 -Type DWord
-}
-""")
+        result = ga.exec_powershell(render_ps("enable_office_macros"))
         if result.exitcode != 0:
             console.print("[yellow][!][/] Warning: macro registry keys may not have been set")
         else:
