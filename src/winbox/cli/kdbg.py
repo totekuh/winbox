@@ -34,6 +34,7 @@ from winbox.kdbg import (
     read_virt_cr3,
     resolve_nt_base,
 )
+from winbox.kdbg.format import format_struct as _format_struct, format_sym as _format_sym
 from winbox.kdbg.hmp import HmpError, hmp as hmp_call, probe_port
 from winbox.kdbg.walk import list_modules, list_processes
 from winbox.vm import VM, GuestAgent, VMState
@@ -246,29 +247,16 @@ def kdbg_sym(
     """
     cfg: Config = ctx.obj["cfg"]
     store = _get_store(cfg)
-
-    module, sym = store.parse_symbol(name)
     try:
-        if search:
-            hits = store.search(sym, module=module, limit=count)
-            if not hits:
-                console.print(f"[red][-][/] no matches for {name}")
-                raise SystemExit(1)
-            for hit_name, hit_rva in hits:
-                if rva:
-                    console.print(f"{module}!{hit_name} 0x{hit_rva:x}")
-                else:
-                    base = store.load(module).get("base") or 0
-                    console.print(f"{module}!{hit_name} 0x{base + hit_rva:x}")
-            return
-        if rva:
-            value = store.rva(name)
-        else:
-            value = store.resolve(name)
-        console.print(f"{name} 0x{value:x}")
+        lines = _format_sym(store, name, search=search, limit=count, rva=rva)
     except SymbolStoreError as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
+    if not lines:
+        console.print(f"[red][-][/] no matches for {name}")
+        raise SystemExit(1)
+    for line in lines:
+        console.print(line)
 
 
 @kdbg.command("struct")
@@ -292,19 +280,21 @@ def kdbg_struct(
     cfg: Config = ctx.obj["cfg"]
     store = _get_store(cfg)
     try:
-        result = store.struct(type_name, field=field, module=module)
+        lines = _format_struct(store, type_name, field=field, module=module)
     except SymbolStoreError as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
 
-    if field is not None:
-        console.print(f"{module}!{type_name}.{field} off=0x{result['off']:x} type={result.get('type', '')}")
-        return
-
-    size = result.get("size", 0)
-    console.print(f"[bold]{module}!{type_name}[/] size=0x{size:x} ({size})")
-    for fname, fdata in sorted(result.get("fields", {}).items(), key=lambda kv: kv[1]["off"]):
-        console.print(f"  +0x{fdata['off']:04x}  {fname}   [dim]{fdata.get('type','')}[/]")
+    # First line is the header (or single-field summary). Bold it on the
+    # CLI for the layout case so the caller can pick out the size at a
+    # glance; rest passes through verbatim.
+    if field is None and lines:
+        console.print(f"[bold]{lines[0]}[/]")
+        for line in lines[1:]:
+            console.print(line)
+    else:
+        for line in lines:
+            console.print(line)
 
 
 @kdbg.command("ps")

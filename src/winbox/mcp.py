@@ -1860,22 +1860,16 @@ def kdbg_sym(name: str, search: bool = False, limit: int = 16, rva: bool = False
         limit: Max results when searching (default 16).
         rva: Return RVA instead of absolute VA.
     """
+    from winbox.kdbg.format import format_sym
+
     store = _kdbg_get_store()
     try:
-        module, sym = store.parse_symbol(name)
-        if search:
-            hits = store.search(sym, module=module, limit=limit)
-            if not hits:
-                return f"no matches for {name}"
-            if rva:
-                return "\n".join(f"{module}!{n} 0x{r:x}" for n, r in hits)
-            base = store.load(module).get("base") or 0
-            return "\n".join(f"{module}!{n} 0x{base + r:x}" for n, r in hits)
-        if rva:
-            return f"{name} 0x{store.rva(name):x}"
-        return f"{name} 0x{store.resolve(name):x}"
+        lines = format_sym(store, name, search=search, limit=limit, rva=rva)
     except _KdbgStoreError as e:
         return f"error: {e}"
+    if not lines:
+        return f"no matches for {name}"
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -1891,18 +1885,13 @@ def kdbg_struct(type_name: str, field: str = "", module: str = "nt") -> str:
         field: Optional field name to look up by itself.
         module: Module the type lives in (default 'nt').
     """
+    from winbox.kdbg.format import format_struct
+
     store = _kdbg_get_store()
     try:
-        result = store.struct(type_name, field=field or None, module=module)
+        lines = format_struct(store, type_name, field=field or None, module=module)
     except _KdbgStoreError as e:
         return f"error: {e}"
-
-    if field:
-        return f"{module}!{type_name}.{field} off=0x{result['off']:x} type={result.get('type','')}"
-    size = result.get("size", 0)
-    lines = [f"{module}!{type_name} size=0x{size:x} ({size})"]
-    for fname, fdata in sorted(result.get("fields", {}).items(), key=lambda kv: kv[1]["off"]):
-        lines.append(f"  +0x{fdata['off']:04x}  {fname}  {fdata.get('type','')}")
     return "\n".join(lines)
 
 
