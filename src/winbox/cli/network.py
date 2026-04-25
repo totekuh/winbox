@@ -11,7 +11,7 @@ from pathlib import Path
 import click
 
 from winbox import nwfilter
-from winbox.cli import console, ensure_running, _ensure_z_drive
+from winbox.cli import console, ensure_running, reboot_and_wait, _ensure_z_drive
 from winbox.cli._ps import ps_array, render_ps
 from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
@@ -588,22 +588,8 @@ def domain_join(
         raise SystemExit(1)
     console.print(f"[green][+][/] Joined {name}")
 
-    # Reboot to apply
-    console.print("[blue][*][/] Rebooting...")
-    try:
-        ga.exec("shutdown /r /t 0", timeout=10)
-    except Exception:
-        pass  # Expected — VM reboots before we get a response
-
-    time.sleep(10)
-    console.print("[blue][*][/] Waiting for VM to come back...")
-    try:
-        ga.wait(timeout=120)
-        _ensure_z_drive(ga)
-    except GuestAgentError:
-        console.print("[yellow][!][/] Guest agent not responding after reboot")
-        console.print(f"    Check with: virsh console {cfg.vm_name}")
-        raise SystemExit(1)
+    # Reboot to apply the new domain membership.
+    reboot_and_wait(cfg, ga, msg="Rebooting...")
     console.print(f"[green][+][/] VM back up — domain-joined to {name}")
     console.print("    Undo with: [bold]winbox domain leave[/]")
 
@@ -634,22 +620,7 @@ def domain_leave(ctx: click.Context) -> None:
     console.print("[blue][*][/] Resetting DNS to DHCP...")
     ga.exec_powershell(render_ps("reset_dns"), timeout=15)
 
-    # Reboot
-    console.print("[blue][*][/] Rebooting...")
-    try:
-        ga.exec("shutdown /r /t 0", timeout=10)
-    except Exception:
-        pass
-
-    time.sleep(10)
-    console.print("[blue][*][/] Waiting for VM to come back...")
-    try:
-        ga.wait(timeout=120)
-        _ensure_z_drive(ga)
-    except GuestAgentError:
-        console.print("[yellow][!][/] Guest agent not responding after reboot")
-        console.print(f"    Check with: virsh console {cfg.vm_name}")
-        raise SystemExit(1)
+    reboot_and_wait(cfg, ga, msg="Rebooting...")
     console.print("[green][+][/] Domain left — back to workgroup, all files intact")
 
 

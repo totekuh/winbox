@@ -6,7 +6,7 @@ import time
 
 import click
 
-from winbox.cli import console, ensure_running, needs_vm, _ensure_z_drive
+from winbox.cli import console, ensure_running, needs_vm, reboot_and_wait, _ensure_z_drive
 from winbox.config import Config
 from winbox.vm import GuestAgent, GuestAgentError
 from winbox.vm import VM
@@ -171,21 +171,7 @@ def av_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
             raise SystemExit(1)
 
     # Step 2: Reboot — the only way to actually stop the WinDefend service
-    console.print("[blue][*][/] Rebooting VM...")
-    try:
-        ga.exec("shutdown /r /t 0", timeout=10)
-    except Exception:
-        pass  # Expected — VM reboots before we get a response
-
-    time.sleep(10)
-    console.print("[blue][*][/] Waiting for VM to come back...")
-    try:
-        ga.wait(timeout=120)
-        _ensure_z_drive(ga)
-    except GuestAgentError:
-        console.print("[yellow][!][/] Guest agent not responding after reboot")
-        console.print(f"    Check with: virsh console {cfg.vm_name}")
-        raise SystemExit(1)
+    reboot_and_wait(cfg, ga, msg="Rebooting VM...")
 
     console.print("[green][+][/] Defender disabled — service stopped")
 

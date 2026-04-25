@@ -141,6 +141,41 @@ def ensure_running(vm: VM, ga: GuestAgent, cfg: Config) -> None:
     console.print("[green][+][/] VM ready")
 
 
+def reboot_and_wait(
+    cfg: Config,
+    ga: GuestAgent,
+    *,
+    msg: str = "Rebooting VM...",
+    wait_timeout: int = 120,
+) -> None:
+    """Reboot the VM and wait for the guest agent + Z: drive to come back.
+
+    Used by commands that flip kernel-level state (av disable, applocker
+    disable, domain join/leave) where the change only takes effect after
+    a fresh boot. The exact 14-line shape used to be inlined in 4 places;
+    this is the canonical version.
+
+    Raises ``SystemExit(1)`` if the GA never comes back. Callers don't
+    need to wrap.
+    """
+    console.print(f"[blue][*][/] {msg}")
+    try:
+        # Expected to fail mid-call: the VM dies before GA can ACK.
+        ga.exec("shutdown /r /t 0", timeout=10)
+    except Exception:
+        pass
+
+    time.sleep(10)
+    console.print("[blue][*][/] Waiting for VM to come back...")
+    try:
+        ga.wait(timeout=wait_timeout)
+        _ensure_z_drive(ga)
+    except GuestAgentError:
+        console.print("[yellow][!][/] Guest agent not responding after reboot")
+        console.print(f"    Check with: virsh console {cfg.vm_name}")
+        raise SystemExit(1)
+
+
 def _ensure_z_drive(ga: GuestAgent) -> None:
     """Verify the VirtIO-FS Z: drive is accessible (VirtioFsSvc auto-mounts it)."""
     # Kick the service in case it hasn't started yet
