@@ -167,14 +167,34 @@ class TestConfigOverrides:
         assert cfg.vm_name == "winbox"
         assert cfg.vm_ram == 4096
 
-    def test_invalid_int_value_skipped(self, tmp_path):
+    def test_invalid_int_value_skipped(self, tmp_path, caplog):
         config_file = tmp_path / "config"
         config_file.write_text("VM_RAM=not_a_number\nVM_CPUS=8\n")
-        cfg = Config._apply_overrides(Config(), config_file)
+        with caplog.at_level("WARNING", logger="winbox.config"):
+            cfg = Config._apply_overrides(Config(), config_file)
         # Invalid VM_RAM skipped, keeps default
         assert cfg.vm_ram == 4096
         # Valid VM_CPUS applied
         assert cfg.vm_cpus == 8
+        # And the user is warned, not left guessing why their override didn't take.
+        assert any(
+            "VM_RAM" in r.message and "not_a_number" in r.message
+            for r in caplog.records
+        )
+
+    def test_unknown_key_warns(self, tmp_path, caplog):
+        config_file = tmp_path / "config"
+        config_file.write_text("VM_TYPO=foo\n")
+        with caplog.at_level("WARNING", logger="winbox.config"):
+            Config._apply_overrides(Config(), config_file)
+        assert any("unknown config key" in r.message for r in caplog.records)
+
+    def test_malformed_line_warns(self, tmp_path, caplog):
+        config_file = tmp_path / "config"
+        config_file.write_text("VM_RAM 8192\n")  # missing '='
+        with caplog.at_level("WARNING", logger="winbox.config"):
+            Config._apply_overrides(Config(), config_file)
+        assert any("malformed" in r.message for r in caplog.records)
 
     def test_load_without_config_file(self, tmp_path, monkeypatch):
         """Config.load() works even if ~/.winbox/config doesn't exist."""

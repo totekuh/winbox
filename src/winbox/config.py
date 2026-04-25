@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -83,7 +86,12 @@ class Config:
 
     @staticmethod
     def _apply_overrides(cfg: Config, path: Path) -> Config:
-        """Parse shell-style KEY=VALUE config file and apply to config."""
+        """Parse shell-style KEY=VALUE config file and apply to config.
+
+        Malformed lines and unknown keys are reported via ``logger.warning``
+        rather than silently dropped — a typo in ``VM_RAM`` would otherwise
+        leave the user wondering why their override never took effect.
+        """
         mapping = {
             "VM_NAME": "vm_name",
             "VM_USER": "vm_user",
@@ -98,11 +106,15 @@ class Config:
         int_fields = {"vm_ram", "vm_cpus", "vm_disk"}
         path_fields = {"winbox_dir"}
 
-        for line in path.read_text().splitlines():
-            line = line.strip()
+        for lineno, raw in enumerate(path.read_text().splitlines(), start=1):
+            line = raw.strip()
             if not line or line.startswith("#"):
                 continue
             if "=" not in line:
+                logger.warning(
+                    "%s:%d: ignoring malformed line (no '='): %r",
+                    path, lineno, line,
+                )
                 continue
             key, _, value = line.partition("=")
             key = key.strip()
@@ -117,11 +129,19 @@ class Config:
 
             attr = mapping.get(key)
             if attr is None:
+                logger.warning(
+                    "%s:%d: unknown config key %r (known: %s)",
+                    path, lineno, key, ", ".join(sorted(mapping)),
+                )
                 continue
             if attr in int_fields:
                 try:
                     setattr(cfg, attr, int(value))
                 except ValueError:
+                    logger.warning(
+                        "%s:%d: %s expects an integer, got %r — keeping default",
+                        path, lineno, key, value,
+                    )
                     continue
             elif attr in path_fields:
                 setattr(cfg, attr, Path(value))
