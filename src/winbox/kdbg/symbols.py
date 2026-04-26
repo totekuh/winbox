@@ -203,6 +203,7 @@ def load_module(
         symbols=symbols,
         types=types,
         base=base,
+        size_of_image=ref.size_of_image,
     )
     info = store.info(module_name)
     return LoadedModule(
@@ -324,7 +325,7 @@ def ensure_types_loaded(
         return
 
     have.update({name: layout.to_json() for name, layout in layouts.items()})
-    # Re-save preserves base, image, symbols, etc.
+    # Re-save preserves base, image, symbols, size, etc.
     store.save(
         module=data["module"],
         build=data["build"],
@@ -332,4 +333,5 @@ def ensure_types_loaded(
         symbols=data["symbols"],
         types=have,
         base=data.get("base"),
+        size_of_image=data.get("size_of_image"),
     )

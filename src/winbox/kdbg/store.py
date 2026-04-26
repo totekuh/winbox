@@ -88,9 +88,16 @@ class SymbolStore:
         symbols: dict[str, int],
         types: dict[str, dict[str, dict[str, int]]],
         base: int | None = None,
+        size_of_image: int | None = None,
         filename: str | None = None,
     ) -> Path:
-        """Write a module file and register it in the index as current."""
+        """Write a module file and register it in the index as current.
+
+        ``size_of_image`` is from the PE optional header — the in-memory
+        size of the loaded image in bytes (different from on-disk file
+        size; pages are aligned). Used by bt to constrain symbol
+        lookups to the module that actually contains a given VA.
+        """
         if not module:
             raise SymbolStoreError("module name is empty")
         fname = filename or f"{module}_{build}.json"
@@ -99,6 +106,7 @@ class SymbolStore:
             "build": build,
             "image": image,
             "base": base,
+            "size_of_image": size_of_image,
             "symbols": symbols,
             "types": types,
         }

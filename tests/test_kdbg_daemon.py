@@ -224,6 +224,42 @@ def test_bp_list_reflects_added_bps():
     assert len(bps) == 1
     assert bps[0]["target"] == "nt!Foo"
     assert bps[0]["va"] == "0xfffff80608000000"
+    # target_pretty is included even for unmangled names (just equals target)
+    assert "target_pretty" in bps[0]
+
+
+def test_bp_list_includes_demangled_pretty_target():
+    """bp_list now exposes a demangled target_pretty alongside the
+    raw mangled target string."""
+    import shutil as _shutil
+    if _shutil.which("llvm-undname") is None:
+        import pytest
+        pytest.skip("llvm-undname not available on this host")
+
+    rsp = FakeRsp()
+    mangled = "?SaveFile@@YA_NPEAUHWND__@@_NPEBG@Z"
+    store = FakeStore({f"notepad!{mangled}": 0x7ff7b04eeabc})
+    session = _make_session(
+        rsp=rsp, store=store,
+        target=TargetInfo(pid=4584, dtb=0x4d6bb000, name="notepad.exe"),
+    )
+    # Stub install to skip the actual gdbstub dance for user-mode bp.
+    from winbox.kdbg.debugger import daemon as daemon_mod
+    from winbox.kdbg.debugger.install import InstallReport
+    original = daemon_mod.install_user_breakpoint
+    daemon_mod.install_user_breakpoint = lambda *a, **kw: InstallReport(
+        user_va=kw["user_va"], target_dtb=kw["target_dtb"], elapsed=0.001,
+    )
+    try:
+        session.handle_op("bp_add", {"target": f"notepad!{mangled}"})
+        reply = session.handle_op("bp_list", {})
+    finally:
+        daemon_mod.install_user_breakpoint = original
+
+    bp = reply["result"]["bps"][0]
+    assert bp["target"] == f"notepad!{mangled}"
+    assert "SaveFile" in bp["target_pretty"]
+    assert "?" not in bp["target_pretty"]  # demangled form has no leading '?'
 
 
 def test_bp_remove_drops_from_registry_and_calls_z0():
@@ -485,3 +521,89 @@ def test_validate_module_bases_skips_modules_with_no_base():
     })
     # Should not raise — both entries skipped.
     _validate_module_bases(rsp, target_dtb=0x4d6bb000, store=store, target_name="x.exe")
+
+
+# ── _best_symbol_for_va — module-range filtering ────────────────────────
+
+
+class _MultiModuleStore:
+    """Store stand-in with multiple modules at different bases + sizes."""
+
+    def __init__(self, modules: dict[str, dict]) -> None:
+        self._modules = modules
+
+    def list_modules(self):
+        return list(self._modules.keys())
+
+    def load(self, name):
+        return self._modules[name]
+
+
+def test_best_symbol_for_va_filters_by_module_range():
+    """A user32 VA must NOT match an ntdll-only symbol just because
+    ntdll's symbol is the closest <= match overall."""
+    store = _MultiModuleStore({
+        "ntdll": {
+            "base": 0x7fff_8a000000,
+            "size_of_image": 0x200000,  # ntdll spans 0x8a000000..0x8a200000
+            "symbols": {"RtlAllocate": 0x10000},  # at 0x7fff_8a010000
+        },
+        "user32": {
+            "base": 0x7fff_8c000000,
+            "size_of_image": 0x100000,  # user32 spans 0x8c000000..0x8c100000
+            "symbols": {"DispatchMessageW": 0x5000},  # at 0x7fff_8c005000
+        },
+    })
+    session = _make_session(store=store)
+
+    # VA inside user32 — must match user32, NOT ntdll.
+    sym = session._best_symbol_for_va(0x7fff_8c008000)
+    assert sym is not None
+    assert "user32" in sym
+    assert "DispatchMessageW" in sym
+
+
+def test_best_symbol_for_va_returns_none_when_no_module_covers():
+    """Random VA outside every module range — explicit None, no
+    wrong-module guess."""
+    store = _MultiModuleStore({
+        "ntdll": {
+            "base": 0x7fff_8a000000,
+            "size_of_image": 0x100000,
+            "symbols": {"RtlFoo": 0x100},
+        },
+    })
+    session = _make_session(store=store)
+    assert session._best_symbol_for_va(0x1234_5678) is None
+
+
+def test_best_symbol_for_va_uses_legacy_fallback_when_size_missing():
+    """Old store entries without size_of_image fall back to a 16MB
+    coarse range — better than no symbol at all for legacy data."""
+    store = _MultiModuleStore({
+        "legacy_mod": {
+            "base": 0x7fff_8a000000,
+            # size_of_image NOT set
+            "symbols": {"OldSym": 0x1000},
+        },
+    })
+    session = _make_session(store=store)
+    # VA within 16MB of base
+    sym = session._best_symbol_for_va(0x7fff_8a002000)
+    assert sym is not None
+    assert "legacy_mod" in sym
+    assert "OldSym" in sym
+
+
+def test_best_symbol_for_va_respects_legacy_fallback_upper_bound():
+    """Past the 16MB legacy fallback, no match."""
+    store = _MultiModuleStore({
+        "legacy_mod": {
+            "base": 0x7fff_8a000000,
+            "symbols": {"OldSym": 0x100},
+        },
+    })
+    session = _make_session(store=store)
+    # 32 MB past base — outside the 16MB fallback
+    far = 0x7fff_8a000000 + 32 * 1024 * 1024
+    assert session._best_symbol_for_va(far) is None

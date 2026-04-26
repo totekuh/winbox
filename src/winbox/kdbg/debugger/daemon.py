@@ -233,12 +233,14 @@ class DaemonSession:
         }
 
     def op_bp_list(self) -> dict[str, Any]:
+        from winbox.kdbg.demangle import pretty_symbol
         return {
             "bps": [
                 {
                     "id": b.bp_id,
                     "va": f"0x{b.va:x}",
                     "target": b.target,
+                    "target_pretty": pretty_symbol(b.target),
                     "user_mode": b.user_mode,
                     "hits": b.hits,
                     "age_s": round(time.monotonic() - b.installed_at, 2),
@@ -519,13 +521,35 @@ class DaemonSession:
                 b.hits += 1
                 return
 
+    # Fallback span when a module has no recorded SizeOfImage (legacy
+    # store entries from before that field was tracked). 16 MiB is
+    # bigger than any single Windows image in practice, but small
+    # enough that it won't match VAs in unrelated modules.
+    _LEGACY_SIZE_FALLBACK = 16 * 1024 * 1024
+
     def _best_symbol_for_va(self, va: int) -> str | None:
-        """Search every loaded module's symbol map for the closest <= match."""
+        """Find the symbol whose owning module actually contains ``va``.
+
+        Old behaviour was "closest <= symbol from any module" — which
+        produced nonsense like ``ntdll!__guard...+0x3a6e9a376`` for
+        VAs in user32 (just the closest known symbol overall, regardless
+        of which module the VA was in).
+
+        Fix: only consider modules whose ``[base, base+size)`` range
+        contains ``va``. If no module covers it, return None rather
+        than report a wrong-module guess. If a module has no recorded
+        size (legacy store entry), use ``_LEGACY_SIZE_FALLBACK`` as a
+        coarse upper bound.
+
+        Symbol display goes through ``demangle.pretty_symbol`` so
+        mangled C++ names render as readable signatures.
+        """
+        from winbox.kdbg.demangle import pretty_symbol
         try:
             modules = self.store.list_modules()
         except Exception:
             return None
-        best: tuple[str, int, int] | None = None
+        best: tuple[str, str, int] | None = None
         for module in modules:
             try:
                 data = self.store.load(module)
@@ -534,15 +558,28 @@ class DaemonSession:
             base = data.get("base") or 0
             if not base:
                 continue
+            size = data.get("size_of_image") or self._LEGACY_SIZE_FALLBACK
+            # Filter: this module actually contains the VA?
+            if not (base <= va < base + size):
+                continue
             symbols = data.get("symbols", {})
+            local_best: tuple[str, int] | None = None
             for name, rva in symbols.items():
                 target = base + rva
-                if target <= va and (best is None or target > best[2]):
-                    best = (module, name, target)
+                if target <= va and (local_best is None or target > local_best[1]):
+                    local_best = (name, target)
+            if local_best is None:
+                continue
+            # Among modules that contain the VA, pick the one with the
+            # closest symbol. (In practice the VA is in exactly one
+            # module's range; this only matters for overlapping ranges
+            # which shouldn't happen but cheap to handle.)
+            if best is None or local_best[1] > best[2]:
+                best = (module, local_best[0], local_best[1])
         if best is None:
             return None
         module, name, addr = best
-        return f"{module}!{name}+0x{va - addr:x}"
+        return f"{pretty_symbol(f'{module}!{name}')}+0x{va - addr:x}"
 
     # ── serve loop ──────────────────────────────────────────────────────
 
