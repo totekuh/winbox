@@ -14,6 +14,15 @@ KdDebuggerEnabled, IsDebuggerPresent, NtQueryInformationProcess).
 
 from __future__ import annotations
 
+from winbox.kdbg.debugger.client import ClientError, DaemonClient
+from winbox.kdbg.debugger.daemon import (
+    DaemonError,
+    DaemonSession,
+    fork_daemon,
+    lock_path,
+    session_path,
+    sock_path,
+)
 from winbox.kdbg.debugger.install import (
     InstallError,
     InstallReport,
@@ -26,10 +35,18 @@ from winbox.kdbg.debugger.rsp import (
 )
 
 __all__ = [
+    "ClientError",
+    "DaemonClient",
+    "DaemonError",
+    "DaemonSession",
     "InstallError",
     "InstallReport",
     "RspClient",
     "RspError",
     "StopReply",
+    "fork_daemon",
     "install_user_breakpoint",
+    "lock_path",
+    "session_path",
+    "sock_path",
 ]

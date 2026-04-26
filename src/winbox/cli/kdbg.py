@@ -39,9 +39,13 @@ from winbox.kdbg import (
     resolve_nt_base,
 )
 from winbox.kdbg.debugger import (
+    ClientError,
+    DaemonClient,
+    DaemonError,
     InstallError,
     RspClient,
     RspError,
+    fork_daemon,
     install_user_breakpoint,
 )
 from winbox.kdbg.format import format_struct as _format_struct, format_sym as _format_sym
@@ -672,6 +676,370 @@ def kdbg_user_bp(
         console.print("\n[green][+][/] detaching, leaving VM running")
     finally:
         cli.close()
+
+
+# ── daemon-backed interactive debugger ────────────────────────────────
+
+
+def _client(cfg: Config) -> DaemonClient:
+    return DaemonClient(cfg)
+
+
+def _print_stop(reason: str, info: dict) -> None:
+    """Render a stop summary returned by cont/step."""
+    if reason == "timeout":
+        console.print("[yellow][!][/] cont timed out (no hit in target)")
+        return
+    if reason == "interrupt":
+        console.print("[yellow][!][/] interrupted")
+    elif reason == "step":
+        console.print("[dim]stepped[/]")
+    elif reason == "bp":
+        bp_id = info.get("bp_id")
+        target = info.get("bp_target")
+        tag = f" [bold green](bp #{bp_id} {target})[/]" if bp_id is not None else ""
+        console.print(f"[green][+][/] HIT in target{tag}")
+    elif reason == "signal":
+        console.print(f"[yellow][!][/] signal {info.get('signal', '?')}")
+    if "rip" in info:
+        console.print(f"    vCPU={info['vcpu']} RIP={info['rip']} CR3={info['cr3']}")
+
+
+@kdbg.command("attach")
+@click.argument("pid", type=int)
+@click.option("--port", default=1234, show_default=True,
+              help="gdbstub port the daemon will connect to.")
+@click.pass_context
+def kdbg_attach(ctx: click.Context, pid: int, port: int) -> None:
+    """Attach a kdbg debugging session to PID via the gdbstub.
+
+    Forks a daemon that holds the gdb connection alive across CLI
+    invocations. Subsequent ``winbox kdbg bp / cont / regs / mem / bt
+    / detach`` commands talk to it via Unix socket. Only one session
+    can be active at a time (enforced by an fcntl lock).
+
+    Requires:
+      - VM running, gdbstub started (``winbox kdbg start``)
+      - nt symbols loaded (``winbox kdbg symbols``)
+    """
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    if vm.state() != VMState.RUNNING:
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+    if not probe_port("127.0.0.1", port):
+        console.print(f"[red][-][/] gdbstub not listening on 127.0.0.1:{port}")
+        console.print("    run [bold]winbox kdbg start[/] first")
+        raise SystemExit(1)
+
+    client = _client(cfg)
+    if client.session_alive():
+        info = client.session_info() or {}
+        console.print(
+            f"[red][-][/] another session is active "
+            f"(target {info.get('target_name', '?')}({info.get('target_pid', '?')}), "
+            f"daemon pid {info.get('daemon_pid', '?')}). "
+            f"Run [bold]winbox kdbg detach[/] first."
+        )
+        raise SystemExit(1)
+
+    try:
+        daemon_pid = fork_daemon(cfg, pid, gdbstub_port=port)
+    except DaemonError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+    # Daemon wrote session.json before signalling OK; safe to read now.
+    info = client.session_info() or {}
+    console.print(
+        f"[green][+][/] attached to {info.get('target_name', f'pid={pid}')}"
+        f"({info.get('target_pid', pid)}) "
+        f"dtb={info.get('target_dtb', '?')}  "
+        f"daemon_pid={daemon_pid}"
+    )
+    console.print(f"    [dim]bp / cont / regs / mem / stack / bt / detach[/]")
+
+
+@kdbg.command("session")
+@click.pass_context
+def kdbg_session(ctx: click.Context) -> None:
+    """Show current daemon session info, or 'no session' if none."""
+    cfg: Config = ctx.obj["cfg"]
+    client = _client(cfg)
+    if not client.session_alive():
+        console.print("[dim]no kdbg session attached[/]")
+        return
+    try:
+        result = client.call("status")
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    t = result["target"]
+    console.print(
+        f"[green][+][/] {t['name']}({t['pid']})  dtb={t['dtb']}  "
+        f"bps={result['bps']}  halted={result['halted']}  "
+        f"uptime={result['uptime_s']:.1f}s  daemon_pid={result['daemon_pid']}"
+    )
+
+
+@kdbg.command("bp")
+@click.argument("target", metavar="VA_OR_SYMBOL")
+@click.pass_context
+def kdbg_bp(ctx: click.Context, target: str) -> None:
+    """Install a bp at TARGET (hex VA or ``module!symbol``)."""
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        result = _client(cfg).call("bp_add", target=target)
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    mode = "user" if result["user_mode"] else "kernel"
+    console.print(
+        f"[green][+][/] bp #{result['id']} at {result['va']} "
+        f"({mode}-mode, {result['elapsed_ms']:.1f}ms)"
+    )
+
+
+@kdbg.command("bps")
+@click.pass_context
+def kdbg_bps(ctx: click.Context) -> None:
+    """List installed breakpoints."""
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        result = _client(cfg).call("bp_list")
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    bps = result.get("bps", [])
+    if not bps:
+        console.print("[dim](no bps)[/]")
+        return
+    console.print("[dim]  id  VA                 hits  age      target[/]")
+    for b in bps:
+        console.print(
+            f"  {b['id']:2d}  {b['va']:18s} {b['hits']:5d}  "
+            f"{b['age_s']:6.1f}s  {b['target']}"
+        )
+
+
+@kdbg.command("rm")
+@click.argument("bp_id", type=int)
+@click.pass_context
+def kdbg_rm(ctx: click.Context, bp_id: int) -> None:
+    """Remove bp by id."""
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        result = _client(cfg).call("bp_remove", id=bp_id)
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    console.print(f"[green][+][/] removed bp #{result['removed']} ({result['va']})")
+
+
+@kdbg.command("cont")
+@click.option("--timeout", default=30.0, show_default=True, type=float,
+              help="Wall-clock cap before returning 'timeout'.")
+@click.pass_context
+def kdbg_cont(ctx: click.Context, timeout: float) -> None:
+    """Resume the VM. Blocks until next bp hit in target's CR3."""
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        result = _client(cfg).call(
+            "cont",
+            sock_timeout=float(timeout) + 10.0,
+            timeout=float(timeout),
+        )
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    _print_stop(result.get("reason", "?"), result)
+
+
+@kdbg.command("step")
+@click.pass_context
+def kdbg_step(ctx: click.Context) -> None:
+    """Single-step the firing vCPU once."""
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        result = _client(cfg).call("step")
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    _print_stop(result.get("reason", "step"), result)
+
+
+@kdbg.command("interrupt")
+@click.pass_context
+def kdbg_interrupt(ctx: click.Context) -> None:
+    """Async halt the running target (use during a stuck cont)."""
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        _client(cfg).call("interrupt")
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    console.print("[dim]interrupt queued[/]")
+
+
+@kdbg.command("regs")
+@click.pass_context
+def kdbg_regs(ctx: click.Context) -> None:
+    """Dump current register state."""
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        result = _client(cfg).call("regs")
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    order = ["rip", "rsp", "rbp", "rax", "rbx", "rcx", "rdx",
+             "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+             "eflags", "cs", "cr0", "cr2", "cr3", "cr4"]
+    for k in order:
+        if k in result:
+            console.print(f"  {k.upper():6s}= {result[k]}")
+
+
+@kdbg.command("mem")
+@click.argument("address", metavar="VA")
+@click.argument("length", type=int, default=64)
+@click.pass_context
+def kdbg_mem(ctx: click.Context, address: str, length: int) -> None:
+    """Read LENGTH bytes at VA in target's address space."""
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        result = _client(cfg).call("mem", va=address, length=length)
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    raw = bytes.fromhex(result["bytes"])
+    base = int(result["va"], 16)
+    for i in range(0, len(raw), 16):
+        chunk = raw[i:i + 16]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        console.print(f"  0x{base + i:016x}  {hex_part:<48}  {ascii_part}")
+
+
+@kdbg.command("stack")
+@click.argument("n", type=int, default=16)
+@click.pass_context
+def kdbg_stack(ctx: click.Context, n: int) -> None:
+    """Show N qwords starting at RSP."""
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        result = _client(cfg).call("stack", n=n)
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    console.print(f"[dim]RSP = {result['rsp']}[/]")
+    rsp_val = int(result['rsp'], 16)
+    for i, qw in enumerate(result["qwords"]):
+        offset = i * 8
+        console.print(f"  rsp+0x{offset:02x}: {qw}")
+
+
+@kdbg.command("bt")
+@click.option("-n", "--depth", type=int, default=8, show_default=True)
+@click.pass_context
+def kdbg_bt(ctx: click.Context, depth: int) -> None:
+    """Crude stack walk; symbolicate likely return addresses."""
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        result = _client(cfg).call("bt", depth=depth)
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    frames = result.get("frames", [])
+    if not frames:
+        console.print("[dim](no candidate code addresses near RSP)[/]")
+        return
+    console.print(f"[dim]RSP = {result['rsp']}[/]")
+    for f in frames:
+        sym = f.get("sym") or "?"
+        console.print(f"  {f['stack_off']:6s}  {f['addr']}  {sym}")
+
+
+@kdbg.command("detach")
+@click.pass_context
+def kdbg_detach(ctx: click.Context) -> None:
+    """Tear down the kdbg session (removes bps, resumes VM, releases lock)."""
+    cfg: Config = ctx.obj["cfg"]
+    client = _client(cfg)
+    if not client.session_alive():
+        console.print("[dim]no kdbg session attached[/]")
+        return
+    try:
+        client.call("detach")
+    except ClientError as e:
+        console.print(f"[yellow][!][/] {e}")
+    # Daemon should exit shortly. Wait briefly for the lock to release.
+    import time as _t
+    deadline = _t.monotonic() + 5.0
+    while _t.monotonic() < deadline:
+        if not client.session_alive():
+            console.print("[green][+][/] detached")
+            return
+        _t.sleep(0.1)
+    console.print("[yellow][!][/] daemon didn't exit within 5s; lock may be stale")
+
+
+@kdbg.command("resume")
+@click.option("--port", default=1234, show_default=True,
+              help="gdbstub port to talk through.")
+@click.pass_context
+def kdbg_resume(ctx: click.Context, port: int) -> None:
+    """Resume a VM stuck in 'paused (debug)' state.
+
+    Recovery valve for when a daemon crashed mid-session or a script
+    bailed without cleaning up. Connects briefly to the gdbstub, sends
+    'continue' + 'detach' so QEMU's gdb_continue() runs and the VM
+    resumes execution. Safe to run if VM is already running (no-op).
+    """
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    state = vm.state()
+
+    if state != VMState.RUNNING and state != VMState.PAUSED:
+        console.print(f"[yellow][!][/] VM state is {state.value}; nothing to do")
+        return
+
+    if not probe_port("127.0.0.1", port):
+        console.print(f"[red][-][/] gdbstub not listening on 127.0.0.1:{port}")
+        console.print("    if VM is paused but gdbstub is gone, try [bold]virsh resume winbox[/]")
+        raise SystemExit(1)
+
+    # Check if a daemon already holds the session — if so, defer to it.
+    client = DaemonClient(cfg)
+    if client.session_alive():
+        console.print(
+            "[yellow][!][/] a kdbg session is active; "
+            "use [bold]winbox kdbg detach[/] to tear it down cleanly"
+        )
+        raise SystemExit(1)
+
+    try:
+        c = RspClient.connect("127.0.0.1", port, timeout=5)
+    except (OSError, RspError) as e:
+        console.print(f"[red][-][/] gdbstub connect failed: {e}")
+        raise SystemExit(1)
+    try:
+        c.handshake()
+        sr = c.query_halt_reason()
+        if sr.signal != 0 and state == VMState.RUNNING:
+            console.print(f"[dim]VM was running; gdb halted it on attach (signal={sr.signal})[/]")
+        c.cont()
+    finally:
+        # close() does interrupt+detach which leaves VM running.
+        c.close()
+
+    # Verify
+    import time as _t
+    _t.sleep(0.3)
+    final = vm.state()
+    if final == VMState.RUNNING:
+        console.print(f"[green][+][/] VM resumed")
+    else:
+        console.print(f"[yellow][!][/] VM state after release: {final.value}")
 
 
 @kdbg.command("base")
