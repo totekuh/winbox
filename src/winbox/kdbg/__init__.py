@@ -31,6 +31,10 @@ from winbox.kdbg.store import ModuleInfo, SymbolStore, SymbolStoreError
 from winbox.kdbg.symbols import (
     LoadedModule,
     SymbolLoadError,
+    cached_pdb_path,
+    copy_user_module,
+    ensure_types_loaded,
+    load_module,
     load_nt,
     resolve_nt_base,
 )
@@ -46,8 +50,12 @@ __all__ = [
     "WalkCache",
     "build_symbol_map",
     "build_type_map",
+    "cached_pdb_path",
+    "copy_user_module",
+    "ensure_types_loaded",
     "fetch_pdb",
     "hmp",
+    "load_module",
     "load_nt",
     "load_publics",
     "load_section_headers",

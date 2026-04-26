@@ -1798,9 +1798,13 @@ def kdbg_status(port: int = 1234) -> str:
 # numbers, never the full table (30k+ entries would blow the context).
 
 from winbox.kdbg import (
+    SymbolLoadError as _KdbgSymbolLoadError,
     SymbolStore as _KdbgStore,
     SymbolStoreError as _KdbgStoreError,
     WalkCache as _KdbgWalkCache,
+    copy_user_module as _kdbg_copy_user_module,
+    ensure_types_loaded as _kdbg_ensure_types_loaded,
+    load_module as _kdbg_load_module,
     load_nt as _kdbg_load_nt,
     read_virt_cr3 as _kdbg_read_virt_cr3,
     resolve_nt_base as _kdbg_resolve_nt_base,
@@ -1808,6 +1812,7 @@ from winbox.kdbg import (
 from winbox.kdbg.hmp import HmpError as _KdbgHmpError
 from winbox.kdbg.walk import list_modules as _kdbg_list_modules
 from winbox.kdbg.walk import list_processes as _kdbg_list_processes
+from winbox.kdbg.walk import list_user_modules as _kdbg_list_user_modules
 
 
 def _kdbg_get_store() -> _KdbgStore:
@@ -1938,6 +1943,122 @@ def kdbg_lm() -> str:
         for m in mods
     ]
     return _json.dumps(out, indent=2)
+
+
+@mcp.tool()
+def kdbg_user_lm(pid: int) -> str:
+    """Walk PEB.Ldr and return all user-mode modules in ``pid``.
+
+    The user-space mirror of ``kdbg_lm``. Shows the EXE plus every DLL
+    Windows mapped into the target's address space, in load order.
+
+    Returns a JSON array of ``{base, size, name, full_path}``. ``base``
+    is a *user* VA in the target's address space and is only meaningful
+    against that process's CR3 — pair with ``kdbg_read_va`` to read
+    bytes out of a specific module.
+
+    First call after a fresh VM auto-extracts the PEB struct layouts
+    from the cached PDB if they're missing — no kdbg_symbols_load
+    re-run needed.
+
+    Args:
+        pid: Target process ID (must be in kdbg_ps output).
+    """
+    cfg, vm, ga = _ensure_vm_ready()
+    store = _kdbg_get_store()
+    try:
+        _kdbg_ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
+    except (_KdbgStoreError, _KdbgSymbolLoadError) as e:
+        return f"error: {e}"
+
+    cache = _KdbgWalkCache()
+    try:
+        procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
+    except (_KdbgStoreError, _KdbgHmpError) as e:
+        return f"error: {e}"
+    target = next((p for p in procs if p.pid == pid), None)
+    if target is None:
+        return f"pid {pid} not found"
+
+    try:
+        mods = _kdbg_list_user_modules(cfg.vm_name, store, target, cache=cache)
+    except (_KdbgStoreError, _KdbgHmpError) as e:
+        return f"error: {e}"
+    out = [
+        {
+            "base": f"0x{m.base:016x}",
+            "size": f"0x{m.size:08x}",
+            "name": m.name,
+            "full_path": m.full_path,
+        }
+        for m in mods
+    ]
+    return _json.dumps(out, indent=2)
+
+
+@mcp.tool()
+def kdbg_user_symbols_load(pid: int, module: str) -> str:
+    """Load PDB symbols for a user-mode module in ``pid``.
+
+    Pulls the binary out of the VM via VirtIO-FS, fetches the matching
+    PDB from msdl, persists it under a short module name (e.g.
+    ``notepad`` for notepad.exe). Subsequent ``kdbg_sym`` calls with
+    ``<short>!<symbol>`` resolve against this store.
+
+    Args:
+        pid: Target process ID (must be in kdbg_ps output).
+        module: Substring matched against PEB.Ldr BaseDllName, then
+            FullDllName. Examples: 'notepad.exe', 'ntdll', 'kernelbase'.
+
+    Returns a one-line summary on success, error string otherwise.
+    """
+    cfg, vm, ga = _ensure_vm_ready()
+    store = _kdbg_get_store()
+    try:
+        _kdbg_ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
+    except (_KdbgStoreError, _KdbgSymbolLoadError) as e:
+        return f"error: {e}"
+
+    cache = _KdbgWalkCache()
+    try:
+        procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
+    except (_KdbgStoreError, _KdbgHmpError) as e:
+        return f"error: {e}"
+    target = next((p for p in procs if p.pid == pid), None)
+    if target is None:
+        return f"pid {pid} not found"
+
+    try:
+        mods = _kdbg_list_user_modules(cfg.vm_name, store, target, cache=cache)
+    except (_KdbgStoreError, _KdbgHmpError) as e:
+        return f"error: {e}"
+
+    needle = module.lower()
+    match = next((m for m in mods if needle in m.name.lower()), None)
+    if match is None:
+        match = next((m for m in mods if needle in m.full_path.lower()), None)
+    if match is None:
+        return f"no module matching {module!r} in pid {pid}"
+
+    short_name = match.name.rsplit(".", 1)[0].lower()
+    cached_basename = match.name
+
+    try:
+        pe_path = _kdbg_copy_user_module(cfg, ga, match.full_path, cached_basename)
+        info = _kdbg_load_module(
+            cfg, store,
+            pe_path=pe_path,
+            module_name=short_name,
+            base=match.base,
+            wanted_types=(),
+        )
+    except (_KdbgSymbolLoadError, _KdbgStoreError) as e:
+        return f"error: {e}"
+
+    return (
+        f"{short_name} {info.build}: {info.symbol_count} symbols, "
+        f"base=0x{info.base:x}"
+    )
 
 
 @mcp.tool()

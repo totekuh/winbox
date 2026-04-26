@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
 MAX_PROCESSES = 4096
 MAX_MODULES = 1024
+MAX_USER_MODULES = 1024
 
 
 @dataclass
@@ -57,6 +58,23 @@ class ModuleRecord:
     base: int               # DllBase
     size: int               # SizeOfImage
     entry: int              # VA of the KLDR_DATA_TABLE_ENTRY
+
+
+@dataclass
+class UserModuleRecord:
+    """A loaded user-mode module discovered via PEB.Ldr.
+
+    ``base`` is a *user* VA in the target process's address space (only
+    valid against ``directory_table_base`` of the target). ``full_path``
+    is the FullDllName from LDR_DATA_TABLE_ENTRY — useful for locating
+    the binary on disk inside the VM.
+    """
+
+    name: str
+    base: int               # DllBase (user VA in target's address space)
+    size: int               # SizeOfImage
+    full_path: str          # FullDllName, e.g. "C:\\Windows\\System32\\ntdll.dll"
+    entry: int              # VA of the LDR_DATA_TABLE_ENTRY
 
 
 # ── Shared helpers ──────────────────────────────────────────────────────
@@ -230,5 +248,119 @@ def list_modules(
         logger.warning(
             "list_modules: hit MAX_MODULES=%d cap; result is truncated",
             MAX_MODULES,
+        )
+    return results
+
+
+# ── User-mode module list (PEB.Ldr walker) ──────────────────────────────
+
+
+def list_user_modules(
+    vm_name: str,
+    store: SymbolStore,
+    target: ProcessRecord,
+    *,
+    cache: WalkCache | None = None,
+) -> list[UserModuleRecord]:
+    """Walk PEB.Ldr.InLoadOrderModuleList for ``target``.
+
+    Reads the user-mode loader's view of mapped PE images: the EXE plus
+    every loaded DLL, in the order Windows mapped them. Mirrors
+    ``list_modules`` but lives in user space — every read uses the
+    target's CR3 (``target.directory_table_base``).
+
+    The list head sits inside PEB.Ldr (a kernel-allocated PEB_LDR_DATA
+    struct that's mapped read-write into the target's user space).
+
+    x86-64 only. WoW64 (32-bit-on-64-bit) processes have a separate
+    32-bit Ldr at PEB.Wow64Process — not handled here yet; for those
+    processes this walker will return the 64-bit DLLs only (ntdll.dll,
+    wow64.dll, etc.), not the 32-bit ones.
+    """
+    if cache is None:
+        cache = WalkCache()
+    target_cr3 = target.directory_table_base
+
+    # Resolve struct offsets up-front so failures surface as a clear
+    # SymbolStoreError (caller can hint the user to re-run kdbg symbols)
+    # instead of a mid-walk read fault.
+    eproc_fields = store.struct("_EPROCESS")["fields"]
+    peb_off = eproc_fields["Peb"]["off"]
+
+    peb_fields = store.struct("_PEB")["fields"]
+    ldr_field_off = peb_fields["Ldr"]["off"]
+
+    ldrdata_fields = store.struct("_PEB_LDR_DATA")["fields"]
+    inload_head_off = ldrdata_fields["InLoadOrderModuleList"]["off"]
+
+    ldr_fields = store.struct("_LDR_DATA_TABLE_ENTRY")["fields"]
+    inload_off = ldr_fields.get("InLoadOrderLinks", {}).get("off", 0)
+    dll_base_off = ldr_fields["DllBase"]["off"]
+    size_off = ldr_fields["SizeOfImage"]["off"]
+    base_name_off = ldr_fields["BaseDllName"]["off"]
+    full_name_off = ldr_fields["FullDllName"]["off"]
+
+    # EPROCESS lives in the kernel half of the address space (mapped in
+    # every CR3), so reading EPROCESS.Peb works regardless of which
+    # process is currently on-CPU. The Peb pointer itself is a *user*
+    # VA — only valid against the target's CR3.
+    peb_va = _read_u64(vm_name, target_cr3, target.eprocess + peb_off, cache)
+    if peb_va == 0:
+        # System idle, kernel-only processes (System, Registry) have no PEB.
+        return []
+
+    # PEB.Ldr is a user VA pointing at PEB_LDR_DATA. Empty Ldr means the
+    # process is mid-tear-down or hasn't finished initial loader setup.
+    ldr_va = _read_u64(vm_name, target_cr3, peb_va + ldr_field_off, cache)
+    if ldr_va == 0:
+        return []
+
+    head = ldr_va + inload_head_off
+    # Flink of the list head points at the first entry's InLoadOrderLinks.
+    try:
+        flink = _read_u64(vm_name, target_cr3, head, cache)
+    except (HmpError, PageWalkError) as e:
+        logger.warning(
+            "list_user_modules: could not read PEB.Ldr list head for pid %d: %s",
+            target.pid, e,
+        )
+        return []
+
+    results: list[UserModuleRecord] = []
+    seen: set[int] = set()
+    while flink != head and flink != 0 and len(results) < MAX_USER_MODULES:
+        if flink in seen:
+            break
+        seen.add(flink)
+        entry = flink - inload_off
+        try:
+            base = _read_u64(vm_name, target_cr3, entry + dll_base_off, cache)
+            size = _read_u32(vm_name, target_cr3, entry + size_off, cache)
+            name = _read_unicode_string(
+                vm_name, target_cr3, entry + base_name_off, store, cache,
+            )
+            full = _read_unicode_string(
+                vm_name, target_cr3, entry + full_name_off, store, cache,
+            )
+        except (HmpError, PageWalkError) as e:
+            # Mid-walk page fault is normal during teardown / paging;
+            # log and return what we have rather than raise.
+            logger.warning(
+                "list_user_modules: walk truncated at LDR_DATA_TABLE_ENTRY 0x%x "
+                "in pid %d (%d returned): %s",
+                entry, target.pid, len(results), e,
+            )
+            break
+        # Skip entries with a zero base — those are placeholder ldr
+        # entries Windows leaves around for unloaded modules.
+        if base != 0:
+            results.append(UserModuleRecord(
+                name=name, base=base, size=size, full_path=full, entry=entry,
+            ))
+        flink = _read_u64(vm_name, target_cr3, flink, cache)
+    if len(results) >= MAX_USER_MODULES:
+        logger.warning(
+            "list_user_modules: hit MAX_USER_MODULES=%d cap; result is truncated",
+            MAX_USER_MODULES,
         )
     return results

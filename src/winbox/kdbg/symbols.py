@@ -1,8 +1,15 @@
 """End-to-end symbol-load orchestrator.
 
-``load_nt`` ties PE parsing, PDB fetch, llvm-pdbutil extraction, and base
-resolution together. The caller is the only place that talks to the VM
-(to copy ntoskrnl.exe out) and to the store (to persist the result).
+The high-level entry point is ``load_module``: copy a Windows PE out of
+the running guest via VirtIO-FS, fetch its CodeView-referenced PDB from
+msdl, parse with llvm-pdbutil, and persist into ``SymbolStore``. The
+``load_nt`` wrapper layers on the kernel-specific base resolution (via
+the live IDT[0] handler).
+
+For per-process user-mode loads, ``copy_user_module`` extracts a binary
+out of an arbitrary process's address space — the binary on disk is
+authoritative for symbol lookup, the in-VM module base is recorded
+separately by the caller (``walk_user_modules``).
 """
 
 from __future__ import annotations
@@ -10,13 +17,19 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from winbox.kdbg.hmp import HmpError, read_cpu_state
 from winbox.kdbg.memory import read_virt_current
-from winbox.kdbg.pdb import build_type_map, load_publics, load_section_headers
-from winbox.kdbg.pe import fetch_pdb, read_pdb_ref
-from winbox.kdbg.store import SymbolStore
+from winbox.kdbg.pdb import (
+    NT_DEFAULT_TYPES,
+    build_type_map,
+    load_publics,
+    load_section_headers,
+    load_types,
+)
+from winbox.kdbg.pe import fetch_pdb, pdb_cache_path, read_pdb_ref
+from winbox.kdbg.store import SymbolStore, SymbolStoreError
 
 if TYPE_CHECKING:
     from winbox.config import Config
@@ -39,39 +52,72 @@ class LoadedModule:
     type_count: int
 
 
-# ── nt loader ───────────────────────────────────────────────────────────
+# ── Binary copy helpers ─────────────────────────────────────────────────
 
 
-def copy_ntoskrnl(cfg: Config, ga: GuestAgent) -> Path:
-    """Copy ``C:\\Windows\\System32\\ntoskrnl.exe`` out via VirtIO-FS.
+def _copy_via_share(
+    cfg: Config,
+    ga: GuestAgent,
+    src_in_vm: str,
+    cached_name: str,
+) -> Path:
+    """Copy a file out of the VM via the VirtIO-FS share.
 
-    The file lands on the shared Z: drive briefly, is copied into the
-    cache next to the PDB, and the staging copy on the share is removed.
+    Stages at ``Z:\\<basename>``, copies into ``cfg.symbols_dir``, removes
+    the staging copy. Raises ``SymbolLoadError`` if the in-VM Copy-Item
+    fails or the staged file never appears.
     """
     cfg.symbols_dir.mkdir(parents=True, exist_ok=True)
-    cached = cfg.symbols_dir / "ntoskrnl.exe"
+    cached = cfg.symbols_dir / cached_name
 
     cfg.shared_dir.mkdir(parents=True, exist_ok=True)
-    staging = cfg.shared_dir / "ntoskrnl.exe"
+    # Use a unique staging name — concurrent module loads (e.g. parallel
+    # MCP calls) on the same VM share would otherwise race on the basename.
+    staging = cfg.shared_dir / cached_name
+    src_basename = src_in_vm.rsplit("\\", 1)[-1]
+    staging_in_vm = f"Z:\\{cached_name}"
 
     try:
         result = ga.exec_powershell(
-            r"Copy-Item -Force C:\Windows\System32\ntoskrnl.exe Z:\ntoskrnl.exe",
+            f"Copy-Item -Force '{src_in_vm}' '{staging_in_vm}'",
             timeout=60,
         )
         if result.exitcode != 0:
             raise SymbolLoadError(
-                f"Copy-Item ntoskrnl.exe failed: {result.stderr or result.stdout}"
+                f"Copy-Item {src_basename} failed: {result.stderr or result.stdout}"
             )
         if not staging.exists():
             raise SymbolLoadError(
-                "ntoskrnl.exe did not appear on the share after Copy-Item"
+                f"{src_basename} did not appear on the share after Copy-Item"
             )
         shutil.copy2(staging, cached)
     finally:
         staging.unlink(missing_ok=True)
 
     return cached
+
+
+def copy_ntoskrnl(cfg: Config, ga: GuestAgent) -> Path:
+    """Copy ``C:\\Windows\\System32\\ntoskrnl.exe`` into the symbol cache."""
+    return _copy_via_share(cfg, ga, r"C:\Windows\System32\ntoskrnl.exe", "ntoskrnl.exe")
+
+
+def copy_user_module(
+    cfg: Config,
+    ga: GuestAgent,
+    vm_path: str,
+    cached_name: str,
+) -> Path:
+    """Copy any user-mode binary out of the VM into the symbol cache.
+
+    ``vm_path`` is the absolute Windows path (e.g.
+    ``C:\\Windows\\System32\\notepad.exe``). ``cached_name`` is the
+    filename to store under (e.g. ``notepad.exe``).
+    """
+    return _copy_via_share(cfg, ga, vm_path, cached_name)
+
+
+# ── nt-specific base resolver ───────────────────────────────────────────
 
 
 def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
@@ -106,7 +152,6 @@ def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
         )
 
     base = handler - rva
-    # Sanity: kernel base is canonical-high, page-aligned.
     if base & 0xFFF:
         raise SymbolLoadError(
             f"computed nt base 0x{base:x} is not page-aligned — "
@@ -120,6 +165,56 @@ def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
     return base
 
 
+# ── Generic module loader ───────────────────────────────────────────────
+
+
+def load_module(
+    cfg: Config,
+    store: SymbolStore,
+    *,
+    pe_path: Path,
+    module_name: str,
+    base: int | None = None,
+    wanted_types: Iterable[str] = (),
+) -> LoadedModule:
+    """PE → PDB ref → fetch → parse → persist for an arbitrary binary.
+
+    Caller is responsible for getting the PE file onto disk (use
+    ``copy_ntoskrnl`` / ``copy_user_module`` for live VM extraction). The
+    base, when known, is recorded so ``store.resolve(name)`` can return
+    absolute VAs; pass None if the caller will fill it in later via
+    ``store.set_base``.
+
+    ``wanted_types`` is the subset of structs to extract. Empty means
+    "no types" — useful for user-mode binaries where only symbols matter.
+    For the kernel pass ``NT_DEFAULT_TYPES``.
+    """
+    ref = read_pdb_ref(pe_path)
+    pdb_path = fetch_pdb(ref, cfg.symbols_dir)
+
+    sections = load_section_headers(pdb_path)
+    symbols = load_publics(pdb_path, sections)
+    types = build_type_map(pdb_path, wanted=wanted_types) if wanted_types else {}
+
+    store.save(
+        module=module_name,
+        build=ref.build_key,
+        image=ref.pdb_name,
+        symbols=symbols,
+        types=types,
+        base=base,
+    )
+    info = store.info(module_name)
+    return LoadedModule(
+        module=module_name,
+        build=ref.build_key,
+        base=base,
+        path=info.path,
+        symbol_count=info.symbol_count,
+        type_count=info.type_count,
+    )
+
+
 def load_nt(
     cfg: Config,
     ga: GuestAgent,
@@ -131,13 +226,8 @@ def load_nt(
 
     ``reuse_cached_pe=True`` skips the in-VM Copy-Item if the cached PE
     still exists — fast, but UNSAFE if the kernel changed (e.g., after a
-    Windows Update). The cached PE is not keyed by build, so a stale PE
-    pairs the live kernel's RVAs against the old kernel's PDB ref, with
-    no error and silent symbol corruption. Default is False; the extra
-    ~1s Copy-Item is the right trade-off vs surprising the user with
-    bad symbols. Re-enable explicitly only on hot paths where you know
-    the kernel is unchanged (e.g., consecutive `kdbg_ps` calls inside
-    one session).
+    Windows Update). Default is False; the extra ~1s Copy-Item is the
+    right trade-off vs surprising the user with bad symbols.
     """
     cached_pe = cfg.symbols_dir / "ntoskrnl.exe"
     if reuse_cached_pe and cached_pe.exists():
@@ -145,35 +235,101 @@ def load_nt(
     else:
         pe_path = copy_ntoskrnl(cfg, ga)
 
-    ref = read_pdb_ref(pe_path)
-    pdb_path = fetch_pdb(ref, cfg.symbols_dir)
-
-    sections = load_section_headers(pdb_path)
-    symbols = load_publics(pdb_path, sections)
-    types = build_type_map(pdb_path)
+    # Load symbols + nt's default type set first, then resolve base.
+    # We do it in two passes because base resolution needs the symbol
+    # table to look up KiDivideErrorFault.
+    info = load_module(
+        cfg, store,
+        pe_path=pe_path,
+        module_name="nt",
+        base=None,
+        wanted_types=NT_DEFAULT_TYPES,
+    )
 
     try:
-        base: int | None = resolve_nt_base(cfg, symbols)
+        base = resolve_nt_base(cfg, store.load("nt").get("symbols", {}))
+        store.set_base("nt", base)
+        info = LoadedModule(
+            module=info.module,
+            build=info.build,
+            base=base,
+            path=info.path,
+            symbol_count=info.symbol_count,
+            type_count=info.type_count,
+        )
     except (HmpError, SymbolLoadError):
         # VM may not be in kernel context at the time of the load call,
-        # or some other transient HMP issue — save symbols without base
-        # and let the caller re-resolve later via `kdbg symbols base`.
-        base = None
+        # or some other transient HMP issue — leave base unset and let
+        # the caller re-resolve later via `kdbg symbols base`.
+        pass
 
+    return info
+
+
+# ── Lazy type extraction ────────────────────────────────────────────────
+
+
+def cached_pdb_path(cfg: Config, store: SymbolStore, module: str) -> Path:
+    """Return the on-disk PDB path for a loaded module, or raise.
+
+    Mirrors ``pe.pdb_cache_path`` using the metadata persisted in the
+    store. Useful for re-extraction on demand without the round-trip to
+    the VM.
+    """
+    data = store.load(module)
+    image = data.get("image", "")
+    build = data.get("build", "")
+    if not image or not build:
+        raise SymbolLoadError(
+            f"module {module!r} has no image/build metadata — "
+            f"re-run `winbox kdbg symbols`"
+        )
+    path = cfg.symbols_dir / f"{Path(image).stem}_{build}.pdb"
+    if not path.exists():
+        raise SymbolLoadError(
+            f"cached PDB missing for {module!r} at {path} — "
+            f"re-run `winbox kdbg symbols`"
+        )
+    return path
+
+
+def ensure_types_loaded(
+    cfg: Config,
+    store: SymbolStore,
+    type_names: Iterable[str],
+    *,
+    module: str = "nt",
+) -> None:
+    """Make sure ``type_names`` are present in the store; extract if missing.
+
+    Reads the cached PDB once and parses the requested types; persists
+    the result back to the store so subsequent calls hit the JSON path.
+
+    No-op if every type is already present. Cheap enough to call from
+    walkers as a precondition without worrying about cost — the JSON
+    check is in-memory.
+    """
+    data = store.load(module)
+    have = data.get("types", {})
+    missing = [t for t in type_names if t not in have]
+    if not missing:
+        return
+
+    pdb_path = cached_pdb_path(cfg, store, module)
+    layouts = load_types(pdb_path, wanted=missing)
+    if not layouts:
+        # Nothing to add — every requested type was either already present
+        # or absent from the PDB. The walker that needed them will surface
+        # a more specific "field not found" message downstream.
+        return
+
+    have.update({name: layout.to_json() for name, layout in layouts.items()})
+    # Re-save preserves base, image, symbols, etc.
     store.save(
-        module="nt",
-        build=ref.build_key,
-        image=ref.pdb_name,
-        symbols=symbols,
-        types=types,
-        base=base,
-    )
-    info = store.info("nt")
-    return LoadedModule(
-        module="nt",
-        build=ref.build_key,
-        base=base,
-        path=info.path,
-        symbol_count=info.symbol_count,
-        type_count=info.type_count,
+        module=data["module"],
+        build=data["build"],
+        image=data["image"],
+        symbols=data["symbols"],
+        types=have,
+        base=data.get("base"),
     )

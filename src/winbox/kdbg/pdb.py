@@ -45,6 +45,9 @@ NT_DEFAULT_TYPES: tuple[str, ...] = (
     "_UNICODE_STRING",
     "_LDR_DATA_TABLE_ENTRY",
     "_KLDR_DATA_TABLE_ENTRY",
+    # Needed by walk_user_modules — PEB→Ldr→InLoadOrderModuleList walk.
+    "_PEB",
+    "_PEB_LDR_DATA",
 )
 
 

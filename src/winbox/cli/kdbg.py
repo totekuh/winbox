@@ -25,9 +25,14 @@ import click
 from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
 from winbox.kdbg import (
+    SymbolLoadError,
     SymbolStore,
     SymbolStoreError,
     WalkCache,
+    cached_pdb_path,
+    copy_user_module,
+    ensure_types_loaded,
+    load_module,
     load_nt,
     read_cpu_state,
     read_virt_cr3,
@@ -35,7 +40,7 @@ from winbox.kdbg import (
 )
 from winbox.kdbg.format import format_struct as _format_struct, format_sym as _format_sym
 from winbox.kdbg.hmp import HmpError, hmp as hmp_call, probe_port
-from winbox.kdbg.walk import list_modules, list_processes
+from winbox.kdbg.walk import list_modules, list_processes, list_user_modules
 from winbox.vm import VM, GuestAgent, VMState
 
 # Use the canonical HMP wrapper in tuple-mode for start/stop/status so the
@@ -394,6 +399,131 @@ def kdbg_read_va(
         hex_part = " ".join(f"{b:02x}" for b in chunk)
         ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         console.print(f"  0x{va + i:016x}  {hex_part:<48}  {ascii_part}")
+
+
+@kdbg.command("user-lm")
+@click.argument("pid", type=int)
+@needs_vm()
+def kdbg_user_lm(cfg: Config, vm: VM, ga: GuestAgent, pid: int) -> None:
+    """Walk PEB.Ldr for ``pid`` and list every loaded user-mode module.
+
+    The user-space mirror of ``kdbg lm``. Shows the EXE plus every DLL
+    Windows mapped into the target's address space, in load order.
+
+    First call after a fresh VM may pull missing struct layouts (_PEB,
+    _PEB_LDR_DATA) out of the cached PDB on demand — no re-run of
+    ``kdbg symbols`` needed.
+    """
+    store = _get_store(cfg)
+    try:
+        # Lazy-extract the PEB structs if the store predates their addition.
+        ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
+    except (SymbolStoreError, SymbolLoadError) as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+    cache = WalkCache()
+    try:
+        procs = list_processes(cfg.vm_name, store, cache=cache)
+    except SymbolStoreError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    target = next((p for p in procs if p.pid == pid), None)
+    if target is None:
+        console.print(f"[red][-][/] pid {pid} not found in process list")
+        raise SystemExit(1)
+
+    try:
+        mods = list_user_modules(cfg.vm_name, store, target, cache=cache)
+    except (SymbolStoreError, HmpError) as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+    if not mods:
+        console.print(f"[yellow][!][/] pid {pid} ({target.name}) has no user modules "
+                      f"(kernel-only process or PEB not yet initialised)")
+        return
+
+    console.print(f"[dim]pid {pid} ({target.name}) — DTB 0x{target.directory_table_base:x}[/]")
+    console.print("[dim]  Base              Size        Name[/]")
+    for m in mods:
+        console.print(f"  0x{m.base:016x}  0x{m.size:08x}  {m.name}")
+    console.print(f"[dim]({len(mods)} modules)[/]")
+
+
+@kdbg.command("user-symbols")
+@click.argument("pid", type=int)
+@click.argument("module_name", metavar="MODULE")
+@needs_vm()
+def kdbg_user_symbols(cfg: Config, vm: VM, ga: GuestAgent, pid: int, module_name: str) -> None:
+    """Load PDB symbols for a user-mode MODULE in ``pid``.
+
+    MODULE matches against PEB.Ldr entries (case-insensitive substring
+    on BaseDllName, then on FullDllName). Examples::
+
+        winbox kdbg user-symbols 4712 notepad.exe
+        winbox kdbg user-symbols 4712 ntdll
+        winbox kdbg user-symbols 4712 kernelbase
+
+    Pulls the binary out of the VM via VirtIO-FS, reads its CodeView
+    debug entry, fetches the PDB from msdl, parses it with llvm-pdbutil,
+    and persists under ``~/.winbox/symbols/`` keyed by the user-supplied
+    short name (e.g. ``notepad`` for notepad.exe). Subsequent
+    ``kdbg sym notepad!WinMain`` will resolve against that store.
+    """
+    store = _get_store(cfg)
+    try:
+        ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
+    except (SymbolStoreError, SymbolLoadError) as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+    cache = WalkCache()
+    procs = list_processes(cfg.vm_name, store, cache=cache)
+    target = next((p for p in procs if p.pid == pid), None)
+    if target is None:
+        console.print(f"[red][-][/] pid {pid} not found in process list")
+        raise SystemExit(1)
+
+    mods = list_user_modules(cfg.vm_name, store, target, cache=cache)
+    needle = module_name.lower()
+    match = next(
+        (m for m in mods if needle in m.name.lower()),
+        None,
+    )
+    if match is None:
+        match = next(
+            (m for m in mods if needle in m.full_path.lower()),
+            None,
+        )
+    if match is None:
+        console.print(f"[red][-][/] no module matching {module_name!r} in pid {pid}")
+        console.print(f"    try [bold]winbox kdbg user-lm {pid}[/] to see what's loaded")
+        raise SystemExit(1)
+
+    short_name = match.name.rsplit(".", 1)[0].lower()
+    cached_basename = match.name
+
+    with console.status(f"[blue]Copying {match.name}, fetching PDB, parsing..."):
+        try:
+            pe_path = copy_user_module(cfg, ga, match.full_path, cached_basename)
+            info = load_module(
+                cfg, store,
+                pe_path=pe_path,
+                module_name=short_name,
+                base=match.base,
+                wanted_types=(),
+            )
+        except (SymbolLoadError, SymbolStoreError) as e:
+            console.print(f"[red][-][/] {e}")
+            raise SystemExit(1)
+
+    console.print(
+        f"[green][+][/] {short_name} ({info.build}) — {info.symbol_count} symbols, "
+        f"base=[bold]0x{info.base:x}[/]"
+    )
+    console.print(f"    stored at {info.path}")
+    console.print(f"    try [bold]winbox kdbg sym {short_name}!<name>[/]")
 
 
 @kdbg.command("base")
