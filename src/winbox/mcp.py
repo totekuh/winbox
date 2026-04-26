@@ -2332,6 +2332,79 @@ def kdbg_step() -> str:
 
 
 @mcp.tool()
+def kdbg_disasm(addr: str = "", count: int = 8) -> str:
+    """Disassemble x86-64 instructions at ADDR (or current RIP if empty).
+
+    Reads up to ~16*count bytes (instructions are 1-15 bytes each) from
+    the target's address space via CR3-masquerade ``mem``, then runs
+    Capstone over them. Returns the first ``count`` instructions.
+
+    Use this after a halt to see what's about to execute, or after a
+    ``kdbg_step`` to see the next sequence. ``addr=""`` (default) reads
+    from current RIP — the most common case.
+
+    Args:
+        addr: Hex VA (``0x7ff7b04eeabc``), decimal, or empty for RIP.
+        count: How many instructions to decode (1..64).
+
+    Returns:
+        JSON ``{base, instructions: [{addr, bytes, mnemonic, op_str}]}``
+        or error string. Each instruction's ``bytes`` is hex-encoded.
+    """
+    try:
+        import capstone as _cs
+    except ImportError:
+        return "error: capstone not installed (apt install python3-capstone)"
+
+    cfg = _kdbg_cfg_only()
+    client = _kdbg_client(cfg)
+
+    # Resolve start address
+    if not addr or not addr.strip():
+        try:
+            regs = client.call("regs")
+            addr_int = int(regs.get("rip", "0x0"), 16)
+        except _ClientError as e:
+            return f"error: {e}"
+    else:
+        try:
+            addr_int = int(addr.strip(), 0)
+        except ValueError:
+            return f"error: not a valid VA: {addr!r}"
+
+    n = max(1, min(int(count), 64))
+    # Cap at 15 bytes per instruction; over-read is harmless, gets discarded
+    bytes_to_read = min(n * 15, 1024)
+
+    try:
+        result = client.call("mem", va=hex(addr_int), length=bytes_to_read)
+    except _ClientError as e:
+        return f"error: {e}"
+
+    try:
+        raw = bytes.fromhex(result["bytes"])
+    except (KeyError, ValueError):
+        return f"error: malformed mem result"
+
+    md = _cs.Cs(_cs.CS_ARCH_X86, _cs.CS_MODE_64)
+    insns = []
+    for ins in md.disasm(raw, addr_int):
+        insns.append({
+            "addr": f"0x{ins.address:x}",
+            "bytes": ins.bytes.hex(),
+            "mnemonic": ins.mnemonic,
+            "op_str": ins.op_str,
+        })
+        if len(insns) >= n:
+            break
+
+    return _json.dumps({
+        "base": f"0x{addr_int:x}",
+        "instructions": insns,
+    }, indent=2)
+
+
+@mcp.tool()
 def kdbg_interrupt() -> str:
     """Async halt request — breaks out of an in-flight ``kdbg_cont``.
 
@@ -2363,7 +2436,7 @@ def kdbg_regs() -> str:
 
 
 @mcp.tool()
-def kdbg_mem(va: str, length: int = 64) -> str:
+def kdbg_mem(va: str, length: int = 64, decode: str = "hex") -> str:
     """Read LENGTH bytes at VA in the attached target's address space.
 
     Uses the same CR3-masquerade trick as bp install — temporarily
@@ -2376,19 +2449,47 @@ def kdbg_mem(va: str, length: int = 64) -> str:
         va: Virtual address as hex string (``0x7ff7b04eeabc``) or
             decimal.
         length: Bytes to read (capped at 64 KiB by the daemon).
+        decode: How to render the bytes:
+            ``hex`` (default) — pure hex string, no decode
+            ``utf-16le`` / ``utf16`` — UTF-16 little-endian, common
+                for Windows wide strings (e.g. notepad's text buffer)
+            ``utf-8`` / ``utf8`` — UTF-8 (saved file content, etc.)
+            ``ascii`` — ASCII (control bytes shown as ``.``)
+            ``cstr`` — null-terminated ASCII (truncates at first 0x00)
 
     Returns:
-        JSON ``{va, bytes}`` where ``bytes`` is a hex-encoded string.
+        JSON ``{va, bytes, decoded?}`` where ``bytes`` is the raw hex
+        and ``decoded`` (when ``decode != 'hex'``) is the textual form.
     """
     cfg = _kdbg_cfg_only()
-    # Daemon accepts string-or-int; pass through as-is.
     try:
-        return _json.dumps(
-            _kdbg_client(cfg).call("mem", va=va, length=int(length)),
-            indent=2,
-        )
+        result = _kdbg_client(cfg).call("mem", va=va, length=int(length))
     except _ClientError as e:
         return f"error: {e}"
+
+    if decode != "hex":
+        try:
+            raw = bytes.fromhex(result["bytes"])
+        except (KeyError, ValueError):
+            raw = b""
+        d = decode.lower()
+        if d in ("utf-16le", "utf16", "utf-16"):
+            text = raw.decode("utf-16-le", errors="replace")
+            # strip trailing nulls common in fixed-size buffers
+            text = text.rstrip("\x00")
+            result["decoded"] = text
+        elif d in ("utf-8", "utf8"):
+            result["decoded"] = raw.decode("utf-8", errors="replace").rstrip("\x00")
+        elif d == "ascii":
+            result["decoded"] = "".join(
+                chr(b) if 32 <= b < 127 else "." for b in raw
+            )
+        elif d == "cstr":
+            cut = raw.split(b"\x00", 1)[0]
+            result["decoded"] = cut.decode("latin-1", errors="replace")
+        else:
+            result["decoded"] = f"unknown decode mode: {decode!r}"
+    return _json.dumps(result, indent=2)
 
 
 @mcp.tool()

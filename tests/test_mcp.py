@@ -1971,6 +1971,99 @@ class TestKdbgDaemonTools:
             kdbg_mem("0x1000", length=4)
         client.call.assert_called_once_with("mem", va="0x1000", length=4)
 
+    def test_mem_decode_utf16le(self, mock_mcp):
+        from winbox.mcp import kdbg_mem
+        # "abc" in UTF-16LE = 61 00 62 00 63 00
+        client = self._client_with(call_result={"va": "0x1000", "bytes": "610062006300"})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_mem("0x1000", length=6, decode="utf-16le")
+        out = _json_mod.loads(result)
+        assert out["decoded"] == "abc"
+
+    def test_mem_decode_utf8(self, mock_mcp):
+        from winbox.mcp import kdbg_mem
+        # "hello" in UTF-8 = 68 65 6c 6c 6f
+        client = self._client_with(call_result={"va": "0x1000", "bytes": "68656c6c6f"})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_mem("0x1000", length=5, decode="utf-8")
+        out = _json_mod.loads(result)
+        assert out["decoded"] == "hello"
+
+    def test_mem_decode_ascii_replaces_control(self, mock_mcp):
+        from winbox.mcp import kdbg_mem
+        # bytes: 41 42 01 7f 43 (A B ctrl-A DEL C)
+        client = self._client_with(call_result={"va": "0x1", "bytes": "41420143"})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_mem("0x1", length=4, decode="ascii")
+        out = _json_mod.loads(result)
+        assert out["decoded"] == "AB.C"
+
+    def test_mem_decode_cstr_truncates_at_null(self, mock_mcp):
+        from winbox.mcp import kdbg_mem
+        # "hello" then null then "tail"
+        client = self._client_with(call_result={
+            "va": "0x1", "bytes": "68656c6c6f00" + "7461696c"
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_mem("0x1", length=10, decode="cstr")
+        out = _json_mod.loads(result)
+        assert out["decoded"] == "hello"
+
+    def test_mem_decode_hex_default_no_decode_field(self, mock_mcp):
+        from winbox.mcp import kdbg_mem
+        client = self._client_with(call_result={"va": "0x1", "bytes": "deadbeef"})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_mem("0x1", length=4)
+        out = _json_mod.loads(result)
+        assert "decoded" not in out  # default hex mode keeps raw
+
+    def test_mem_decode_unknown_mode_surfaces_in_decoded(self, mock_mcp):
+        from winbox.mcp import kdbg_mem
+        client = self._client_with(call_result={"va": "0x1", "bytes": "00"})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_mem("0x1", length=1, decode="bogus")
+        out = _json_mod.loads(result)
+        assert "unknown decode" in out["decoded"]
+
+    # ── kdbg_disasm ───────────────────────────────────────────────────
+
+    def test_disasm_uses_rip_when_addr_empty(self, mock_mcp):
+        from winbox.mcp import kdbg_disasm
+        # mock client: regs returns rip; mem returns a few bytes;
+        # capstone disasms them.
+        client = MagicMock()
+        client.call.side_effect = [
+            {"rip": "0x401000", "rsp": "0x0", "cr3": "0x0"},  # regs reply
+            {"va": "0x401000", "bytes": "9090c3"},            # mem reply
+        ]
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_disasm(addr="", count=4)
+        out = _json_mod.loads(result)
+        assert out["base"] == "0x401000"
+        # 90 90 c3 = nop; nop; ret
+        mnemonics = [i["mnemonic"] for i in out["instructions"]]
+        assert mnemonics[:3] == ["nop", "nop", "ret"]
+
+    def test_disasm_explicit_addr_skips_regs_call(self, mock_mcp):
+        from winbox.mcp import kdbg_disasm
+        client = MagicMock()
+        # Only mem call expected (no regs since addr was given)
+        client.call.return_value = {"va": "0x500000", "bytes": "488d0500000000"}
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_disasm(addr="0x500000", count=1)
+        # Only mem should be called once.
+        assert client.call.call_count == 1
+        op_name, kwargs = client.call.call_args[0][0], client.call.call_args[1]
+        assert op_name == "mem"
+        out = _json_mod.loads(result)
+        assert out["instructions"][0]["mnemonic"] == "lea"
+
+    def test_disasm_invalid_addr_returns_error(self, mock_mcp):
+        from winbox.mcp import kdbg_disasm
+        with patch("winbox.mcp._kdbg_client", return_value=MagicMock()):
+            result = kdbg_disasm(addr="not_a_number", count=1)
+        assert result.startswith("error:")
+
     def test_stack_passes_n(self, mock_mcp):
         from winbox.mcp import kdbg_stack
         client = self._client_with(call_result={"rsp": "0x100", "qwords": []})
