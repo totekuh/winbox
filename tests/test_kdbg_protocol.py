@@ -93,7 +93,7 @@ def test_reply_err_stringifies_non_str():
 def test_ops_contains_core_verbs():
     for v in ("status", "bp_add", "bp_list", "bp_remove",
               "cont", "step", "interrupt",
-              "regs", "mem", "stack", "bt",
+              "regs", "mem", "write_mem", "stack", "bt",
               "detach"):
         assert v in OPS, f"missing op: {v}"
 

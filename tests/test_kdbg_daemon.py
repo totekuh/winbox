@@ -291,3 +291,197 @@ def test_ops_match_daemon_methods():
     session = _make_session()
     for op in OPS:
         assert hasattr(session, f"op_{op}"), f"DaemonSession.op_{op} missing"
+
+
+# ── op_write_mem ─────────────────────────────────────────────────────────
+
+
+class _FakeRspWithWrite(FakeRsp):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.writes: list[tuple[int, bytes]] = []
+
+    def write_memory(self, va, data):
+        self.writes.append((va, data))
+
+
+def test_op_write_mem_decodes_hex_and_writes():
+    rsp = _FakeRspWithWrite()
+    session = _make_session(rsp=rsp)
+    reply = session.handle_op("write_mem", {"va": "0x1000", "data": "deadbeef"})
+    assert reply["ok"]
+    assert reply["result"]["va"] == "0x1000"
+    assert reply["result"]["length"] == 4
+    assert rsp.writes == [(0x1000, b"\xde\xad\xbe\xef")]
+
+
+def test_op_write_mem_rejects_non_hex_data():
+    rsp = _FakeRspWithWrite()
+    session = _make_session(rsp=rsp)
+    reply = session.handle_op("write_mem", {"va": "0x1000", "data": "not_hex"})
+    assert reply["ok"] is False
+    assert "hex" in reply["error"].lower()
+
+
+def test_op_write_mem_caps_at_64kib():
+    rsp = _FakeRspWithWrite()
+    session = _make_session(rsp=rsp)
+    big = "00" * (64 * 1024 + 1)
+    reply = session.handle_op("write_mem", {"va": "0x1000", "data": big})
+    assert reply["ok"] is False
+    assert "64" in reply["error"] or "cap" in reply["error"].lower()
+    assert rsp.writes == []  # nothing written
+
+
+def test_op_write_mem_empty_data_is_noop():
+    rsp = _FakeRspWithWrite()
+    session = _make_session(rsp=rsp)
+    reply = session.handle_op("write_mem", {"va": "0x1000", "data": ""})
+    assert reply["ok"]
+    assert reply["result"]["length"] == 0
+    assert rsp.writes == []
+
+
+def test_op_write_mem_restores_cr3_even_on_failure():
+    """If gdbstub rejects the M packet, original CR3 must still be restored."""
+    rsp = _FakeRspWithWrite()
+    # Track G-packet CR3 values directly since the daemon-test FakeRsp
+    # doesn't carry a cr3_writes list — its _exchange just updates the
+    # regs_blob in place. We track here by intercepting _exchange.
+    cr3_writes: list[int] = []
+    original_exchange = rsp._exchange
+
+    def tracking_exchange(body, *, timeout=None):
+        if body.startswith(b"G"):
+            blob = bytes.fromhex(body[1:].decode("ascii"))
+            cr3_writes.append(struct.unpack_from("<Q", blob, _CR3_OFFSET)[0])
+        return original_exchange(body, timeout=timeout)
+
+    rsp._exchange = tracking_exchange
+
+    # Make write_memory fail (M packet)
+    def fail_write(va, data):
+        from winbox.kdbg.debugger.rsp import RspError
+        raise RspError("M failed: E22")
+    rsp.write_memory = fail_write
+
+    session = _make_session(rsp=rsp)
+    target_dtb = session.target.dtb
+    initial_cr3 = struct.unpack_from("<Q", rsp.regs_blob, _CR3_OFFSET)[0]
+
+    reply = session.handle_op("write_mem", {"va": "0x1000", "data": "00"})
+    assert reply["ok"] is False
+
+    # Two G writes: target_dtb (masquerade), then initial CR3 (restore in finally).
+    assert len(cr3_writes) == 2
+    assert cr3_writes[0] == target_dtb
+    assert cr3_writes[1] == initial_cr3
+
+
+# ── _validate_module_bases ───────────────────────────────────────────────
+
+
+class _RspForValidation:
+    """Minimal RspClient stand-in for stale-base detection unit tests.
+
+    Returns canned bytes from a per-base lookup so we can simulate
+    "module's base points at MZ" vs "module's base points at garbage".
+    """
+
+    def __init__(self, mappings: dict[int, bytes]) -> None:
+        self.mappings = mappings  # base_va -> 2 bytes
+        self.threads_returned = ["01"]
+        self.regs_blob = _blob()
+
+    def list_threads(self):
+        return list(self.threads_returned)
+
+    def select_thread(self, t, *, op="g"):
+        pass
+
+    def read_registers(self):
+        return self.regs_blob
+
+    def read_memory(self, va, length):
+        # The validator passes the module's base as va; we look it up
+        # in mappings. If not present, simulate "VA not mapped".
+        if va in self.mappings:
+            return self.mappings[va][:length]
+        from winbox.kdbg.debugger.rsp import RspError
+        raise RspError(f"m failed at 0x{va:x}: E22")
+
+    def _exchange(self, body, *, timeout=None):
+        return b"OK"  # G writes always accepted in this fake
+
+
+class _StoreForValidation:
+    def __init__(self, modules: dict[str, dict]) -> None:
+        self._modules = modules
+
+    def list_modules(self):
+        return list(self._modules.keys())
+
+    def load(self, name):
+        return self._modules[name]
+
+
+def test_validate_module_bases_passes_when_all_show_MZ():
+    from winbox.kdbg.debugger.daemon import _validate_module_bases
+    rsp = _RspForValidation({0x7ff700000000: b"MZ", 0x7ff800000000: b"MZ"})
+    store = _StoreForValidation({
+        "notepad": {"base": 0x7ff700000000},
+        "ntdll": {"base": 0x7ff800000000},
+    })
+    # Should not raise.
+    _validate_module_bases(rsp, target_dtb=0x4d6bb000, store=store, target_name="notepad.exe")
+
+
+def test_validate_module_bases_raises_on_stale():
+    from winbox.kdbg.debugger.daemon import _validate_module_bases, DaemonError
+    rsp = _RspForValidation({
+        0x7ff700000000: b"MZ",       # notepad's base — valid
+        0x7ff800000000: b"\x00\x00",  # ntdll's base — STALE (zeros, not MZ)
+    })
+    store = _StoreForValidation({
+        "notepad": {"base": 0x7ff700000000},
+        "ntdll": {"base": 0x7ff800000000},
+    })
+    with pytest.raises(DaemonError) as exc:
+        _validate_module_bases(rsp, target_dtb=0x4d6bb000, store=store, target_name="notepad.exe")
+    msg = str(exc.value)
+    assert "stale" in msg.lower()
+    assert "ntdll" in msg
+    assert "0x7ff800000000" in msg
+    assert "kdbg_user_symbols_load" in msg
+
+
+def test_validate_module_bases_skips_nt_module():
+    """The kernel module's base is validated by kdbg_base_refresh, not here."""
+    from winbox.kdbg.debugger.daemon import _validate_module_bases
+    rsp = _RspForValidation({})  # no mappings
+    store = _StoreForValidation({
+        "nt": {"base": 0xfffff80608628000},  # would otherwise be flagged stale
+    })
+    # Should not raise — we skipped the nt entry.
+    _validate_module_bases(rsp, target_dtb=0x1ae000, store=store, target_name="System")
+
+
+def test_validate_module_bases_treats_unmapped_as_stale():
+    from winbox.kdbg.debugger.daemon import _validate_module_bases, DaemonError
+    rsp = _RspForValidation({})  # base not mapped at all
+    store = _StoreForValidation({
+        "notepad": {"base": 0x7ff700000000},
+    })
+    with pytest.raises(DaemonError, match="stale"):
+        _validate_module_bases(rsp, target_dtb=0x4d6bb000, store=store, target_name="notepad.exe")
+
+
+def test_validate_module_bases_skips_modules_with_no_base():
+    from winbox.kdbg.debugger.daemon import _validate_module_bases
+    rsp = _RspForValidation({})
+    store = _StoreForValidation({
+        "kernelbase": {"base": None},  # loaded but base unset
+        "user32": {"base": 0},
+    })
+    # Should not raise — both entries skipped.
+    _validate_module_bases(rsp, target_dtb=0x4d6bb000, store=store, target_name="x.exe")

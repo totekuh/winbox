@@ -2493,6 +2493,40 @@ def kdbg_mem(va: str, length: int = 64, decode: str = "hex") -> str:
 
 
 @mcp.tool()
+def kdbg_write_mem(va: str, data: str) -> str:
+    """Write hex-encoded DATA at VA in the attached target's address space.
+
+    Mirror of ``kdbg_mem`` but for writes. Uses CR3-masquerade so the
+    write lands in the target process's address space regardless of
+    which process is on-CPU. Use for fault injection, fuzzing struct
+    fields, faking function returns (write 0 to RAX before step over
+    return), or any modification you'd do in WinDbg with ``ed``/``eb``.
+
+    The write is REAL — patches physical memory backing the target's
+    VA. If the target reads this region next, it sees your bytes.
+    Don't aim at code segments unless you mean it (that'd be a bp
+    install gone wrong).
+
+    Args:
+        va: Virtual address (hex string ``0x...`` or decimal).
+        data: Hex-encoded bytes (no ``0x`` prefix needed). E.g.
+            ``"deadbeef"`` writes 4 bytes, ``"00"`` writes one zero.
+
+    Returns:
+        JSON ``{va, length}`` with the byte count actually written,
+        or error string.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        return _json.dumps(
+            _kdbg_client(cfg).call("write_mem", va=va, data=data),
+            indent=2,
+        )
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
 def kdbg_stack(n: int = 16) -> str:
     """Read N qwords starting at RSP (current halt's stack pointer).
 

@@ -368,6 +368,54 @@ class DaemonSession:
 
         return {"va": f"0x{va:x}", "bytes": data.hex()}
 
+    def op_write_mem(self, va: int | str, data: str) -> dict[str, Any]:
+        """Write hex-encoded ``data`` at ``va`` in target's address space.
+
+        Mirror of op_mem: temporarily masquerades the firing vCPU's CR3
+        as target_dtb, sends gdb ``M`` packet, restores. Use for fault
+        injection, fuzzing, faking returns, etc. Capped at 64 KiB.
+
+        Args:
+            va: Virtual address in target's address space (int or hex string).
+            data: Hex-encoded bytes to write (e.g. ``"deadbeef"`` writes 4 bytes).
+
+        Returns ``{va, length}`` on success.
+        """
+        if isinstance(va, str):
+            va = int(va, 0)
+        try:
+            payload = bytes.fromhex(data)
+        except ValueError as e:
+            raise RuntimeError(f"data must be hex-encoded: {e}") from e
+        if not payload:
+            return {"va": f"0x{va:x}", "length": 0}
+        if len(payload) > 64 * 1024:
+            raise RuntimeError(f"write capped at 64 KiB; got {len(payload)} bytes")
+
+        threads = self.rsp.list_threads()
+        if not threads:
+            raise RuntimeError("no vCPUs returned by gdbstub")
+        vcpu = threads[0]
+        self.rsp.select_thread(vcpu)
+        regs = self.rsp.read_registers()
+        original_cr3 = struct.unpack_from("<Q", regs, _CR3_OFFSET_IN_G)[0]
+
+        try:
+            mod = bytearray(regs)
+            struct.pack_into("<Q", mod, _CR3_OFFSET_IN_G, self.target.dtb)
+            resp = self.rsp._exchange(b"G" + bytes(mod).hex().encode("ascii"))
+            if resp != b"OK":
+                raise RuntimeError(f"G-packet (write_mem) rejected: {resp!r}")
+            # gdb ``M addr,len:hex`` writes payload bytes at addr.
+            self.rsp.write_memory(va, payload)
+        finally:
+            restore = bytearray(regs)
+            struct.pack_into("<Q", restore, _CR3_OFFSET_IN_G, original_cr3)
+            with suppress(Exception):
+                self.rsp._exchange(b"G" + bytes(restore).hex().encode("ascii"))
+
+        return {"va": f"0x{va:x}", "length": len(payload)}
+
     def op_stack(self, n: int = 16) -> dict[str, Any]:
         """N qwords starting at RSP."""
         if self.stop is None:
@@ -721,6 +769,87 @@ def _bind_unix_socket(sock_file: Path) -> socket.socket:
     return s
 
 
+def _read_target_bytes(rsp: "RspClient", target_dtb: int, va: int, length: int) -> bytes:
+    """One-shot CR3-masquerade read. Used by attach-time stale-base
+    detection — borrows the same primitive op_mem uses but doesn't
+    need a DaemonSession yet."""
+    threads = rsp.list_threads()
+    if not threads:
+        raise DaemonError("gdbstub returned no threads (vCPUs)")
+    rsp.select_thread(threads[0])
+    regs = rsp.read_registers()
+    original_cr3 = struct.unpack_from("<Q", regs, _CR3_OFFSET_IN_G)[0]
+    try:
+        mod = bytearray(regs)
+        struct.pack_into("<Q", mod, _CR3_OFFSET_IN_G, target_dtb)
+        resp = rsp._exchange(b"G" + bytes(mod).hex().encode("ascii"))
+        if resp != b"OK":
+            raise DaemonError(f"G-packet rejected during base validation: {resp!r}")
+        return rsp.read_memory(va, length)
+    finally:
+        restore = bytearray(regs)
+        struct.pack_into("<Q", restore, _CR3_OFFSET_IN_G, original_cr3)
+        with suppress(Exception):
+            rsp._exchange(b"G" + bytes(restore).hex().encode("ascii"))
+
+
+def _validate_module_bases(
+    rsp: "RspClient",
+    target_dtb: int,
+    store: SymbolStore,
+    target_name: str,
+) -> None:
+    """Verify each loaded user-mode module's cached base still points
+    at a valid PE header in the target's address space.
+
+    PE images start with the DOS magic ``MZ`` (0x4D 0x5A). If we read
+    those 2 bytes at the cached base and don't get MZ, ASLR has moved
+    the module since the store was populated — typically because the
+    VM rebooted between symbol loads.
+
+    Raises ``DaemonError`` with a clear remediation message naming
+    every stale module so the agent / user knows exactly which
+    ``kdbg_user_symbols_load`` calls to re-issue.
+
+    Skips ``nt`` itself — its base is set via the IDT trick at load
+    time and gets re-resolved by ``kdbg_base_refresh``, not via this
+    walker. Also skips entries with no base (loaded via load_module
+    without a base, e.g. for symbol-only access).
+    """
+    try:
+        modules = store.list_modules()
+    except Exception:
+        return  # No store, nothing to validate
+
+    stale: list[tuple[str, int]] = []
+    for mod_name in modules:
+        if mod_name == "nt":
+            continue  # Kernel base validated separately
+        try:
+            data = store.load(mod_name)
+        except Exception:
+            continue
+        base = data.get("base")
+        if not base:
+            continue
+        try:
+            head = _read_target_bytes(rsp, target_dtb, base, 2)
+        except Exception:
+            # Couldn't read at all — VA isn't even mapped, definitely stale
+            stale.append((mod_name, base))
+            continue
+        if len(head) < 2 or head[:2] != b"MZ":
+            stale.append((mod_name, base))
+
+    if stale:
+        names = ", ".join(f"{name} (was 0x{base:x})" for name, base in stale)
+        raise DaemonError(
+            f"stale module bases for {target_name}: {names}. "
+            f"VM likely rebooted since symbols were loaded. "
+            f"Re-run kdbg_user_symbols_load for each stale module before retrying."
+        )
+
+
 def fork_daemon(
     cfg: Config,
     target_pid: int,
@@ -775,6 +904,13 @@ def fork_daemon(
         rsp = RspClient.connect("127.0.0.1", gdbstub_port, timeout=5.0)
         rsp.handshake()
         rsp.query_halt_reason()
+
+        # Stale-base check. If the VM rebooted since the symbol store
+        # was last updated, ASLR moved every module's base. The cached
+        # ``base`` field in store entries points nowhere in current
+        # process — Z0 user_va install fails later with cryptic E22.
+        # Catch it now and tell the user exactly what to do.
+        _validate_module_bases(rsp, target.directory_table_base, store, target.name)
 
         listen_sock = _bind_unix_socket(sock_path(cfg))
         info = TargetInfo(pid=target.pid, dtb=target.directory_table_base, name=target.name)

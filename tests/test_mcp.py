@@ -1971,6 +1971,23 @@ class TestKdbgDaemonTools:
             kdbg_mem("0x1000", length=4)
         client.call.assert_called_once_with("mem", va="0x1000", length=4)
 
+    def test_write_mem_passes_va_and_data(self, mock_mcp):
+        from winbox.mcp import kdbg_write_mem
+        client = self._client_with(call_result={"va": "0x1000", "length": 4})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_write_mem("0x1000", "deadbeef")
+        client.call.assert_called_once_with("write_mem", va="0x1000", data="deadbeef")
+        out = _json_mod.loads(result)
+        assert out["length"] == 4
+
+    def test_write_mem_surfaces_error(self, mock_mcp):
+        from winbox.mcp import kdbg_write_mem
+        from winbox.kdbg.debugger.client import ClientError
+        client = self._client_with(call_raises=ClientError("M failed: E22"))
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_write_mem("0x1000", "ff")
+        assert "error: M failed: E22" in result
+
     def test_mem_decode_utf16le(self, mock_mcp):
         from winbox.mcp import kdbg_mem
         # "abc" in UTF-16LE = 61 00 62 00 63 00

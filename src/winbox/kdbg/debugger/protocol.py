@@ -40,6 +40,7 @@ OPS: frozenset[str] = frozenset({
     "interrupt",    # async halt (for breaking out of cont)
     "regs",         # current register state at last halt
     "mem",          # read memory in target's CR3
+    "write_mem",    # write hex bytes to memory in target's CR3
     "stack",        # read N qwords from RSP
     "bt",           # basic backtrace
     "detach",       # graceful shutdown
