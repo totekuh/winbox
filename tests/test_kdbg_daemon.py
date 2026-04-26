@@ -183,11 +183,10 @@ def test_bp_add_kernel_va_uses_plain_z0():
 # ── op_bp_add (user) — uses real install_user_breakpoint internally ────
 
 
-def test_bp_add_user_va_uses_cr3_masquerade(monkeypatch):
-    """User VA dispatches through install_user_breakpoint."""
+def test_bp_add_soft_user_va_uses_cr3_masquerade(monkeypatch):
+    """mode='soft' on a user VA still routes through install_user_breakpoint."""
     user_va = 0x7ff6e289a760
 
-    # Stub install to avoid needing the full G-packet dance against FakeRsp
     from winbox.kdbg.debugger import daemon as daemon_mod
     from winbox.kdbg.debugger.install import InstallReport
 
@@ -203,11 +202,120 @@ def test_bp_add_user_va_uses_cr3_masquerade(monkeypatch):
     rsp = FakeRsp()
     store = FakeStore({"notepad!NPWndProc": user_va})
     session = _make_session(rsp=rsp, store=store)
-    reply = session.handle_op("bp_add", {"target": "notepad!NPWndProc"})
+    reply = session.handle_op(
+        "bp_add", {"target": "notepad!NPWndProc", "mode": "soft"},
+    )
     assert reply["ok"]
     assert reply["result"]["user_mode"] is True
+    assert reply["result"]["hw"] is False
     assert captured["target_dtb"] == 0x4d6bb000
     assert captured["user_va"] == user_va
+
+
+# ── new mode= dispatching ───────────────────────────────────────────────
+
+
+def test_bp_add_default_mode_is_hw():
+    """No mode arg == hw bp via Z1, no CR3 masquerade for user VAs."""
+    user_va = 0x7ff6e289a760
+    rsp = FakeRsp()
+    # Add hw-aware insert tracker
+    hw_calls: list[dict] = []
+    real_insert = rsp.insert_breakpoint
+    def tracking_insert(addr, *, kind=1, hardware=False):
+        hw_calls.append({"addr": addr, "hw": hardware})
+        real_insert(addr, kind=kind, hardware=hardware)
+    rsp.insert_breakpoint = tracking_insert
+
+    store = FakeStore({"notepad!Foo": user_va})
+    session = _make_session(rsp=rsp, store=store)
+    reply = session.handle_op("bp_add", {"target": "notepad!Foo"})
+    assert reply["ok"]
+    assert reply["result"]["hw"] is True
+    assert hw_calls == [{"addr": user_va, "hw": True}]
+
+
+def test_bp_add_hw_user_skips_install_user_breakpoint(monkeypatch):
+    """mode=hw user VA must NOT invoke install_user_breakpoint
+    (Z1 doesn't need CR3 masquerade)."""
+    from winbox.kdbg.debugger import daemon as daemon_mod
+    captured = {"called": False}
+    def fake_install(*a, **kw):
+        captured["called"] = True
+        raise AssertionError("install_user_breakpoint should NOT be called for hw bps")
+    monkeypatch.setattr(daemon_mod, "install_user_breakpoint", fake_install)
+
+    rsp = FakeRsp()
+    store = FakeStore({"notepad!Bar": 0x7ff6_e289_b000})
+    session = _make_session(rsp=rsp, store=store)
+    reply = session.handle_op("bp_add", {"target": "notepad!Bar", "mode": "hw"})
+    assert reply["ok"]
+    assert captured["called"] is False
+
+
+def test_bp_add_hw_kernel_uses_z1_directly():
+    """Kernel hw bp = plain Z1 (kernel pages are in every CR3 anyway)."""
+    rsp = FakeRsp()
+    hw_calls: list[bool] = []
+    real_insert = rsp.insert_breakpoint
+    def tracking_insert(addr, *, kind=1, hardware=False):
+        hw_calls.append(hardware)
+        real_insert(addr, kind=kind, hardware=hardware)
+    rsp.insert_breakpoint = tracking_insert
+
+    store = FakeStore({"nt!SwapContext": 0xfffff80608628520})
+    session = _make_session(rsp=rsp, store=store)
+    reply = session.handle_op("bp_add", {"target": "nt!SwapContext"})
+    assert reply["ok"]
+    assert reply["result"]["hw"] is True
+    assert reply["result"]["user_mode"] is False
+    assert hw_calls == [True]
+
+
+def test_bp_add_hw_no_slots_clear_error():
+    """When QEMU rejects Z1 (e.g. all 4 DRs in use), surface a remediation
+    hint that mentions mode='soft'."""
+    from winbox.kdbg.debugger.rsp import RspError
+    rsp = FakeRsp()
+    def reject_z1(addr, *, kind=1, hardware=False):
+        if hardware:
+            raise RspError(f"Z1 insert at 0x{addr:x} failed: b'E22'")
+    rsp.insert_breakpoint = reject_z1
+
+    store = FakeStore({"nt!Foo": 0xfffff80608000000})
+    session = _make_session(rsp=rsp, store=store)
+    reply = session.handle_op("bp_add", {"target": "nt!Foo", "mode": "hw"})
+    assert reply["ok"] is False
+    assert "soft" in reply["error"]
+    assert "slot" in reply["error"].lower() or "budget" in reply["error"].lower()
+
+
+def test_bp_add_auto_falls_back_to_soft_on_no_slots(monkeypatch):
+    """mode=auto: Z1 fails -> Z0 path runs -> result has hw=False."""
+    from winbox.kdbg.debugger.rsp import RspError
+    rsp = FakeRsp()
+    soft_installed: list[int] = []
+    def half_reject(addr, *, kind=1, hardware=False):
+        if hardware:
+            raise RspError(f"Z1 insert at 0x{addr:x} failed: b'E22'")
+        soft_installed.append(addr)
+    rsp.insert_breakpoint = half_reject
+
+    store = FakeStore({"nt!Foo": 0xfffff80608000000})
+    session = _make_session(rsp=rsp, store=store)
+    reply = session.handle_op("bp_add", {"target": "nt!Foo", "mode": "auto"})
+    assert reply["ok"]
+    assert reply["result"]["hw"] is False
+    assert soft_installed == [0xfffff80608000000]
+
+
+def test_bp_add_invalid_mode_errors():
+    rsp = FakeRsp()
+    store = FakeStore({"nt!Foo": 0xfffff80608000000})
+    session = _make_session(rsp=rsp, store=store)
+    reply = session.handle_op("bp_add", {"target": "nt!Foo", "mode": "weird"})
+    assert reply["ok"] is False
+    assert "mode" in reply["error"]
 
 
 # ── bp_list / bp_remove ─────────────────────────────────────────────────
@@ -281,6 +389,46 @@ def test_bp_remove_unknown_id_errors():
     reply = session.handle_op("bp_remove", {"id": 999})
     assert reply["ok"] is False
     assert "no bp with id" in reply["error"]
+
+
+def test_bp_remove_routes_to_correct_packet():
+    """hw bp removal must send z1; soft bp removal must send z0."""
+    rsp = FakeRsp()
+    rm_calls: list[bool] = []
+    real_remove = rsp.remove_breakpoint
+    def tracking_remove(addr, *, kind=1, hardware=False):
+        rm_calls.append(hardware)
+        real_remove(addr, kind=kind, hardware=hardware)
+    rsp.remove_breakpoint = tracking_remove
+
+    store = FakeStore({"nt!Foo": 0xfffff80608000000})
+    session = _make_session(rsp=rsp, store=store)
+
+    # Install one hw, one soft (using auto path won't work since FakeRsp
+    # always succeeds — explicit modes).
+    hw_id = session.handle_op("bp_add", {"target": "nt!Foo", "mode": "hw"})["result"]["id"]
+    soft_id = session.handle_op("bp_add", {"target": "nt!Foo", "mode": "soft"})["result"]["id"]
+
+    session.handle_op("bp_remove", {"id": hw_id})
+    session.handle_op("bp_remove", {"id": soft_id})
+
+    # Removal calls in order: hw (True), soft (False)
+    assert rm_calls == [True, False]
+
+
+def test_bp_list_includes_hw_field():
+    rsp = FakeRsp()
+    store = FakeStore({"nt!Foo": 0xfffff80608000000, "nt!Bar": 0xfffff80608000100})
+    session = _make_session(rsp=rsp, store=store)
+    session.handle_op("bp_add", {"target": "nt!Foo", "mode": "hw"})
+    session.handle_op("bp_add", {"target": "nt!Bar", "mode": "soft"})
+    reply = session.handle_op("bp_list", {})
+    bps = reply["result"]["bps"]
+    assert len(bps) == 2
+    # Both bps have hw field set correctly
+    by_target = {b["target"]: b for b in bps}
+    assert by_target["nt!Foo"]["hw"] is True
+    assert by_target["nt!Bar"]["hw"] is False
 
 
 # ── interrupt / status fast paths ──────────────────────────────────────

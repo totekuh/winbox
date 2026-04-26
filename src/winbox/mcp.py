@@ -2230,24 +2230,39 @@ def kdbg_session() -> str:
 
 
 @mcp.tool()
-def kdbg_bp(target: str) -> str:
-    """Install a software breakpoint at TARGET in the attached process.
+def kdbg_bp(target: str, mode: str = "hw") -> str:
+    """Install a breakpoint at TARGET in the attached process.
 
-    Auto-detects user vs kernel VA. Kernel addresses use plain Z0;
-    user-mode addresses use the CR3-masquerade trick (write target's
-    DTB into the firing vCPU's CR3 register, install Z0, restore CR3)
-    so the bp lands in the target process's address space.
+    Defaults to **hardware breakpoint** (CPU debug register, Z1
+    packet) — invisible to PatchGuard (no code modification) AND
+    invisible to in-guest ``GetThreadContext(CONTEXT_DEBUG_REGISTERS)``
+    checks because KVM virtualizes DR access (the guest sees its
+    own shadow DRs which are zero, not the actual hardware DRs we
+    set). Limit: 4 active per vCPU.
 
     Args:
-        target: Symbol (``module!sym`` like ``notepad!SaveFile``) or
-            hex VA (``0x7ff7b04eeabc``).
+        target: Symbol (``module!sym``) or hex VA.
+        mode: Breakpoint mechanism:
+            ``"hw"`` (default) — hardware bp via Z1. PG-safe and
+                anti-debug-invisible. Limit 4 per vCPU.
+            ``"soft"`` — software 0xCC patch via Z0. Unlimited
+                count but visible to code self-hashing and
+                PatchGuard. Use when >4 hw bps needed or for
+                bp on data ranges (future).
+            ``"auto"`` — try hw first, fall back to soft on slot
+                exhaustion. Inspect the returned ``hw`` field to
+                see which path you got.
 
     Returns:
-        JSON ``{id, va, user_mode, elapsed_ms}`` on success.
+        JSON ``{id, va, user_mode, hw, elapsed_ms}`` — ``hw`` field
+        tells you whether you got a hardware or software bp.
     """
     cfg = _kdbg_cfg_only()
     try:
-        return _json.dumps(_kdbg_client(cfg).call("bp_add", target=target), indent=2)
+        return _json.dumps(
+            _kdbg_client(cfg).call("bp_add", target=target, mode=mode),
+            indent=2,
+        )
     except _ClientError as e:
         return f"error: {e}"
 

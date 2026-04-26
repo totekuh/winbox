@@ -95,12 +95,13 @@ def log_path(cfg: Config) -> Path:
 
 @dataclass
 class Breakpoint:
-    """One installed software bp tracked by the daemon."""
+    """One installed bp tracked by the daemon."""
 
     bp_id: int
     va: int
     target: str           # the user-supplied "module!sym" or hex string
-    user_mode: bool       # True if installed via CR3 masquerade
+    user_mode: bool       # True if VA is in user-half of address space
+    hw: bool              # True if installed via Z1 (hardware DR), False if Z0 (software 0xCC)
     installed_at: float   # monotonic timestamp
     hits: int = 0
 
@@ -198,22 +199,67 @@ class DaemonSession:
             "daemon_pid": os.getpid(),
         }
 
-    def op_bp_add(self, target: str) -> dict[str, Any]:
-        """Install a bp at sym/VA. Auto-detect user vs kernel by VA."""
-        va = self._resolve_target(target)
+    def op_bp_add(self, target: str, mode: str = "hw") -> dict[str, Any]:
+        """Install a bp at sym/VA.
 
+        ``mode`` selects the bp mechanism:
+
+        * ``"hw"`` (default) — hardware bp via gdbstub ``Z1`` packet.
+          Sets a CPU debug register (DR0..3). Invisible to PatchGuard
+          (no code modification) and invisible to in-guest GetThread\
+          Context (KVM virtualizes DR access). For user-mode VAs no
+          CR3 masquerade is needed — Z1 doesn't translate the VA, it
+          just configures a register match. Limit: 4 active per vCPU.
+        * ``"soft"`` — software bp via gdbstub ``Z0`` (0xCC patch).
+          Visible to code self-hashing and PatchGuard. Unlimited count.
+          For user-mode VAs goes through ``install_user_breakpoint``
+          (CR3 masquerade dance).
+        * ``"auto"`` — try hw first; on slot exhaustion fall back to
+          soft. Surfaces neither the hw success nor the fallback in
+          a special way; the resulting bp's ``hw`` field tells which
+          you got.
+        """
+        va = self._resolve_target(target)
         is_user = (va >> 47) != 0x1FFFF  # canonical-high == kernel half
-        if is_user:
-            report = install_user_breakpoint(
-                self.rsp, self.cfg.vm_name, self.store,
-                target_dtb=self.target.dtb,
-                user_va=va,
-            )
-            elapsed_ms = report.elapsed * 1000.0
-        else:
+
+        if mode not in ("hw", "soft", "auto"):
+            raise ValueError(f"mode must be 'hw', 'soft', or 'auto'; got {mode!r}")
+
+        # Track how the bp got installed for the registry + reply.
+        installed_hw = False
+        elapsed_ms = 0.0
+
+        if mode in ("hw", "auto"):
+            # Try hw first.
             t0 = time.monotonic()
-            self.rsp.insert_breakpoint(va, kind=1)
-            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            try:
+                self.rsp.insert_breakpoint(va, kind=1, hardware=True)
+                installed_hw = True
+                elapsed_ms = (time.monotonic() - t0) * 1000.0
+            except RspError as e:
+                if mode == "hw":
+                    raise RuntimeError(
+                        f"hw bp install failed: {e}. The 4-slot DR0..3 budget "
+                        f"may be exhausted; set mode='soft' to use a software "
+                        f"breakpoint instead (unlimited but PG-visible / hash-"
+                        f"detectable)."
+                    ) from e
+                # mode == "auto" — fall through to soft path
+
+        if not installed_hw:
+            # Software path. Kernel VAs get plain Z0 (kernel pages are
+            # in every CR3); user VAs need the CR3-masquerade dance.
+            t0 = time.monotonic()
+            if is_user:
+                report = install_user_breakpoint(
+                    self.rsp, self.cfg.vm_name, self.store,
+                    target_dtb=self.target.dtb,
+                    user_va=va,
+                )
+                elapsed_ms = report.elapsed * 1000.0
+            else:
+                self.rsp.insert_breakpoint(va, kind=1)
+                elapsed_ms = (time.monotonic() - t0) * 1000.0
 
         bp_id = self._next_bp_id
         self._next_bp_id += 1
@@ -222,6 +268,7 @@ class DaemonSession:
             va=va,
             target=target,
             user_mode=is_user,
+            hw=installed_hw,
             installed_at=time.monotonic(),
         )
         self.bps[bp_id] = bp
@@ -229,6 +276,7 @@ class DaemonSession:
             "id": bp_id,
             "va": f"0x{va:x}",
             "user_mode": is_user,
+            "hw": installed_hw,
             "elapsed_ms": round(elapsed_ms, 2),
         }
 
@@ -242,6 +290,7 @@ class DaemonSession:
                     "target": b.target,
                     "target_pretty": pretty_symbol(b.target),
                     "user_mode": b.user_mode,
+                    "hw": b.hw,
                     "hits": b.hits,
                     "age_s": round(time.monotonic() - b.installed_at, 2),
                 }
@@ -254,14 +303,17 @@ class DaemonSession:
         if bp is None:
             raise ValueError(f"no bp with id {id}")
         try:
-            self.rsp.remove_breakpoint(bp.va, kind=1)
+            # Route to the right packet (z0 vs z1) based on how it
+            # was installed. Mismatching is a no-op or error in QEMU.
+            self.rsp.remove_breakpoint(bp.va, kind=1, hardware=bp.hw)
         except RspError as e:
             # Surface but still drop from registry — the alternative is a
             # stale entry the user can't get rid of.
             del self.bps[id]
-            raise RuntimeError(f"z0 failed: {e}; bp untracked") from e
+            packet = "z1" if bp.hw else "z0"
+            raise RuntimeError(f"{packet} failed: {e}; bp untracked") from e
         del self.bps[id]
-        return {"removed": id, "va": f"0x{bp.va:x}"}
+        return {"removed": id, "va": f"0x{bp.va:x}", "hw": bp.hw}
 
     def op_cont(self, timeout: float = 30.0) -> dict[str, Any]:
         """Resume; block until next stop *in target's CR3*. Silent-cont

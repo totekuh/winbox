@@ -784,19 +784,36 @@ def kdbg_session(ctx: click.Context) -> None:
 
 @kdbg.command("bp")
 @click.argument("target", metavar="VA_OR_SYMBOL")
+@click.option(
+    "--mode", type=click.Choice(["hw", "soft", "auto"], case_sensitive=False),
+    default="hw", show_default=True,
+    help=(
+        "Breakpoint mechanism. 'hw' uses CPU debug registers (Z1) — "
+        "PG-safe and anti-debug-invisible, limit 4 per vCPU. "
+        "'soft' uses 0xCC patches (Z0) — unlimited but PG/hash visible. "
+        "'auto' tries hw first, falls back to soft on slot exhaustion."
+    ),
+)
 @click.pass_context
-def kdbg_bp(ctx: click.Context, target: str) -> None:
-    """Install a bp at TARGET (hex VA or ``module!symbol``)."""
+def kdbg_bp(ctx: click.Context, target: str, mode: str) -> None:
+    """Install a bp at TARGET (hex VA or ``module!symbol``).
+
+    Default mode is hardware (Z1) — invisible to PatchGuard and
+    anti-debug GetThreadContext checks because KVM virtualizes DR
+    access. Use ``--mode soft`` for the legacy 0xCC behaviour
+    (needed when >4 simultaneous bps required).
+    """
     cfg: Config = ctx.obj["cfg"]
     try:
-        result = _client(cfg).call("bp_add", target=target)
+        result = _client(cfg).call("bp_add", target=target, mode=mode)
     except ClientError as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
-    mode = "user" if result["user_mode"] else "kernel"
+    user_kernel = "user" if result["user_mode"] else "kernel"
+    bp_kind = "hw" if result["hw"] else "soft"
     console.print(
         f"[green][+][/] bp #{result['id']} at {result['va']} "
-        f"({mode}-mode, {result['elapsed_ms']:.1f}ms)"
+        f"({user_kernel}-mode, {bp_kind}, {result['elapsed_ms']:.1f}ms)"
     )
 
 
@@ -814,10 +831,11 @@ def kdbg_bps(ctx: click.Context) -> None:
     if not bps:
         console.print("[dim](no bps)[/]")
         return
-    console.print("[dim]  id  VA                 hits  age      target[/]")
+    console.print("[dim]  id  VA                 kind  hits  age      target[/]")
     for b in bps:
+        kind = "hw" if b.get("hw") else "soft"
         console.print(
-            f"  {b['id']:2d}  {b['va']:18s} {b['hits']:5d}  "
+            f"  {b['id']:2d}  {b['va']:18s} {kind:4s}  {b['hits']:5d}  "
             f"{b['age_s']:6.1f}s  {b['target']}"
         )
 

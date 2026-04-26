@@ -1866,18 +1866,31 @@ class TestKdbgDaemonTools:
 
     # ── kdbg_bp ─────────────────────────────────────────────────────────
 
-    def test_bp_passes_target_to_daemon(self, mock_mcp):
+    def test_bp_passes_target_and_mode_to_daemon(self, mock_mcp):
         from winbox.mcp import kdbg_bp
         client = self._client_with(call_result={
             "id": 0, "va": "0x7ff7b04eeabc",
-            "user_mode": True, "elapsed_ms": 3.7,
+            "user_mode": True, "hw": True, "elapsed_ms": 3.7,
         })
         with patch("winbox.mcp._kdbg_client", return_value=client):
             result = kdbg_bp("notepad!Save")
-        client.call.assert_called_once_with("bp_add", target="notepad!Save")
+        # Default mode is "hw" — verify it's forwarded
+        client.call.assert_called_once_with("bp_add", target="notepad!Save", mode="hw")
         out = _json_mod.loads(result)
         assert out["id"] == 0
-        assert out["user_mode"] is True
+        assert out["hw"] is True
+
+    def test_bp_explicit_soft_mode_forwarded(self, mock_mcp):
+        from winbox.mcp import kdbg_bp
+        client = self._client_with(call_result={
+            "id": 0, "va": "0x7ff7b04eeabc",
+            "user_mode": True, "hw": False, "elapsed_ms": 4.2,
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            kdbg_bp("notepad!Save", mode="soft")
+        client.call.assert_called_once_with(
+            "bp_add", target="notepad!Save", mode="soft",
+        )
 
     def test_bp_returns_error_on_install_failure(self, mock_mcp):
         from winbox.mcp import kdbg_bp
