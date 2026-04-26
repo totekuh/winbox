@@ -38,8 +38,14 @@ from winbox.kdbg import (
     read_virt_cr3,
     resolve_nt_base,
 )
+from winbox.kdbg.debugger import (
+    InstallError,
+    RspClient,
+    RspError,
+    install_user_breakpoint,
+)
 from winbox.kdbg.format import format_struct as _format_struct, format_sym as _format_sym
-from winbox.kdbg.hmp import HmpError, hmp as hmp_call, probe_port
+from winbox.kdbg.hmp import HmpError, hmp as hmp_call, parse_registers, probe_port
 from winbox.kdbg.walk import list_modules, list_processes, list_user_modules
 from winbox.vm import VM, GuestAgent, VMState
 
@@ -524,6 +530,148 @@ def kdbg_user_symbols(cfg: Config, vm: VM, ga: GuestAgent, pid: int, module_name
     )
     console.print(f"    stored at {info.path}")
     console.print(f"    try [bold]winbox kdbg sym {short_name}!<name>[/]")
+
+
+@kdbg.command("user-bp")
+@click.argument("pid", type=int)
+@click.argument("target", metavar="VA_OR_SYMBOL")
+@click.option(
+    "--port", default=1234, show_default=True,
+    help="Port the gdbstub is listening on.",
+)
+@click.option(
+    "--timeout", default=30.0, show_default=True, type=float,
+    help="Wall-clock budget for the install dance (seconds).",
+)
+@click.option(
+    "--max-hits", default=10, show_default=True, type=int,
+    help="Number of bp fires to observe before detaching.",
+)
+@click.pass_context
+def kdbg_user_bp(
+    ctx: click.Context,
+    pid: int,
+    target: str,
+    port: int,
+    timeout: float,
+    max_hits: int,
+) -> None:
+    """Install a software bp at a USER virtual address in PID via gdbstub.
+
+    TARGET is either a hex VA (``0x7ffbded10000``) or ``module!symbol``
+    (``ntdll!NtClose``, ``notepad!WinMain``). Symbols must be loaded
+    via ``winbox kdbg user-symbols`` first.
+
+    The install dance: bp on ``nt!SwapContext``, on each fire step
+    inside until CR3 changes, when CR3 matches target's DTB install
+    Z0 at the user VA. Then resumes the VM and reports the first
+    ``--max-hits`` bp fires (filtered: shows whether each hit's CR3
+    matched target's DTB).
+
+    Requires:
+      - gdbstub running (``winbox kdbg start``)
+      - nt symbols loaded (``winbox kdbg symbols``)
+      - The user VA must be paged in already; cold pages will fail
+        with E22 from QEMU.
+    """
+    cfg: Config = ctx.obj["cfg"]
+    store = _get_store(cfg)
+    vm = VM(cfg)
+    if vm.state() != VMState.RUNNING:
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+    if not probe_port("127.0.0.1", port):
+        console.print(f"[red][-][/] gdbstub not listening on 127.0.0.1:{port}")
+        console.print("    run [bold]winbox kdbg start[/] first")
+        raise SystemExit(1)
+
+    # Find target process to get its DTB.
+    procs = list_processes(cfg.vm_name, store)
+    target_proc = next((p for p in procs if p.pid == pid), None)
+    if target_proc is None:
+        console.print(f"[red][-][/] pid {pid} not found")
+        raise SystemExit(1)
+
+    # Resolve TARGET to a VA.
+    if "!" in target:
+        try:
+            user_va = store.resolve(target)
+        except SymbolStoreError as e:
+            console.print(f"[red][-][/] symbol resolution failed: {e}")
+            raise SystemExit(1)
+    else:
+        try:
+            user_va = int(target, 0)
+        except ValueError:
+            raise click.BadParameter(f"not a valid VA or module!symbol: {target!r}")
+
+    console.print(
+        f"[dim]target: pid={pid} ({target_proc.name}) "
+        f"dtb=0x{target_proc.directory_table_base:x}  "
+        f"user_va=0x{user_va:x}[/]"
+    )
+
+    cli = RspClient.connect("127.0.0.1", port, timeout=10.0)
+    try:
+        cli.handshake()
+        cli.query_halt_reason()
+
+        with console.status(f"[blue]Installing user bp via CR3 masquerade..."):
+            try:
+                report = install_user_breakpoint(
+                    cli, cfg.vm_name, store,
+                    target_dtb=target_proc.directory_table_base,
+                    user_va=user_va,
+                    timeout=timeout,
+                )
+            except InstallError as e:
+                console.print(f"[red][-][/] install failed: {e}")
+                raise SystemExit(1)
+
+        console.print(
+            f"[green][+][/] bp installed in {report.elapsed*1000:.1f}ms "
+            f"via CR3 masquerade (target_dtb=0x{report.target_dtb:x})"
+        )
+
+        # Drain hits, silent-continue when firing CR3 != target (this
+        # is the Day 4 stop-time CR3 filter, inlined here for the demo).
+        target_dtb = target_proc.directory_table_base
+        console.print(f"\n[dim]Waiting for {max_hits} hits in target's address space (silent-cont others)...[/]\n")
+        target_hits = 0
+        skipped = 0
+        deadline = timeout * 6  # generous outer budget
+        import time as _t
+        start_drain = _t.monotonic()
+        while target_hits < max_hits and _t.monotonic() - start_drain < deadline:
+            cli.cont()
+            try:
+                sr = cli.wait_for_stop(timeout=timeout)
+            except RspError as e:
+                console.print(f"[yellow][!][/] wait_for_stop: {e}")
+                break
+            cli.select_thread(sr.thread or "01")
+            cr3 = cli.read_cr3()
+            if cr3 != target_dtb:
+                skipped += 1
+                continue
+            target_hits += 1
+            import struct as _struct
+            regs = cli.read_registers()
+            rip = _struct.unpack_from("<Q", regs, 16 * 8)[0]
+            console.print(
+                f"  hit #{target_hits}: vCPU={sr.thread} RIP=0x{rip:x} "
+                f"CR3=0x{cr3:x}  [bold green]<-- IN NOTEPAD[/]"
+            )
+        console.print(f"\n[dim]({target_hits} target hits, {skipped} silent-continues from other processes)[/]")
+
+        # Cleanup: remove user bp, resume VM, detach.
+        try:
+            cli.remove_breakpoint(user_va, kind=1)
+        except RspError as e:
+            console.print(f"[yellow][!][/] failed to remove user bp: {e}")
+        console.print("\n[green][+][/] detaching, leaving VM running")
+    finally:
+        cli.close()
 
 
 @kdbg.command("base")

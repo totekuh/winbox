@@ -14,6 +14,11 @@ KdDebuggerEnabled, IsDebuggerPresent, NtQueryInformationProcess).
 
 from __future__ import annotations
 
+from winbox.kdbg.debugger.install import (
+    InstallError,
+    InstallReport,
+    install_user_breakpoint,
+)
 from winbox.kdbg.debugger.rsp import (
     RspClient,
     RspError,
@@ -21,7 +26,10 @@ from winbox.kdbg.debugger.rsp import (
 )
 
 __all__ = [
+    "InstallError",
+    "InstallReport",
     "RspClient",
     "RspError",
     "StopReply",
+    "install_user_breakpoint",
 ]
