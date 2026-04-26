@@ -882,38 +882,60 @@ def _read_target_bytes(rsp: "RspClient", target_dtb: int, va: int, length: int) 
             rsp._exchange(b"G" + bytes(restore).hex().encode("ascii"))
 
 
+def _normalize_module_name(name: str) -> str:
+    """Strip common PE suffixes for matching across naming conventions.
+
+    SymbolStore short names: ``notepad``, ``ntdll`` (filename stems).
+    PEB.Ldr BaseDllName values: ``notepad.exe``, ``ntdll.dll``.
+    Match case-insensitively after stripping the extension.
+    """
+    n = name.lower().rsplit(".", 1)[0]
+    return n
+
+
 def _validate_module_bases(
+    cfg: Config,
     rsp: "RspClient",
-    target_dtb: int,
+    target,
     store: SymbolStore,
-    target_name: str,
 ) -> None:
-    """Verify each loaded user-mode module's cached base still points
-    at a valid PE header in the target's address space.
+    """Verify cached module bases match what's actually loaded in target.
 
-    PE images start with the DOS magic ``MZ`` (0x4D 0x5A). If we read
-    those 2 bytes at the cached base and don't get MZ, ASLR has moved
-    the module since the store was populated — typically because the
-    VM rebooted between symbol loads.
+    The check has TWO failure modes to distinguish:
 
-    Raises ``DaemonError`` with a clear remediation message naming
-    every stale module so the agent / user knows exactly which
-    ``kdbg_user_symbols_load`` calls to re-issue.
+    1. Module is loaded in target but its base differs from our cached
+       value → STALE (ASLR moved it across a VM reboot, or symbols
+       loaded against a different process). Forces a clear error
+       naming the affected modules.
 
-    Skips ``nt`` itself — its base is set via the IDT trick at load
-    time and gets re-resolved by ``kdbg_base_refresh``, not via this
-    walker. Also skips entries with no base (loaded via load_module
-    without a base, e.g. for symbol-only access).
+    2. Module is in our store but NOT loaded in this target → SKIP.
+       The store is global across the whole VM; entries from a
+       different process (e.g. notepad symbols cached when we worked
+       with notepad, now attaching to cyserver) are perfectly fine,
+       just irrelevant to this target. Validating them against this
+       target's CR3 would falsely report stale.
+
+    Strategy:
+      - Walk target's PEB.Ldr once → {normalized_name: base}
+      - For each cached store module: look it up in the target's
+        loaded set. If found and bases mismatch → stale. If not
+        found → skip silently.
+      - Skip ``nt`` (kernel module, handled by kdbg_base_refresh).
+
+    Raises ``DaemonError`` with remediation message listing each
+    stale module — names match the ``kdbg_user_symbols_load`` arg
+    the user should pass to fix it.
     """
     try:
         modules = store.list_modules()
     except Exception:
         return  # No store, nothing to validate
 
-    stale: list[tuple[str, int]] = []
+    # Filter to modules with cached bases that aren't the kernel.
+    candidates: list[tuple[str, int]] = []
     for mod_name in modules:
         if mod_name == "nt":
-            continue  # Kernel base validated separately
+            continue
         try:
             data = store.load(mod_name)
         except Exception:
@@ -921,20 +943,49 @@ def _validate_module_bases(
         base = data.get("base")
         if not base:
             continue
-        try:
-            head = _read_target_bytes(rsp, target_dtb, base, 2)
-        except Exception:
-            # Couldn't read at all — VA isn't even mapped, definitely stale
-            stale.append((mod_name, base))
+        candidates.append((mod_name, base))
+
+    if not candidates:
+        return  # Nothing to check; skip the PEB.Ldr walk entirely.
+
+    # Walk target's PEB.Ldr to get the actual loaded modules.
+    # ensure_types_loaded for _PEB / _PEB_LDR_DATA may be needed if
+    # the store predates their inclusion — handle gracefully.
+    from winbox.kdbg import ensure_types_loaded
+    from winbox.kdbg.walk import list_user_modules
+    try:
+        ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
+        loaded = list_user_modules(cfg.vm_name, store, target)
+    except Exception as e:
+        # Couldn't walk PEB.Ldr — skip validation rather than block
+        # the attach. The user will get a clearer error later if a
+        # specific bp install actually fails on a stale base.
+        return
+
+    # Build normalized lookup of currently loaded modules in target.
+    target_loaded: dict[str, int] = {
+        _normalize_module_name(m.name): m.base for m in loaded
+    }
+
+    stale: list[tuple[str, int, int]] = []  # (cached_name, cached_base, current_base)
+    for mod_name, cached_base in candidates:
+        norm = _normalize_module_name(mod_name)
+        actual_base = target_loaded.get(norm)
+        if actual_base is None:
+            # Not loaded in this target — store entry is from a
+            # different process. Skip without complaint.
             continue
-        if len(head) < 2 or head[:2] != b"MZ":
-            stale.append((mod_name, base))
+        if actual_base != cached_base:
+            stale.append((mod_name, cached_base, actual_base))
 
     if stale:
-        names = ", ".join(f"{name} (was 0x{base:x})" for name, base in stale)
+        details = ", ".join(
+            f"{name} (cached 0x{cached:x}, actual 0x{actual:x})"
+            for name, cached, actual in stale
+        )
         raise DaemonError(
-            f"stale module bases for {target_name}: {names}. "
-            f"VM likely rebooted since symbols were loaded. "
+            f"stale module bases for {target.name}: {details}. "
+            f"ASLR moved them since symbols were loaded. "
             f"Re-run kdbg_user_symbols_load for each stale module before retrying."
         )
 
@@ -999,7 +1050,10 @@ def fork_daemon(
         # ``base`` field in store entries points nowhere in current
         # process — Z0 user_va install fails later with cryptic E22.
         # Catch it now and tell the user exactly what to do.
-        _validate_module_bases(rsp, target.directory_table_base, store, target.name)
+        # Only validates store entries that are ACTUALLY loaded in the
+        # target — irrelevant entries (e.g. notepad symbols cached
+        # while now attaching to cyserver) are skipped without complaint.
+        _validate_module_bases(cfg, rsp, target, store)
 
         listen_sock = _bind_unix_socket(sock_path(cfg))
         info = TargetInfo(pid=target.pid, dtb=target.directory_table_base, name=target.name)

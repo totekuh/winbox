@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import struct
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -565,39 +566,6 @@ def test_op_write_mem_restores_cr3_even_on_failure():
 # ── _validate_module_bases ───────────────────────────────────────────────
 
 
-class _RspForValidation:
-    """Minimal RspClient stand-in for stale-base detection unit tests.
-
-    Returns canned bytes from a per-base lookup so we can simulate
-    "module's base points at MZ" vs "module's base points at garbage".
-    """
-
-    def __init__(self, mappings: dict[int, bytes]) -> None:
-        self.mappings = mappings  # base_va -> 2 bytes
-        self.threads_returned = ["01"]
-        self.regs_blob = _blob()
-
-    def list_threads(self):
-        return list(self.threads_returned)
-
-    def select_thread(self, t, *, op="g"):
-        pass
-
-    def read_registers(self):
-        return self.regs_blob
-
-    def read_memory(self, va, length):
-        # The validator passes the module's base as va; we look it up
-        # in mappings. If not present, simulate "VA not mapped".
-        if va in self.mappings:
-            return self.mappings[va][:length]
-        from winbox.kdbg.debugger.rsp import RspError
-        raise RspError(f"m failed at 0x{va:x}: E22")
-
-    def _exchange(self, body, *, timeout=None):
-        return b"OK"  # G writes always accepted in this fake
-
-
 class _StoreForValidation:
     def __init__(self, modules: dict[str, dict]) -> None:
         self._modules = modules
@@ -609,66 +577,157 @@ class _StoreForValidation:
         return self._modules[name]
 
 
-def test_validate_module_bases_passes_when_all_show_MZ():
+class _FakeUserModule:
+    """Mimics walk.UserModuleRecord shape for tests."""
+    def __init__(self, name: str, base: int) -> None:
+        self.name = name
+        self.base = base
+        self.size = 0x100000
+        self.full_path = f"C:\\Windows\\{name}"
+        self.entry = 0
+
+
+class _FakeTarget:
+    """Mimics ProcessRecord for the validator's target arg."""
+    def __init__(self, pid=4584, dtb=0x4d6bb000, name="notepad.exe", eprocess=0xffffe000_00100000) -> None:
+        self.pid = pid
+        self.directory_table_base = dtb
+        self.name = name
+        self.eprocess = eprocess
+
+
+def _patch_validator(monkeypatch, loaded_modules):
+    """Stub list_user_modules + ensure_types_loaded so _validate_module_bases
+    sees ``loaded_modules`` as the target's PEB.Ldr contents.
+    """
+    from winbox.kdbg.debugger import daemon as daemon_mod
+    monkeypatch.setattr(
+        daemon_mod, "_validate_module_bases",
+        daemon_mod._validate_module_bases,  # keep real impl
+    )
+    # Patch the inner imports
+    import winbox.kdbg as kdbg_mod
+    import winbox.kdbg.walk as walk_mod
+    monkeypatch.setattr(walk_mod, "list_user_modules",
+                        lambda vm, store, target, cache=None: loaded_modules)
+    monkeypatch.setattr(kdbg_mod, "ensure_types_loaded",
+                        lambda *a, **kw: None)
+
+
+def test_validate_passes_when_cached_base_matches_loaded(monkeypatch):
     from winbox.kdbg.debugger.daemon import _validate_module_bases
-    rsp = _RspForValidation({0x7ff700000000: b"MZ", 0x7ff800000000: b"MZ"})
+    _patch_validator(monkeypatch, [
+        _FakeUserModule("notepad.exe", 0x7ff700000000),
+        _FakeUserModule("ntdll.dll", 0x7ff800000000),
+    ])
     store = _StoreForValidation({
         "notepad": {"base": 0x7ff700000000},
         "ntdll": {"base": 0x7ff800000000},
     })
-    # Should not raise.
-    _validate_module_bases(rsp, target_dtb=0x4d6bb000, store=store, target_name="notepad.exe")
+    # Should not raise — bases match what's loaded.
+    _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
 
 
-def test_validate_module_bases_raises_on_stale():
+def test_validate_raises_on_base_mismatch(monkeypatch):
+    """Module loaded in target at a DIFFERENT base than cached → stale."""
     from winbox.kdbg.debugger.daemon import _validate_module_bases, DaemonError
-    rsp = _RspForValidation({
-        0x7ff700000000: b"MZ",       # notepad's base — valid
-        0x7ff800000000: b"\x00\x00",  # ntdll's base — STALE (zeros, not MZ)
-    })
+    _patch_validator(monkeypatch, [
+        _FakeUserModule("ntdll.dll", 0x7ff_99999000),  # actual base
+    ])
     store = _StoreForValidation({
-        "notepad": {"base": 0x7ff700000000},
-        "ntdll": {"base": 0x7ff800000000},
+        "ntdll": {"base": 0x7ff800000000},  # cached base — stale
     })
     with pytest.raises(DaemonError) as exc:
-        _validate_module_bases(rsp, target_dtb=0x4d6bb000, store=store, target_name="notepad.exe")
+        _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
     msg = str(exc.value)
     assert "stale" in msg.lower()
     assert "ntdll" in msg
     assert "0x7ff800000000" in msg
+    assert "0x7ff99999000" in msg
     assert "kdbg_user_symbols_load" in msg
 
 
-def test_validate_module_bases_skips_nt_module():
-    """The kernel module's base is validated by kdbg_base_refresh, not here."""
+def test_validate_skips_modules_not_loaded_in_target(monkeypatch):
+    """THE BUG FIX: cached store entries for modules not loaded in
+    THIS target must be skipped (not flagged stale).
+
+    Realistic case: notepad symbols cached during a previous notepad
+    debug session; user now attaches to cyserver.exe. cyserver doesn't
+    have notepad loaded, so the cached notepad entry is irrelevant —
+    NOT stale.
+    """
     from winbox.kdbg.debugger.daemon import _validate_module_bases
-    rsp = _RspForValidation({})  # no mappings
+    _patch_validator(monkeypatch, [
+        # Target only has ntdll loaded — notepad isn't in this process.
+        _FakeUserModule("ntdll.dll", 0x7ff800000000),
+    ])
     store = _StoreForValidation({
-        "nt": {"base": 0xfffff80608628000},  # would otherwise be flagged stale
+        "notepad": {"base": 0x7ff700000000},  # not in target — should skip
+        "ntdll": {"base": 0x7ff800000000},     # in target, base matches — pass
     })
-    # Should not raise — we skipped the nt entry.
-    _validate_module_bases(rsp, target_dtb=0x1ae000, store=store, target_name="System")
+    # Should NOT raise — notepad cached entry is irrelevant to this target.
+    _validate_module_bases(
+        FakeCfg(), MagicMock(),
+        _FakeTarget(name="cyserver.exe"),
+        store,
+    )
 
 
-def test_validate_module_bases_treats_unmapped_as_stale():
-    from winbox.kdbg.debugger.daemon import _validate_module_bases, DaemonError
-    rsp = _RspForValidation({})  # base not mapped at all
-    store = _StoreForValidation({
-        "notepad": {"base": 0x7ff700000000},
-    })
-    with pytest.raises(DaemonError, match="stale"):
-        _validate_module_bases(rsp, target_dtb=0x4d6bb000, store=store, target_name="notepad.exe")
-
-
-def test_validate_module_bases_skips_modules_with_no_base():
+def test_validate_skips_nt_module(monkeypatch):
+    """nt is a kernel module — validated by kdbg_base_refresh, not here."""
     from winbox.kdbg.debugger.daemon import _validate_module_bases
-    rsp = _RspForValidation({})
+    _patch_validator(monkeypatch, [])  # no user modules in target
+    store = _StoreForValidation({
+        "nt": {"base": 0xfffff80608628000},  # kernel — should be skipped
+    })
+    # Should not raise.
+    _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
+
+
+def test_validate_skips_modules_with_no_base(monkeypatch):
+    from winbox.kdbg.debugger.daemon import _validate_module_bases
+    _patch_validator(monkeypatch, [])
     store = _StoreForValidation({
         "kernelbase": {"base": None},  # loaded but base unset
         "user32": {"base": 0},
     })
     # Should not raise — both entries skipped.
-    _validate_module_bases(rsp, target_dtb=0x4d6bb000, store=store, target_name="x.exe")
+    _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
+
+
+def test_validate_no_candidates_skips_peb_walk(monkeypatch):
+    """If the store has no user-mode modules with bases, skip the
+    PEB.Ldr walk entirely (it's an HMP-heavy operation we don't want
+    to trigger if there's nothing to validate)."""
+    from winbox.kdbg.debugger import daemon as daemon_mod
+    walked = {"called": False}
+    def tracking_walk(*a, **kw):
+        walked["called"] = True
+        return []
+    import winbox.kdbg.walk as walk_mod
+    monkeypatch.setattr(walk_mod, "list_user_modules", tracking_walk)
+
+    store = _StoreForValidation({
+        "nt": {"base": 0xfffff80608628000},  # kernel-only, gets skipped
+    })
+    daemon_mod._validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
+    assert walked["called"] is False
+
+
+def test_validate_peb_walk_failure_skips_gracefully(monkeypatch):
+    """If the PEB.Ldr walk fails (target has no PEB, store missing
+    types, etc.), skip validation rather than block attach."""
+    from winbox.kdbg.debugger.daemon import _validate_module_bases
+    import winbox.kdbg.walk as walk_mod
+    def boom(*a, **kw):
+        raise RuntimeError("walk failed")
+    monkeypatch.setattr(walk_mod, "list_user_modules", boom)
+
+    store = _StoreForValidation({
+        "ntdll": {"base": 0x7ff800000000},
+    })
+    # Should NOT raise — graceful fallback.
+    _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
 
 
 # ── _best_symbol_for_va — module-range filtering ────────────────────────
