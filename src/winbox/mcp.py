@@ -2063,12 +2063,16 @@ def kdbg_user_symbols_load(pid: int, module: str) -> str:
 
 @mcp.tool()
 def kdbg_read_va(pid: int, address: str, length: int) -> str:
-    """Read virtual memory from an arbitrary process - the CR3-switching primitive.
+    """Read virtual memory from an arbitrary process WITHOUT an attached
+    debugger session — uses HMP page-walks directly.
 
     Looks up the target's EPROCESS, grabs its ``DirectoryTableBase``,
     and walks the page tables manually against that CR3 to read
-    ``length`` bytes at ``address``. Works regardless of which process
-    was scheduled on the CPU when the debug halt happened.
+    ``length`` bytes at ``address``. Works without ``kdbg_attach`` and
+    regardless of which process was scheduled on the CPU.
+
+    For in-session reads (after ``kdbg_attach``), prefer ``kdbg_mem``:
+    same effect but ~40x faster (gdbstub CR3-masquerade vs HMP).
 
     Returns a bare hex string of the bytes. Pair with ``kdbg_ps`` to
     find a PID first.
@@ -2127,6 +2131,366 @@ def kdbg_base_refresh() -> str:
         return f"could not resolve nt base: {e}"
     store.set_base("nt", base)
     return f"nt base = 0x{base:x}"
+
+
+# ─── Tool 14: kdbg session daemon (interactive debugger) ─────────────────
+#
+# These wrap the long-running session daemon's Unix-socket protocol. The
+# daemon is forked by ``kdbg_attach`` and persists across MCP tool calls
+# until ``kdbg_detach``. While attached, every other tool here calls into
+# the daemon via DaemonClient on a fresh socket connection per call.
+# Single-session-at-a-time is enforced by an fcntl lock on the daemon's
+# lock file (kernel auto-releases on daemon death).
+
+from winbox.kdbg.debugger.client import DaemonClient as _DaemonClient
+from winbox.kdbg.debugger.client import ClientError as _ClientError
+from winbox.kdbg.debugger.daemon import DaemonError as _DaemonError
+from winbox.kdbg.debugger.daemon import fork_daemon as _fork_daemon
+from winbox.kdbg.debugger.rsp import RspClient as _RspClient
+from winbox.kdbg.debugger.rsp import RspError as _RspError
+
+
+def _kdbg_client(cfg) -> "_DaemonClient":
+    return _DaemonClient(cfg)
+
+
+def _kdbg_cfg_only():
+    """Get cfg without _ensure_vm_ready's resume-on-paused logic.
+
+    Daemon-driven tools (bp, cont, regs, mem, etc.) require the VM to
+    be paused via gdbstub. Calling _ensure_vm_ready here would
+    forcibly resume the VM out from under the gdbstub, breaking the
+    debug session. Use this lighter helper instead — it just returns
+    cfg without messing with VM state.
+    """
+    cfg, _, _ = _get_state()
+    return cfg
+
+
+@mcp.tool()
+def kdbg_attach(pid: int, port: int = 1234) -> str:
+    """Attach a kdbg debugging session to a Windows process via the gdbstub.
+
+    Forks a long-running daemon that holds the gdb connection alive
+    across subsequent MCP tool calls. Only one session can be active at
+    a time (fcntl-locked); call ``kdbg_detach`` before re-attaching.
+
+    Requires the gdbstub to be running (``kdbg_start``) and nt symbols
+    to be loaded (``kdbg_symbols_load``).
+
+    Args:
+        pid: Target Windows process PID (find via ``kdbg_ps``).
+        port: gdbstub TCP port the daemon should connect to.
+
+    Returns:
+        JSON with daemon_pid + target info on success, or error string.
+    """
+    cfg, vm, ga = _ensure_vm_ready()
+    client = _kdbg_client(cfg)
+    if client.session_alive():
+        info = client.session_info() or {}
+        return (
+            f"error: another session is active "
+            f"(target {info.get('target_name', '?')}({info.get('target_pid', '?')}), "
+            f"daemon_pid={info.get('daemon_pid', '?')}); call kdbg_detach first"
+        )
+    try:
+        daemon_pid = _fork_daemon(cfg, pid, gdbstub_port=port)
+    except _DaemonError as e:
+        return f"error: {e}"
+    info = client.session_info() or {}
+    return _json.dumps({
+        "daemon_pid": daemon_pid,
+        "target": {
+            "pid": info.get("target_pid", pid),
+            "dtb": info.get("target_dtb", "?"),
+            "name": info.get("target_name", "?"),
+        },
+        "gdbstub_port": info.get("gdbstub_port", port),
+    }, indent=2)
+
+
+@mcp.tool()
+def kdbg_session() -> str:
+    """Show current kdbg session info, or report no session.
+
+    Safe to call when nothing is attached — returns ``{"attached": false}``
+    rather than erroring. Use this to check session state before
+    operations that require an attached daemon.
+    """
+    cfg = _kdbg_cfg_only()
+    client = _kdbg_client(cfg)
+    if not client.session_alive():
+        return _json.dumps({"attached": False}, indent=2)
+    try:
+        result = client.call("status")
+    except _ClientError as e:
+        return f"error: {e}"
+    return _json.dumps({"attached": True, **result}, indent=2)
+
+
+@mcp.tool()
+def kdbg_bp(target: str) -> str:
+    """Install a software breakpoint at TARGET in the attached process.
+
+    Auto-detects user vs kernel VA. Kernel addresses use plain Z0;
+    user-mode addresses use the CR3-masquerade trick (write target's
+    DTB into the firing vCPU's CR3 register, install Z0, restore CR3)
+    so the bp lands in the target process's address space.
+
+    Args:
+        target: Symbol (``module!sym`` like ``notepad!SaveFile``) or
+            hex VA (``0x7ff7b04eeabc``).
+
+    Returns:
+        JSON ``{id, va, user_mode, elapsed_ms}`` on success.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        return _json.dumps(_kdbg_client(cfg).call("bp_add", target=target), indent=2)
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_bps() -> str:
+    """List all installed breakpoints in the current session.
+
+    Returns:
+        JSON array of ``{id, va, target, user_mode, hits, age_s}`` per bp.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        return _json.dumps(_kdbg_client(cfg).call("bp_list"), indent=2)
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_rm(bp_id: int) -> str:
+    """Remove a breakpoint by id.
+
+    Args:
+        bp_id: The id reported by ``kdbg_bp`` / ``kdbg_bps``.
+
+    Returns:
+        JSON ``{removed, va}`` on success.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        return _json.dumps(_kdbg_client(cfg).call("bp_remove", id=bp_id), indent=2)
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_cont(timeout: float = 30.0) -> str:
+    """Resume the VM; block until next bp hit in target's CR3.
+
+    The daemon silent-continues fires that aren't in the target process
+    (so cortex-XDR / dwm / other noise is filtered out at stop time).
+    Returns when a bp fires *in the target* OR when the timeout
+    expires OR when ``kdbg_interrupt`` is called from another flow.
+
+    Args:
+        timeout: Wall-clock budget in seconds (default 30). Sock timeout
+            is set to ``timeout + 10`` so the daemon's wait can run
+            its full budget.
+
+    Returns:
+        JSON with ``reason`` (bp/timeout/interrupt/signal/step) plus
+        register summary on hit.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        result = _kdbg_client(cfg).call(
+            "cont",
+            sock_timeout=float(timeout) + 10.0,
+            timeout=float(timeout),
+        )
+    except _ClientError as e:
+        return f"error: {e}"
+    return _json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def kdbg_step() -> str:
+    """Single-step the firing vCPU once.
+
+    Only valid after a stop (call ``kdbg_cont`` first or attach to a
+    halted state). Advances RIP by one instruction (1-15 bytes for
+    x86-64).
+
+    Returns:
+        JSON with stop info at the new RIP.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        return _json.dumps(_kdbg_client(cfg).call("step"), indent=2)
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_interrupt() -> str:
+    """Async halt request — breaks out of an in-flight ``kdbg_cont``.
+
+    Useful when ``kdbg_cont`` is sitting in a long wait and you want
+    to inspect immediately. The interrupt is queued; the cont loop
+    will pick it up at its next iteration and return with
+    ``reason=interrupt``.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        return _json.dumps(_kdbg_client(cfg).call("interrupt"), indent=2)
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_regs() -> str:
+    """Dump full register state at the most recent halt.
+
+    Returns:
+        JSON dict with ``rip, rsp, rbp, rax..r15, eflags, cs, cr0..cr4``
+        as hex strings.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        return _json.dumps(_kdbg_client(cfg).call("regs"), indent=2)
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_mem(va: str, length: int = 64) -> str:
+    """Read LENGTH bytes at VA in the attached target's address space.
+
+    Uses the same CR3-masquerade trick as bp install — temporarily
+    sets the firing vCPU's CR3 to target's DTB, reads via gdb ``m``,
+    restores. ~40x faster than HMP page-walks. Requires an attached
+    session (``kdbg_attach`` first); for session-less reads against
+    arbitrary PIDs use ``kdbg_read_va`` instead.
+
+    Args:
+        va: Virtual address as hex string (``0x7ff7b04eeabc``) or
+            decimal.
+        length: Bytes to read (capped at 64 KiB by the daemon).
+
+    Returns:
+        JSON ``{va, bytes}`` where ``bytes`` is a hex-encoded string.
+    """
+    cfg = _kdbg_cfg_only()
+    # Daemon accepts string-or-int; pass through as-is.
+    try:
+        return _json.dumps(
+            _kdbg_client(cfg).call("mem", va=va, length=int(length)),
+            indent=2,
+        )
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_stack(n: int = 16) -> str:
+    """Read N qwords starting at RSP (current halt's stack pointer).
+
+    Reads target's address space via CR3 masquerade, so this works
+    even if the firing vCPU isn't currently in target context (rare
+    but possible mid-step).
+
+    Args:
+        n: Number of 8-byte qwords to read (1..256).
+
+    Returns:
+        JSON ``{rsp, qwords}`` with hex strings.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        return _json.dumps(_kdbg_client(cfg).call("stack", n=int(n)), indent=2)
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_bt(depth: int = 8) -> str:
+    """Crude stack-walk backtrace; symbolicates plausible return addrs.
+
+    Treats values on the stack that look like canonical-high (kernel)
+    or canonical-low user-image addresses as candidate return addresses
+    and resolves them against loaded symbol stores. Best-effort only —
+    frame-pointer-omitted code won't unwind cleanly without proper
+    CFI, which is out of scope for this primitive.
+
+    Args:
+        depth: Max frames to return (1..64).
+
+    Returns:
+        JSON ``{rsp, frames}`` where each frame has ``addr, sym, stack_off``.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        return _json.dumps(_kdbg_client(cfg).call("bt", depth=int(depth)), indent=2)
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_detach() -> str:
+    """Tear down the kdbg session: remove bps, resume VM, release lock.
+
+    Safe to call when no session is active — returns "no session".
+    """
+    cfg = _kdbg_cfg_only()
+    client = _kdbg_client(cfg)
+    if not client.session_alive():
+        return "no kdbg session attached"
+    try:
+        client.call("detach")
+    except _ClientError as e:
+        # Daemon may have already started shutting down; ignore.
+        pass
+    # Wait for lock release (daemon exit) up to 5s.
+    import time as _time
+    deadline = _time.monotonic() + 5.0
+    while _time.monotonic() < deadline:
+        if not client.session_alive():
+            return "detached"
+        _time.sleep(0.1)
+    return "warning: daemon didn't exit within 5s; lock may be stale"
+
+
+@mcp.tool()
+def kdbg_resume(port: int = 1234) -> str:
+    """Recovery valve — resume a VM stuck in 'paused (debug)' state.
+
+    Connects briefly to the gdbstub and sends cont+detach so QEMU's
+    gdb_continue() runs the VM. Use when a daemon crashed mid-session
+    or a script bailed without cleanup. No-op if VM is already running.
+
+    Args:
+        port: gdbstub port to talk through.
+    """
+    cfg = _kdbg_cfg_only()
+    client = _kdbg_client(cfg)
+    if client.session_alive():
+        return "error: a kdbg session is active; call kdbg_detach instead"
+
+    from winbox.kdbg.hmp import probe_port as _kdbg_probe_port
+    if not _kdbg_probe_port("127.0.0.1", port):
+        return f"error: gdbstub not listening on 127.0.0.1:{port}"
+
+    try:
+        c = _RspClient.connect("127.0.0.1", port, timeout=5)
+    except (OSError, _RspError) as e:
+        return f"error: gdbstub connect failed: {e}"
+    try:
+        c.handshake()
+        c.query_halt_reason()
+        c.cont()
+    finally:
+        c.close()
+    return "VM resumed"
 
 
 # ─── Entry point ────────────────────────────────────────────────────────────

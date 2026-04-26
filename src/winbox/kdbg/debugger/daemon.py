@@ -567,14 +567,52 @@ class DaemonSession:
             conn.sendall(encode(reply))
 
     def shutdown(self) -> None:
-        """Best-effort cleanup. Removes bps, detaches gdb, closes sock."""
+        """Best-effort cleanup. Removes bps, resumes VM, detaches gdb,
+        closes sock.
+
+        We DO NOT use ``rsp.close()`` here — its interrupt+wait+D dance
+        was designed for the case where a client may be detaching from
+        a running VM, but in our daemon-shutdown context the VM is
+        usually halted (caller just did cont and got a stop). In that
+        state interrupt+wait double-halts QEMU's run-state machine and
+        leaves the VM in ``RUN_STATE_PAUSED`` after D — virsh shows
+        plain ``paused`` (not ``paused (debug)``) and ``virsh resume``
+        is needed to wake it. Direct cont→D bypasses that path:
+
+            cont        — sets QEMU's run state to RUNNING
+            D detach    — gdb_continue() inside QEMU re-runs vm_start()
+                          and clears the gdbstub's halt registry
+
+        After D, QEMU sends OK (which we read or skip) and the VM
+        keeps running until something else stops it.
+        """
         # Remove bps first so the gdbstub's bp registry is clean.
         for bp in list(self.bps.values()):
             with suppress(Exception):
                 self.rsp.remove_breakpoint(bp.va, kind=1)
         self.bps.clear()
-        with suppress(Exception):
-            self.rsp.close()
+
+        # Send cont to resume the VM, give QEMU time to process it,
+        # then just close the socket. QEMU's CHR_EVENT_CLOSED handler
+        # removes any leftover breakpoints (we already cleared ours
+        # above) but does NOT halt the VM — it keeps running in
+        # whatever state it was in at disconnect, which after our
+        # cont() is RUN_STATE_RUNNING. No D-packet needed; D's
+        # gdb_continue() was the source of the "paused after detach"
+        # bug because it raced with our cont's vm_start in QEMU's
+        # run-state machine.
+        try:
+            with suppress(Exception):
+                self.rsp.cont()
+            # Hold long enough that vCont;c is fully processed by
+            # QEMU before we yank the socket. 100ms is more than
+            # enough — vCont round-trip is sub-ms.
+            import time as _time
+            _time.sleep(0.1)
+        finally:
+            with suppress(OSError):
+                self.rsp._sock.close()
+
         if self._listen_sock is not None:
             with suppress(OSError):
                 self._listen_sock.close()

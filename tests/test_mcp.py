@@ -1773,3 +1773,252 @@ class TestKdbgListTools:
         vm.resume.assert_called_once()
         assert "VM not running" not in result
         assert result == "deadbeef"
+
+
+# ─── kdbg session daemon tools (Tool 14) ───────────────────────────────────
+
+
+import json as _json_mod
+
+
+class TestKdbgDaemonTools:
+    """MCP wrappers around the long-running session daemon.
+
+    Patches winbox.mcp._kdbg_client (and _fork_daemon for attach) so we
+    don't fork or open Unix sockets during tests.
+    """
+
+    def _client_with(self, *, alive=True, info=None, call_result=None,
+                     call_raises=None):
+        client = MagicMock()
+        client.session_alive.return_value = alive
+        client.session_info.return_value = info or {
+            "target_pid": 4584, "target_dtb": "0x4d6bb000",
+            "target_name": "notepad.exe", "daemon_pid": 9999,
+            "gdbstub_port": 1234,
+        }
+        if call_raises is not None:
+            client.call.side_effect = call_raises
+        else:
+            client.call.return_value = call_result if call_result is not None else {}
+        return client
+
+    # ── kdbg_attach ─────────────────────────────────────────────────────
+
+    def test_attach_forks_daemon_when_no_session(self, mock_mcp):
+        from winbox.mcp import kdbg_attach
+        client = self._client_with(alive=False, info={
+            "target_pid": 4584, "target_dtb": "0x4d6bb000",
+            "target_name": "notepad.exe", "daemon_pid": 1234,
+            "gdbstub_port": 1234,
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.mcp._fork_daemon", return_value=1234) as ff:
+            result = kdbg_attach(4584)
+
+        ff.assert_called_once()
+        out = _json_mod.loads(result)
+        assert out["daemon_pid"] == 1234
+        assert out["target"]["pid"] == 4584
+        assert out["target"]["name"] == "notepad.exe"
+
+    def test_attach_refuses_when_session_already_alive(self, mock_mcp):
+        from winbox.mcp import kdbg_attach
+        client = self._client_with(alive=True)
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.mcp._fork_daemon") as ff:
+            result = kdbg_attach(4584)
+
+        ff.assert_not_called()
+        assert "another session" in result
+        assert "kdbg_detach" in result
+
+    def test_attach_surfaces_daemon_error(self, mock_mcp):
+        from winbox.mcp import kdbg_attach
+        from winbox.kdbg.debugger.daemon import DaemonError
+        client = self._client_with(alive=False)
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.mcp._fork_daemon", side_effect=DaemonError("pid X not found")):
+            result = kdbg_attach(99999)
+        assert "error: pid X not found" in result
+
+    # ── kdbg_session ────────────────────────────────────────────────────
+
+    def test_session_when_not_attached(self, mock_mcp):
+        from winbox.mcp import kdbg_session
+        client = self._client_with(alive=False)
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_session()
+        assert _json_mod.loads(result) == {"attached": False}
+
+    def test_session_when_attached(self, mock_mcp):
+        from winbox.mcp import kdbg_session
+        client = self._client_with(alive=True, call_result={
+            "target": {"pid": 4584, "dtb": "0x4d6bb000", "name": "notepad.exe"},
+            "bps": 1, "halted": True, "uptime_s": 12.3, "daemon_pid": 1234,
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_session()
+        out = _json_mod.loads(result)
+        assert out["attached"] is True
+        assert out["target"]["pid"] == 4584
+        assert out["bps"] == 1
+
+    # ── kdbg_bp ─────────────────────────────────────────────────────────
+
+    def test_bp_passes_target_to_daemon(self, mock_mcp):
+        from winbox.mcp import kdbg_bp
+        client = self._client_with(call_result={
+            "id": 0, "va": "0x7ff7b04eeabc",
+            "user_mode": True, "elapsed_ms": 3.7,
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_bp("notepad!Save")
+        client.call.assert_called_once_with("bp_add", target="notepad!Save")
+        out = _json_mod.loads(result)
+        assert out["id"] == 0
+        assert out["user_mode"] is True
+
+    def test_bp_returns_error_on_install_failure(self, mock_mcp):
+        from winbox.mcp import kdbg_bp
+        from winbox.kdbg.debugger.client import ClientError
+        client = self._client_with(call_raises=ClientError("Z0 failed: E22"))
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_bp("notepad!Cold")
+        assert "error: Z0 failed: E22" in result
+
+    # ── kdbg_bps / kdbg_rm ─────────────────────────────────────────────
+
+    def test_bps_returns_list(self, mock_mcp):
+        from winbox.mcp import kdbg_bps
+        client = self._client_with(call_result={
+            "bps": [{"id": 0, "va": "0x...", "target": "x", "user_mode": True,
+                     "hits": 5, "age_s": 1.2}]
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_bps()
+        out = _json_mod.loads(result)
+        assert len(out["bps"]) == 1
+        assert out["bps"][0]["hits"] == 5
+
+    def test_rm_passes_id(self, mock_mcp):
+        from winbox.mcp import kdbg_rm
+        client = self._client_with(call_result={"removed": 0, "va": "0x123"})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            kdbg_rm(0)
+        client.call.assert_called_once_with("bp_remove", id=0)
+
+    # ── kdbg_cont ─────────────────────────────────────────────────────
+
+    def test_cont_passes_timeout_in_args_not_sock_kwarg(self, mock_mcp):
+        """Critical: timeout is op-level (in args), sock_timeout is the
+        client-side socket timeout. They MUST NOT collide."""
+        from winbox.mcp import kdbg_cont
+        client = self._client_with(call_result={"reason": "bp"})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            kdbg_cont(timeout=15.0)
+        # Call must be call("cont", sock_timeout=25.0, timeout=15.0)
+        args, kwargs = client.call.call_args
+        assert args == ("cont",)
+        assert kwargs["sock_timeout"] == 25.0
+        assert kwargs["timeout"] == 15.0
+
+    def test_cont_returns_stop_info(self, mock_mcp):
+        from winbox.mcp import kdbg_cont
+        client = self._client_with(call_result={
+            "reason": "bp", "vcpu": "01", "rip": "0x7ff7...",
+            "cr3": "0x4d6bb000", "in_target": True,
+            "bp_id": 0, "bp_target": "notepad!SaveFile",
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_cont()
+        out = _json_mod.loads(result)
+        assert out["reason"] == "bp"
+        assert out["bp_id"] == 0
+
+    # ── kdbg_step / kdbg_interrupt ────────────────────────────────────
+
+    def test_step_calls_daemon(self, mock_mcp):
+        from winbox.mcp import kdbg_step
+        client = self._client_with(call_result={"reason": "step", "rip": "0x..."})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            kdbg_step()
+        client.call.assert_called_once_with("step")
+
+    def test_interrupt_calls_daemon(self, mock_mcp):
+        from winbox.mcp import kdbg_interrupt
+        client = self._client_with(call_result={"queued": True})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            kdbg_interrupt()
+        client.call.assert_called_once_with("interrupt")
+
+    # ── kdbg_regs / kdbg_mem / kdbg_stack / kdbg_bt ───────────────────
+
+    def test_regs_returns_dict(self, mock_mcp):
+        from winbox.mcp import kdbg_regs
+        client = self._client_with(call_result={
+            "rip": "0x123", "rsp": "0x456", "cr3": "0x789",
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            out = _json_mod.loads(kdbg_regs())
+        assert out["rip"] == "0x123"
+        assert out["cr3"] == "0x789"
+
+    def test_mem_passes_va_and_length(self, mock_mcp):
+        from winbox.mcp import kdbg_mem
+        client = self._client_with(call_result={"va": "0x1000", "bytes": "deadbeef"})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            kdbg_mem("0x1000", length=4)
+        client.call.assert_called_once_with("mem", va="0x1000", length=4)
+
+    def test_stack_passes_n(self, mock_mcp):
+        from winbox.mcp import kdbg_stack
+        client = self._client_with(call_result={"rsp": "0x100", "qwords": []})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            kdbg_stack(n=8)
+        client.call.assert_called_once_with("stack", n=8)
+
+    def test_bt_passes_depth(self, mock_mcp):
+        from winbox.mcp import kdbg_bt
+        client = self._client_with(call_result={"rsp": "0x100", "frames": []})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            kdbg_bt(depth=12)
+        client.call.assert_called_once_with("bt", depth=12)
+
+    # ── kdbg_detach ───────────────────────────────────────────────────
+
+    def test_detach_no_session_is_noop(self, mock_mcp):
+        from winbox.mcp import kdbg_detach
+        client = self._client_with(alive=False)
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_detach()
+        assert "no kdbg session" in result
+        client.call.assert_not_called()
+
+    def test_detach_calls_daemon_and_waits_for_release(self, mock_mcp):
+        from winbox.mcp import kdbg_detach
+        # Alive on first probe, dead on second (simulates fast daemon shutdown).
+        client = MagicMock()
+        client.session_alive.side_effect = [True, False]
+        client.call.return_value = {"shutting_down": True}
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_detach()
+        client.call.assert_called_once_with("detach")
+        assert result == "detached"
+
+    # ── kdbg_resume ───────────────────────────────────────────────────
+
+    def test_resume_refuses_when_session_active(self, mock_mcp):
+        from winbox.mcp import kdbg_resume
+        client = self._client_with(alive=True)
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_resume()
+        assert "kdbg_detach instead" in result
+
+    def test_resume_errors_when_no_gdbstub(self, mock_mcp):
+        from winbox.mcp import kdbg_resume
+        client = self._client_with(alive=False)
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.kdbg.hmp.probe_port", return_value=False):
+            result = kdbg_resume()
+        assert "gdbstub not listening" in result
