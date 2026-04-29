@@ -229,6 +229,22 @@ def test_read_byte_with_none_timeout_calls_settimeout_none():
     assert sock.timeout is None
 
 
+def test_read_ack_uses_default_timeout_not_none():
+    """Regression: when C1 made ``_read_byte(timeout=None)`` block forever
+    (the documented intent for ``wait_for_stop``), an implicit
+    dependency from ``_read_ack`` was missed — it called ``_read_byte()``
+    with no args (defaulted to None). After the C1 fix, every post-send
+    ack-mode round-trip would block forever if the server crashed
+    between our send and its ack. Pre-handshake (before NoAckMode) was
+    fully exposed. Verify ``_read_ack`` now sets a bounded timeout."""
+    cli, sock = _client([b"+"])
+    sock.timeout = None  # simulate post-C1 fresh socket state
+    cli._read_ack(strict=True)
+    # Must be bounded — a number, not None.
+    assert sock.timeout is not None
+    assert sock.timeout > 0
+
+
 def test_write_memory_emits_M_with_hex_payload():
     cli, sock = _client([b"+", _frame(b"OK")])
     cli.write_memory(0x2000, b"\xcc\x90")

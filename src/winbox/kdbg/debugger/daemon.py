@@ -627,12 +627,24 @@ class DaemonSession:
             # known state, drain whatever it sends, and surface a clear
             # error so the next op runs against a consistent stub
             # instead of indeterminate state.
-            with suppress(RspError):
+            recovered = False
+            try:
                 self.rsp.interrupt()
                 sr_recovery = self.rsp.wait_for_stop(timeout=2.0)
                 self._capture_stop(sr_recovery)
+                recovered = True
+            except RspError:
+                # Recovery interrupt+wait also failed → genuine hang.
+                # ``self.stop`` is whatever the pre-step state was; we
+                # don't claim it's current.
+                pass
+            if recovered:
+                raise RuntimeError(
+                    "step did not complete within 5s; stub recovered to halted state"
+                ) from e
             raise RuntimeError(
-                "step did not complete within 5s; stub recovered to halted state"
+                "step did not complete within 5s and recovery halt failed; "
+                "stub state is indeterminate, daemon may need restart"
             ) from e
         self.rsp.select_thread(sr.thread or vcpu)
         self._capture_stop(sr)
@@ -1568,10 +1580,13 @@ def fork_daemon(
                 lock_path(cfg).unlink()
         os._exit(0)
     except DaemonError as e:
-        # Setup-time failure (most commonly stale-base validation). The
-        # gdbstub may have halted the VM on connect; resume it so we
-        # don't leave the VM frozen with no breadcrumb to the operator.
-        if rsp is not None:
+        # Resume the VM ONLY if we failed during startup — i.e., before
+        # the parent was signaled OK. Past that point the daemon was
+        # driving the stub through normal cont/halt cycles, so an
+        # unconditional ``rsp.cont()`` here could double-resume against
+        # an unexpected state. ``pipe_signaled`` is the cleanest "we
+        # got past startup" gate (set immediately after the parent ack).
+        if rsp is not None and not pipe_signaled:
             with suppress(Exception):
                 rsp.cont()
         if not pipe_signaled:
@@ -1580,7 +1595,7 @@ def fork_daemon(
                 os.close(pipe_w)
         os._exit(1)
     except Exception as e:  # noqa: BLE001 — surface anything that broke setup
-        if rsp is not None:
+        if rsp is not None and not pipe_signaled:
             with suppress(Exception):
                 rsp.cont()
         if not pipe_signaled:

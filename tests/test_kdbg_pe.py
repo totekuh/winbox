@@ -93,11 +93,13 @@ def test_fetch_pdb_incomplete_read_raises_and_cleans_part(tmp_path, monkeypatch)
 
     _patch_urlopen(monkeypatch, lambda req: _DroppingResp([b"Z" * 4096], content_length=999999))
 
-    # The size mismatch trips first (Content-Length validation runs before
-    # IncompleteRead in this shape because read() returns b'' at EOF without
-    # raising in our fake), so check for either error class — both are
-    # acceptable hardening outcomes.
-    with pytest.raises(PeError):
+    # The fake raises ``IncompleteRead`` on the next read() call after
+    # the buffer drains, before urlopen's __exit__. Catch must be
+    # specific to that branch, not the size-mismatch fallback —
+    # otherwise a future regression that drops the IncompleteRead
+    # handler entirely would silently still pass (size mismatch would
+    # cover it).
+    with pytest.raises(PeError, match="connection dropped"):
         fetch_pdb(_REF, tmp_path)
     assert not list(tmp_path.glob("*.part"))
 

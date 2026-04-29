@@ -554,6 +554,41 @@ def test_op_step_propagates_non_timeout_rsp_error():
     assert rsp.interrupted == 0
 
 
+def test_op_step_double_timeout_message_admits_indeterminate_state():
+    """Regression: when both the original step's wait AND the recovery
+    halt's wait time out (genuine stub hang), the previous message
+    claimed "stub recovered to halted state" — a lie. Operator
+    following the message would assume the stub is consistent and run
+    the next op against an actually-running stub. Now the message
+    explicitly says "stub state is indeterminate, daemon may need
+    restart"."""
+    from winbox.kdbg.debugger.rsp import RspError
+
+    class _DoubleTimeoutRsp(FakeRsp):
+        def wait_for_stop(self, *, timeout: float | None = None):
+            raise RspError("read timed out")
+
+    rsp = _DoubleTimeoutRsp()
+    session = _make_session(rsp=rsp)
+    from winbox.kdbg.debugger.daemon import StopState
+    pre_step_stop = StopState(
+        vcpu="01", rip=0xffffffff80001000, cr3=0x1234000,
+        signal=5, raw_regs=_blob(),
+    )
+    session.stop = pre_step_stop
+    reply = session.handle_op("step", {})
+    assert reply["ok"] is False
+    # Old (lying) message had "stub recovered"; new message must admit
+    # the truth.
+    assert "indeterminate" in reply["error"]
+    # Recovery interrupt was attempted exactly once.
+    assert rsp.interrupted == 1
+    # ``self.stop`` is the pre-step state since recovery didn't capture
+    # anything new — operator can see the daemon hasn't claimed false
+    # progress.
+    assert session.stop is pre_step_stop
+
+
 # ── KPTI / KVA Shadow CR3 filter ────────────────────────────────────────
 #
 # Live VM trace from a real Cortex audit session showed half the running

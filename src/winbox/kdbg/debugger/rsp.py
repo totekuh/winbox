@@ -223,7 +223,14 @@ class RspClient:
         return b
 
     def _read_ack(self, *, strict: bool) -> None:
-        b = self._read_byte()
+        # Acks are post-send round-trip — they MUST be bounded. Before
+        # the C1 fix this called `_read_byte()` (no timeout), which used
+        # to silently inherit the socket's last-set timeout (typically
+        # _DEFAULT_TIMEOUT from a prior read). After C1, ``timeout=None``
+        # means "block forever" — and ``_read_byte()`` defaults to
+        # ``timeout=None``. Without the explicit bound here, a server
+        # crash between our send and its ack hung the daemon forever.
+        b = self._read_byte(timeout=self._DEFAULT_TIMEOUT)
         if b == 0x2B:  # '+'
             return
         if b == 0x2D:  # '-'
