@@ -20,12 +20,16 @@ Output discipline: the parser returns ``{name: rva}`` for symbols and
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+
+
+_log = logging.getLogger(__name__)
 
 
 class PdbError(RuntimeError):
@@ -176,11 +180,26 @@ def parse_publics(text: str, sections: dict[int, int]) -> dict[str, int]:
                 dropped += 1
             pending_name = None
     if dropped:
-        print(
-            f"warning: parse_publics dropped {dropped} symbol(s) with "
-            f"unknown section index — llvm-pdbutil output may be "
-            f"truncated; symbol table is incomplete",
-            file=sys.stderr,
+        # If we got nothing usable, the PDB parse is catastrophically
+        # broken — caller MUST not cache this as a successful symbol
+        # load. Raise instead of returning an empty dict that looks
+        # like "this PDB just has no publics."
+        if not out:
+            raise PdbError(
+                f"parse_publics: all {dropped} symbol(s) dropped due to "
+                f"unknown section index — llvm-pdbutil output appears "
+                f"truncated or PDB is corrupt"
+            )
+        # Partial drops with usable symbols: warn loudly via the proper
+        # logger so the daemon's stderr/log file captures it. Previous
+        # ``print(file=sys.stderr)`` was easy to miss, made test capture
+        # awkward, and didn't include a count of accepted symbols for
+        # context. Operators tail the daemon log to see this.
+        _log.warning(
+            "parse_publics dropped %d/%d symbol(s) with unknown section "
+            "index — llvm-pdbutil output may be truncated; symbol table "
+            "is incomplete",
+            dropped, dropped + len(out),
         )
     return out
 

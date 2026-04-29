@@ -175,8 +175,25 @@ def list_processes(
                 # walk. Sentinel 0 means "no second CR3 known"; daemon
                 # filters fall back to single-CR3 mode for this process.
                 try:
-                    user_dtb = _read_u64(vm_name, cr3, eproc + user_dtb_off, cache)
+                    raw_user_dtb = _read_u64(vm_name, cr3, eproc + user_dtb_off, cache)
                 except (HmpError, PageWalkError):
+                    raw_user_dtb = 0
+                # Validate it looks like a PML4 physical address before
+                # trusting it. If the cached _KPROCESS struct map came
+                # from a different Windows build than the live kernel
+                # (struct shuffles between Server 2019/2022/24H2), the
+                # offset can point at an adjacent field and we'd hand
+                # the daemon a garbage CR3 — its filter would accept
+                # random fires. PML4 PAs are page-aligned (low 12 bits
+                # zero), non-zero, and below the architectural 52-bit
+                # phys-addr cap. Anything else is suspicious junk.
+                if (
+                    raw_user_dtb != 0
+                    and (raw_user_dtb & 0xFFF) == 0
+                    and raw_user_dtb < (1 << 52)
+                ):
+                    user_dtb = raw_user_dtb
+                else:
                     user_dtb = 0
         except (HmpError, PageWalkError) as e:
             # Bare `except Exception` here used to silently truncate the walk

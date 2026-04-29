@@ -229,3 +229,97 @@ def test_list_user_modules_missing_struct_in_store_raises(monkeypatch):
     # No reads should happen; the failure is at struct lookup time.
     with pytest.raises(KeyError):
         list_user_modules("vm", incomplete, target)
+
+
+# ── KPTI dual-CR3 validation (H7) ───────────────────────────────────────
+
+
+_PROC_TYPES = {
+    "_EPROCESS": {
+        "size": 0x800,
+        "fields": {
+            "ImageFileName": {"off": 0x5a8, "type": ""},
+            "UniqueProcessId": {"off": 0x440, "type": ""},
+            "ActiveProcessLinks": {"off": 0x448, "type": ""},
+        },
+    },
+    "_KPROCESS": {
+        "size": 0x300,
+        "fields": {
+            "DirectoryTableBase": {"off": 0x28, "type": ""},
+            "UserDirectoryTableBase": {"off": 0x388, "type": ""},
+        },
+    },
+}
+
+
+def _list_proc_with_user_dtb(monkeypatch, raw_user_dtb_value: int):
+    """Run list_processes against a single-process walk where the
+    UserDirectoryTableBase field reads as ``raw_user_dtb_value``.
+    Returns the resulting ProcessRecord."""
+    from winbox.kdbg.walk import list_processes
+
+    HEAD = 0xFFFFF800_00C26340
+    EPROC = 0xFFFFE000_00100000
+    DTB = 0x12345000
+
+    apl_off = _PROC_TYPES["_EPROCESS"]["fields"]["ActiveProcessLinks"]["off"]
+    pid_off = _PROC_TYPES["_EPROCESS"]["fields"]["UniqueProcessId"]["off"]
+    img_off = _PROC_TYPES["_EPROCESS"]["fields"]["ImageFileName"]["off"]
+    dtb_off = _PROC_TYPES["_KPROCESS"]["fields"]["DirectoryTableBase"]["off"]
+    user_off = _PROC_TYPES["_KPROCESS"]["fields"]["UserDirectoryTableBase"]["off"]
+
+    flink = EPROC + apl_off
+    qwords = {
+        HEAD: flink,            # head -> first entry's flink
+        flink: HEAD,            # entry's flink -> head (single entry)
+        EPROC + pid_off: 1234,
+        EPROC + dtb_off: DTB,
+        EPROC + user_off: raw_user_dtb_value,
+    }
+
+    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3", lambda vm: 0x999000)
+    monkeypatch.setattr("winbox.kdbg.walk._read_u64",
+                        lambda vm, cr3, va, cache: qwords[va])
+    monkeypatch.setattr("winbox.kdbg.walk._read_cstr",
+                        lambda vm, cr3, va, n, cache: "test.exe")
+
+    class S:
+        def resolve(self, name):
+            return HEAD
+        def struct(self, t, field=None, *, module="nt"):
+            return _PROC_TYPES[t]
+
+    procs = list_processes("vm", S())
+    assert len(procs) == 1
+    return procs[0]
+
+
+def test_list_processes_accepts_valid_user_dtb(monkeypatch):
+    """KPTI build with a well-formed second PML4 PA: page-aligned,
+    non-zero, below 2^52. Walker preserves it."""
+    p = _list_proc_with_user_dtb(monkeypatch, 0x6789a000)
+    assert p.user_directory_table_base == 0x6789a000
+
+
+def test_list_processes_rejects_unaligned_user_dtb(monkeypatch):
+    """Stale store: the cached _KPROCESS offset points at an adjacent
+    field, read returns a non-page-aligned value. Must be filtered to
+    0 so the daemon's CR3 filter doesn't accept fires from random
+    processes whose dtb happens to match the garbage."""
+    p = _list_proc_with_user_dtb(monkeypatch, 0xdeadbeef00112233)
+    assert p.user_directory_table_base == 0
+
+
+def test_list_processes_rejects_user_dtb_above_phys_addr_cap(monkeypatch):
+    """A value > 2^52 cannot be a real PA on x86-64 (architectural
+    cap). Must be filtered to 0."""
+    p = _list_proc_with_user_dtb(monkeypatch, 1 << 60)
+    assert p.user_directory_table_base == 0
+
+
+def test_list_processes_rejects_zero_user_dtb(monkeypatch):
+    """Pre-KPTI builds and read failures yield 0 raw — must stay 0
+    (sentinel meaning "no second CR3 known")."""
+    p = _list_proc_with_user_dtb(monkeypatch, 0)
+    assert p.user_directory_table_base == 0

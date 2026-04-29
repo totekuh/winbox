@@ -14,10 +14,13 @@ separately by the caller (``walk_user_modules``).
 
 from __future__ import annotations
 
+import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
+
+_log = logging.getLogger(__name__)
 
 from winbox.kdbg.hmp import HmpError, read_cpu_state
 from winbox.kdbg.memory import read_virt_current
@@ -258,11 +261,18 @@ def load_nt(
             symbol_count=info.symbol_count,
             type_count=info.type_count,
         )
-    except (HmpError, SymbolLoadError):
+    except (HmpError, SymbolLoadError) as e:
         # VM may not be in kernel context at the time of the load call,
         # or some other transient HMP issue — leave base unset and let
-        # the caller re-resolve later via `kdbg symbols base`.
-        pass
+        # the caller re-resolve later via `kdbg symbols base`. Logged
+        # so an operator can tell the symbol load partially succeeded
+        # (symbols cached, base unresolved) rather than seeing a silent
+        # ``base=null`` and wondering why every later resolve fails.
+        _log.warning(
+            "load_nt: symbols cached but nt base unresolved (%s: %s); "
+            "re-run `winbox kdbg base` once the VM is in kernel context",
+            type(e).__name__, e,
+        )
 
     return info
 

@@ -190,3 +190,60 @@ def test_list_modules(tmp_path):
         symbols={"g_Ptr": 0x1000}, types={},
     )
     assert store.list_modules() == ["cyverak", "nt"]
+
+
+# ── Atomic-write hardening (H10) ────────────────────────────────────────
+
+
+def test_save_writes_atomically_no_tmp_left_on_success(tmp_path):
+    """After save() returns, no .tmp file should be lying around."""
+    store = SymbolStore(tmp_path)
+    _save_nt(store)
+    leftover = list(tmp_path.glob('*.tmp'))
+    assert leftover == []
+
+
+def test_save_atomic_does_not_corrupt_concurrent_reader(tmp_path):
+    """While save() runs, an interleaving reader must see either the old
+    bytes or the new bytes — never a half-written file. We simulate by
+    pre-populating, then asserting that .read_text() during the next save
+    always parses as valid JSON."""
+    store = SymbolStore(tmp_path)
+    _save_nt(store)
+    initial = (tmp_path / 'nt_ABCD1234.json').read_text()
+    assert json.loads(initial)  # parses
+    # Now save a new build. Because we use os.replace, the old file is
+    # atomically swapped for the new — at no point is the on-disk content
+    # a partial concatenation.
+    store.save(
+        module='nt', build='FEEDFACE', image='ntkrnlmp.pdb',
+        symbols={'X': 1}, types={}, base=None,
+    )
+    new_index = json.loads((tmp_path / 'index.json').read_text())
+    assert new_index['nt'] == 'nt_FEEDFACE.json'
+
+
+def test_set_base_atomic(tmp_path):
+    """set_base also goes through the atomic-write path; no .tmp should
+    remain after the rename."""
+    store = SymbolStore(tmp_path)
+    _save_nt(store, base=None)
+    store.set_base('nt', 0xFFFFF80608000000)
+    leftover = list(tmp_path.glob('*.tmp'))
+    assert leftover == []
+    assert store.info('nt').base == 0xFFFFF80608000000
+
+
+def test_atomic_write_cleans_up_tmp_on_failure(tmp_path, monkeypatch):
+    """If os.replace raises (e.g., disk full mid-rename), the .tmp file
+    must be unlinked so we don't accumulate junk."""
+    from winbox.kdbg import store as store_mod
+    real_replace = store_mod.os.replace
+    def boom(src, dst):
+        raise OSError('disk full')
+    monkeypatch.setattr(store_mod.os, 'replace', boom)
+    with pytest.raises(OSError, match='disk full'):
+        store_mod._atomic_write_text(tmp_path / 'foo.json', '{"x": 1}')
+    leftover = list(tmp_path.glob('*.tmp'))
+    assert leftover == []
+

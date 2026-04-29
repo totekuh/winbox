@@ -29,6 +29,8 @@ an LLM context would be ruinous.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,36 @@ from typing import Any
 
 class SymbolStoreError(RuntimeError):
     pass
+
+
+def _atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+    """Write ``content`` to ``path`` atomically.
+
+    Naked ``path.write_text`` truncate-then-writes — two parallel callers
+    (CLI + MCP, or two MCP tool calls during agent parallelism) interleave
+    bytes and corrupt the file. ``tempfile.NamedTemporaryFile`` in the same
+    dir + ``os.replace`` gives us atomic rename semantics on POSIX, so a
+    concurrent reader sees either the old file or the new file but never
+    a half-written one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        # Don't leave .tmp turds around if rename failed.
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 @dataclass
@@ -72,9 +104,9 @@ class SymbolStore:
             return {}
 
     def _write_index(self, index: dict[str, str]) -> None:
-        self.index_path.write_text(
+        _atomic_write_text(
+            self.index_path,
             json.dumps(index, indent=2, sort_keys=True),
-            encoding="utf-8",
         )
 
     # ── Save / load ─────────────────────────────────────────────────────
@@ -111,9 +143,9 @@ class SymbolStore:
             "types": types,
         }
         path = self.root / fname
-        path.write_text(
+        _atomic_write_text(
+            path,
             json.dumps(data, indent=2, sort_keys=True),
-            encoding="utf-8",
         )
         index = self._read_index()
         index[module] = fname
@@ -125,9 +157,9 @@ class SymbolStore:
         path = self._module_path(module)
         data = json.loads(path.read_text(encoding="utf-8"))
         data["base"] = base
-        path.write_text(
+        _atomic_write_text(
+            path,
             json.dumps(data, indent=2, sort_keys=True),
-            encoding="utf-8",
         )
 
     def _module_path(self, module: str) -> Path:
