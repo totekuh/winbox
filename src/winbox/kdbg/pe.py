@@ -18,8 +18,10 @@ use that directly instead of rebuilding it.
 
 from __future__ import annotations
 
+import http.client
 import urllib.error
 import urllib.request
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -103,6 +105,17 @@ def fetch_pdb(ref: PdbRef, cache_root: Path, *, timeout: int = 120) -> Path:
     We do not handle the cab-compressed ``.pd_`` variant — Microsoft's
     kernel PDBs on the public server are served uncompressed for years
     now. Falling back to cab-extract would be bloat we don't need yet.
+
+    Streams the response to a ``.part`` file in 64 KiB chunks rather
+    than buffering in RAM — kernel PDBs run 25-40 MB, win32k tens of
+    MB, large user-mode DLL PDBs into the hundreds. ``resp.read()``
+    on small Kali VMs OOM-killed the daemon mid-fetch.
+
+    Validates the final size against ``Content-Length`` (when the
+    server provides it) and against ``http.client.IncompleteRead`` so
+    a connection drop mid-download can't poison the cache with a
+    truncated PDB. ``.part`` files are always cleaned up in a
+    ``finally``; only a fully-validated download is renamed into place.
     """
     cache_root.mkdir(parents=True, exist_ok=True)
     dest = pdb_cache_path(ref, cache_root)
@@ -118,15 +131,46 @@ def fetch_pdb(ref: PdbRef, cache_root: Path, *, timeout: int = 120) -> Path:
         },
     )
     tmp = dest.with_suffix(dest.suffix + ".part")
+    success = False
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            tmp.write_bytes(resp.read())
-    except urllib.error.HTTPError as e:
-        raise PeError(
-            f"msdl returned HTTP {e.code} for {url} — "
-            "symbol not available (wrong build?)"
-        ) from e
-    except urllib.error.URLError as e:
-        raise PeError(f"could not reach msdl: {e.reason}") from e
-    tmp.replace(dest)
-    return dest
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                expected = resp.headers.get("Content-Length")
+                expected_n = int(expected) if expected and expected.isdigit() else None
+                written = 0
+                with open(tmp, "wb") as fh:
+                    while True:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        written += len(chunk)
+            if expected_n is not None and written != expected_n:
+                raise PeError(
+                    f"truncated PDB from msdl: got {written}/{expected_n} bytes"
+                )
+            if written == 0:
+                raise PeError(f"empty PDB body from msdl for {url}")
+        except urllib.error.HTTPError as e:
+            raise PeError(
+                f"msdl returned HTTP {e.code} for {url} — "
+                "symbol not available (wrong build?)"
+            ) from e
+        except urllib.error.URLError as e:
+            raise PeError(f"could not reach msdl: {e.reason}") from e
+        except http.client.IncompleteRead as e:
+            raise PeError(
+                f"connection dropped during PDB fetch from {url}: "
+                f"got {len(e.partial)}/{e.expected or '?'} bytes"
+            ) from e
+        tmp.replace(dest)
+        success = True
+        return dest
+    finally:
+        if not success:
+            # Don't leave a partial .part lying around: the next call
+            # would skip the fetch (dest doesn't exist either, but a
+            # future `tmp.replace(dest)` inside another caller's path
+            # could trip on a half-written file).
+            with suppress(FileNotFoundError):
+                tmp.unlink()
