@@ -43,8 +43,8 @@ PS C:\Windows\system32>
 - **Autologin** — persistent Administrator auto-login that survives reboots on Server 2022
 - **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
-- **MCP server** — 31 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including a session-based named-pipe broker and hypervisor-level kernel debug
-- **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM, with PDB-backed symbol cache, EPROCESS/module walkers, and CR3-switching memory reads (PPL-resistant, EDR-invisible)
+- **MCP server** — 51 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including a session-based named-pipe broker and a long-running hypervisor-level kernel debug session
+- **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
 - **VNC display** via virt-manager (`winbox vnc`) — plain VGA, no clipboard/resize
 - **x64dbg in the guest** — bundled in setup, extracted to `C:\Tools\x64dbg`, both x32 and x64 on PATH
 - **Python in the guest** — Python 3.13 installed during setup (pip, PATH, py.exe launcher) for MCP-driven research
@@ -295,7 +295,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (33):**
+**Available tools (51):**
 
 User-mode primitives:
 
@@ -332,18 +332,43 @@ Named pipes:
 
 Hypervisor-level kernel debug (via QEMU gdbstub + HMP, EDR-invisible):
 
+*Stateless walks and symbol management — work against the live VM without an attached session:*
+
 | Tool | Description |
 |------|-------------|
 | `kdbg_start(port?, any_interface?)` | Start the gdbstub listener |
 | `kdbg_stop()` | Stop the gdbstub listener |
 | `kdbg_status(port?)` | Show stub state + reachability |
-| `kdbg_symbols_load(module?, from_ghidra?, base?)` | Pull ntoskrnl.exe out, fetch PDB from msdl, persist symbols + struct layouts to `~/.winbox/symbols/` |
+| `kdbg_symbols_load()` | Pull ntoskrnl.exe out, fetch PDB from msdl, persist symbols + struct layouts to `~/.winbox/symbols/` |
+| `kdbg_user_symbols_load(name, vm_path)` | Same flow for an arbitrary user-mode binary (per-process PDB) |
 | `kdbg_sym(name, search?, limit?, rva?)` | Resolve `mod!sym` to VA or RVA; substring search supported |
 | `kdbg_struct(type_name, field?, module?)` | Dump full struct layout or one field offset |
 | `kdbg_ps()` | Walk `PsActiveProcessHead` (JSON: pid, dtb, eprocess, name) |
 | `kdbg_lm()` | Walk `PsLoadedModuleList` (JSON: base, size, name) |
+| `kdbg_user_lm(pid)` | Walk `PEB.Ldr` for one process — modules actually loaded in target |
 | `kdbg_read_va(pid, address, length)` | CR3-switching arbitrary-process read; works against PPL targets (1MB cap, hex bytes) |
 | `kdbg_base_refresh()` | Re-resolve nt load base after ASLR reboot |
+
+*Session daemon — long-running debug session (attach once, drive across many tool calls):*
+
+| Tool | Description |
+|------|-------------|
+| `kdbg_attach(pid, port?)` | Fork the session daemon and attach to a target process. VM keeps running; bps stay armed until detach |
+| `kdbg_detach()` | Tear down the session and leave the VM running |
+| `kdbg_session()` | Show current daemon state (target pid, attach time, bp count, halted vs running) |
+| `kdbg_bp(target, mode?, condition?)` | Install a bp. Default `mode="hw"` (Z1/DR — invisible to PatchGuard + `GetThreadContext`); `mode="soft"` for >4 simultaneous bps. Optional `condition` is a server-side predicate evaluated on each fire (regs, `[reg+off]` qword reads, `==/!=/</<=/>/>=`, `&&`/`||`) |
+| `kdbg_bps()` | List installed bps with hit/skip/error counters |
+| `kdbg_rm(bp_id)` | Remove an installed bp |
+| `kdbg_cont(timeout?)` | Resume; block until next stop in target's CR3 set (KPTI-aware: kernel + user PML4) |
+| `kdbg_step()` | Single-instruction step on the firing vCPU |
+| `kdbg_interrupt()` | Halt a running cont via raw `\x03` on the RSP socket |
+| `kdbg_resume()` | Resume without waiting (fire-and-forget) |
+| `kdbg_regs()` | Dump GPRs + control regs from the firing vCPU |
+| `kdbg_stack(n?)` | Hex-dump the top `n` qwords of the current stack |
+| `kdbg_bt(depth?)` | Symbolicated backtrace (cross-module, with C++ demangling via `llvm-undname`) |
+| `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); `decode` modes for hex/utf8/utf16/disasm |
+| `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |
+| `kdbg_disasm(va, length?)` | Capstone disassembly at a target VA |
 
 The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker process per session (spawned as DETACHED_PROCESS | CREATE_NO_WINDOW inside the VM). IPC happens via `cmd.json`/`result.json` files on the VirtIO-FS share, so there's no VM round-trip on the polling path. This matters for protocols where a write on one handle must be answered on the same handle (stateless `send`/`recv` open fresh handles and never see each other's messages).
 
