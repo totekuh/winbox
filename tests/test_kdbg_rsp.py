@@ -194,6 +194,41 @@ def test_read_memory_raises_on_error_reply():
         cli.read_memory(0xDEAD, 16)
 
 
+def test_read_memory_preserves_partial_bytes_on_chunk_failure():
+    """Regression: prior to the partial=… field, a mid-read failure on
+    a multi-chunk read threw away every byte already harvested. Callers
+    walking a struct boundary on the failed chunk had no way to recover
+    what already came back. RspError now carries the partial buffer."""
+    # First chunk OK (4080 bytes worth), second chunk errors. Ask for
+    # more than _MEM_CHUNK so we exercise the chunked path.
+    good_hex = b"aa" * 0xFF0
+    cli, _ = _client([b"+", _frame(good_hex), b"+", _frame(b"E14")])
+    with pytest.raises(RspError) as ei:
+        cli.read_memory(0x1000, 0xFF0 + 16)
+    assert ei.value.partial == b"\xaa" * 0xFF0
+    # Existing callers that don't use .partial still see RspError.
+    assert "after" in str(ei.value)
+
+
+def test_rsp_error_default_partial_is_empty_bytes():
+    """RspError without an explicit ``partial=`` exposes b''. Catches
+    a regression where tests/callers blindly read e.partial."""
+    err = RspError("boom")
+    assert err.partial == b""
+
+
+def test_read_byte_with_none_timeout_calls_settimeout_none():
+    """Regression: ``_read_byte(timeout=None)`` used to leave the socket
+    timeout at whatever a prior call set, which silently broke
+    ``wait_for_stop(timeout=None)`` (caller asks to block forever; socket
+    still has a 10s timeout from a prior read). Verify settimeout(None)
+    is now issued explicitly."""
+    cli, sock = _client([b"X"])
+    sock.timeout = 10.0  # leftover from a hypothetical prior op
+    cli._read_byte(timeout=None)
+    assert sock.timeout is None
+
+
 def test_write_memory_emits_M_with_hex_payload():
     cli, sock = _client([b"+", _frame(b"OK")])
     cli.write_memory(0x2000, b"\xcc\x90")

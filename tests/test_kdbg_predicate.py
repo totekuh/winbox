@@ -433,3 +433,20 @@ def test_parse_long_decimal_literal_does_not_leak_value_error():
         # ValueError that's NOT the subclass means we leaked.
         if not isinstance(e, PredicateSyntaxError):
             pytest.fail(f"raw ValueError leaked: {e!r}")
+
+def test_parse_unicode_digit_rejected_cleanly():
+    """Regression: str.isdigit() accepts Unicode digits like ²
+    (superscript-2) but int('²', 10) raises bare ValueError, which
+    used to escape the parser. Now fenced to ASCII-only digits."""
+    with pytest.raises(PredicateSyntaxError):
+        parse('²² == 1')
+
+
+def test_parse_unicode_digit_after_first_digit_rejected():
+    """Same hazard but with a Unicode digit *inside* a literal that
+    starts with an ASCII digit. The inner-loop isdigit was the
+    second site."""
+    with pytest.raises(PredicateSyntaxError):
+        # '1²' looks like one literal; the inner loop must not accept '²'.
+        parse('1² == 1')
+

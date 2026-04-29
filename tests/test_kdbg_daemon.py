@@ -1262,16 +1262,17 @@ def test_op_cont_predicate_boolean_combo():
     assert fire_idx["n"] == 2
 
 
-def test_op_cont_predicate_runtime_error_surfaces():
-    """If the predicate's mem deref fails, halt with reason='predicate_error'
-    rather than silently swallow it. Counter bumps too."""
+def test_op_cont_predicate_unmapped_va_reads_as_zero():
+    """RspError from ``rsp.read_memory`` means the gdbstub rejected the
+    read — typically an unmapped VA. Documented predicate semantic: such
+    reads return 0 so checks like ``[rcx+N] != 0`` naturally false-out on
+    dangling pointers without aborting the bp. No predicate_errors bump."""
     rsp = _ScriptedRsp([
         _blob(rip=_KERNEL_VA, rcx=0xdeadbeef, cr3=_TARGET_DTB),
     ])
     session = _make_session(rsp=rsp)
     _install_kernel_bp(session, condition="[rcx] == 0")
 
-    # Make the m-packet fail.
     from winbox.kdbg.debugger.rsp import RspError
 
     def bad_read(va, length):
@@ -1280,9 +1281,11 @@ def test_op_cont_predicate_runtime_error_surfaces():
 
     out = session.handle_op("cont", {"timeout": 1.0})
     assert out["ok"], out
-    assert out["result"]["reason"] == "predicate_error"
+    # [rcx] silently reads as 0 -> 0 == 0 -> true -> predicate_hits, halt.
+    assert out["result"]["reason"] == "bp"
     bp = next(iter(session.bps.values()))
-    assert bp.predicate_errors == 1
+    assert bp.predicate_hits == 1
+    assert bp.predicate_errors == 0
 
 
 def test_op_cont_predicate_oserror_does_not_crash_daemon():

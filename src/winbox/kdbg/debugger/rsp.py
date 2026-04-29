@@ -31,7 +31,16 @@ from dataclasses import dataclass
 
 
 class RspError(RuntimeError):
-    """Raised on protocol-level failures: timeouts, NAKs, malformed framing."""
+    """Raised on protocol-level failures: timeouts, NAKs, malformed framing.
+
+    ``partial`` carries any bytes successfully harvested before the
+    failure on chunked memory reads — callers that can use a short read
+    can recover them via ``e.partial`` instead of getting nothing.
+    """
+
+    def __init__(self, *args: object, partial: bytes = b"") -> None:
+        super().__init__(*args)
+        self.partial = partial
 
 
 @dataclass
@@ -192,8 +201,13 @@ class RspClient:
             self._read_ack(strict=True)
 
     def _read_byte(self, timeout: float | None = None) -> int:
-        if timeout is not None:
-            self._sock.settimeout(timeout)
+        # Always set the socket timeout to the requested value — including
+        # ``None`` for blocking. Without the explicit ``settimeout(None)``
+        # branch, the socket inherits whatever timeout a previous call
+        # set, which silently broke ``wait_for_stop(timeout=None)`` (the
+        # caller asks to block forever; the socket still has a 10s
+        # timeout from a prior _DEFAULT_TIMEOUT read).
+        self._sock.settimeout(timeout)
         if not self._inbuf:
             try:
                 chunk = self._sock.recv(self._CHUNK)
@@ -448,19 +462,35 @@ class RspClient:
         cur = addr
         while remaining > 0:
             n = min(remaining, self._MEM_CHUNK)
-            resp = self._exchange(f"m{cur:x},{n:x}".encode("ascii"))
+            try:
+                resp = self._exchange(f"m{cur:x},{n:x}".encode("ascii"))
+            except RspError as e:
+                # Surface bytes already collected so callers walking a
+                # struct boundary can decide whether to use the partial
+                # read or retry.
+                raise RspError(
+                    f"m failed at 0x{cur:x} after {len(out)}/{length} bytes: {e}",
+                    partial=bytes(out),
+                ) from e
             if resp.startswith(b"E"):
-                raise RspError(f"m failed at 0x{cur:x}: {resp!r}")
+                raise RspError(
+                    f"m failed at 0x{cur:x} after {len(out)}/{length} bytes: {resp!r}",
+                    partial=bytes(out),
+                )
             try:
                 chunk = bytes.fromhex(resp.decode("ascii"))
             except ValueError as e:
-                raise RspError(f"non-hex m response: {resp!r}") from e
+                raise RspError(
+                    f"non-hex m response at 0x{cur:x}: {resp!r}",
+                    partial=bytes(out),
+                ) from e
             if not chunk:
                 # gdbstub returned an empty (but non-error) reply.
                 # Treat as short read — surface so caller doesn't
                 # believe it got ``length`` bytes back.
                 raise RspError(
-                    f"empty m reply at 0x{cur:x} (asked {n}, got 0)"
+                    f"empty m reply at 0x{cur:x} (asked {n}, got 0)",
+                    partial=bytes(out),
                 )
             out.extend(chunk)
             cur += len(chunk)

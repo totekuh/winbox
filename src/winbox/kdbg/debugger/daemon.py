@@ -815,10 +815,22 @@ class DaemonSession:
         before yielding control.
 
         Failure modes:
-          * Read or G-swap rejected → ``PredicateRuntimeError`` (op_cont
-            converts to ``reason="predicate_error"`` and stays halted).
+          * Read rejected (unmapped VA, gdbstub error) → return 0. The
+            documented predicate semantic is that unmapped derefs read
+            as zero so a check like ``[rcx+0x10] != 0`` composes with
+            dangling-pointer cases without the operator pre-validating
+            the deref. The cost: a real transport hiccup looks the
+            same as an unmapped read inside the predicate. Acceptable
+            because the surrounding session would also be visibly
+            broken (next op fails for other reasons).
+          * G-swap rejected → ``PredicateRuntimeError`` (op_cont converts
+            to ``reason="predicate_error"`` and stays halted; this is a
+            session-level failure, not a data-level miss).
           * G-restore failed → ``CR3RestoreError`` propagates up (the
             session is poisoned at this point; cont will tear down).
+          * Short read with no error → ``PredicateRuntimeError`` — the
+            chunked-read path post-1.3.0 should never produce this; if
+            it does, surface loudly rather than silently returning 0.
         """
         rsp = self.rsp
         session = self
@@ -831,10 +843,9 @@ class DaemonSession:
                 with session._cr3_masquerade(vcpu_hint, fired_regs):
                     try:
                         data = rsp.read_memory(addr, 8)
-                    except RspError as e:
-                        raise PredicateRuntimeError(
-                            f"mem read at 0x{addr:x} failed: {e}"
-                        ) from e
+                    except RspError:
+                        # Unmapped or otherwise rejected — predicate sees 0.
+                        return 0
             except CR3RestoreError:
                 # Don't dress this up as a predicate failure — the
                 # session is dead and the operator needs to know.

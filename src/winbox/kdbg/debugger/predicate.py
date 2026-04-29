@@ -210,7 +210,10 @@ def _tokenize(src: str) -> list[tuple]:
         # raises ValueError, not PredicateSyntaxError, on long inputs.
         # 64-bit values fit in 20 decimal / 16 hex digits, so anything
         # past these caps is junk.
-        if c.isdigit():
+        # ASCII-only digit check. ``str.isdigit`` accepts characters like
+        # superscript-2 ('²') which then crash ``int(s, 10)`` with a bare
+        # ValueError that escapes the parser as a non-PredicateSyntaxError.
+        if c in "0123456789":
             j = i
             if c == "0" and i + 1 < n and src[i+1] in "xX":
                 j = i + 2
@@ -226,7 +229,7 @@ def _tokenize(src: str) -> list[tuple]:
                     )
                 out.append(("INT", int(src[i:j], 16)))
             else:
-                while j < n and src[j].isdigit():
+                while j < n and src[j] in "0123456789":
                     j += 1
                 # Way more than any 64-bit decimal needs (20 digits);
                 # 32 keeps us comfortably under PEP 651's 4300 cap and
