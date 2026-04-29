@@ -275,12 +275,14 @@ class RspClient:
         ack-every-packet flow.
         """
         # We advertise modest gdb features — we don't implement multiprocess
-        # extensions, etc. Long PacketSize lets us get full register dumps
-        # in one go (CPU state can run ~700 bytes hex on x86-64).
+        # extensions, etc. PacketSize=0x10000 (65536) covers the daemon's
+        # 64 KiB op_mem cap in a single ``m`` reply; smaller values silently
+        # truncate. We still chunk on our side in ``read_memory`` /
+        # ``write_memory`` defensively in case a stub honours a smaller cap.
         body = (
             b"qSupported:"
             b"swbreak+;hwbreak+;multiprocess-;xmlRegisters=i386;"
-            b"PacketSize=4000"
+            b"PacketSize=10000"
         )
         resp = self._exchange(body)
         features = self._parse_features(resp.decode("ascii", errors="replace"))
@@ -418,6 +420,13 @@ class RspClient:
             raise RspError(f"non-hex CR3 window: {hex_window!r}") from e
         return struct.unpack("<Q", cr3_bytes)[0]
 
+    # Chunk size for memory I/O — kept comfortably under the smallest
+    # PacketSize any historical QEMU build advertises (typically 0x1000
+    # bytes data, leaving ~4 KB for hex-encoded reply framing). Big
+    # reads/writes get split across multiple ``m`` / ``M`` exchanges
+    # rather than risking silent truncation or an E22 reject.
+    _MEM_CHUNK = 0xFF0  # 4080 bytes per request
+
     def read_memory(self, addr: int, length: int) -> bytes:
         """``m addr,len`` — read ``length`` bytes from ``addr``.
 
@@ -426,28 +435,59 @@ class RspClient:
         running in that process first — or use the HMP-based
         ``read_virt_cr3`` which lets us pass CR3 explicitly without the
         vCPU dance.
+
+        Reads larger than ``_MEM_CHUNK`` are split into multiple ``m``
+        requests and concatenated. QEMU's gdbstub honours per-request
+        sizes well below its advertised PacketSize, so chunking is
+        the only reliable way to read large windows.
         """
         if length <= 0:
             return b""
-        resp = self._exchange(f"m{addr:x},{length:x}".encode("ascii"))
-        if resp.startswith(b"E"):
-            raise RspError(f"m failed at 0x{addr:x}: {resp!r}")
-        try:
-            return bytes.fromhex(resp.decode("ascii"))
-        except ValueError as e:
-            raise RspError(f"non-hex m response: {resp!r}") from e
+        out = bytearray()
+        remaining = length
+        cur = addr
+        while remaining > 0:
+            n = min(remaining, self._MEM_CHUNK)
+            resp = self._exchange(f"m{cur:x},{n:x}".encode("ascii"))
+            if resp.startswith(b"E"):
+                raise RspError(f"m failed at 0x{cur:x}: {resp!r}")
+            try:
+                chunk = bytes.fromhex(resp.decode("ascii"))
+            except ValueError as e:
+                raise RspError(f"non-hex m response: {resp!r}") from e
+            if not chunk:
+                # gdbstub returned an empty (but non-error) reply.
+                # Treat as short read — surface so caller doesn't
+                # believe it got ``length`` bytes back.
+                raise RspError(
+                    f"empty m reply at 0x{cur:x} (asked {n}, got 0)"
+                )
+            out.extend(chunk)
+            cur += len(chunk)
+            remaining -= len(chunk)
+        return bytes(out)
 
     def write_memory(self, addr: int, data: bytes) -> None:
         """``M addr,len:hex`` — write ``data`` to memory.
 
-        Same CR3 caveat as ``read_memory``.
+        Same CR3 caveat as ``read_memory``. Writes larger than
+        ``_MEM_CHUNK`` bytes are split across multiple ``M`` packets to
+        avoid the gdbstub's E22 reject on oversized requests.
         """
         if not data:
             return
-        body = f"M{addr:x},{len(data):x}:".encode("ascii") + data.hex().encode("ascii")
-        resp = self._exchange(body)
-        if resp != b"OK":
-            raise RspError(f"M failed at 0x{addr:x}: {resp!r}")
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset:offset + self._MEM_CHUNK]
+            cur = addr + offset
+            body = (
+                f"M{cur:x},{len(chunk):x}:".encode("ascii")
+                + chunk.hex().encode("ascii")
+            )
+            resp = self._exchange(body)
+            if resp != b"OK":
+                raise RspError(f"M failed at 0x{cur:x}: {resp!r}")
+            offset += len(chunk)
 
     def insert_breakpoint(self, addr: int, *, kind: int = 1, hardware: bool = False) -> None:
         """``Z0,addr,kind`` (sw) or ``Z1,addr,kind`` (hw exec).

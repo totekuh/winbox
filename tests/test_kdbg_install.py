@@ -194,3 +194,44 @@ def test_install_verifies_cr3_actually_changed(monkeypatch):
             cli, "vm", store=None,
             target_dtb=0x4D6BB000, user_va=0x7FF6E289A760,
         )
+
+
+def test_install_restore_failure_raises_install_error():
+    """If the CR3 RESTORE G-packet is rejected, install_user_breakpoint
+    must raise InstallError rather than silently swallow — otherwise
+    the firing vCPU is left holding target_dtb in its register file
+    and the next resume BSODs the guest."""
+    cli = FakeRsp()
+    target_dtb = 0x4D6BB000
+    user_va = 0x7FF6E289A760
+
+    # Track G calls; reject the second (the restore).
+    g_count = {"n": 0}
+    original_exchange = cli._exchange
+
+    def reject_restore(body, *, timeout=None):
+        if body.startswith(b"G"):
+            g_count["n"] += 1
+            if g_count["n"] == 2:
+                # Second G is the restore — non-OK reply.
+                cr3 = struct.unpack_from(
+                    "<Q",
+                    bytes.fromhex(body[1:].decode("ascii")),
+                    _CR3_OFFSET,
+                )[0]
+                cli.cr3_writes.append(cr3)
+                return b"E22"
+            return original_exchange(body, timeout=timeout)
+        return original_exchange(body, timeout=timeout)
+
+    cli._exchange = reject_restore
+
+    with pytest.raises(InstallError, match="poisoned"):
+        install_user_breakpoint(
+            cli, "vm", store=None,
+            target_dtb=target_dtb, user_va=user_va,
+        )
+
+    # Two G writes total: swap and restore. Both attempted (the install
+    # didn't bail before getting to restore).
+    assert g_count["n"] == 2

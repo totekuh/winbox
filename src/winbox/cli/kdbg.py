@@ -794,26 +794,51 @@ def kdbg_session(ctx: click.Context) -> None:
         "'auto' tries hw first, falls back to soft on slot exhaustion."
     ),
 )
+@click.option(
+    "--condition", "condition", default=None,
+    help=(
+        "Optional predicate evaluated server-side on every in-target "
+        "fire. False -> silent-cont (no halt surfaced). True -> halt. "
+        "Grammar: regs (rax..r15, rip, eflags), [reg+0xN] qword reads, "
+        "== != < <= > >=, & (bitwise), && || (short-circuit), parens. "
+        "Examples: 'rcx == 0xdeadbeef', '[rsp+0x18] == 0x226048', "
+        "'(rax & 0x80000000) != 0'."
+    ),
+)
 @click.pass_context
-def kdbg_bp(ctx: click.Context, target: str, mode: str) -> None:
+def kdbg_bp(
+    ctx: click.Context, target: str, mode: str, condition: str | None,
+) -> None:
     """Install a bp at TARGET (hex VA or ``module!symbol``).
 
     Default mode is hardware (Z1) — invisible to PatchGuard and
     anti-debug GetThreadContext checks because KVM virtualizes DR
     access. Use ``--mode soft`` for the legacy 0xCC behaviour
     (needed when >4 simultaneous bps required).
+
+    With ``--condition`` the daemon only halts on fires that satisfy
+    the predicate; other fires silent-cont. See ``winbox kdbg bps``
+    for predicate hit/skip/error counters.
     """
     cfg: Config = ctx.obj["cfg"]
+    if condition is not None and not condition.strip():
+        condition = None
     try:
-        result = _client(cfg).call("bp_add", target=target, mode=mode)
+        result = _client(cfg).call(
+            "bp_add", target=target, mode=mode, condition=condition,
+        )
     except ClientError as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
     user_kernel = "user" if result["user_mode"] else "kernel"
     bp_kind = "hw" if result["hw"] else "soft"
+    cond_suffix = ""
+    if result.get("condition"):
+        cond_suffix = f"  cond={result['condition']!r}"
     console.print(
         f"[green][+][/] bp #{result['id']} at {result['va']} "
         f"({user_kernel}-mode, {bp_kind}, {result['elapsed_ms']:.1f}ms)"
+        f"{cond_suffix}"
     )
 
 

@@ -47,7 +47,13 @@ class FakeSocket:
         if not self._recv:
             return b""
         chunk = self._recv.popleft()
-        return chunk[:n] if n else chunk
+        if n and len(chunk) > n:
+            # Re-queue the leftover so a chunk larger than the requested
+            # size doesn't silently drop bytes — the real socket would
+            # return them on the next recv().
+            self._recv.appendleft(chunk[n:])
+            return chunk[:n]
+        return chunk
 
     def close(self) -> None:
         self.closed = True
@@ -266,3 +272,110 @@ def test_interrupt_sends_raw_ctrl_c():
     cli, sock = _client([])
     cli.interrupt()
     assert bytes(sock.sent) == b"\x03"
+
+
+# ── PacketSize advertisement ────────────────────────────────────────────
+
+
+def test_handshake_advertises_64kib_packet_size():
+    """PacketSize=10000 (hex, 65536 bytes) lets QEMU return op_mem's
+    full 64 KiB cap in one ``m`` reply. Smaller values silently
+    truncated large reads / rejected large writes with E22."""
+    feat_body = b"swbreak+;PacketSize=10000"
+    chunks = [
+        _frame(feat_body),
+        _frame(b"OK"),
+    ]
+    cli, sock = _client(chunks)
+    cli.handshake()
+    sent = bytes(sock.sent)
+    assert b"PacketSize=10000" in sent
+    # Sanity: must not regress to the pre-fix 0x4000 cap.
+    assert b"PacketSize=4000" not in sent
+
+
+# ── Memory chunking ─────────────────────────────────────────────────────
+
+
+def test_read_memory_chunks_above_chunk_threshold():
+    """Reads larger than _MEM_CHUNK get split across multiple ``m``
+    requests and the bytes are concatenated in order."""
+    chunk_size = RspClient._MEM_CHUNK  # 0xFF0
+    total = chunk_size + 0x100  # forces exactly two requests
+    # First reply: chunk_size bytes (all 0xAA), second: 0x100 bytes (0xBB).
+    first = (b"\xAA" * chunk_size).hex().encode("ascii")
+    second = (b"\xBB" * 0x100).hex().encode("ascii")
+    cli, sock = _client([_frame(first), _frame(second)])
+    data = cli.read_memory(0x1000, total)
+    assert len(data) == total
+    assert data[:chunk_size] == b"\xAA" * chunk_size
+    assert data[chunk_size:] == b"\xBB" * 0x100
+    sent = bytes(sock.sent)
+    # First request asks for the full chunk; second asks for the remainder.
+    assert f"$m1000,{chunk_size:x}#".encode("ascii") in sent
+    second_addr = 0x1000 + chunk_size
+    assert f"$m{second_addr:x},100#".encode("ascii") in sent
+
+
+def test_read_memory_under_threshold_uses_single_request():
+    """Small reads stay one packet — chunking adds no extra round-trip."""
+    cli, sock = _client([_frame(b"deadbeef")])
+    data = cli.read_memory(0x1000, 4)
+    assert data == b"\xde\xad\xbe\xef"
+    # Exactly one ``m`` packet on the wire.
+    sent = bytes(sock.sent)
+    assert sent.count(b"$m") == 1
+
+
+def test_read_memory_short_chunk_advances_correctly():
+    """If a chunk reply returns fewer bytes than asked, advance by the
+    actual returned length and continue from there. Defends against a
+    stub that hands back partial chunks."""
+    chunk_size = RspClient._MEM_CHUNK
+    total = chunk_size + 0x10
+    # Advertise full chunk request, but reply with chunk_size - 0x10 bytes.
+    short = chunk_size - 0x10
+    first = (b"\xAA" * short).hex().encode("ascii")
+    rest = total - short
+    second = (b"\xBB" * rest).hex().encode("ascii")
+    cli, sock = _client([_frame(first), _frame(second)])
+    data = cli.read_memory(0x2000, total)
+    assert len(data) == total
+    assert data[:short] == b"\xAA" * short
+    assert data[short:] == b"\xBB" * rest
+    sent = bytes(sock.sent)
+    # Second request must start where the actual read ended.
+    second_addr = 0x2000 + short
+    assert f"$m{second_addr:x},{rest:x}#".encode("ascii") in sent
+
+
+def test_read_memory_empty_reply_raises():
+    """Empty reply from server (non-error, but zero bytes) means we
+    can't make progress — raise rather than infinite-loop."""
+    cli, _ = _client([_frame(b"")])
+    with pytest.raises(RspError, match="empty m reply"):
+        cli.read_memory(0x1000, 16)
+
+
+def test_write_memory_chunks_above_chunk_threshold():
+    """Writes larger than _MEM_CHUNK split into multiple ``M`` packets."""
+    chunk_size = RspClient._MEM_CHUNK
+    total = chunk_size + 0x40
+    payload = b"\xCC" * total
+    chunks = [_frame(b"OK"), _frame(b"OK")]
+    cli, sock = _client(chunks)
+    cli.write_memory(0x3000, payload)
+    sent = bytes(sock.sent)
+    # First write at base addr for chunk_size bytes.
+    assert f"$M3000,{chunk_size:x}:".encode("ascii") in sent
+    # Second write at advanced addr for the remainder.
+    second_addr = 0x3000 + chunk_size
+    assert f"$M{second_addr:x},40:".encode("ascii") in sent
+
+
+def test_write_memory_under_threshold_uses_single_packet():
+    cli, sock = _client([_frame(b"OK")])
+    cli.write_memory(0x4000, b"\xCC\x90")
+    sent = bytes(sock.sent)
+    assert sent.count(b"$M") == 1
+    assert b"$M4000,2:cc90#" in sent

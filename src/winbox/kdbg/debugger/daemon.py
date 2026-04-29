@@ -38,7 +38,7 @@ import socket
 import struct
 import sys
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,6 +49,11 @@ from winbox.kdbg.debugger.install import (
     InstallError,
     install_user_breakpoint,
     _CR3_OFFSET_IN_G,  # for read-via-CR3-masquerade memory reads
+)
+from winbox.kdbg.debugger.predicate import (
+    PredicateRuntimeError,
+    PredicateSyntaxError,
+    parse as parse_predicate,
 )
 from winbox.kdbg.debugger.protocol import (
     OPS,
@@ -104,6 +109,15 @@ class Breakpoint:
     hw: bool              # True if installed via Z1 (hardware DR), False if Z0 (software 0xCC)
     installed_at: float   # monotonic timestamp
     hits: int = 0
+    # Conditional-bp state. ``condition`` is the raw user string for
+    # display; ``_predicate`` is the parsed AST evaluated on each fire
+    # (None means unconditional — original behaviour). Counters track
+    # how the predicate decided each in-target fire.
+    condition: str | None = None
+    _predicate: Any = field(default=None, repr=False)
+    predicate_hits: int = 0
+    predicate_skips: int = 0
+    predicate_errors: int = 0
 
 
 @dataclass
@@ -122,6 +136,36 @@ class TargetInfo:
     pid: int
     dtb: int
     name: str
+    user_dtb: int = 0  # KPROCESS.UserDirectoryTableBase if present (KVA
+                       # Shadow / KPTI builds). 0 means "field absent or
+                       # read failed; we only know one CR3".
+
+    @property
+    def cr3_set(self) -> tuple[int, ...]:
+        """All CR3 values that mean "this is our target".
+
+        On KVA Shadow / KPTI builds Windows keeps two separate PML4
+        physical pages per process — one mapped during user-mode
+        execution, one during kernel-mode. ``KPROCESS.DirectoryTableBase``
+        and ``KPROCESS.UserDirectoryTableBase`` point at them. The
+        names are historically ambiguous about which is which (the
+        ``install.py`` comment hedges and field semantics have shifted
+        across builds), so we don't try to label them — we just accept
+        either as "in target".
+
+        Fallback: if ``user_dtb == 0`` (pre-KPTI struct or read
+        failed), assume the kernel/user pair is allocator-adjacent
+        and accept ``dtb ^ 0x1000`` too. This is empirical
+        (nt!MmAllocateContiguousPages tends to allocate them
+        consecutively) — not a documented contract — but it's a
+        better fallback than single-CR3 filtering. ``^`` not ``|``
+        because some processes' DirectoryTableBase already has bit
+        12 set, in which case ``|`` is a no-op (the bug we're
+        fixing).
+        """
+        if self.user_dtb:
+            return (self.dtb, self.user_dtb)
+        return (self.dtb, self.dtb ^ 0x1000)
 
 
 # ── Daemon process ──────────────────────────────────────────────────────
@@ -129,6 +173,16 @@ class TargetInfo:
 
 class DaemonError(RuntimeError):
     pass
+
+
+class CR3RestoreError(RuntimeError):
+    """Raised when restoring the firing vCPU's CR3 via G-packet fails.
+
+    This is a session-poisoning event. After it fires, the daemon
+    cannot safely resume the VM (resuming with a masqueraded CR3 is
+    a guaranteed BSOD), so the session goes into a hard-locked state
+    where every subsequent op refuses to touch the gdbstub.
+    """
 
 
 class DaemonSession:
@@ -151,6 +205,11 @@ class DaemonSession:
         self.store = store
 
         self.bps: dict[int, Breakpoint] = {}
+        # va -> bp_id index for O(1) lookup on the cont/predicate hot
+        # path. Populated/cleaned in op_bp_add / op_bp_remove. If two
+        # bps share a VA (shouldn't happen in normal use) only the
+        # latest is indexed; the others still appear in self.bps.
+        self._bp_by_va: dict[int, int] = {}
         self._next_bp_id = 0
         self.stop: StopState | None = None
         self.attach_time = time.monotonic()
@@ -161,6 +220,17 @@ class DaemonSession:
         # Set by signal handler when SIGUSR1 arrives — a hint to the cont
         # loop to break out.
         self._interrupt_pending = False
+
+        # Set when a CR3-masquerade restore G-packet fails. Once true,
+        # the daemon refuses every subsequent op that would touch the
+        # gdbstub — resuming with a masqueraded CR3 instant-BSODs the
+        # guest. Only path out is process restart (the _CR3Masquerade
+        # context manager sets this on restore failure).
+        self._cr3_corrupted = False
+
+        # Last vCPU we sent Hg for. Cache to skip redundant select_thread
+        # calls in the cont hot path; reset on shutdown / detach.
+        self._last_selected_vcpu: str | None = None
 
         self._serving = False
         self._listen_sock: socket.socket | None = None
@@ -174,6 +244,15 @@ class DaemonSession:
         method = getattr(self, f"op_{op}", None)
         if method is None:
             return reply_err(f"op not implemented: {op!r}")
+        # If a previous CR3 masquerade left the firing vCPU's CR3 in
+        # an unrestored state, refuse anything that could resume the
+        # guest or talk to the gdbstub. Status/interrupt are safe-ish
+        # but we lock them out too — the operator should detach + restart.
+        if self._cr3_corrupted and op != "status":
+            return reply_err(
+                "daemon poisoned: CR3 restore previously failed; "
+                "detach and restart the kdbg session"
+            )
         try:
             result = method(**args)
         except TypeError as e:
@@ -183,6 +262,72 @@ class DaemonSession:
         if isinstance(result, dict):
             return reply_ok(result)
         return reply_ok({"value": result})
+
+    # ── CR3 masquerade plumbing ─────────────────────────────────────────
+
+    @contextmanager
+    def _cr3_masquerade(self, vcpu: str, regs: bytes):
+        """Context manager: enter target's CR3 on ``vcpu``, restore on exit.
+
+        Centralises the four-step dance that op_mem / op_write_mem /
+        _mem_qword_reader all used to repeat with a ``with suppress(Exception)``
+        on the restore. Suppressing the restore failure was a silent BSOD
+        bomb — if we leave target_dtb in the firing vCPU's register file
+        and resume, the vCPU runs kernel code with the wrong page tables.
+
+        On restore failure: set ``self._cr3_corrupted`` so every
+        subsequent op short-circuits with a clear error, log to stderr,
+        and re-raise as ``CR3RestoreError``. Caller's ``finally`` then
+        propagates instead of silently swallowing.
+
+        ``vcpu`` must already be selected via ``rsp.select_thread``.
+        ``regs`` is the full g-packet blob captured before masquerade
+        (used to extract original CR3 and as the template for restore).
+        """
+        original_cr3 = struct.unpack_from("<Q", regs, _CR3_OFFSET_IN_G)[0]
+        target_dtb = self.target.dtb
+
+        # Swap in target_dtb.
+        mod = bytearray(regs)
+        struct.pack_into("<Q", mod, _CR3_OFFSET_IN_G, target_dtb)
+        resp = self.rsp._exchange(b"G" + bytes(mod).hex().encode("ascii"))
+        if resp != b"OK":
+            raise RuntimeError(f"G-packet (CR3 swap) rejected: {resp!r}")
+
+        try:
+            yield
+        finally:
+            restore = bytearray(regs)
+            struct.pack_into("<Q", restore, _CR3_OFFSET_IN_G, original_cr3)
+            try:
+                resp = self.rsp._exchange(
+                    b"G" + bytes(restore).hex().encode("ascii"),
+                )
+                if resp != b"OK":
+                    self._cr3_corrupted = True
+                    print(
+                        f"[kdbg-daemon] FATAL: CR3 restore G-packet rejected "
+                        f"({resp!r}); session poisoned, vCPU {vcpu} still "
+                        f"holds masqueraded CR3 0x{target_dtb:x}",
+                        file=sys.stderr, flush=True,
+                    )
+                    raise CR3RestoreError(
+                        "CR3 restore failed; daemon poisoned"
+                    )
+            except CR3RestoreError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # Network/protocol error during restore — same poison state.
+                self._cr3_corrupted = True
+                print(
+                    f"[kdbg-daemon] FATAL: CR3 restore raised {type(e).__name__}: "
+                    f"{e}; session poisoned, vCPU {vcpu} still holds "
+                    f"masqueraded CR3 0x{target_dtb:x}",
+                    file=sys.stderr, flush=True,
+                )
+                raise CR3RestoreError(
+                    "CR3 restore failed; daemon poisoned"
+                ) from e
 
     # ── ops ─────────────────────────────────────────────────────────────
 
@@ -199,7 +344,12 @@ class DaemonSession:
             "daemon_pid": os.getpid(),
         }
 
-    def op_bp_add(self, target: str, mode: str = "hw") -> dict[str, Any]:
+    def op_bp_add(
+        self,
+        target: str,
+        mode: str = "hw",
+        condition: str | None = None,
+    ) -> dict[str, Any]:
         """Install a bp at sym/VA.
 
         ``mode`` selects the bp mechanism:
@@ -218,7 +368,29 @@ class DaemonSession:
           soft. Surfaces neither the hw success nor the fallback in
           a special way; the resulting bp's ``hw`` field tells which
           you got.
+
+        ``condition`` is an optional predicate evaluated server-side on
+        each in-target fire. False predicate -> silent-cont (no halt
+        surfaced to client). True predicate -> halt as today. Parse
+        errors raise immediately, before any RSP packet is sent, so a
+        bad predicate never installs a bp. See ``predicate.py`` for the
+        grammar (regs, ``[reg+offset]`` qword reads, ``== != < <= > >=``,
+        ``&``, ``&&``, ``||``).
         """
+        # Treat empty string the same as None — convenient for callers
+        # that always pass the arg through.
+        if isinstance(condition, str) and not condition.strip():
+            condition = None
+
+        # Parse predicate FIRST. We don't want a bp installed in the
+        # gdbstub if the predicate is malformed.
+        predicate_ast = None
+        if condition is not None:
+            try:
+                predicate_ast = parse_predicate(condition)
+            except PredicateSyntaxError as e:
+                raise RuntimeError(f"bad condition: {e}") from e
+
         va = self._resolve_target(target)
         is_user = (va >> 47) != 0x1FFFF  # canonical-high == kernel half
 
@@ -270,13 +442,17 @@ class DaemonSession:
             user_mode=is_user,
             hw=installed_hw,
             installed_at=time.monotonic(),
+            condition=condition,
+            _predicate=predicate_ast,
         )
         self.bps[bp_id] = bp
+        self._bp_by_va[va] = bp_id
         return {
             "id": bp_id,
             "va": f"0x{va:x}",
             "user_mode": is_user,
             "hw": installed_hw,
+            "condition": condition,
             "elapsed_ms": round(elapsed_ms, 2),
         }
 
@@ -292,6 +468,10 @@ class DaemonSession:
                     "user_mode": b.user_mode,
                     "hw": b.hw,
                     "hits": b.hits,
+                    "condition": b.condition,
+                    "predicate_hit_count": b.predicate_hits,
+                    "predicate_skip_count": b.predicate_skips,
+                    "predicate_error_count": b.predicate_errors,
                     "age_s": round(time.monotonic() - b.installed_at, 2),
                 }
                 for b in self.bps.values()
@@ -307,18 +487,39 @@ class DaemonSession:
             # was installed. Mismatching is a no-op or error in QEMU.
             self.rsp.remove_breakpoint(bp.va, kind=1, hardware=bp.hw)
         except RspError as e:
-            # Surface but still drop from registry — the alternative is a
-            # stale entry the user can't get rid of.
-            del self.bps[id]
+            # Don't drop from registry on failure. If the z-packet
+            # didn't actually clear the bp in QEMU, untracking it
+            # locally would leave a phantom: future fires would hit
+            # the linear-scan fallback in op_cont with no predicate
+            # context, and the user would have no way to retry the
+            # removal. Surface the error and keep both entries in
+            # place so a subsequent bp_remove can try again.
             packet = "z1" if bp.hw else "z0"
-            raise RuntimeError(f"{packet} failed: {e}; bp untracked") from e
+            print(
+                f"[kdbg-daemon] {packet} remove failed for bp {id} at "
+                f"0x{bp.va:x}: {e}; bp left tracked, retry bp_remove",
+                file=sys.stderr, flush=True,
+            )
+            raise RuntimeError(
+                f"{packet} failed: {e}; bp still tracked, retry bp_remove"
+            ) from e
         del self.bps[id]
+        if self._bp_by_va.get(bp.va) == id:
+            del self._bp_by_va[bp.va]
         return {"removed": id, "va": f"0x{bp.va:x}", "hw": bp.hw}
 
     def op_cont(self, timeout: float = 30.0) -> dict[str, Any]:
-        """Resume; block until next stop *in target's CR3*. Silent-cont
-        all other firings (typical when a bp hit is in shared code)."""
-        target_dtb = self.target.dtb
+        """Resume; block until next stop in any of target's CR3s.
+        Silent-cont everything else (typical when a bp hit is in
+        shared code that another process tripped).
+
+        Under KVA Shadow each process has two CR3 values (user-mode
+        and kernel-mode PML4s); a bp set in driver code fires with
+        the kernel one loaded. ``target.cr3_set`` returns both when
+        ``KPROCESS.UserDirectoryTableBase`` was readable at attach,
+        else falls back to ``(dtb, dtb ^ 0x1000)``.
+        """
+        accepted_cr3s = self.target.cr3_set
         deadline = time.monotonic() + max(0.5, float(timeout))
         self._interrupt_pending = False
         while True:
@@ -353,15 +554,61 @@ class DaemonSession:
                 self._capture_stop(sr)
                 return {"reason": "signal", **self._stop_summary()}
 
-            self.rsp.select_thread(sr.thread or "01")
-            cr3 = self.rsp.read_cr3()
-            if cr3 != target_dtb:
+            # ONE g-packet per fire — extract cr3 + rip from the same
+            # blob. The previous shape (select_thread, read_cr3,
+            # optional _read_rip, then read_registers) was three to four
+            # RSP round-trips per silent-cont iteration, which made
+            # high-frequency conditional bps (an EDR IOCTL dispatcher
+            # firing thousands of times per second) starve the VM —
+            # most of the wall-clock was spent on RSP traffic, the
+            # guest barely advanced between halts.
+            #
+            # Skip the Hg if the firing vCPU is the one we already
+            # selected last iteration. On -smp 1 (default) this elides
+            # an entire round-trip per fire.
+            firing_vcpu = sr.thread or "01"
+            if self._last_selected_vcpu != firing_vcpu:
+                self.rsp.select_thread(firing_vcpu)
+                self._last_selected_vcpu = firing_vcpu
+            regs = self.rsp.read_registers()
+            cr3 = struct.unpack_from("<Q", regs, _CR3_OFFSET_IN_G)[0]
+            rip = struct.unpack_from("<Q", regs, 128)[0]
+
+            if cr3 not in accepted_cr3s:
                 # silent-continue — bump bp hit counter best-effort
-                self._bump_bp_hits(self._read_rip(), in_target=False)
+                self._bump_bp_hits(rip, in_target=False)
                 continue
 
-            self._capture_stop(sr)
-            self._bump_bp_hits(self.stop.rip if self.stop else 0, in_target=True)
+            # Predicate gate. Reuse the regs blob we already read so
+            # the per-fire cost stays at one g-packet plus any mem
+            # derefs the predicate explicitly triggers.
+            bp = self.bps.get(self._bp_by_va.get(rip, -1))
+
+            if bp is not None and bp._predicate is not None:
+                try:
+                    truthy = bool(bp._predicate.eval(
+                        regs, self._mem_qword_reader(regs)
+                    ))
+                except PredicateRuntimeError as e:
+                    bp.predicate_errors += 1
+                    bp.hits += 1
+                    self._capture_stop_with_regs(sr, regs)
+                    return {
+                        "reason": "predicate_error",
+                        "error": str(e),
+                        **self._stop_summary(),
+                    }
+                if not truthy:
+                    bp.predicate_skips += 1
+                    bp.hits += 1
+                    continue
+                bp.predicate_hits += 1
+
+            self._capture_stop_with_regs(sr, regs)
+            if bp is not None:
+                bp.hits += 1
+            else:
+                self._bump_bp_hits(rip, in_target=True)
             return {"reason": "bp", **self._stop_summary()}
 
     def op_step(self) -> dict[str, Any]:
@@ -387,6 +634,26 @@ class DaemonSession:
             return _decode_regs(blob)
         return _decode_regs(self.stop.raw_regs)
 
+    def _pick_vcpu(self) -> str:
+        """Pick the vCPU to perform a CR3 masquerade against.
+
+        Prefer the firing vCPU recorded in ``self.stop`` — that's the
+        one whose register file the bp/step machinery is already
+        manipulating, and using a different vCPU here would mean
+        masquerading CR3 on a thread that may be running guest code
+        and crash it on resume.
+
+        Fall back to the first thread the gdbstub reports if no stop
+        is recorded (typically only on the first op after attach,
+        before any cont/step has captured a stop).
+        """
+        if self.stop is not None:
+            return self.stop.vcpu
+        threads = self.rsp.list_threads()
+        if not threads:
+            raise RuntimeError("no vCPUs returned by gdbstub")
+        return threads[0]
+
     def op_mem(self, va: int | str, length: int = 64) -> dict[str, Any]:
         """Read `length` bytes at `va` in target's CR3. Uses the same
         CR3-masquerade trick as bp install: temporarily writes target
@@ -398,27 +665,14 @@ class DaemonSession:
         if length == 0:
             return {"va": f"0x{va:x}", "bytes": ""}
 
-        # Pick a vCPU and snapshot its CR3.
-        threads = self.rsp.list_threads()
-        if not threads:
-            raise RuntimeError("no vCPUs returned by gdbstub")
-        vcpu = threads[0]
+        # Pick the firing vCPU (or fall back to threads[0] pre-stop)
+        # and snapshot its CR3 via the masquerade context.
+        vcpu = self._pick_vcpu()
         self.rsp.select_thread(vcpu)
         regs = self.rsp.read_registers()
-        original_cr3 = struct.unpack_from("<Q", regs, _CR3_OFFSET_IN_G)[0]
 
-        try:
-            mod = bytearray(regs)
-            struct.pack_into("<Q", mod, _CR3_OFFSET_IN_G, self.target.dtb)
-            resp = self.rsp._exchange(b"G" + bytes(mod).hex().encode("ascii"))
-            if resp != b"OK":
-                raise RuntimeError(f"G-packet (mem) rejected: {resp!r}")
+        with self._cr3_masquerade(vcpu, regs):
             data = self.rsp.read_memory(va, length)
-        finally:
-            restore = bytearray(regs)
-            struct.pack_into("<Q", restore, _CR3_OFFSET_IN_G, original_cr3)
-            with suppress(Exception):
-                self.rsp._exchange(b"G" + bytes(restore).hex().encode("ascii"))
 
         return {"va": f"0x{va:x}", "bytes": data.hex()}
 
@@ -446,27 +700,13 @@ class DaemonSession:
         if len(payload) > 64 * 1024:
             raise RuntimeError(f"write capped at 64 KiB; got {len(payload)} bytes")
 
-        threads = self.rsp.list_threads()
-        if not threads:
-            raise RuntimeError("no vCPUs returned by gdbstub")
-        vcpu = threads[0]
+        vcpu = self._pick_vcpu()
         self.rsp.select_thread(vcpu)
         regs = self.rsp.read_registers()
-        original_cr3 = struct.unpack_from("<Q", regs, _CR3_OFFSET_IN_G)[0]
 
-        try:
-            mod = bytearray(regs)
-            struct.pack_into("<Q", mod, _CR3_OFFSET_IN_G, self.target.dtb)
-            resp = self.rsp._exchange(b"G" + bytes(mod).hex().encode("ascii"))
-            if resp != b"OK":
-                raise RuntimeError(f"G-packet (write_mem) rejected: {resp!r}")
+        with self._cr3_masquerade(vcpu, regs):
             # gdb ``M addr,len:hex`` writes payload bytes at addr.
             self.rsp.write_memory(va, payload)
-        finally:
-            restore = bytearray(regs)
-            struct.pack_into("<Q", restore, _CR3_OFFSET_IN_G, original_cr3)
-            with suppress(Exception):
-                self.rsp._exchange(b"G" + bytes(restore).hex().encode("ascii"))
 
         return {"va": f"0x{va:x}", "length": len(payload)}
 
@@ -546,6 +786,17 @@ class DaemonSession:
         vcpu = sr.thread or "01"
         self.rsp.select_thread(vcpu)
         regs = self.rsp.read_registers()
+        self._capture_stop_with_regs(sr, regs, vcpu=vcpu)
+
+    def _capture_stop_with_regs(self, sr, regs: bytes, *, vcpu: str | None = None) -> None:
+        """Same as _capture_stop but reuses an already-fetched regs blob.
+
+        Saves a g-packet round-trip when the caller (e.g. the predicate
+        gate in op_cont) has just read regs to evaluate a condition.
+        """
+        if vcpu is None:
+            vcpu = sr.thread or "01"
+            self.rsp.select_thread(vcpu)
         self.stop = StopState(
             vcpu=vcpu,
             rip=struct.unpack_from("<Q", regs, 16 * 8)[0],
@@ -553,6 +804,55 @@ class DaemonSession:
             signal=sr.signal,
             raw_regs=regs,
         )
+
+    def _mem_qword_reader(self, fired_regs: bytes):
+        """Build a closure that reads a qword from target's address space.
+
+        Uses the shared ``_cr3_masquerade`` context manager (same dance
+        as op_mem / op_write_mem). Per-call cost is 3 RSP packets
+        (G-swap, m, G-restore). The firing vCPU must still be selected
+        when the closure runs — caller's responsibility to invoke
+        before yielding control.
+
+        Failure modes:
+          * Read or G-swap rejected → ``PredicateRuntimeError`` (op_cont
+            converts to ``reason="predicate_error"`` and stays halted).
+          * G-restore failed → ``CR3RestoreError`` propagates up (the
+            session is poisoned at this point; cont will tear down).
+        """
+        rsp = self.rsp
+        session = self
+        # Snapshot vcpu hint at construction time; if the daemon hasn't
+        # captured a stop yet we trust the firing vCPU is still selected.
+        vcpu_hint = self.stop.vcpu if self.stop is not None else "01"
+
+        def _read(addr: int) -> int:
+            try:
+                with session._cr3_masquerade(vcpu_hint, fired_regs):
+                    try:
+                        data = rsp.read_memory(addr, 8)
+                    except RspError as e:
+                        raise PredicateRuntimeError(
+                            f"mem read at 0x{addr:x} failed: {e}"
+                        ) from e
+            except CR3RestoreError:
+                # Don't dress this up as a predicate failure — the
+                # session is dead and the operator needs to know.
+                raise
+            except RuntimeError as e:
+                # G-swap rejected (in-context, before yield). Convert
+                # to a predicate-level failure so op_cont reports it
+                # cleanly without poisoning the session.
+                if "G-packet" in str(e):
+                    raise PredicateRuntimeError(str(e)) from e
+                raise
+            if len(data) != 8:
+                raise PredicateRuntimeError(
+                    f"short mem read at 0x{addr:x}: got {len(data)} bytes"
+                )
+            return int.from_bytes(data, "little")
+
+        return _read
 
     def _stop_summary(self) -> dict[str, Any]:
         if self.stop is None:
@@ -562,7 +862,12 @@ class DaemonSession:
             "vcpu": self.stop.vcpu,
             "rip": f"0x{self.stop.rip:x}",
             "cr3": f"0x{self.stop.cr3:x}",
-            "in_target": self.stop.cr3 == self.target.dtb,
+            "in_target": self.stop.cr3 in self.target.cr3_set,
+            # primary_cr3 is whichever CR3 was loaded at thread creation
+            # (KPROCESS.DirectoryTableBase). second_cr3 is the other half
+            # of the KVA Shadow pair. Don't try to label which is "user"
+            # vs "kernel" — semantics have drifted across builds.
+            "primary_cr3": self.stop.cr3 == self.target.dtb,
             "bp_id": bp_hit.bp_id if bp_hit else None,
             "bp_target": bp_hit.target if bp_hit else None,
         }
@@ -723,10 +1028,24 @@ class DaemonSession:
         After D, QEMU sends OK (which we read or skip) and the VM
         keeps running until something else stops it.
         """
-        # Remove bps first so the gdbstub's bp registry is clean.
-        for bp in list(self.bps.values()):
-            with suppress(Exception):
-                self.rsp.remove_breakpoint(bp.va, kind=1)
+        # If a CR3 dance is currently in flight on another op, give it
+        # a brief window to unwind before we touch the gdbstub. The
+        # masquerade context manager restores CR3 in its finally clause,
+        # so waiting on _busy avoids races where shutdown() yanks the
+        # socket mid-restore (which would mark the session corrupted
+        # spuriously and leave bps in QEMU we couldn't clear).
+        deadline = time.monotonic() + 2.0
+        while self._busy and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        # Remove bps first so the gdbstub's bp registry is clean. Pass
+        # hardware=bp.hw so hardware bps installed via Z1 actually get
+        # removed via z1 — sending z0 for an hw bp is a no-op in QEMU
+        # and leaks DR0..3 across the detach.
+        if not self._cr3_corrupted:
+            for bp in list(self.bps.values()):
+                with suppress(Exception):
+                    self.rsp.remove_breakpoint(bp.va, kind=1, hardware=bp.hw)
         self.bps.clear()
 
         # Send cont to resume the VM, give QEMU time to process it,
@@ -738,14 +1057,28 @@ class DaemonSession:
         # gdb_continue() was the source of the "paused after detach"
         # bug because it raced with our cont's vm_start in QEMU's
         # run-state machine.
+        #
+        # If _cr3_corrupted is set, the firing vCPU still holds a
+        # masqueraded target CR3 in its register file; resuming with
+        # vCont;c would run kernel code under the wrong page tables
+        # and instant-BSOD the guest. Skip the cont entirely and just
+        # close the socket — QEMU's CHR_EVENT_CLOSED halts the stub
+        # without resuming, leaving the VM paused so the operator
+        # can recover the CR3 manually (or restore from snapshot).
         try:
-            with suppress(Exception):
-                self.rsp.cont()
-            # Hold long enough that vCont;c is fully processed by
-            # QEMU before we yank the socket. 100ms is more than
-            # enough — vCont round-trip is sub-ms.
-            import time as _time
-            _time.sleep(0.1)
+            if not self._cr3_corrupted:
+                with suppress(Exception):
+                    self.rsp.cont()
+                # Hold long enough that vCont;c is fully processed by
+                # QEMU before we yank the socket. 100ms is more than
+                # enough — vCont round-trip is sub-ms.
+                time.sleep(0.1)
+            else:
+                print(
+                    "[kdbg-daemon] CR3 corrupted; skipping cont on shutdown — "
+                    "VM will remain paused. Recover CR3 via HMP or restore snapshot.",
+                    file=sys.stderr, flush=True,
+                )
         finally:
             with suppress(OSError):
                 self.rsp._sock.close()
@@ -861,7 +1194,20 @@ def _bind_unix_socket(sock_file: Path) -> socket.socket:
 def _read_target_bytes(rsp: "RspClient", target_dtb: int, va: int, length: int) -> bytes:
     """One-shot CR3-masquerade read. Used by attach-time stale-base
     detection — borrows the same primitive op_mem uses but doesn't
-    need a DaemonSession yet."""
+    need a DaemonSession yet.
+
+    NOTE on vCPU selection: this is called BEFORE any DaemonSession
+    exists (and therefore before ``self.stop`` could record the firing
+    vCPU). We fall back to ``threads[0]`` because there's nothing
+    better available pre-stop. Callers post-stop should go through
+    ``DaemonSession.op_mem`` / ``_pick_vcpu`` instead, which prefers
+    the recorded firing vCPU.
+
+    Restore failures here can't poison a session that doesn't exist,
+    but they DO leave the firing vCPU with a masqueraded CR3 — which
+    will instantly BSOD the guest on resume. Surface as DaemonError
+    so the parent fails the attach and the operator can recover.
+    """
     threads = rsp.list_threads()
     if not threads:
         raise DaemonError("gdbstub returned no threads (vCPUs)")
@@ -878,8 +1224,29 @@ def _read_target_bytes(rsp: "RspClient", target_dtb: int, va: int, length: int) 
     finally:
         restore = bytearray(regs)
         struct.pack_into("<Q", restore, _CR3_OFFSET_IN_G, original_cr3)
-        with suppress(Exception):
-            rsp._exchange(b"G" + bytes(restore).hex().encode("ascii"))
+        try:
+            resp = rsp._exchange(b"G" + bytes(restore).hex().encode("ascii"))
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[kdbg-daemon] FATAL: CR3 restore raised {type(e).__name__}: "
+                f"{e} during base validation; vCPU still holds masqueraded "
+                f"CR3 0x{target_dtb:x} — DO NOT resume the guest",
+                file=sys.stderr, flush=True,
+            )
+            raise DaemonError(
+                "CR3 restore failed during base validation; daemon poisoned"
+            ) from e
+        else:
+            if resp != b"OK":
+                print(
+                    f"[kdbg-daemon] FATAL: CR3 restore G-packet rejected "
+                    f"({resp!r}) during base validation; vCPU still holds "
+                    f"masqueraded CR3 0x{target_dtb:x} — DO NOT resume",
+                    file=sys.stderr, flush=True,
+                )
+                raise DaemonError(
+                    "CR3 restore failed during base validation; daemon poisoned"
+                )
 
 
 def _normalize_module_name(name: str) -> str:
@@ -901,7 +1268,7 @@ def _validate_module_bases(
 ) -> None:
     """Verify cached module bases match what's actually loaded in target.
 
-    The check has TWO failure modes to distinguish:
+    The check has THREE failure modes to distinguish:
 
     1. Module is loaded in target but its base differs from our cached
        value → STALE (ASLR moved it across a VM reboot, or symbols
@@ -915,23 +1282,61 @@ def _validate_module_bases(
        just irrelevant to this target. Validating them against this
        target's CR3 would falsely report stale.
 
-    Strategy:
-      - Walk target's PEB.Ldr once → {normalized_name: base}
-      - For each cached store module: look it up in the target's
-        loaded set. If found and bases mismatch → stale. If not
-        found → skip silently.
-      - Skip ``nt`` (kernel module, handled by kdbg_base_refresh).
+    3. Special-case ``nt`` (the kernel): not in PEB.Ldr — re-derive
+       its live base from the IDT (the same primitive ``load_nt``
+       uses) and compare against the cached value. Mismatch → stale.
+       Failure to derive (transient HMP issue, missing PDB symbol) is
+       logged and skipped, not fatal.
 
-    Raises ``DaemonError`` with remediation message listing each
-    stale module — names match the ``kdbg_user_symbols_load`` arg
-    the user should pass to fix it.
+    Strategy:
+      - For ``nt``: re-derive live base via ``resolve_nt_base``; compare.
+      - Walk target's PEB.Ldr once → {normalized_name: base}.
+      - For each cached user-mode module: look it up in the target's
+        loaded set. Found + mismatch → stale. Not found → skip silently.
+
+    Raises ``DaemonError`` with a remediation message listing each
+    stale module — for user-mode modules names match the
+    ``kdbg_user_symbols_load`` arg; for ``nt`` the message points at
+    ``winbox kdbg base`` + ``kdbg symbols load -m nt``.
     """
     try:
         modules = store.list_modules()
     except Exception:
         return  # No store, nothing to validate
 
-    # Filter to modules with cached bases that aren't the kernel.
+    # ── Step 1: validate nt separately (kernel — no PEB.Ldr entry) ──
+    if "nt" in modules:
+        try:
+            nt_data = store.load("nt")
+        except Exception:
+            nt_data = None
+        cached_nt_base = (nt_data or {}).get("base")
+        nt_syms = (nt_data or {}).get("symbols") or {}
+        if cached_nt_base and nt_syms:
+            from winbox.kdbg.hmp import HmpError
+            from winbox.kdbg.symbols import SymbolLoadError, resolve_nt_base
+            try:
+                live_nt_base = resolve_nt_base(cfg, nt_syms)
+            except (HmpError, SymbolLoadError, OSError) as e:
+                # Can't derive live nt base right now — log + skip
+                # rather than fail. A concrete bp install against a
+                # stale nt base will surface a clearer error later.
+                print(
+                    f"warning: could not validate nt base "
+                    f"({type(e).__name__}: {e}); skipping nt staleness check",
+                    file=sys.stderr,
+                )
+            else:
+                if live_nt_base != cached_nt_base:
+                    raise DaemonError(
+                        f"stale nt base: cached 0x{cached_nt_base:x}, "
+                        f"actual 0x{live_nt_base:x}. ASLR moved the kernel "
+                        f"since symbols were loaded (typically a VM reboot). "
+                        f"Run `winbox kdbg base` to refresh nt base, then "
+                        f"`winbox kdbg symbols load -m nt` to repull."
+                    )
+
+    # ── Step 2: collect user-mode candidates with cached bases ──
     candidates: list[tuple[str, int]] = []
     for mod_name in modules:
         if mod_name == "nt":
@@ -946,20 +1351,33 @@ def _validate_module_bases(
         candidates.append((mod_name, base))
 
     if not candidates:
-        return  # Nothing to check; skip the PEB.Ldr walk entirely.
+        return  # Nothing user-mode to check; skip the PEB.Ldr walk.
 
     # Walk target's PEB.Ldr to get the actual loaded modules.
     # ensure_types_loaded for _PEB / _PEB_LDR_DATA may be needed if
     # the store predates their inclusion — handle gracefully.
     from winbox.kdbg import ensure_types_loaded
+    from winbox.kdbg.hmp import HmpError
     from winbox.kdbg.walk import list_user_modules
     try:
         ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
         loaded = list_user_modules(cfg.vm_name, store, target)
-    except Exception as e:
-        # Couldn't walk PEB.Ldr — skip validation rather than block
-        # the attach. The user will get a clearer error later if a
-        # specific bp install actually fails on a stale base.
+    except (HmpError, OSError, RuntimeError, LookupError, SymbolStoreError) as e:
+        # Expected failure modes:
+        #   HmpError       - transient HMP / virsh failure
+        #   OSError        - socket/IO during a memory read
+        #   RuntimeError   - generic walker failures (page fault, bad PEB)
+        #   LookupError    - store missing nt or required type entries
+        #   SymbolStoreError - store on disk but malformed
+        # Surface a warning and skip user-mode validation rather than
+        # block the attach. Anything else (TypeError, ValueError on a
+        # real bug, etc.) falls through unchanged so the daemon dies
+        # loudly instead of silently skipping checks.
+        print(
+            f"warning: PEB.Ldr walk failed: {type(e).__name__}: {e}; "
+            "cannot validate user-mode module bases for stale state",
+            file=sys.stderr,
+        )
         return
 
     # Build normalized lookup of currently loaded modules in target.
@@ -1056,7 +1474,12 @@ def fork_daemon(
         _validate_module_bases(cfg, rsp, target, store)
 
         listen_sock = _bind_unix_socket(sock_path(cfg))
-        info = TargetInfo(pid=target.pid, dtb=target.directory_table_base, name=target.name)
+        info = TargetInfo(
+            pid=target.pid,
+            dtb=target.directory_table_base,
+            name=target.name,
+            user_dtb=target.user_directory_table_base,
+        )
         _write_session_file(session_path(cfg), {
             "target_pid": info.pid,
             "target_dtb": f"0x{info.dtb:x}",

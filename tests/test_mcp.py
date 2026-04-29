@@ -1875,7 +1875,9 @@ class TestKdbgDaemonTools:
         with patch("winbox.mcp._kdbg_client", return_value=client):
             result = kdbg_bp("notepad!Save")
         # Default mode is "hw" — verify it's forwarded
-        client.call.assert_called_once_with("bp_add", target="notepad!Save", mode="hw")
+        client.call.assert_called_once_with(
+            "bp_add", target="notepad!Save", mode="hw", condition=None,
+        )
         out = _json_mod.loads(result)
         assert out["id"] == 0
         assert out["hw"] is True
@@ -1889,7 +1891,7 @@ class TestKdbgDaemonTools:
         with patch("winbox.mcp._kdbg_client", return_value=client):
             kdbg_bp("notepad!Save", mode="soft")
         client.call.assert_called_once_with(
-            "bp_add", target="notepad!Save", mode="soft",
+            "bp_add", target="notepad!Save", mode="soft", condition=None,
         )
 
     def test_bp_returns_error_on_install_failure(self, mock_mcp):
@@ -1899,6 +1901,31 @@ class TestKdbgDaemonTools:
         with patch("winbox.mcp._kdbg_client", return_value=client):
             result = kdbg_bp("notepad!Cold")
         assert "error: Z0 failed: E22" in result
+
+    def test_bp_condition_passed_through(self, mock_mcp):
+        from winbox.mcp import kdbg_bp
+        client = self._client_with(call_result={
+            "id": 1, "va": "0xfffff806123456", "user_mode": False,
+            "hw": True, "condition": "rcx == 0xdeadbeef", "elapsed_ms": 2.1,
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            kdbg_bp("nt!NtClose", condition="rcx == 0xdeadbeef")
+        client.call.assert_called_once_with(
+            "bp_add", target="nt!NtClose", mode="hw",
+            condition="rcx == 0xdeadbeef",
+        )
+
+    def test_bp_empty_condition_treated_as_none(self, mock_mcp):
+        from winbox.mcp import kdbg_bp
+        client = self._client_with(call_result={
+            "id": 0, "va": "0x1", "user_mode": False, "hw": True,
+            "condition": None, "elapsed_ms": 1.0,
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            kdbg_bp("nt!Foo", condition="   ")
+        client.call.assert_called_once_with(
+            "bp_add", target="nt!Foo", mode="hw", condition=None,
+        )
 
     # ── kdbg_bps / kdbg_rm ─────────────────────────────────────────────
 

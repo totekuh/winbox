@@ -85,6 +85,45 @@ def test_parse_publics_ignores_unknown_section():
     assert "PsActiveProcessHead" not in syms
 
 
+def test_parse_publics_warns_on_dropped_unknown_section(capsys):
+    """When a public references a section index we don't have, we drop
+    it AND surface a stderr warning so the caller doesn't silently get
+    a partial symbol table (truncated llvm-pdbutil output, corrupt
+    PDB, etc.)."""
+    sections = {1: 0x1000}  # no section 2 — PsActiveProcessHead drops
+    syms = parse_publics(PUBLICS_FIXTURE, sections)
+    captured = capsys.readouterr()
+    assert "PsActiveProcessHead" not in syms
+    assert "parse_publics dropped" in captured.err
+    # Must include a count so the user can gauge severity.
+    assert "1 symbol" in captured.err
+
+
+def test_parse_publics_no_warning_when_nothing_dropped(capsys):
+    """Healthy parse: every section is known → no spurious warning."""
+    sections = {1: 0x1000, 2: 0x2000}
+    parse_publics(PUBLICS_FIXTURE, sections)
+    captured = capsys.readouterr()
+    assert "dropped" not in captured.err
+
+
+def test_parse_publics_counts_multiple_drops(capsys):
+    """Drop counter aggregates across multiple unknown-section symbols."""
+    text = """
+       0 | S_PUB32 [size = 32] `Sym1`
+           flags = none, addr = 0009:100
+      32 | S_PUB32 [size = 32] `Sym2`
+           flags = none, addr = 0009:200
+      64 | S_PUB32 [size = 32] `Sym3`
+           flags = none, addr = 0001:300
+"""
+    syms = parse_publics(text, {1: 0x1000})
+    captured = capsys.readouterr()
+    assert "Sym3" in syms
+    assert "Sym1" not in syms and "Sym2" not in syms
+    assert "2 symbol" in captured.err
+
+
 def test_parse_publics_survives_name_without_addr():
     # llvm-pdbutil section offsets are decimal, so 256 -> RVA = 0x1100.
     text = """

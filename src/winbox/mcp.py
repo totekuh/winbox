@@ -2230,7 +2230,7 @@ def kdbg_session() -> str:
 
 
 @mcp.tool()
-def kdbg_bp(target: str, mode: str = "hw") -> str:
+def kdbg_bp(target: str, mode: str = "hw", condition: str | None = None) -> str:
     """Install a breakpoint at TARGET in the attached process.
 
     Defaults to **hardware breakpoint** (CPU debug register, Z1
@@ -2252,15 +2252,42 @@ def kdbg_bp(target: str, mode: str = "hw") -> str:
             ``"auto"`` — try hw first, fall back to soft on slot
                 exhaustion. Inspect the returned ``hw`` field to
                 see which path you got.
+        condition: Optional predicate evaluated server-side on every
+            in-target fire. False predicate -> silent-cont (no halt
+            surfaced). True predicate -> halt as today. Use this to
+            cut through high-frequency dispatchers (IOCTL switches,
+            adoption helpers) that would otherwise drown analysis.
+            Bad syntax is rejected at install time, not at first fire.
+
+            Grammar (qword unsigned 64-bit semantics):
+              regs    = rax rbx rcx rdx rsi rdi rbp rsp r8..r15 rip eflags
+              memory  = ``[reg]``, ``[reg+0xN]``, ``[reg-0xN]``, ``[0xABS]``
+                        (qword little-endian read in target's CR3)
+              ops     = ``== != < <= > >=``, ``&`` (bitwise AND),
+                        ``&& ||`` (short-circuit), parens
+              literal = ``0x...`` or decimal
+
+            Examples:
+              ``rcx == 0xdeadbeef``
+              ``[rsp+0x18] == 0x226048``
+              ``(rax & 0x80000000) != 0``
+              ``rcx == 0x4 && [rdx] != 0``
+
+            For string compares, encode the bytes as a little-endian
+            qword literal yourself (e.g. ``"w00t"`` -> ``0x74303077``).
 
     Returns:
-        JSON ``{id, va, user_mode, hw, elapsed_ms}`` — ``hw`` field
-        tells you whether you got a hardware or software bp.
+        JSON ``{id, va, user_mode, hw, condition, elapsed_ms}``. The
+        ``predicate_*_count`` fields appear in ``kdbg_bps`` output.
     """
     cfg = _kdbg_cfg_only()
+    if condition is not None and not condition.strip():
+        condition = None
     try:
         return _json.dumps(
-            _kdbg_client(cfg).call("bp_add", target=target, mode=mode),
+            _kdbg_client(cfg).call(
+                "bp_add", target=target, mode=mode, condition=condition,
+            ),
             indent=2,
         )
     except _ClientError as e:
@@ -2272,7 +2299,12 @@ def kdbg_bps() -> str:
     """List all installed breakpoints in the current session.
 
     Returns:
-        JSON array of ``{id, va, target, user_mode, hits, age_s}`` per bp.
+        JSON ``{"bps": [...]}`` where each entry is
+        ``{id, va, target, target_pretty, user_mode, hw, hits,
+        condition, predicate_hit_count, predicate_skip_count,
+        predicate_error_count, age_s}``. For unconditional bps,
+        ``condition`` is null and the predicate counts stay at 0;
+        ``hits`` counts every in-target fire regardless of mode.
     """
     cfg = _kdbg_cfg_only()
     try:

@@ -51,6 +51,7 @@ Invariants:
 from __future__ import annotations
 
 import struct
+import sys
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -179,15 +180,34 @@ def install_user_breakpoint(
     finally:
         # Restore CR3 unconditionally. If we leave target_dtb in vCPU's
         # register file and resume, the vCPU runs kernel code with the
-        # wrong page tables = instant BSOD.
+        # wrong page tables = instant BSOD. Failure to restore is
+        # session-fatal — log loudly and re-raise as InstallError so
+        # the daemon's op handler propagates it (and the operator
+        # knows the firing vCPU is poisoned).
         if swapped:
             try:
                 restore = bytearray(regs)  # ``regs`` already has original CR3
                 struct.pack_into("<Q", restore, _CR3_OFFSET_IN_G, original_cr3)
-                cli._exchange(b"G" + bytes(restore).hex().encode("ascii"))
-            except Exception:
-                # Couldn't restore via gdbstub — caller's only recourse
-                # is to halt the VM externally before resume. We surface
-                # the original install error if any (re-raised by the
-                # outer try) so the user knows.
-                pass
+                resp = cli._exchange(b"G" + bytes(restore).hex().encode("ascii"))
+                if resp != b"OK":
+                    print(
+                        f"[kdbg-install] FATAL: CR3 restore G-packet rejected "
+                        f"({resp!r}); vCPU {vcpu} still holds masqueraded "
+                        f"CR3 0x{target_dtb:x} — DO NOT resume",
+                        file=sys.stderr, flush=True,
+                    )
+                    raise InstallError(
+                        "CR3 restore failed during install; daemon poisoned"
+                    )
+            except InstallError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[kdbg-install] FATAL: CR3 restore raised "
+                    f"{type(e).__name__}: {e}; vCPU {vcpu} still holds "
+                    f"masqueraded CR3 0x{target_dtb:x} — DO NOT resume",
+                    file=sys.stderr, flush=True,
+                )
+                raise InstallError(
+                    "CR3 restore failed during install; daemon poisoned"
+                ) from e

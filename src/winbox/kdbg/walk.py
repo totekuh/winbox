@@ -50,6 +50,10 @@ class ProcessRecord:
     name: str
     eprocess: int           # VA of the EPROCESS struct
     directory_table_base: int
+    user_directory_table_base: int = 0  # KPROCESS.UserDirectoryTableBase (KVA Shadow);
+                                        # 0 if the field is absent (pre-KPTI struct) or
+                                        # the read failed. Either way the daemon falls
+                                        # back to filtering on directory_table_base alone.
 
 
 @dataclass
@@ -146,6 +150,11 @@ def list_processes(
     pid_off = eproc_fields["UniqueProcessId"]["off"]
     kproc_fields = store.struct("_KPROCESS")["fields"]
     dtb_off = kproc_fields["DirectoryTableBase"]["off"]
+    # UserDirectoryTableBase only exists on KVA Shadow / KPTI builds.
+    # Pre-KPTI Win10 / 2016 builds don't have this field; reading it
+    # would point at unrelated KPROCESS bytes. Probe the field map and
+    # only read if present.
+    user_dtb_off = kproc_fields.get("UserDirectoryTableBase", {}).get("off")
 
     # Flink of PsActiveProcessHead points at the first EPROCESS.ActiveProcessLinks.
     flink = _read_u64(vm_name, cr3, head, cache)
@@ -160,6 +169,15 @@ def list_processes(
             pid = _read_u64(vm_name, cr3, eproc + pid_off, cache)
             dtb = _read_u64(vm_name, cr3, eproc + dtb_off, cache)
             name = _read_cstr(vm_name, cr3, eproc + img_off, 15, cache)
+            user_dtb = 0
+            if user_dtb_off is not None:
+                # Best-effort: per-process read failure shouldn't kill the
+                # walk. Sentinel 0 means "no second CR3 known"; daemon
+                # filters fall back to single-CR3 mode for this process.
+                try:
+                    user_dtb = _read_u64(vm_name, cr3, eproc + user_dtb_off, cache)
+                except (HmpError, PageWalkError):
+                    user_dtb = 0
         except (HmpError, PageWalkError) as e:
             # Bare `except Exception` here used to silently truncate the walk
             # mid-list — callers thought they had the full process table.
@@ -172,6 +190,7 @@ def list_processes(
             break
         results.append(ProcessRecord(
             pid=pid, name=name, eprocess=eproc, directory_table_base=dtb,
+            user_directory_table_base=user_dtb,
         ))
         flink = _read_u64(vm_name, cr3, flink, cache)
     if len(results) >= MAX_PROCESSES:

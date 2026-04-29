@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,6 +150,7 @@ def parse_publics(text: str, sections: dict[int, int]) -> dict[str, int]:
     """
     out: dict[str, int] = {}
     pending_name: str | None = None
+    dropped = 0
     for line in text.splitlines():
         pub_match = _PUB_RE.search(line)
         if pub_match:
@@ -165,7 +167,21 @@ def parse_publics(text: str, sections: dict[int, int]) -> dict[str, int]:
                 # Publics with spurious C++ literal names crowd the table; we
                 # keep them since filtering would hide legitimate entries.
                 out[pending_name] = sec_va + sec_off
+            else:
+                # Section index not in the headers map. Common causes:
+                # truncated llvm-pdbutil output (timeout mid-stream),
+                # forward-declared sections in fragments, or genuinely
+                # corrupt PDB. Count + warn at end so the caller doesn't
+                # silently get a partial symbol table.
+                dropped += 1
             pending_name = None
+    if dropped:
+        print(
+            f"warning: parse_publics dropped {dropped} symbol(s) with "
+            f"unknown section index — llvm-pdbutil output may be "
+            f"truncated; symbol table is incomplete",
+            file=sys.stderr,
+        )
     return out
 
 
