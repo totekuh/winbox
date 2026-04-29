@@ -86,8 +86,17 @@ class DaemonClient:
         ``sock_timeout`` is the *socket* timeout for this call; op-level
         timeouts (e.g. ``cont``'s wall-clock budget) go in ``**args``.
         """
-        if not self._sock_path.exists():
-            raise ClientError("no kdbg session is attached (run `winbox kdbg attach <pid>`)")
+        # Authoritative liveness check via the lock file. Catches both
+        # the missing-sock case AND stale-sock-without-daemon cases (the
+        # daemon was killed but didn't get to unlink the socket). Without
+        # this, a dead daemon's stale .sock surfaced raw
+        # ``[Errno 111] Connection refused`` in the CLI/MCP tool output —
+        # operators saw cryptic socket errors and didn't know they
+        # needed to re-run ``kdbg attach``.
+        if not self.session_alive():
+            raise ClientError(
+                "no kdbg session is attached (run `winbox kdbg attach <pid>`)"
+            )
 
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(sock_timeout)
@@ -95,7 +104,14 @@ class DaemonClient:
             try:
                 s.connect(str(self._sock_path))
             except OSError as e:
-                raise ClientError(f"daemon unreachable: {e}") from e
+                # Lock said alive but socket refused → daemon died between
+                # the check and the connect, OR the sock isn't where we
+                # expect (corrupted state). Still actionable to retry
+                # the attach, so spell that out.
+                raise ClientError(
+                    f"kdbg daemon unreachable ({e}); "
+                    "the daemon may have died — re-run `winbox kdbg attach <pid>`"
+                ) from e
             s.sendall(encode(request(op, **args)))
             try:
                 line = read_line(s)
