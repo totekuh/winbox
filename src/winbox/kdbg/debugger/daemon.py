@@ -616,15 +616,49 @@ class DaemonSession:
             raise RuntimeError("not halted; cont first")
         vcpu = self.stop.vcpu
         self.rsp.step(vcpu)
-        sr = self.rsp.wait_for_stop(timeout=5.0)
+        try:
+            sr = self.rsp.wait_for_stop(timeout=5.0)
+        except RspError as e:
+            if "timed out" not in str(e).lower():
+                raise
+            # Step didn't complete in the budget. The stub may still owe
+            # us a stop reply (single-step trap pending in QEMU), or be
+            # genuinely hung. Force a halt to drag the stub back into a
+            # known state, drain whatever it sends, and surface a clear
+            # error so the next op runs against a consistent stub
+            # instead of indeterminate state.
+            with suppress(RspError):
+                self.rsp.interrupt()
+                sr_recovery = self.rsp.wait_for_stop(timeout=2.0)
+                self._capture_stop(sr_recovery)
+            raise RuntimeError(
+                "step did not complete within 5s; stub recovered to halted state"
+            ) from e
         self.rsp.select_thread(sr.thread or vcpu)
         self._capture_stop(sr)
         return {"reason": "step", **self._stop_summary()}
 
     def op_interrupt(self) -> dict[str, Any]:
-        """Mark interrupt-pending; if a cont is in flight (different
-        connection), the loop will pick it up and break out."""
+        """Halt a running VM via raw ``\\x03`` on the RSP socket, in
+        addition to setting the cooperative interrupt-pending flag.
+
+        ``op_interrupt`` is a lightweight op (bypasses ``_busy``), so it
+        runs on a separate connection while ``op_cont`` is blocked in
+        ``wait_for_stop`` on a different connection. The flag alone is
+        only checked at the top of each cont-loop iteration — a stuck
+        cont that isn't firing bps wouldn't notice for the full 30s
+        default timeout. Sending ``\\x03`` directly punts a stop reply
+        onto the wire so ``wait_for_stop`` returns promptly.
+
+        Sockets are full-duplex; ``rsp.interrupt`` only writes (no read,
+        no rsp-state mutation) so it's safe to call concurrently with
+        a cont-loop's read on the same RspClient.
+        """
         self._interrupt_pending = True
+        # Best-effort — if the rsp socket is dead the cont loop is
+        # already going to surface its own error. Don't double-fault.
+        with suppress(RspError, OSError):
+            self.rsp.interrupt()
         return {"queued": True}
 
     def op_regs(self) -> dict[str, Any]:
@@ -1457,6 +1491,12 @@ def fork_daemon(
 
     # Child — won't return
     os.close(pipe_r)
+    # Track lifecycle so the error paths can do the right thing without
+    # double-closing the pipe (writes after close = EBADF, parent then
+    # sees an empty pipe instead of our error message) and so we can
+    # resume the VM if attach failed after the gdbstub halted it.
+    rsp: RspClient | None = None
+    pipe_signaled = False
     try:
         _detach_to_log(log_path(cfg))
         lock_fd = _acquire_lock_or_die(lock_path(cfg))
@@ -1468,6 +1508,8 @@ def fork_daemon(
         target = next((p for p in procs if p.pid == target_pid), None)
         if target is None:
             os.write(pipe_w, f"ERR: pid {target_pid} not found\n".encode())
+            os.close(pipe_w)
+            pipe_signaled = True
             os._exit(1)
 
         rsp = RspClient.connect("127.0.0.1", gdbstub_port, timeout=5.0)
@@ -1504,6 +1546,7 @@ def fork_daemon(
 
         os.write(pipe_w, b"OK\n")
         os.close(pipe_w)
+        pipe_signaled = True
 
         sys.stderr.write(f"[kdbg-daemon pid={os.getpid()}] attached to "
                          f"{info.name}({info.pid}) dtb=0x{info.dtb:x}\n")
@@ -1525,12 +1568,25 @@ def fork_daemon(
                 lock_path(cfg).unlink()
         os._exit(0)
     except DaemonError as e:
-        os.write(pipe_w, f"ERR: {e}\n".encode())
-        os.close(pipe_w)
+        # Setup-time failure (most commonly stale-base validation). The
+        # gdbstub may have halted the VM on connect; resume it so we
+        # don't leave the VM frozen with no breadcrumb to the operator.
+        if rsp is not None:
+            with suppress(Exception):
+                rsp.cont()
+        if not pipe_signaled:
+            with suppress(OSError):
+                os.write(pipe_w, f"ERR: {e}\n".encode())
+                os.close(pipe_w)
         os._exit(1)
     except Exception as e:  # noqa: BLE001 — surface anything that broke setup
-        os.write(pipe_w, f"ERR: {type(e).__name__}: {e}\n".encode())
-        os.close(pipe_w)
+        if rsp is not None:
+            with suppress(Exception):
+                rsp.cont()
+        if not pipe_signaled:
+            with suppress(OSError):
+                os.write(pipe_w, f"ERR: {type(e).__name__}: {e}\n".encode())
+                os.close(pipe_w)
         os._exit(1)
 
 

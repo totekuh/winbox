@@ -459,6 +459,101 @@ def test_interrupt_queues_pending_flag():
     assert session._interrupt_pending is True
 
 
+def test_interrupt_also_sends_real_break_to_rsp():
+    """Regression: previously ``op_interrupt`` only set the pending
+    flag, which was checked at the top of each cont-loop iteration.
+    A cont stuck inside ``wait_for_stop`` against a target that wasn't
+    firing would ignore the flag for the full 30s timeout. Now the op
+    also calls ``rsp.interrupt()`` so the gdbstub receives \\x03 and
+    surfaces a stop reply promptly."""
+    rsp = FakeRsp()
+    session = _make_session(rsp=rsp)
+    session.handle_op("interrupt", {})
+    assert rsp.interrupted == 1
+    assert session._interrupt_pending is True
+
+
+def test_interrupt_swallows_rsp_failure_without_raising():
+    """If the RSP socket is dead the cont loop will surface its own
+    error — interrupt itself shouldn't double-fault on the lightweight
+    path (it bypasses _busy and runs from a separate connection)."""
+    from winbox.kdbg.debugger.rsp import RspError
+
+    class _BrokenRsp(FakeRsp):
+        def interrupt(self) -> None:
+            raise RspError("socket closed")
+    rsp = _BrokenRsp()
+    session = _make_session(rsp=rsp)
+    reply = session.handle_op("interrupt", {})
+    # No exception leaked; flag still set so the cont loop can pick up
+    # cooperative interrupt if the socket recovers.
+    assert reply["ok"] is True
+    assert session._interrupt_pending is True
+
+
+def test_op_step_recovers_from_wait_for_stop_timeout():
+    """Regression: a step whose ``wait_for_stop`` timed out left
+    ``self.stop`` unchanged and the gdbstub in indeterminate state
+    (it might still owe us a stop reply). Now: force a halt, drain
+    the recovery stop, and surface a clear RuntimeError so the next
+    op runs against a known-halted stub."""
+    from winbox.kdbg.debugger.rsp import RspError, StopReply
+
+    class _StepTimeoutRsp(FakeRsp):
+        def __init__(self):
+            super().__init__()
+            self._wait_calls = 0
+
+        def wait_for_stop(self, *, timeout: float | None = None):
+            self._wait_calls += 1
+            if self._wait_calls == 1:
+                # First call (post-step) times out.
+                raise RspError("read timed out")
+            # Recovery wait after our forced interrupt — succeeds.
+            return StopReply(signal=2, thread="01", stop_kind=None, raw="T02")
+
+    rsp = _StepTimeoutRsp()
+    session = _make_session(rsp=rsp)
+    # Pre-step state: capture a stop so op_step's halted check passes.
+    from winbox.kdbg.debugger.daemon import StopState
+    session.stop = StopState(
+        vcpu="01", rip=0xffffffff80001000, cr3=0x1234000,
+        signal=5, raw_regs=_blob(),
+    )
+    reply = session.handle_op("step", {})
+    assert reply["ok"] is False
+    assert "step did not complete" in reply["error"]
+    # The recovery interrupt was sent.
+    assert rsp.interrupted == 1
+    # And the recovery stop was captured so the next op sees the halted state.
+    assert session.stop is not None
+    assert session.stop.signal == 2  # SIGINT from our forced halt
+
+
+def test_op_step_propagates_non_timeout_rsp_error():
+    """Step recovery only kicks in for timeouts. Other RspErrors should
+    propagate so the op handler reports them (and doesn't pretend the
+    stub is in a known state)."""
+    from winbox.kdbg.debugger.rsp import RspError
+
+    class _StepFailsRsp(FakeRsp):
+        def wait_for_stop(self, *, timeout: float | None = None):
+            raise RspError("connection closed by peer")
+
+    rsp = _StepFailsRsp()
+    session = _make_session(rsp=rsp)
+    from winbox.kdbg.debugger.daemon import StopState
+    session.stop = StopState(
+        vcpu="01", rip=0xffffffff80001000, cr3=0x1234000,
+        signal=5, raw_regs=_blob(),
+    )
+    reply = session.handle_op("step", {})
+    assert reply["ok"] is False
+    assert "connection closed" in reply["error"]
+    # No recovery attempted — error is not a timeout.
+    assert rsp.interrupted == 0
+
+
 # ── KPTI / KVA Shadow CR3 filter ────────────────────────────────────────
 #
 # Live VM trace from a real Cortex audit session showed half the running
