@@ -165,6 +165,45 @@ class TestEnsureFilterDefined:
             with pytest.raises(RuntimeError, match="unexpected XML"):
                 nwfilter.ensure_filter_defined()
 
+    def test_uuid_conflict_triggers_undefine_then_retry(self):
+        """Kali's libvirt rejects a redefine of a same-named filter when the
+        incoming XML has no <uuid>. _define_one must undefine the stale
+        filter and retry, otherwise winbox setup re-runs (and any caller of
+        ensure_filter_defined) silently keep the old ruleset."""
+        calls = []
+        uuid_err = (
+            "error: operation failed: filter 'winbox-isolate-ipv4' "
+            "already exists with uuid abc-123"
+        )
+
+        def fake_virsh(*args, check=True):
+            calls.append(args)
+            if args[0] == "nwfilter-define":
+                # First define of each filter hits the UUID conflict;
+                # subsequent define (after undefine) succeeds.
+                prior_defines = sum(
+                    1 for c in calls[:-1]
+                    if c[0] == "nwfilter-define" and c[1] == args[1]
+                )
+                if prior_defines == 0:
+                    return _proc(1, stderr=uuid_err)
+                return _proc(0)
+            if args[0] == "nwfilter-undefine":
+                return _proc(0)
+            raise AssertionError(f"unexpected virsh call: {args}")
+
+        with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
+            nwfilter.ensure_filter_defined()
+
+        # Each filter: define (fail) -> undefine -> define (ok), times two filters.
+        ops = [c[0] for c in calls]
+        assert ops == [
+            "nwfilter-define", "nwfilter-undefine", "nwfilter-define",
+            "nwfilter-define", "nwfilter-undefine", "nwfilter-define",
+        ]
+        undefined = [c[1] for c in calls if c[0] == "nwfilter-undefine"]
+        assert undefined == [nwfilter.FILTER_IPV4_NAME, nwfilter.FILTER_NAME]
+
     def test_both_filter_files_exist_and_parse(self):
         """Both data files must be present and parseable as XML."""
         root_path = nwfilter._filter_path(nwfilter.FILTER_XML)

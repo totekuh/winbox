@@ -4,6 +4,13 @@
     <mac protocolid='arp'/>
   </rule>
 
+  <!-- DHCP: delegate to libvirt's built-in allow-dhcp. Some nft-backend
+       libvirt builds (recent Kali / Debian) do not match port-only UDP
+       rules against broadcast DHCPDISCOVER (src 0.0.0.0 -> dst
+       255.255.255.255), so the VM ends up on APIPA. allow-dhcp matches
+       with explicit broadcast IPs and works across backends. -->
+  <filterref filter='allow-dhcp'/>
+
   <!-- Delegate IPv4 handling to the 'ipv4' chain sub-filter.
        libvirt dispatches by EtherType, so rules matching <ip>/<udp>
        MUST live in a chain='ipv4' filter; they never fire from the

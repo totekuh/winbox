@@ -3,9 +3,10 @@
 Two filters are defined together:
 
   * ``winbox-isolate``      — ``chain='root'``, handles L2 (ARP allow, IPv6 drop,
-                              default drop) and ``<filterref>`` delegates IPv4
-                              to the sub-filter below.
-  * ``winbox-isolate-ipv4`` — ``chain='ipv4'``, allows DHCPv4 + intra-192.168.122.0/24
+                              default drop), delegates DHCPv4 to libvirt's
+                              built-in ``allow-dhcp`` filter, and ``<filterref>``
+                              delegates the rest of IPv4 to the sub-filter below.
+  * ``winbox-isolate-ipv4`` — ``chain='ipv4'``, allows intra-192.168.122.0/24
                               and drops everything else.
 
 The split is required because libvirt dispatches by EtherType out of the root
@@ -45,6 +46,12 @@ def _define_one(filename: str, name: str, render_kwargs: dict | None = None) -> 
     the IPv4 sub-filter picks up the configured subnet without keeping a
     second copy of ``192.168.122.0`` in ``data/`` that can drift from
     ``Config.vm_subnet``.
+
+    On a UUID conflict (some libvirt builds — notably recent Kali — refuse
+    to redefine a same-named filter when the incoming XML has no ``<uuid>``,
+    aborting with "filter '...' already exists with uuid ..."), the existing
+    filter is undefined and the define retried. Without this, every caller
+    on those builds silently keeps the stale ruleset on disk.
     """
     if render_kwargs:
         body = _data.render(filename, **render_kwargs)
@@ -53,23 +60,39 @@ def _define_one(filename: str, name: str, render_kwargs: dict | None = None) -> 
         ) as tmp:
             tmp.write(body)
             tmp_path = tmp.name
-        try:
-            result = virsh_run("nwfilter-define", tmp_path, check=False)
-        finally:
+        cleanup_paths: list[str] = [tmp_path]
+        define_arg = tmp_path
+    else:
+        cleanup_paths = []
+        define_arg = str(_data.path(filename))
+
+    try:
+        result = virsh_run("nwfilter-define", define_arg, check=False)
+        if result.returncode != 0 and "already exists with uuid" in (result.stderr or ""):
+            undef = virsh_run("nwfilter-undefine", name, check=False)
+            if undef.returncode != 0:
+                msg = undef.stderr.strip() or f"virsh exit {undef.returncode}"
+                raise RuntimeError(
+                    f"Failed to undefine stale nwfilter '{name}' before redefine: {msg}"
+                )
+            result = virsh_run("nwfilter-define", define_arg, check=False)
+
+        if result.returncode != 0:
+            msg = result.stderr.strip() or result.stdout.strip() or f"virsh exit {result.returncode}"
+            raise RuntimeError(f"Failed to define nwfilter '{name}': {msg}")
+    finally:
+        for p in cleanup_paths:
             try:
-                Path(tmp_path).unlink()
+                Path(p).unlink()
             except OSError:
                 pass
-    else:
-        result = virsh_run("nwfilter-define", str(_data.path(filename)), check=False)
-
-    if result.returncode != 0:
-        msg = result.stderr.strip() or result.stdout.strip() or f"virsh exit {result.returncode}"
-        raise RuntimeError(f"Failed to define nwfilter '{name}': {msg}")
 
 
 def ensure_filter_defined(cfg=None) -> None:
-    """Define both libvirt nwfilters. Idempotent (libvirt overwrites on re-define).
+    """Define both libvirt nwfilters. Idempotent on every supported libvirt
+    backend — ``_define_one`` undefines and retries on the UUID-conflict
+    error that Kali's libvirt raises when re-defining a same-named filter
+    whose XML lacks a ``<uuid>``.
 
     Sub-filter is defined first so the root filter's ``<filterref>`` resolves.
     The IPv4 sub-filter is rendered with ``cfg.vm_subnet`` / ``cfg.vm_subnet_mask``

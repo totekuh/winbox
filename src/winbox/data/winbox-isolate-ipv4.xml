@@ -1,12 +1,7 @@
 <filter name='winbox-isolate-ipv4' chain='ipv4'>
-  <!-- DHCPv4 client: allow renewals so Windows doesn't mark the NIC
-       "unidentified" or strip the IP. -->
-  <rule action='accept' direction='out' priority='100'>
-    <udp srcportstart='68' dstportstart='67'/>
-  </rule>
-  <rule action='accept' direction='in' priority='100'>
-    <udp srcportstart='67' dstportstart='68'/>
-  </rule>
+  <!-- DHCPv4 is handled by the allow-dhcp filterref in the root filter
+       (winbox-isolate.xml). It correctly matches broadcast DHCPDISCOVER
+       across libvirt backends; port-only rules here did not. -->
 
   <!-- Intra-subnet (rendered from cfg.vm_subnet / cfg.vm_subnet_mask). -->
   <rule action='accept' direction='inout' priority='200'>
