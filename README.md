@@ -42,6 +42,7 @@ PS C:\Windows\system32>
 - **AppLocker** — enable AppLocker with default rules for bypass testing
 - **Autologin** — persistent Administrator auto-login that survives reboots on Server 2022
 - **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
+- **Malware detonation lab** — `winbox capture` (host-side tcpdump on the bridge → pcap), `winbox sinkhole` (zero-dependency DNS sinkhole that answers every C2 lookup with the bridge IP and logs the domain, plus optional INETSim fake services), and `winbox detonate check` (read-only preflight that refuses to go green unless the guest genuinely can't reach the internet). See [docs/malware-detonation.md](docs/malware-detonation.md)
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
 - **MCP server** — 51 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including a session-based named-pipe broker and a long-running hypervisor-level kernel debug session
 - **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
@@ -97,6 +98,7 @@ Execute        exec  shell  ssh  vnc  jobs  msi  eventlogs  kdbg
 Files          tools  upload  iso
 Network        net  dns  hosts  domain
 Target         av  applocker  autologin     (bidirectional — flip on to test bypass tools)
+Malware        capture  sinkhole  detonate    (detonation lab — capture C2, sinkhole DNS, preflight)
 Integrations   binfmt  mcp  office
 ```
 
