@@ -1163,3 +1163,59 @@ class TestProvisionPs1NonAsciiInStrings:
             "PowerShell (no BOM) will misdecode them as Windows-1252 and "
             "may break parsing. Offenders:\n  " + "\n  ".join(offenders)
         )
+
+
+class TestRebootWaitsForAStableAgent:
+    """One answered ping after a reboot is not proof the guest has settled.
+
+    The agent has repeatedly come up, answered, and dropped again seconds
+    later — so the command issued right after a reboot died with "QEMU guest
+    agent is not connected". Seen four times across live runs, always in the
+    command immediately following a reboot.
+    """
+
+    def test_requires_consecutive_answers(self):
+        from winbox.cli import _wait_for_stable_agent
+
+        ga = MagicMock()
+        # Up, drop, up, up, up — the drop must reset the count.
+        ga.ping.side_effect = [True, False, True, True, True]
+
+        with patch("winbox.cli.time.sleep"):
+            _wait_for_stable_agent(ga, checks=3, gap=0)
+
+        assert ga.ping.call_count == 5
+
+    def test_returns_as_soon_as_it_is_stable(self):
+        from winbox.cli import _wait_for_stable_agent
+
+        ga = MagicMock()
+        ga.ping.return_value = True
+
+        with patch("winbox.cli.time.sleep"):
+            _wait_for_stable_agent(ga, checks=3, gap=0)
+
+        assert ga.ping.call_count == 3
+
+    def test_gives_up_rather_than_hanging(self):
+        """The reboot itself already succeeded; failing here would turn a
+        settled-slowly guest into a failed command."""
+        from winbox.cli import _wait_for_stable_agent
+
+        ga = MagicMock()
+        ga.ping.return_value = False
+
+        times = iter([0.0] + [i * 10.0 for i in range(1, 20)])
+        with (
+            patch("winbox.cli.time.sleep"),
+            patch("winbox.cli.time.monotonic", side_effect=lambda: next(times)),
+        ):
+            _wait_for_stable_agent(ga, checks=3, gap=0)  # must return, not raise
+
+    def test_reboot_and_wait_uses_it(self):
+        import inspect
+
+        from winbox.cli import reboot_and_wait
+
+        src = inspect.getsource(reboot_and_wait)
+        assert "_wait_for_stable_agent" in src

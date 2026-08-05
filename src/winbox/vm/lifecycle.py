@@ -127,7 +127,32 @@ class VM:
         return self.state() == VMState.RUNNING
 
     def start(self) -> None:
-        virsh_run("start", self.name)
+        """Start the domain, tolerating one that is still winding down.
+
+        ``state()`` folds "in shutdown" into SHUTOFF — right for callers
+        asking "is it usable", wrong for callers asking "can I start it".
+        A `winbox down` immediately followed by `winbox up` therefore hit
+        ``virsh start`` while the domain was still active, and libvirt
+        refused with "Domain is already active".
+
+        Rather than leak that distinction into every caller, settle it here:
+        wait for the shutdown to finish and start once more. If it never
+        settles, the domain is genuinely running and the goal is already met.
+        """
+        result = virsh_run("start", self.name, check=False)
+        if result.returncode == 0:
+            return
+
+        stderr = (result.stderr or "").lower()
+        if "already active" not in stderr:
+            msg = result.stderr.strip() or f"virsh exit {result.returncode}"
+            raise RuntimeError(f"virsh start {self.name} failed: {msg}")
+
+        if self.wait_shutdown(timeout=120, poll=2):
+            virsh_run("start", self.name)
+            return
+        # Still up after two minutes: it was not shutting down at all, it was
+        # simply running. Nothing to do.
 
     def shutdown(self) -> None:
         virsh_run("shutdown", self.name, check=False)

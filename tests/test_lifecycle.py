@@ -105,7 +105,9 @@ class TestPowerCommands:
     @pytest.mark.parametrize(
         "method,expected_verb,checked",
         [
-            ("start", "start", True),
+            # start checks the result itself so it can absorb "already
+            # active"; see TestStartRaceWithShutdown.
+            ("start", "start", False),
             ("shutdown", "shutdown", False),
             ("force_stop", "destroy", False),
             ("resume", "resume", True),
@@ -405,3 +407,63 @@ class TestDestroy:
         ):
             with pytest.raises(RuntimeError, match="Manual cleanup"):
                 vm.destroy()
+
+
+class TestStartRaceWithShutdown:
+    """`winbox down` immediately followed by `winbox up` used to fail.
+
+    state() folds "in shutdown" into SHUTOFF — right for "is it usable",
+    wrong for "can I start it" — so ensure_running called virsh start on a
+    domain that was still active, and libvirt refused.
+    """
+
+    def test_waits_out_a_shutdown_then_starts(self, vm):
+        calls = []
+
+        def fake_virsh(*args, check=True):
+            calls.append(args)
+            if args[0] == "start" and len([c for c in calls if c[0] == "start"]) == 1:
+                return _proc(returncode=1, stderr="error: Domain is already active")
+            return _proc()
+
+        with (
+            patch("winbox.vm.lifecycle.virsh_run", side_effect=fake_virsh),
+            patch.object(VM, "wait_shutdown", return_value=True) as waited,
+        ):
+            vm.start()
+
+        waited.assert_called_once()
+        assert [c for c in calls if c[0] == "start"] == [
+            ("start", vm.name), ("start", vm.name)
+        ], "must retry the start once the domain has actually gone down"
+
+    def test_a_domain_that_never_goes_down_is_left_running(self, vm):
+        """It was not shutting down, it was simply up — the goal is met."""
+        with (
+            patch(
+                "winbox.vm.lifecycle.virsh_run",
+                return_value=_proc(returncode=1, stderr="Domain is already active"),
+            ),
+            patch.object(VM, "wait_shutdown", return_value=False),
+        ):
+            vm.start()  # must not raise
+
+    def test_other_start_failures_still_raise(self, vm):
+        with (
+            patch(
+                "winbox.vm.lifecycle.virsh_run",
+                return_value=_proc(returncode=1, stderr="error: no such domain"),
+            ),
+            patch.object(VM, "wait_shutdown") as waited,
+        ):
+            with pytest.raises(RuntimeError, match="no such domain"):
+                vm.start()
+        waited.assert_not_called()
+
+    def test_a_clean_start_does_not_wait(self, vm):
+        with (
+            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()),
+            patch.object(VM, "wait_shutdown") as waited,
+        ):
+            vm.start()
+        waited.assert_not_called()
