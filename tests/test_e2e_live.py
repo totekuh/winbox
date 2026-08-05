@@ -270,6 +270,11 @@ class TestExec:
         assert "running" in out
         assert "responding" in out
 
+    def test_channel_reads_connected_on_a_live_vm(self, vm, ga):
+        """The authoritative readiness signal agrees with a real round-trip."""
+        assert vm.agent_connected() is True
+        assert ga.ping() is True
+
 
 # ─── files ──────────────────────────────────────────────────────────────────
 
@@ -1043,5 +1048,8 @@ class TestLifecycleTeardown:
     def test_down_then_up(self, run, vm, ga):
         run("down")
         assert vm.state() != VMState.RUNNING
+        # A stopped domain's channel is genuinely disconnected — this is the
+        # signal the readiness gate reads, observed at its source.
+        assert vm.agent_connected() is False
         run("up")
         assert "back-up" in ga.exec("echo back-up", timeout=60).stdout

@@ -12,6 +12,8 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from winbox.vm.lifecycle import agent_channel_connected
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -152,7 +154,20 @@ class GuestAgent:
             raise GuestAgentUnreachable(f"Invalid JSON from guest agent: {e}") from e
 
     def ping(self) -> bool:
-        """Check if the guest agent is responding."""
+        """Whether the guest agent is ready to take a command.
+
+        Channel-first. libvirt's channel-state attribute is the authoritative
+        view of the transport, and its flapping right after a reboot is the
+        exact failure this guards — so consult it before spending a round-trip.
+        If the channel is down there is nothing to talk to; return immediately
+        rather than firing a ``guest-ping`` into a dead pipe. If it is up,
+        confirm with the round-trip so a channel that is connected while
+        qemu-ga is momentarily wedged still reads not-ready.
+
+        Referenced as a module global so tests can patch it.
+        """
+        if not agent_channel_connected(self.vm_name):
+            return False
         try:
             self._raw_command({"execute": "guest-ping"}, timeout=5)
             return True

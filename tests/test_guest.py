@@ -265,3 +265,68 @@ class TestExecPowershellFile:
         )
         ga.exec_powershell_file("x.ps1", timeout=42)
         assert seen["timeout"] == 42
+
+
+class TestPingIsChannelFirst:
+    """ping() consults libvirt's channel state before spending a round-trip.
+
+    The post-reboot flake is the channel dropping; firing a guest-ping into a
+    dead pipe only learns that the slow way. So: channel down -> False with no
+    round-trip; channel up -> confirm with the ping so a wedged-but-connected
+    agent still reads not-ready.
+    """
+
+    def _ga(self, monkeypatch, *, connected, raw=None):
+        from winbox.config import Config
+        from winbox.vm.guest import GuestAgent
+
+        ga = GuestAgent(Config())
+        monkeypatch.setattr(
+            "winbox.vm.guest.agent_channel_connected", lambda vm_name: connected
+        )
+        calls = []
+
+        def fake_raw(payload, **kw):
+            calls.append(payload)
+            if raw is None:
+                raise AssertionError("guest-ping must not run when channel is down")
+            if isinstance(raw, Exception):
+                raise raw
+            return raw
+
+        monkeypatch.setattr(ga, "_raw_command", fake_raw)
+        return ga, calls
+
+    def test_channel_down_returns_false_without_a_round_trip(self, monkeypatch):
+        ga, calls = self._ga(monkeypatch, connected=False)
+        assert ga.ping() is False
+        assert calls == [], "no guest-ping should be attempted on a dead channel"
+
+    def test_channel_up_and_agent_answers(self, monkeypatch):
+        ga, calls = self._ga(monkeypatch, connected=True, raw={"return": {}})
+        assert ga.ping() is True
+        assert len(calls) == 1  # the confirming guest-ping ran
+
+    def test_channel_up_but_agent_wedged(self, monkeypatch):
+        from winbox.vm.guest import GuestAgentError
+
+        ga, _ = self._ga(
+            monkeypatch, connected=True, raw=GuestAgentError("no answer")
+        )
+        assert ga.ping() is False
+
+    def test_wait_loops_on_the_channel_state(self, monkeypatch):
+        """wait() inherits the channel gate through ping(), so it blocks until
+        the channel is up — which is the whole point post-reboot."""
+        from winbox.config import Config
+        from winbox.vm.guest import GuestAgent
+
+        ga = GuestAgent(Config())
+        states = iter([False, False, True])
+        monkeypatch.setattr(
+            "winbox.vm.guest.agent_channel_connected", lambda vm_name: next(states)
+        )
+        monkeypatch.setattr(ga, "_raw_command", lambda p, **kw: {"return": {}})
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+
+        ga.wait(timeout=5, interval=0)  # must return, not raise

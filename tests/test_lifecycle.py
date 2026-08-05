@@ -467,3 +467,72 @@ class TestStartRaceWithShutdown:
         ):
             vm.start()
         waited.assert_not_called()
+
+
+class TestAgentChannelConnected:
+    """libvirt's channel-state attribute is the authoritative readiness
+    signal — the post-reboot flake is the channel dropping, and libvirt sees
+    that directly where a guest-ping only sees it after the fact. Read only
+    that attribute, and degrade like state(): a "not connected" answer is a
+    value callers gate on, never an exception."""
+
+    def _xml(self, state_attr):
+        target = (
+            f"<target type='virtio' name='org.qemu.guest_agent.0' "
+            f"state='{state_attr}'/>" if state_attr is not None
+            else "<target type='virtio' name='org.qemu.guest_agent.0'/>"
+        )
+        return f"""<domain type='kvm'>
+          <name>winbox</name>
+          <devices>
+            <channel type='unix'>
+              <source mode='bind' path='/run/x'/>
+              {target}
+            </channel>
+          </devices>
+        </domain>"""
+
+    def _call(self, proc):
+        from winbox.vm.lifecycle import agent_channel_connected
+
+        with patch("winbox.vm.lifecycle.virsh_run", return_value=proc):
+            return agent_channel_connected("winbox")
+
+    def test_connected(self):
+        assert self._call(_proc(self._xml("connected"))) is True
+
+    def test_disconnected(self):
+        assert self._call(_proc(self._xml("disconnected"))) is False
+
+    def test_attribute_absent_is_not_connected(self):
+        """A shut-off domain emits the channel but no state attribute."""
+        assert self._call(_proc(self._xml(None))) is False
+
+    def test_no_channel_element(self):
+        xml = "<domain><name>winbox</name><devices></devices></domain>"
+        assert self._call(_proc(xml)) is False
+
+    def test_no_devices_element(self):
+        assert self._call(_proc("<domain><name>winbox</name></domain>")) is False
+
+    def test_domain_not_found_is_not_connected(self):
+        assert self._call(_proc(returncode=1, stderr="error: no such domain")) is False
+
+    def test_malformed_xml_is_not_connected(self):
+        assert self._call(_proc("<domain><not-closed")) is False
+
+    def test_only_the_guest_agent_channel_counts(self):
+        """A different channel being connected must not read as the agent."""
+        xml = """<domain><devices>
+          <channel type='unix'>
+            <target type='virtio' name='org.other.channel.0' state='connected'/>
+          </channel>
+        </devices></domain>"""
+        assert self._call(_proc(xml)) is False
+
+    def test_vm_method_delegates(self, vm):
+        with patch(
+            "winbox.vm.lifecycle.agent_channel_connected", return_value=True
+        ) as reader:
+            assert vm.agent_connected() is True
+        reader.assert_called_once_with(vm.name)

@@ -4,11 +4,48 @@ from __future__ import annotations
 
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from winbox.config import Config
+
+# The virtio-serial channel qemu-ga speaks over. libvirt stamps a live
+# ``state`` attribute on this target and keeps it current as the agent
+# connects and drops — see ``agent_channel_connected``.
+_GUEST_AGENT_CHANNEL = "org.qemu.guest_agent.0"
+
+
+def agent_channel_connected(vm_name: str) -> bool:
+    """Whether libvirt currently sees the guest-agent channel as connected.
+
+    This is the authoritative readiness signal, and the cause of the
+    post-reboot flake it guards against: the agent comes up, answers once, and
+    the channel drops again for a few seconds before it settles. A
+    ``guest-ping`` only sees that indirectly; libvirt tracks the channel state
+    directly and exposes it in ``virsh dumpxml`` as::
+
+        <target type='virtio' name='org.qemu.guest_agent.0' state='connected'/>
+
+    Reads that attribute and nothing else. Returns ``False`` — never raises —
+    when the domain is off, absent, unqueryable, or the channel/attribute is
+    missing, matching how :meth:`VM.state` degrades an unusable domain: a
+    "not connected" answer has to be a value callers can gate on, not an
+    exception.
+    """
+    result = virsh_run("dumpxml", vm_name, check=False)
+    if result.returncode != 0:
+        return False
+    try:
+        domain = ET.fromstring(result.stdout)
+    except ET.ParseError:
+        return False
+    target = domain.find(
+        f"devices/channel/target[@name='{_GUEST_AGENT_CHANNEL}']"
+    )
+    # `state` is only present on a live domain; absent on a shut-off one.
+    return target is not None and target.get("state") == "connected"
 
 
 class VMState(Enum):
@@ -125,6 +162,15 @@ class VM:
 
     def is_running(self) -> bool:
         return self.state() == VMState.RUNNING
+
+    def agent_connected(self) -> bool:
+        """Whether libvirt sees the guest-agent channel as connected.
+
+        The authoritative readiness signal — see
+        :func:`agent_channel_connected`. A method here so callers read it the
+        conventional ``vm.*`` way and tests can mock it like ``state``.
+        """
+        return agent_channel_connected(self.name)
 
     def start(self) -> None:
         """Start the domain, tolerating one that is still winding down.

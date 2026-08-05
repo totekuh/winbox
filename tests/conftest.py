@@ -76,6 +76,7 @@ def mock_env(cfg):
 
     vm = MagicMock()
     vm.state.return_value = VMState.RUNNING
+    vm.agent_connected.return_value = True
     vm.ip.return_value = "192.168.122.203"
     vm.exists.return_value = True
     vm.disk_usage.return_value = "6.5 GB"
