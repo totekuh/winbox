@@ -22,6 +22,15 @@ if TYPE_CHECKING:
 # practice one discard is enough; the cap only bounds a pathological case.
 _MAX_STALE_DISCARDS = 3
 
+# A PID the guest agent cannot hold a result for: its table only contains
+# processes it spawned itself, and Windows PIDs are well under this.
+_NEVER_SPAWNED_PID = 0xFFFFFFF0
+
+# How many *consecutive* failed status polls are treated as a virtio-serial
+# hiccup rather than a dead agent. A long-running command used to be aborted
+# by the first one, even though the in-VM process was still running fine.
+_MAX_TRANSIENT_ERRORS = 5
+
 
 @dataclass
 class ExecResult:
@@ -173,6 +182,107 @@ class GuestAgent:
                 return
             time.sleep(interval)
 
+    def _poll_exec(
+        self,
+        pid: int,
+        *,
+        deadline: float,
+        timeout: int,
+        poll_interval: float,
+        resolve,
+    ) -> dict:
+        """Poll ``guest-exec-status`` until this command's own result arrives.
+
+        Shared by :meth:`exec` and :meth:`exec_argv` so both get the same two
+        properties, which used to exist only in ``exec``:
+
+        * a brief virtio-serial hiccup mid-poll is tolerated (up to
+          ``_MAX_TRANSIENT_ERRORS`` consecutive failures) instead of aborting
+          a command the guest is still happily running;
+        * **every** path that walks away from ``pid`` kills and reaps it.
+          Abandoning a PID without reaping leaves a result nobody will ever
+          read inside the agent, and that entry is exactly the orphan a later
+          command inherits once Windows recycles the PID.
+
+        ``resolve(ret)`` is called for each result reporting ``exited`` and
+        returns the ``ret`` to accept, or None to reject it as somebody
+        else's (reading it has already freed the offending entry, so polling
+        simply continues).
+
+        The caller owns the clock: it passes an absolute ``deadline`` — so the
+        window it grants starts where the caller says it does — plus the
+        ``timeout`` that produced it, used only to describe it in the error.
+        """
+        status_payload = {
+            "execute": "guest-exec-status",
+            "arguments": {"pid": pid},
+        }
+        consecutive_errors = 0
+        stale_discards = 0
+        while True:
+            try:
+                status = self._raw_command(status_payload)
+                consecutive_errors = 0
+            except GuestAgentError:
+                consecutive_errors += 1
+                if (
+                    consecutive_errors > _MAX_TRANSIENT_ERRORS
+                    or time.monotonic() >= deadline
+                ):
+                    self._kill_and_reap(pid)
+                    raise
+                time.sleep(poll_interval)
+                continue
+            ret = status.get("return", {})
+            if ret.get("exited"):
+                resolved = resolve(ret)
+                if resolved is not None:
+                    return resolved
+                # Not ours: a stale entry parked on this recycled PID. Reading
+                # it above freed it, so the next poll should find ours. Bail
+                # out rather than loop forever if it keeps up.
+                stale_discards += 1
+                logger.warning(
+                    "discarded a foreign guest-exec result on PID %s "
+                    "(recycled PID collided with an abandoned result); "
+                    "discard %d/%d",
+                    pid, stale_discards, _MAX_STALE_DISCARDS,
+                )
+                if stale_discards >= _MAX_STALE_DISCARDS:
+                    self._kill_and_reap(pid)
+                    raise GuestAgentError(
+                        f"Could not obtain this command's own output on PID "
+                        f"{pid} after {stale_discards} foreign results"
+                    )
+                continue
+            if time.monotonic() >= deadline:
+                self._kill_and_reap(pid)
+                raise GuestAgentError(
+                    f"Command timed out after {timeout}s (PID {pid})"
+                )
+            time.sleep(poll_interval)
+
+    def _errors_on_unknown_pid(self) -> bool:
+        """Does this agent report an *error* for a PID it has no entry for?
+
+        qemu-ga does (``qmp_guest_exec_status`` fails the command), and
+        ``exec_argv``'s orphan check reads a "not exited" answer as proof that
+        a second entry exists. That inference is only sound against an agent
+        that behaves this way, so it is verified rather than assumed — the
+        cost of assuming wrong is discarding a command's real output.
+
+        Probes with a PID the agent cannot have spawned: its table only holds
+        processes it started itself.
+        """
+        try:
+            self._raw_command({
+                "execute": "guest-exec-status",
+                "arguments": {"pid": _NEVER_SPAWNED_PID},
+            }, timeout=5)
+        except GuestAgentError:
+            return True
+        return False
+
     def exec_status(self, pid: int) -> dict:
         """Query the status of a previously started guest-exec process.
 
@@ -237,57 +347,16 @@ class GuestAgent:
         if pid is None:
             raise GuestAgentError("Failed to start process — no PID returned")
 
-        # Poll for completion. Tolerate up to N consecutive transient
-        # errors -- a brief virtio-serial hiccup mid-poll used to abort
-        # a long-running command immediately, even though the in-VM
-        # process was still chugging along just fine.
-        status_payload = {
-            "execute": "guest-exec-status",
-            "arguments": {"pid": pid},
-        }
+        # A completed result is ours only if it carries the nonce we echoed.
+        def resolve(ret: dict) -> dict | None:
+            return ret if nonce in _decode_b64(ret.get("out-data", "")) else None
+
         deadline = time.monotonic() + timeout
-        consecutive_errors = 0
-        max_transient_errors = 5
-        stale_discards = 0
-        while True:
-            try:
-                status = self._raw_command(status_payload)
-                consecutive_errors = 0
-            except GuestAgentError:
-                consecutive_errors += 1
-                if consecutive_errors > max_transient_errors:
-                    raise
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(poll_interval)
-                continue
-            ret = status.get("return", {})
-            if ret.get("exited"):
-                stdout = _decode_b64(ret.get("out-data", ""))
-                if nonce in stdout:
-                    break
-                # Not our result: a stale entry parked on this recycled PID.
-                # Reading it above freed it, so the next poll should find
-                # ours. Bail out rather than loop forever if it keeps up.
-                stale_discards += 1
-                logger.warning(
-                    "discarded a foreign guest-exec result on PID %s "
-                    "(recycled PID collided with an abandoned result); "
-                    "discard %d/%d",
-                    pid, stale_discards, _MAX_STALE_DISCARDS,
-                )
-                if stale_discards >= _MAX_STALE_DISCARDS:
-                    raise GuestAgentError(
-                        f"Could not obtain this command's own output on PID "
-                        f"{pid} after {stale_discards} foreign results"
-                    )
-                continue
-            if time.monotonic() >= deadline:
-                self._kill_and_reap(pid)
-                raise GuestAgentError(
-                    f"Command timed out after {timeout}s (PID {pid})"
-                )
-            time.sleep(poll_interval)
+        ret = self._poll_exec(
+            pid, deadline=deadline, timeout=timeout,
+            poll_interval=poll_interval, resolve=resolve,
+        )
+        stdout = _decode_b64(ret.get("out-data", ""))
 
         # Decode output. Use -1 as the missing-exitcode sentinel to match
         # exec_status() — a real exit 1 should not be indistinguishable from
@@ -314,6 +383,10 @@ class GuestAgent:
         Unlike exec(), this bypasses cmd.exe entirely — no shell interpretation
         of metacharacters. Use this for direct exe calls that don't need shell
         features (pipes, redirects, cd).
+
+        There is no room for exec()'s nonce here — that is the whole point of
+        the method — so identity is established out of band, see
+        ``_resolve_first`` below.
         """
         if poll_interval <= 0:
             poll_interval = 0.5
@@ -331,22 +404,47 @@ class GuestAgent:
         if pid is None:
             raise GuestAgentError("Failed to start process — no PID returned")
 
-        status_payload = {
-            "execute": "guest-exec-status",
-            "arguments": {"pid": pid},
-        }
+        first_poll = True
+
+        def resolve(ret: dict) -> dict | None:
+            nonlocal first_poll
+            if not first_poll:
+                return ret
+            first_poll = False
+            # The agent hands back the *oldest* entry matching a PID, so if an
+            # abandoned result is squatting on this recycled PID it is what we
+            # just read — and ours, newer, is still behind it. Both cases look
+            # identical from one read, so look behind: reading an exited entry
+            # frees it, and asking again for the same PID tells us whether
+            # anything was underneath. qemu-ga errors on a PID it has no entry
+            # for, so an error means the result we already hold was the only
+            # one — ours. Any answer at all means a second entry exists, which
+            # can only be ours, so what we read first was the orphan.
+            try:
+                behind = self._raw_command({
+                    "execute": "guest-exec-status",
+                    "arguments": {"pid": pid},
+                })
+            except GuestAgentError:
+                return ret
+            behind_ret = behind.get("return", {})
+            if behind_ret.get("exited"):
+                return behind_ret
+            # "not exited" reads two ways: our entry really is behind the
+            # orphan and still running, or this agent answers "not exited"
+            # for a PID it has no entry for at all — in which case the read
+            # above was ours and throwing it away would lose the command's
+            # output. Settle it instead of guessing: ask about a PID the
+            # agent cannot have an entry for.
+            if not self._errors_on_unknown_pid():
+                return ret
+            return None
+
         deadline = time.monotonic() + timeout
-        while True:
-            status = self._raw_command(status_payload)
-            ret = status.get("return", {})
-            if ret.get("exited"):
-                break
-            if time.monotonic() >= deadline:
-                self._kill_and_reap(pid)
-                raise GuestAgentError(
-                    f"Command timed out after {timeout}s (PID {pid})"
-                )
-            time.sleep(poll_interval)
+        ret = self._poll_exec(
+            pid, deadline=deadline, timeout=timeout,
+            poll_interval=poll_interval, resolve=resolve,
+        )
 
         # Use -1 as the missing-exitcode sentinel; matches exec() and
         # exec_status(). A real exit 1 should not be indistinguishable

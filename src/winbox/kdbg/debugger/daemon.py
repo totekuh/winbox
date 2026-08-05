@@ -21,10 +21,19 @@ LOCK_EX is automatically released by the kernel on process death, so
 stale-lock recovery is free. The .session.json file is for
 introspection only (CLI clients can read it before connecting).
 
-Single-threaded serve loop: one op at a time. While a long-running op
-(``cont``) is in flight, other connections get an immediate
-``BUSY`` reply — except SIGUSR1 (sent by ``winbox kdbg interrupt``)
-which interrupts the in-flight gdb wait and lets ``cont`` return.
+Single-threaded serve loop: one op at a time. A long-running op
+(``cont``) pumps the listen socket itself while it waits (see
+``_wait_for_stop_serving``), so clients are still answered: heavy ops
+get an immediate ``BUSY`` reply and the lightweight ops (``status``,
+``interrupt``) are executed for real. That pump is what lets
+``winbox kdbg interrupt`` break an in-flight ``cont`` — the accept()
+in ``serve`` is unreachable for the whole duration of the op, so
+without it a second client just sits in the listen backlog until its
+own socket timeout fires.
+
+SIGUSR1 sets the same interrupt-pending flag and is kept as a
+last-resort path for an operator holding only the daemon pid; nothing
+in winbox sends it.
 """
 
 from __future__ import annotations
@@ -521,6 +530,11 @@ class DaemonSession:
         """
         accepted_cr3s = self.target.cr3_set
         deadline = time.monotonic() + max(0.5, float(timeout))
+        # Drop a flag left over from an interrupt issued while nothing was
+        # running — honouring it would make this cont return immediately
+        # without ever resuming the guest. An interrupt that arrives *during*
+        # this cont is delivered by the pump in _wait_for_stop_serving and
+        # consumed below, so it is no longer at risk of being swallowed here.
         self._interrupt_pending = False
         while True:
             if self._interrupt_pending:
@@ -535,7 +549,7 @@ class DaemonSession:
 
             self.rsp.cont()
             try:
-                sr = self.rsp.wait_for_stop(timeout=remaining)
+                sr = self._wait_for_stop_serving(remaining)
             except RspError as e:
                 if "timed out" in str(e).lower():
                     # Wall-clock budget exhausted in wait_for_stop —
@@ -548,6 +562,15 @@ class DaemonSession:
                         pass
                     return {"reason": "timeout"}
                 raise RuntimeError(f"cont/wait failed: {e}") from e
+
+            if self._interrupt_pending:
+                # An interrupt was served mid-wait and its \x03 is what
+                # halted us (QEMU reports SIGINT, not SIGTRAP). Consume the
+                # flag here so it can't leak into the next cont, and label
+                # the stop for what the operator asked for.
+                self._interrupt_pending = False
+                self._capture_stop(sr)
+                return {"reason": "interrupt", **self._stop_summary()}
 
             if sr.signal != 5:
                 # Not a bp — surface anyway, caller decides.
@@ -656,7 +679,10 @@ class DaemonSession:
 
         ``op_interrupt`` is a lightweight op (bypasses ``_busy``), so it
         runs on a separate connection while ``op_cont`` is blocked in
-        ``wait_for_stop`` on a different connection. The flag alone is
+        ``wait_for_stop`` on a different connection — that connection is
+        accepted by ``_pump_client`` from inside the cont wait, since the
+        serve loop's own accept() is unreachable until the op finishes.
+        The flag alone is
         only checked at the top of each cont-loop iteration — a stuck
         cont that isn't firing bps wouldn't notice for the full 30s
         default timeout. Sending ``\\x03`` directly punts a stop reply
@@ -997,6 +1023,92 @@ class DaemonSession:
 
     # ── serve loop ──────────────────────────────────────────────────────
 
+    def _rsp_fd(self) -> int | None:
+        """fileno of the gdbstub socket, or None if unavailable.
+
+        Returns None for RspClient stand-ins that hold no socket (unit
+        tests), which is the signal to fall back to a plain blocking wait.
+        """
+        sock = getattr(self.rsp, "_sock", None)
+        if sock is None:
+            return None
+        try:
+            fd = sock.fileno()
+        except (OSError, AttributeError):
+            return None
+        return fd if fd >= 0 else None
+
+    def _wait_for_stop_serving(self, timeout: float):
+        """``rsp.wait_for_stop`` that keeps answering daemon clients.
+
+        WHY this exists: ``serve`` accepts one connection, runs the op to
+        completion, and only then loops back to ``select``/``accept``. So
+        for the whole of a ``cont`` — up to the caller's full timeout —
+        nothing accepts. A concurrently-launched ``winbox kdbg interrupt``
+        never gets read off the backlog, hits its own 60s socket timeout
+        and tells the operator the daemon "went away" on a session that is
+        perfectly healthy. The ``is_lightweight`` bypass in ``_serve_one``
+        was written for a concurrency that did not exist at the transport
+        layer; this is what supplies it.
+
+        We deliberately do NOT slice the RSP read into short timeouts:
+        ``_read_packet`` consumes the frame byte by byte and drops what it
+        has collected when a read times out, so a stop reply straddling a
+        slice boundary would desync the stream. Instead we select on both
+        fds and only enter ``wait_for_stop`` once the gdbstub actually has
+        bytes for us; the rest of the budget is spent serving clients.
+        """
+        fd = self._rsp_fd()
+        listen = self._listen_sock
+        if fd is None or listen is None:
+            return self.rsp.wait_for_stop(timeout=timeout)
+
+        deadline = time.monotonic() + timeout
+        # Bytes already buffered by a previous read mean select would never
+        # fire for them — check before ever blocking.
+        while not getattr(self.rsp, "_inbuf", None):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                # Same error shape a bounded rsp read raises, so op_cont's
+                # existing "timed out" handling applies unchanged.
+                raise RspError("read timed out")
+            try:
+                ready, _, _ = select.select([fd, listen], [], [], min(left, 0.5))
+            except (OSError, InterruptedError):
+                # A signal landed mid-select (e.g. SIGUSR1) — re-check.
+                continue
+            if fd in ready:
+                break
+            if listen in ready:
+                self._pump_client()
+        return self.rsp.wait_for_stop(
+            timeout=max(0.5, deadline - time.monotonic())
+        )
+
+    def _pump_client(self) -> None:
+        """Accept and service one client from inside a long-running op."""
+        listen = self._listen_sock
+        if listen is None:
+            return
+        try:
+            conn, _ = listen.accept()
+        except OSError:
+            return
+        # Force the busy flag: op_cont may have been entered directly (not
+        # through _serve_one), and a heavy op running reentrantly on this
+        # stack would interleave RSP packets with the cont we're inside of.
+        was_busy = self._busy
+        self._busy = True
+        try:
+            # Short read budget — this is on the debugger's hot path, so a
+            # client that connects and then says nothing must not stall the
+            # cont for the serve loop's full 60s.
+            self._serve_one(conn, read_timeout=5.0)
+        finally:
+            self._busy = was_busy
+            with suppress(OSError):
+                conn.close()
+
     def serve(self, listen_sock: socket.socket) -> None:
         """Single-threaded select loop. Returns when detach is requested
         or a signal asks for shutdown."""
@@ -1023,11 +1135,14 @@ class DaemonSession:
                 with suppress(OSError):
                     conn.close()
 
-    def _serve_one(self, conn: socket.socket) -> None:
-        conn.settimeout(60.0)
+    def _serve_one(self, conn: socket.socket, *, read_timeout: float = 60.0) -> None:
+        conn.settimeout(read_timeout)
         try:
             line = read_line(conn)
-        except ProtocolError as e:
+        except (ProtocolError, OSError) as e:
+            # OSError covers the socket timeout: a client that connects and
+            # sends nothing used to let socket.timeout escape all the way
+            # out of serve() and kill the daemon.
             with suppress(OSError):
                 conn.sendall(encode(reply_err(f"protocol: {e}")))
             return

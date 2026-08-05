@@ -30,6 +30,21 @@ def _poll_job_status(ga: GuestAgent, pid: int, *, attempts: int = 3) -> dict:
     raise AssertionError("unreachable")
 
 
+def _exited_status(ga: GuestAgent, pid: int) -> dict | None:
+    """Return the agent's finished-result dict for ``pid``, else None.
+
+    None means "not finished, or the agent has no record" — the two cases
+    a caller must not treat as a completed job. Errors are swallowed on
+    purpose: this runs on failure paths where a probe blowing up should
+    not replace the failure the caller is already reporting.
+    """
+    try:
+        status = ga.exec_status(pid)
+    except GuestAgentError:
+        return None
+    return status if status.get("exited") else None
+
+
 @click.group()
 @click.pass_context
 def jobs(ctx: click.Context) -> None:
@@ -231,9 +246,45 @@ def jobs_kill(ctx: click.Context, job_id: int) -> None:
         # agent went on buffering their output into a result slot nobody
         # would ever read — the orphan that later collided with a recycled
         # PID and surfaced as another command's output.
-        ga.exec(f"taskkill /PID {job.pid} /T /F", timeout=15)
+        kill = ga.exec(f"taskkill /PID {job.pid} /T /F", timeout=15)
     except GuestAgentError as e:
         console.print(f"[red][-][/] Kill failed: {e}")
+        raise SystemExit(1)
+
+    if kill.exitcode != 0:
+        # taskkill exits 128 when the PID is gone and 1 on access-denied.
+        # Treating either as success used to print "killed" and then reap
+        # the job's buffered result away, destroying the output of a run
+        # that had in fact completed. Ask the agent what actually happened
+        # before deciding.
+        exited = _exited_status(ga, job.pid)
+        if exited is not None:
+            # The job finished on its own; the status read we just did is
+            # also what frees the agent's slot, so record the real result
+            # rather than fabricating FAILED/-1.
+            job.exitcode = exited["exitcode"]
+            job.stdout = exited["stdout"]
+            job.stderr = exited["stderr"]
+            job.status = JobStatus.DONE if job.exitcode == 0 else JobStatus.FAILED
+            store.update(job)
+            console.print(
+                f"[yellow][!][/] Job {job_id} had already exited "
+                f"(code {job.exitcode}) — nothing to kill; output preserved"
+            )
+            return
+        # Still running (or unknowable) and taskkill refused: leave the
+        # ledger alone — the job is not dead and its slot is not ours to
+        # free. Reaping here would strand a live process's output.
+        console.print(
+            f"[red][-][/] Kill failed: taskkill exited {kill.exitcode}"
+        )
+        # taskkill writes its diagnostics to stderr, but the guest agent has
+        # been seen surfacing them on stdout too — print whatever we got.
+        detail = " ".join(
+            part for part in (kill.stderr.strip(), kill.stdout.strip()) if part
+        )
+        if detail:
+            console.print(f"    {detail}", markup=False, highlight=False)
         raise SystemExit(1)
 
     # Consume this job's buffered result so its slot is freed now, rather

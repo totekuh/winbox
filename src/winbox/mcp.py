@@ -1064,6 +1064,54 @@ def av_status(timeout: int = 15) -> str:
     return _format_exec_result(defender.status(ga, timeout=timeout))
 
 
+# The start types defender.enable() writes back with reg.exe, and the values
+# it writes. Kept here so the MCP tool can *verify* the write instead of
+# trusting it — see _defender_start_types_unwritten.
+_DEFENDER_DEFAULT_START = {"WinDefend": 2, "WdFilter": 0, "WdNisSvc": 3, "WdNisDrv": 3}
+
+
+def _defender_start_types_unwritten(ga: GuestAgent) -> list[str]:
+    """Return the Defender services whose Services\\*\\Start is still wrong.
+
+    defender.enable() writes these with reg.exe and discards the exit codes,
+    but those values are ACL-protected: on a guest built with the offline
+    Defender disable the write silently fails. Read them back rather than
+    trusting the write — claiming "start types restored" when nothing was
+    written sent agents into an unbreakable loop (reboot, retry, identical
+    ERROR_SERVICE_DISABLED, forever) with no hint that the real fix is the
+    host-side offline hive edit.
+
+    A service we cannot read is reported as unwritten: this gate only ever
+    downgrades a success claim, so failing closed is the safe direction.
+    """
+    import re as _re
+
+    unwritten: list[str] = []
+    for svc, want in _DEFENDER_DEFAULT_START.items():
+        try:
+            result = ga.exec_argv(
+                "reg.exe",
+                ["query", rf"HKLM\SYSTEM\CurrentControlSet\Services\{svc}",
+                 "/v", "Start"],
+                timeout=15,
+            )
+            match = _re.search(
+                r"Start\s+REG_DWORD\s+0x([0-9a-fA-F]+)", result.stdout or ""
+            )
+            ok = (
+                result.exitcode == 0
+                and match is not None
+                and int(match.group(1), 16) == want
+            )
+        except Exception:
+            # Any probe failure counts as "could not confirm" — a crash inside
+            # an MCP tool is worse than a downgraded success claim.
+            ok = False
+        if not ok:
+            unwritten.append(svc)
+    return unwritten
+
+
 @mcp.tool()
 def av_enable() -> str:
     """Re-enable Windows Defender real-time protection, AMSI, and behavior monitoring.
@@ -1072,7 +1120,9 @@ def av_enable() -> str:
     service via sc.exe (PowerShell Start-Service is ACL-blocked), adds
     exclusions for the QEMU guest agent and the Z:\\ VirtIO-FS share so
     winbox tooling keeps working, then re-asserts the Set-MpPreference
-    flags. Persists across reboots. Undo with av_disable. No reboot needed.
+    flags, and finally reports Defender's own status. May require a reboot
+    to finish (WdFilter is a boot-start driver) — the return value says so
+    when it does. Undo with av_disable.
     """
     from winbox import defender
 
@@ -1087,13 +1137,45 @@ def av_enable() -> str:
     if needs_reboot:
         # A Win11 image built with the offline Defender disable keeps
         # WinDefend marked disabled in the SCM for the life of this boot, so
-        # the corrected start types only apply after a restart.
+        # the corrected start types only apply after a restart — *if* they
+        # were corrected at all. Verify before promising a reboot will help.
+        unwritten = _defender_start_types_unwritten(ga)
+        if unwritten:
+            return (
+                "error: WinDefend is disabled in this boot's SCM and the service "
+                f"start types could NOT be restored from inside the guest "
+                f"({', '.join(unwritten)} still wrong). Defender's "
+                "Services\\*\\Start values are ACL-protected, so reg.exe cannot "
+                "undo an offline disable from within Windows — rebooting and "
+                "calling av_enable again will produce this same result. Run the "
+                "host CLI `winbox av enable`, which powers the VM down and edits "
+                "the SYSTEM hive offline."
+            )
         return (
             "Defender service start types restored, but WinDefend is still "
             "disabled in this boot's SCM. Reboot the VM and call av_enable "
             "again to finish (the CLI `winbox av enable` does this for you)."
         )
-    return "Defender enabled (real-time, AMSI, behavior monitoring). Undo with av_disable."
+
+    # Report what Defender says, not what we hoped for. WdFilter is a
+    # boot-start driver: if it was disabled when this boot began, real-time
+    # protection cannot arm this boot no matter what we just did — and an
+    # agent told "enabled" runs its sample believing it is being scanned.
+    # The CLI already verifies this (cli/av.py::_defender_fully_on); the MCP
+    # twin is the frontend agents actually drive, so it must too.
+    try:
+        status_text = (defender.status(ga, timeout=60).stdout or "").strip()
+    except GuestAgentError:
+        status_text = ""
+    if "Defender: ON" in status_text:
+        return "Defender enabled (real-time, AMSI, behavior monitoring). Undo with av_disable."
+    return (
+        "Defender services started, but not every protection is active. "
+        "WdFilter is a boot-start driver, so real-time protection cannot arm "
+        "until the VM is rebooted. Reboot and call av_enable again (or run the "
+        "host CLI `winbox av enable`, which reboots for you), then confirm with "
+        "av_status.\n" + status_text
+    ).rstrip()
 
 
 @mcp.tool()
@@ -1526,6 +1608,14 @@ def pipe_connect(name: str, access: str = "read", timeout: int = 30) -> str:
 # Written to Z:\.mcp\pipes\<session_id>\broker.py and run as a detached
 # background process that holds the pipe handle open between tool calls.
 # IPC is file-based via the VirtIO-FS shared directory.
+#
+# The protocol is sequence-numbered: the host writes cmd.<seq>.json and waits
+# only for result.<seq>.json. It used to be a single fixed cmd.json/result.json
+# pair with no correlation at all, which desynchronised the session for good
+# after the first timed-out call — the late answer was consumed by whatever
+# call polled next, so a pipe_recv could be handed a *write*'s result (and
+# blow up on the missing data_hex), while a command written during a blocked
+# read was silently overwritten by the next one.
 
 _BROKER_SCRIPT = """\
 import ctypes
@@ -1558,6 +1648,12 @@ kernel32.ReadFile.argtypes = [
     wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
     ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
 ]
+kernel32.PeekNamedPipe.restype = wintypes.BOOL
+kernel32.PeekNamedPipe.argtypes = [
+    wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD),
+]
 kernel32.CloseHandle.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
@@ -1576,8 +1672,7 @@ access_map = {
 desired_access = access_map.get(access_str, GENERIC_READ | GENERIC_WRITE)
 
 status_file = os.path.join(script_dir, 'status.json')
-cmd_file    = os.path.join(script_dir, 'cmd.json')
-result_file = os.path.join(script_dir, 'result.json')
+config_file = os.path.join(script_dir, 'config.json')
 
 handle = kernel32.CreateFileW(
     pipe_path, desired_access,
@@ -1595,20 +1690,89 @@ if handle == INVALID_HANDLE_VALUE:
 with open(status_file, 'w') as f:
     json.dump({'status': 'ready'}, f)
 
+
+def next_command():
+    # Commands are numbered; always take the lowest pending seq so they are
+    # executed in the order the host issued them.
+    try:
+        names = os.listdir(script_dir)
+    except OSError:
+        return None
+    best = None
+    for n in names:
+        if n.startswith('cmd.') and n.endswith('.json'):
+            try:
+                seq = int(n[4:-5])
+            except ValueError:
+                continue
+            if best is None or seq < best[0]:
+                best = (seq, n)
+    return best
+
+
+def do_read(cmd):
+    # ReadFile on this synchronous handle blocks forever when the pipe server
+    # has sent nothing, and the host has no way to cancel it — one quiet
+    # pipe_recv used to wedge this loop past every host-side timeout, so the
+    # close command was never seen and the broker leaked. Peek first and read
+    # only what is already queued, so a quiet pipe times out here instead.
+    size = cmd['size']
+    wait_ms = cmd.get('wait_ms', 5000)
+    avail = wintypes.DWORD(0)
+    deadline = time.time() + (wait_ms / 1000.0)
+    while True:
+        ok = kernel32.PeekNamedPipe(
+            handle, None, 0, None, ctypes.byref(avail), None
+        )
+        if not ok:
+            err = ctypes.get_last_error()
+            return {'ok': False, 'error': 'PeekNamedPipe failed: error %d' % err}
+        if avail.value:
+            break
+        if time.time() >= deadline:
+            return {
+                'ok': False,
+                'timed_out': True,
+                'error': 'no data available within %.1fs' % (wait_ms / 1000.0),
+            }
+        time.sleep(0.02)
+
+    want = min(size, avail.value)
+    buf = ctypes.create_string_buffer(want)
+    nread = wintypes.DWORD(0)
+    ok = kernel32.ReadFile(handle, buf, want, ctypes.byref(nread), None)
+    if ok:
+        return {'ok': True, 'data_hex': buf.raw[:nread.value].hex()}
+    err = ctypes.get_last_error()
+    return {'ok': False, 'error': 'ReadFile failed: error %d' % err}
+
+
 while True:
-    if not os.path.exists(cmd_file):
+    # pipe_close deletes the session dir. Once it is gone nothing can ever
+    # reach us again, so exit rather than spin forever holding the pipe
+    # handle open — that leaked one python.exe (and one pipe instance) per
+    # session until the VM was rebooted.
+    if not os.path.exists(config_file):
+        kernel32.CloseHandle(handle)
+        break
+
+    pending = next_command()
+    if pending is None:
         time.sleep(0.05)
         continue
+    seq, fname = pending
+    cmd_path = os.path.join(script_dir, fname)
 
     try:
-        with open(cmd_file) as f:
+        with open(cmd_path) as f:
             cmd = json.load(f)
-        os.remove(cmd_file)
+        os.remove(cmd_path)
     except Exception:
         time.sleep(0.05)
         continue
 
     action = cmd.get('cmd')
+    closing = False
 
     if action == 'write':
         data = bytes.fromhex(cmd['data_hex'])
@@ -1619,30 +1783,27 @@ while True:
             result = {'ok': True, 'written': written.value}
         else:
             err = ctypes.get_last_error()
-            result = {'ok': False, 'error': f'WriteFile failed: error {err}'}
+            result = {'ok': False, 'error': 'WriteFile failed: error %d' % err}
 
     elif action == 'read':
-        size = cmd['size']
-        buf  = ctypes.create_string_buffer(size)
-        nread = wintypes.DWORD(0)
-        ok = kernel32.ReadFile(handle, buf, size, ctypes.byref(nread), None)
-        if ok:
-            result = {'ok': True, 'data_hex': buf.raw[:nread.value].hex()}
-        else:
-            err = ctypes.get_last_error()
-            result = {'ok': False, 'error': f'ReadFile failed: error {err}'}
+        result = do_read(cmd)
 
     elif action == 'close':
         kernel32.CloseHandle(handle)
-        with open(result_file, 'w') as f:
-            json.dump({'ok': True}, f)
-        break
+        result = {'ok': True}
+        closing = True
 
     else:
-        result = {'ok': False, 'error': f'unknown command: {action}'}
+        result = {'ok': False, 'error': 'unknown command: %s' % action}
 
-    with open(result_file, 'w') as f:
+    # Echo the seq into a per-seq result file: a result the host already gave
+    # up waiting for can then never be mistaken for the answer to a later call.
+    result['seq'] = seq
+    with open(os.path.join(script_dir, 'result.%d.json' % seq), 'w') as f:
         json.dump(result, f)
+
+    if closing:
+        break
 """
 
 
@@ -1667,6 +1828,44 @@ def _poll_result(result_file: Path, timeout: int) -> dict | None:
                 pass  # partial write — retry
         _time.sleep(0.1)
     return None
+
+
+def _next_seq(session_dir: Path) -> int:
+    """Allocate this session's next command sequence number.
+
+    Persisted in the session dir rather than in memory: the MCP server can be
+    restarted (or a session inspected by another process) between calls, and a
+    reused seq would let a stale result be read as a fresh one.
+    """
+    seq_file = session_dir / "seq"
+    try:
+        current = int(seq_file.read_text().strip())
+    except (OSError, ValueError):
+        current = 0
+    current += 1
+    seq_file.write_text(str(current))
+    return current
+
+
+def _broker_cmd(session_dir: Path, cmd: dict, timeout: int) -> dict | None:
+    """Send one command to the in-guest broker and wait for *its* answer.
+
+    Returns the parsed result dict, or None if the broker didn't answer this
+    specific command in time. Correlation is by sequence number, so a caller
+    that gave up earlier can never steal (or be handed) another call's result.
+    """
+    seq = _next_seq(session_dir)
+    payload = dict(cmd)
+    payload["seq"] = seq
+
+    # Sweep answers to calls we already abandoned. Harmless to keep — nothing
+    # reads them now that results are per-seq — but the session dir lives on
+    # the VirtIO-FS share and would grow for the life of the session.
+    for stale in session_dir.glob("result.*.json"):
+        stale.unlink(missing_ok=True)
+
+    (session_dir / f"cmd.{seq}.json").write_text(_json.dumps(payload))
+    return _poll_result(session_dir / f"result.{seq}.json", timeout)
 
 
 # ─── Tool 11: pipe_open / pipe_send / pipe_recv / pipe_close ─────────────────
@@ -1789,16 +1988,14 @@ def pipe_send(session_id: str, data_hex: str, timeout: int = 10) -> str:
     if not session_dir.exists():
         return f"session not found: {session_id}"
 
-    cmd_file    = session_dir / "cmd.json"
-    result_file = session_dir / "result.json"
-    result_file.unlink(missing_ok=True)
-    cmd_file.write_text(_json.dumps({"cmd": "write", "data_hex": data_hex}))
-
-    res = _poll_result(result_file, timeout)
+    res = _broker_cmd(session_dir, {"cmd": "write", "data_hex": data_hex}, timeout)
     if res is None:
-        return "timeout waiting for write result"
+        return (
+            "timeout waiting for write result — the write may still be executed "
+            "by the broker; its result is discarded, not returned to a later call."
+        )
     if res.get("ok"):
-        return f"wrote {res['written']} bytes"
+        return f"wrote {res.get('written', 0)} bytes"
     return f"error: {res.get('error')}"
 
 
@@ -1817,16 +2014,24 @@ def pipe_recv(session_id: str, size: int, timeout: int = 10) -> str:
     if not session_dir.exists():
         return f"session not found: {session_id}"
 
-    cmd_file    = session_dir / "cmd.json"
-    result_file = session_dir / "result.json"
-    result_file.unlink(missing_ok=True)
-    cmd_file.write_text(_json.dumps({"cmd": "read", "size": size}))
-
-    res = _poll_result(result_file, timeout)
+    # Give the broker a slightly shorter budget than our own, so a quiet pipe
+    # comes back as a clean "no data" answer rather than as a host-side
+    # timeout with the read still pending in the guest.
+    wait_ms = max(500, int((timeout - 1) * 1000))
+    res = _broker_cmd(
+        session_dir, {"cmd": "read", "size": size, "wait_ms": wait_ms}, timeout
+    )
     if res is None:
         return "timeout waiting for read result"
     if res.get("ok"):
-        return res["data_hex"]
+        # .get, not [...]: an unexpected result shape must surface as an error
+        # string, never as a KeyError out of the tool call.
+        data_hex = res.get("data_hex")
+        if data_hex is None:
+            return f"error: broker returned no data for a read: {res}"
+        return data_hex
+    if res.get("timed_out"):
+        return f"no data available on the pipe within {timeout}s"
     return f"error: {res.get('error')}"
 
 
@@ -1843,14 +2048,52 @@ def pipe_close(session_id: str) -> str:
     if not session_dir.exists():
         return f"session not found: {session_id}"
 
-    cmd_file    = session_dir / "cmd.json"
-    result_file = session_dir / "result.json"
-    result_file.unlink(missing_ok=True)
-    cmd_file.write_text(_json.dumps({"cmd": "close"}))
+    # Read the PID *before* the rmtree. broker.pid is the only record of the
+    # in-guest process, and a broker that never ACKs the close is still
+    # holding the pipe handle (and one of the pipe's instances) open. Deleting
+    # the session dir first made that orphan unkillable — it accumulated one
+    # python.exe per session until the VM was rebooted.
+    broker_pid: int | None = None
+    try:
+        broker_pid = int((session_dir / "broker.pid").read_text().strip())
+    except (OSError, ValueError):
+        pass
 
-    _poll_result(result_file, timeout=5)  # best-effort — broker may already be gone
+    res = _broker_cmd(session_dir, {"cmd": "close"}, timeout=5)
+
+    killed: bool | None = None
+    if res is None and broker_pid is not None:
+        try:
+            _, _, ga = _ensure_vm_ready()
+            kill = ga.exec_argv(
+                "taskkill.exe", ["/F", "/T", "/PID", str(broker_pid)], timeout=10
+            )
+            killed = kill.exitcode == 0
+        except Exception:
+            killed = False
+
     shutil.rmtree(session_dir, ignore_errors=True)
-    return f"closed session {session_id}"
+
+    if res is not None:
+        return f"closed session {session_id}"
+    if killed:
+        return (
+            f"closed session {session_id} — the broker never acknowledged the "
+            f"close and was force-killed (PID {broker_pid}); the pipe handle "
+            "is released."
+        )
+    if broker_pid is None:
+        return (
+            f"closed session {session_id} locally, but the broker never "
+            "acknowledged the close and no broker.pid was recorded, so it "
+            "could not be killed. A python.exe may still hold the pipe handle "
+            "open in the VM."
+        )
+    return (
+        f"closed session {session_id} locally, but the broker (PID "
+        f"{broker_pid}) neither acknowledged the close nor could be killed. "
+        "It may still hold the pipe handle open in the VM."
+    )
 
 
 # ── removed: old pipe_recv(name, size) — superseded by pipe_open/pipe_recv ───

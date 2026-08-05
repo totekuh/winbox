@@ -838,15 +838,60 @@ class TestAvTools:
     def test_enable_drives_all_steps(self, mock_mcp):
         from winbox.mcp import av_enable
         ga, vm, cfg = mock_mcp
-        ga.exec_powershell.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        # Serves the three enable scripts *and* the closing status query.
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="Defender: ON\n  RealTimeProtection: True\n", stderr=""
+        )
         ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
 
         result = av_enable()
         assert "Defender enabled" in result
 
-        # 3 PowerShell steps (registry cleanup, exclusions, prefs) + sc.exe start.
-        assert ga.exec_powershell.call_count == 3
+        # 3 PowerShell steps (registry cleanup, exclusions, prefs) + sc.exe
+        # start + the status query that backs the claim we just made.
+        assert ga.exec_powershell.call_count == 4
         assert "sc.exe start WinDefend" in ga.exec.call_args[0][0]
+
+    def test_enable_does_not_claim_protections_it_has_not_verified(self, mock_mcp):
+        """WdFilter is a boot-start driver: when it was disabled at boot,
+        real-time protection cannot arm this boot no matter what we ran. An
+        agent told "enabled" runs its sample believing it is being scanned."""
+        from winbox.mcp import av_enable
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout="Defender: partial\n  RealTimeProtection: False\n",
+            stderr="",
+        )
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+
+        result = av_enable()
+
+        assert "Defender enabled (real-time, AMSI, behavior monitoring)" not in result
+        assert "not every protection is active" in result
+        assert "RealTimeProtection: False" in result
+        assert "reboot" in result.lower()
+
+    def test_enable_survives_a_guest_that_wont_answer_the_status_query(self, mock_mcp):
+        """A status probe that fails must downgrade the claim, not crash."""
+        from winbox.mcp import av_enable
+        from winbox.vm import GuestAgentError
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec_powershell.side_effect = [
+            ExecResult(exitcode=0, stdout="", stderr=""),
+            ExecResult(exitcode=0, stdout="", stderr=""),
+            ExecResult(exitcode=0, stdout="", stderr=""),
+            GuestAgentError("guest agent gone"),
+        ]
+
+        result = av_enable()
+        assert "not every protection is active" in result
+
+    def test_enable_docstring_does_not_promise_no_reboot(self, mock_mcp):
+        import winbox.mcp as m
+        fn = m.av_enable.fn if hasattr(m.av_enable, "fn") else m.av_enable
+        assert "No reboot needed" not in (fn.__doc__ or "")
 
     def test_enable_start_failure_surfaces_error(self, mock_mcp):
         from winbox.mcp import av_enable
@@ -1298,22 +1343,41 @@ def _make_session(cfg, session_id: str) -> object:
     return session_dir
 
 
-def _broker_thread(session_dir, response: dict, *, delay: float = 0.05):
-    """Simulate the broker: wait for cmd.json, write result.json."""
+def _pending_cmds(session_dir):
+    """(seq, path) for every command file the broker hasn't consumed, in order."""
+    out = []
+    for p in session_dir.glob("cmd.*.json"):
+        try:
+            out.append((int(p.name[4:-5]), p))
+        except ValueError:
+            continue
+    return sorted(out)
+
+
+def _broker_thread(session_dir, response: dict, *, delay: float = 0.05, count: int = 1):
+    """Simulate the broker: consume the next cmd.<seq>.json, answer into
+    result.<seq>.json. `response` may be a dict or a list of dicts (one per
+    command served)."""
     import json
     import threading
     import time as _t
 
+    responses = response if isinstance(response, list) else [response] * count
+
     def _run():
-        cmd_file    = session_dir / "cmd.json"
-        result_file = session_dir / "result.json"
         deadline = _t.time() + 3
-        while _t.time() < deadline:
-            if cmd_file.exists():
-                cmd_file.unlink()
+        served = 0
+        while _t.time() < deadline and served < len(responses):
+            pending = _pending_cmds(session_dir)
+            if pending:
+                seq, path = pending[0]
+                path.unlink()
                 _t.sleep(delay)
-                result_file.write_text(json.dumps(response))
-                return
+                (session_dir / f"result.{seq}.json").write_text(
+                    json.dumps({**responses[served], "seq": seq})
+                )
+                served += 1
+                continue
             _t.sleep(0.01)
 
     t = threading.Thread(target=_run, daemon=True)
@@ -1580,7 +1644,7 @@ class TestPipeSession:
 
         sid = "aabbcc001129"
         session_dir = _make_session(cfg, sid)
-        # No broker thread — result.json never appears; close should still clean up
+        # No broker thread — no result ever appears; close should still clean up
 
         result = pipe_close(sid)
         assert "closed session" in result
@@ -1594,13 +1658,194 @@ class TestPipeSession:
         assert "WriteFile" in _BROKER_SCRIPT
         assert "ReadFile" in _BROKER_SCRIPT
         assert "status.json" in _BROKER_SCRIPT
-        assert "cmd.json" in _BROKER_SCRIPT
-        assert "result.json" in _BROKER_SCRIPT
+        # Assert the sequence-numbered protocol specifically. Matching on a
+        # bare "cmd." prefix passes against almost any text, which would let a
+        # regression back to the fixed cmd.json/result.json pair — the desync
+        # this protocol exists to prevent — sail straight through.
+        assert "result.%d.json" in _BROKER_SCRIPT, "results must be seq-numbered"
+        assert "startswith('cmd.')" in _BROKER_SCRIPT
+        assert "endswith('.json')" in _BROKER_SCRIPT
+        # The fixed single-slot filenames must not come back.
+        assert "cmd.json" not in _BROKER_SCRIPT
+        assert "result.json" not in _BROKER_SCRIPT
 
     def test_broker_script_is_valid_python(self, mock_mcp):
         import ast
         from winbox.mcp import _BROKER_SCRIPT
         ast.parse(_BROKER_SCRIPT)  # raises SyntaxError if invalid
+
+
+class TestPipeSessionDoesNotDesync:
+    """One timed-out pipe call used to poison the session forever: commands
+    and results were unkeyed, so a late answer was consumed by whatever call
+    polled next."""
+
+    def test_a_late_result_is_never_handed_to_the_next_call(self, mock_mcp):
+        """The exact reported sequence: a recv times out, then the broker
+        answers a *write*. The next recv must not receive that write's result
+        (which has no data_hex and used to raise KeyError out of the tool)."""
+        import json
+        from winbox.mcp import pipe_recv, pipe_send
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000001"
+        session_dir = _make_session(cfg, sid)
+
+        # 1. recv times out with nothing answering.
+        assert "timeout" in pipe_recv(sid, 1024, timeout=0)
+        # 2. send times out too.
+        assert "timeout" in pipe_send(sid, "deadbeef", timeout=0)
+        # 3. the broker now wakes up and answers both abandoned commands.
+        for seq, path in _pending_cmds(session_dir):
+            cmd = json.loads(path.read_text())
+            path.unlink()
+            answer = (
+                {"ok": True, "data_hex": "cafe"} if cmd["cmd"] == "read"
+                else {"ok": True, "written": 4}
+            )
+            (session_dir / f"result.{seq}.json").write_text(
+                json.dumps({**answer, "seq": seq})
+            )
+
+        # 4. a fresh recv, answered properly, must get its own answer.
+        _broker_thread(session_dir, {"ok": True, "data_hex": "beef"})
+        assert pipe_recv(sid, 16) == "beef"
+
+    def test_a_stale_answer_alone_does_not_satisfy_a_new_call(self, mock_mcp):
+        """Belt and braces: an orphan result from an earlier seq must not be
+        mistaken for the current call's."""
+        import json
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000002"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "result.1.json").write_text(
+            json.dumps({"ok": True, "written": 4, "seq": 1})
+        )
+
+        result = pipe_recv(sid, 16, timeout=0)
+        assert "timeout" in result
+
+    def test_a_command_is_not_overwritten_while_another_is_in_flight(self, mock_mcp):
+        """Both commands went to the same fixed cmd.json, so a call issued
+        while the broker was busy silently destroyed the previous one."""
+        import json
+        from winbox.mcp import pipe_recv, pipe_send
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000003"
+        session_dir = _make_session(cfg, sid)
+
+        pipe_recv(sid, 1024, timeout=0)
+        pipe_send(sid, "deadbeef", timeout=0)
+
+        pending = [json.loads(p.read_text()) for _, p in _pending_cmds(session_dir)]
+        assert [c["cmd"] for c in pending] == ["read", "write"]
+        assert [c["seq"] for c in pending] == sorted(c["seq"] for c in pending)
+
+    def test_recv_reports_an_unexpected_result_shape_as_an_error(self, mock_mcp):
+        """Never a KeyError out of an MCP tool call."""
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000004"
+        session_dir = _make_session(cfg, sid)
+        _broker_thread(session_dir, {"ok": True, "written": 4})
+
+        result = pipe_recv(sid, 16)
+        assert "error" in result
+
+    def test_recv_asks_the_broker_to_time_out_first(self, mock_mcp):
+        """ReadFile on the synchronous handle blocks forever with no data and
+        nothing host-side can cancel it, so the broker needs its own deadline —
+        shorter than ours, or the answer arrives after we've given up."""
+        import json
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000005"
+        session_dir = _make_session(cfg, sid)
+        pipe_recv(sid, 16, timeout=0)
+
+        cmd = json.loads(_pending_cmds(session_dir)[0][1].read_text())
+        assert "wait_ms" in cmd
+
+    def test_broker_side_timeout_is_reported_as_no_data(self, mock_mcp):
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000006"
+        session_dir = _make_session(cfg, sid)
+        _broker_thread(
+            session_dir,
+            {"ok": False, "timed_out": True, "error": "no data available within 9.0s"},
+        )
+
+        result = pipe_recv(sid, 16)
+        assert "no data" in result
+
+    def test_broker_peeks_before_reading_and_exits_when_its_dir_is_gone(self, mock_mcp):
+        """Both halves of "a wedged broker is unreachable": it must be able to
+        time out a read, and it must give up when pipe_close removes the
+        session dir it takes orders from."""
+        from winbox.mcp import _BROKER_SCRIPT
+        assert "PeekNamedPipe" in _BROKER_SCRIPT
+        assert "config_file" in _BROKER_SCRIPT
+
+
+class TestPipeCloseDoesNotLeakTheBroker:
+    """pipe_close deleted broker.pid along with the session dir, so a broker
+    still blocked in ReadFile kept the pipe handle (and one of the pipe's
+    instances) forever with nothing left able to kill it."""
+
+    def test_unacknowledged_close_taskkills_the_broker(self, mock_mcp):
+        from winbox.mcp import pipe_close
+        ga, _, cfg = mock_mcp
+
+        sid = "1eak00000001"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "broker.pid").write_text("4242")
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        # No broker thread — the close is never acknowledged.
+
+        result = pipe_close(sid)
+
+        kills = [
+            c for c in ga.exec_argv.call_args_list
+            if c[0][0] == "taskkill.exe" and "4242" in c[0][1]
+        ]
+        assert len(kills) == 1, f"expected the orphan broker to be killed, got {kills}"
+        assert "force-killed" in result
+        assert not session_dir.exists()
+
+    def test_acknowledged_close_does_not_kill_anything(self, mock_mcp):
+        from winbox.mcp import pipe_close
+        ga, _, cfg = mock_mcp
+
+        sid = "1eak00000002"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "broker.pid").write_text("4242")
+        _broker_thread(session_dir, {"ok": True})
+
+        result = pipe_close(sid)
+
+        assert result == f"closed session {sid}"
+        assert [c for c in ga.exec_argv.call_args_list if c[0][0] == "taskkill.exe"] == []
+
+    def test_unkillable_broker_is_reported_not_papered_over(self, mock_mcp):
+        from winbox.mcp import pipe_close
+        ga, _, cfg = mock_mcp
+
+        sid = "1eak00000003"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "broker.pid").write_text("4242")
+        ga.exec_argv.return_value = ExecResult(exitcode=128, stdout="", stderr="no such PID")
+
+        result = pipe_close(sid)
+
+        assert "4242" in result
+        assert "may still hold the pipe handle" in result
 
 
 # ─── kdbg_start / kdbg_stop / kdbg_status tools ─────────────────────────────

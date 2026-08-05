@@ -453,18 +453,60 @@ class TestEnableNeedsRebootWhenServiceDisabled:
         assert result.exit_code != 0
         assert "still disabled after a reboot" in result.output
 
-    def test_mcp_reports_the_reboot_requirement(self):
+    def _mcp_enable(self, ga):
         import winbox.mcp as m
 
         fn = m.av_enable.fn if hasattr(m.av_enable, "fn") else m.av_enable
         with (
-            patch.object(m, "_ensure_vm_ready", return_value=(MagicMock(),) * 3),
+            patch.object(m, "_ensure_vm_ready", return_value=(MagicMock(), MagicMock(), ga)),
             patch("winbox.defender.enable", return_value=True),
         ):
-            out = fn()
+            return fn()
+
+    def _start_readback(self, values: dict[str, int]):
+        """A ga whose `reg.exe query ... /v Start` reports `values`."""
+        from winbox.vm.guest import ExecResult
+
+        ga = MagicMock()
+
+        def fake_argv(exe, args, **kw):
+            key = args[1]
+            svc = key.rsplit("\\", 1)[-1]
+            if svc not in values:
+                return ExecResult(exitcode=1, stdout="", stderr="not found")
+            return ExecResult(
+                exitcode=0,
+                stdout=f"    Start    REG_DWORD    0x{values[svc]:x}\n",
+                stderr="",
+            )
+
+        ga.exec_argv.side_effect = fake_argv
+        return ga
+
+    def test_mcp_reports_the_reboot_requirement(self):
+        """When the start types really did land, a reboot is the right advice."""
+        ga = self._start_readback(
+            {"WinDefend": 2, "WdFilter": 0, "WdNisSvc": 3, "WdNisDrv": 3}
+        )
+        out = self._mcp_enable(ga)
 
         assert "Reboot the VM" in out
         assert "av_enable" in out
+
+    def test_mcp_does_not_claim_a_restore_that_did_not_happen(self):
+        """Services\\*\\Start is ACL-protected: on a guest built with the
+        offline disable, defender.enable()'s reg.exe writes silently fail. The
+        tool used to report them restored and ask for a reboot — an
+        unbreakable loop, since the reboot changes nothing."""
+        ga = self._start_readback({"WinDefend": 4, "WdFilter": 4, "WdNisSvc": 4, "WdNisDrv": 4})
+        out = self._mcp_enable(ga)
+
+        assert "restored" not in out or "could NOT be restored" in out
+        assert "WinDefend" in out
+        # Must point at the only thing that actually works: the host-side
+        # offline hive edit.
+        assert "winbox av enable" in out
+        assert "Reboot the VM and call av_enable again to finish" not in out
 
 
 class TestOfflineDisableOnClientSku:
@@ -685,3 +727,61 @@ class TestEnableVerifiesWhatItClaims:
         ga = MagicMock()
         ga.exec_powershell.side_effect = GuestAgentError("gone")
         assert _status_text(ga) == ""
+
+
+class TestOfflineEditNeverTouchesALiveDisk:
+    """Both offline paths hand cfg.disk_path to `guestfish --rw`. Editing a
+    disk a live QEMU still has open scrambles the SYSTEM hive — an unbootable
+    VM with no in-guest recovery. The disable path checked; the enable-side
+    power cycle discarded the second wait_shutdown result and edited anyway."""
+
+    def test_enable_power_cycle_refuses_while_the_disk_may_be_in_use(self, cfg):
+        from winbox.cli.av import _restart_clearing_tamper_protection
+
+        vm, ga = MagicMock(), MagicMock()
+        vm.wait_shutdown.return_value = False  # never shuts down, even after destroy
+
+        with (
+            patch("winbox.cli.av.defender.enable_offline") as services,
+            patch("winbox.cli.av.defender.clear_tamper_protection_offline") as tamper,
+            pytest.raises(SystemExit),
+        ):
+            _restart_clearing_tamper_protection(cfg, vm, ga)
+
+        services.assert_not_called()
+        tamper.assert_not_called()
+        vm.force_stop.assert_called_once()
+        vm.start.assert_not_called()
+
+    def test_enable_power_cycle_proceeds_once_the_force_stop_lands(self, cfg):
+        """A graceful shutdown that fails but a `virsh destroy` that works is
+        still a safe disk — don't turn that into a hard failure."""
+        from winbox.cli.av import _restart_clearing_tamper_protection
+
+        vm, ga = MagicMock(), MagicMock()
+        vm.wait_shutdown.side_effect = [False, True]
+
+        with (
+            patch("winbox.cli.av.defender.enable_offline") as services,
+            patch("winbox.cli.av.defender.clear_tamper_protection_offline"),
+        ):
+            _restart_clearing_tamper_protection(cfg, vm, ga)
+
+        services.assert_called_once()
+        vm.start.assert_called_once()
+
+    def test_disable_path_still_refuses_too(self, cfg):
+        """The contract both paths must share, pinned from the other side."""
+        from winbox.cli.av import _disable_via_offline_hive
+
+        vm, ga = MagicMock(), MagicMock()
+        vm.wait_shutdown.return_value = False
+
+        with (
+            patch("winbox.offlinereg.tools_available", return_value=None),
+            patch("winbox.cli.av.defender.disable_offline") as edit,
+            pytest.raises(SystemExit),
+        ):
+            _disable_via_offline_hive(cfg, vm, ga)
+
+        edit.assert_not_called()

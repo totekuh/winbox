@@ -978,3 +978,85 @@ class TestVerifyPython:
         ga = self._ga([ExecResult(0, "Python 3.13.13", "")])
         _verify_python(ga)
         assert '"' not in ga.exec.call_args_list[0][0][0]
+
+
+# ─── hivexregedit prereq ────────────────────────────────────────────────────
+
+
+class TestOfflineRegistryPrereq:
+    """The win11 build disables Defender by editing the offline SYSTEM hive,
+    which needs guestfish *and* hivexregedit. They come from different apt
+    packages (libguestfs-tools vs libwin-hivex-perl, and the former does not
+    depend on the latter), so a host that installed exactly what winbox tells
+    it to has guestfish and no hivexregedit. That used to surface ~40 minutes
+    into the build as a best-effort warning, leaving Defender armed on a guest
+    whose provisioning it then breaks.
+    """
+
+    def _which_missing(self, *absent):
+        def fake_which(name):
+            return None if name in absent else f"/usr/bin/{name}"
+        return fake_which
+
+    def test_hivexregedit_is_a_required_tool(self):
+        from winbox.setup.installer import REQUIRED_TOOLS
+
+        assert "hivexregedit" in REQUIRED_TOOLS
+
+    @patch("winbox.setup.installer.shutil.which")
+    @patch("winbox.setup.installer.Path.exists", return_value=True)
+    def test_missing_hivexregedit_is_reported(self, _exists, mock_which):
+        mock_which.side_effect = self._which_missing("hivexregedit")
+
+        missing = check_prereqs()
+
+        assert any("hivexregedit" in m for m in missing)
+
+    @patch("winbox.setup.installer.shutil.which")
+    @patch("winbox.setup.installer.Path.exists", return_value=True)
+    def test_report_names_the_package_that_actually_provides_it(
+        self, _exists, mock_which
+    ):
+        """"install libguestfs-tools" is a no-op fix — they already have it."""
+        mock_which.side_effect = self._which_missing("hivexregedit")
+
+        report = " ".join(check_prereqs())
+
+        assert "libwin-hivex-perl" in report
+
+    @patch("winbox.setup.installer.shutil.which")
+    @patch("winbox.setup.installer.Path.exists", return_value=True)
+    def test_not_required_for_a_profile_that_never_edits_hives_offline(
+        self, _exists, mock_which
+    ):
+        """Server 2022 has no Tamper Protection and never takes the offline
+        path, so it must not be blocked on the package."""
+        from winbox.config import Config
+
+        mock_which.side_effect = self._which_missing("hivexregedit")
+
+        missing = check_prereqs(Config(vm_os="server2022"))
+
+        assert not any("hivexregedit" in m for m in missing)
+
+    @patch("winbox.setup.installer.shutil.which")
+    @patch("winbox.setup.installer.Path.exists", return_value=True)
+    def test_required_for_the_profile_that_does(self, _exists, mock_which):
+        from winbox.config import Config
+
+        mock_which.side_effect = self._which_missing("hivexregedit")
+
+        missing = check_prereqs(Config(vm_os="win11"))
+
+        assert any("hivexregedit" in m for m in missing)
+
+    @patch("winbox.setup.installer.shutil.which")
+    @patch("winbox.setup.installer.Path.exists", return_value=True)
+    def test_nothing_missing_stays_empty_for_both_profiles(self, _exists, mock_which):
+        from winbox.config import Config
+
+        mock_which.side_effect = lambda name: f"/usr/bin/{name}"
+
+        assert check_prereqs(Config(vm_os="server2022")) == []
+        assert check_prereqs(Config(vm_os="win11")) == []
+        assert check_prereqs() == []

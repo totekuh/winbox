@@ -140,16 +140,44 @@ def applocker_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     console.print("[blue][*][/] Clearing AppLocker policies...")
     policy_file.write_text(_clear_policy_xml(), encoding="utf-8")
     try:
-        ga.exec_powershell(_DISABLE_APPLY_SCRIPT, timeout=30)
+        result = ga.exec_powershell(_DISABLE_APPLY_SCRIPT, timeout=30)
     finally:
         policy_file.unlink(missing_ok=True)
+
+    # The reboot only flushes appid.sys's cached rules — it does NOT clear a
+    # policy that is still in the registry. So if Set-AppLockerPolicy failed
+    # (commonly: Z: not mounted yet, so the script's Test-Path bails with
+    # exit 1 having cleared nothing) rebooting and claiming success leaves
+    # the guest still enforcing while the user is told it is off. Match
+    # applocker_enable and refuse to continue.
+    if result.exitcode != 0:
+        console.print("[red][-][/] Failed to clear AppLocker policy:")
+        detail = result.stderr.strip() or result.stdout.strip()
+        if detail:
+            console.print(f"    {detail}", markup=False, highlight=False)
+        raise SystemExit(1)
 
     reboot_and_wait(
         cfg, ga,
         msg="Rebooting VM (kernel caches enforcement)...",
     )
 
-    console.print("[green][+][/] AppLocker disabled")
+    # Trust the guest, not the exit code: appid.sys can survive the clear
+    # (compiled rule cache, service restart racing the reboot). Re-query
+    # rather than assert an outcome we never checked.
+    status = ga.exec_powershell(_STATUS_SCRIPT, timeout=90)
+    reported = status.stdout.strip()
+    if status.exitcode != 0:
+        console.print("[yellow][!][/] Policy cleared, but could not verify state:")
+        console.print(f"    {status.stderr.strip()}", markup=False, highlight=False)
+        return
+    if "AppLocker: off" in reported or "not available" in reported:
+        console.print("[green][+][/] AppLocker disabled")
+        return
+
+    console.print("[red][-][/] AppLocker still active after disable:")
+    console.print(reported, markup=False, highlight=False)
+    raise SystemExit(1)
 
 
 @applocker.command("status")

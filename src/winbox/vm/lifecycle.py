@@ -55,11 +55,24 @@ class VM:
         self.cfg = cfg
         self.name = cfg.vm_name
 
-    def state(self) -> VMState:
+    def _domstate_raw(self) -> str | None:
+        """Raw, lowercased ``virsh domstate`` text — or None if unqueryable.
+
+        Kept separate from :meth:`state` because two callers want two
+        different questions answered from the same output: "roughly, what is
+        this domain doing" (``state``, which folds transient states onto the
+        nearest stable one) and "has QEMU actually let go of the disk"
+        (``is_off``, which must not fold anything).
+        """
         result = virsh_run("domstate", self.name, check=False)
         if result.returncode != 0:
+            return None
+        return result.stdout.strip().lower()
+
+    def state(self) -> VMState:
+        raw = self._domstate_raw()
+        if raw is None:
             return VMState.NOT_FOUND
-        raw = result.stdout.strip().lower()
         # virsh emits 8 well-known states; map the transient ones to the
         # nearest stable one rather than collapsing them all to UNKNOWN
         # (which callers like _ensure_vm_ready treat as fatal). "saved"
@@ -81,6 +94,31 @@ class VM:
         if raw == "pmsuspended":
             return VMState.SAVED
         return VMState.UNKNOWN
+
+    def is_off(self) -> bool:
+        """True only when libvirt reports the domain as genuinely "shut off".
+
+        Deliberately *not* ``state() == VMState.SHUTOFF``. ``state()`` folds
+        "in shutdown", "dying", "crashed" and "idle" onto SHUTOFF so callers
+        like ``ensure_running`` don't treat them as a fatal UNKNOWN — but in
+        every one of those states the domain is still active and the QEMU
+        process still holds the qcow2 open read-write. "crashed" is the worst
+        of them: it is not transient, it persists until someone destroys the
+        domain.
+
+        This is the predicate for "QEMU has released the disk, so guestfish
+        may open it read-write" (offline provisioning, the offline Defender
+        hive edits). A false "yes" costs a corrupted disk image; a false "no"
+        costs a caller some waiting. So anything we cannot positively confirm
+        as off — including a domain we failed to query at all, since a dead
+        libvirtd is not evidence that QEMU exited — answers False.
+
+        "shut off (saved)" is excluded on purpose too: the disk is free, but
+        the next ``start`` restores RAM captured before whatever edit we are
+        about to make, and a hive edited underneath a saved memory image is
+        its own kind of corruption.
+        """
+        return self._domstate_raw() == "shut off"
 
     def exists(self) -> bool:
         return self.state() != VMState.NOT_FOUND
@@ -232,9 +270,17 @@ class VM:
         return [s.strip() for s in result.stdout.splitlines() if s.strip()]
 
     def wait_shutdown(self, timeout: int = 600, poll: int = 5) -> bool:
-        """Wait for the VM to reach SHUTOFF state. Returns True if shut down within timeout."""
+        """Wait for the VM to be genuinely shut off. False on timeout.
+
+        Gated on :meth:`is_off`, not on ``state()``: every caller of this
+        method uses a True return as permission to open the qcow2 read-write
+        from the host (``winbox setup`` phase 2, ``winbox av enable/disable``).
+        Under ``state()``'s lenient mapping a domain that had crashed — QEMU
+        still running, image still open — reported SHUTOFF on the very first
+        poll, and provisioning went on to write to a live disk.
+        """
         deadline = time.monotonic() + timeout
-        while self.state() != VMState.SHUTOFF:
+        while not self.is_off():
             if time.monotonic() >= deadline:
                 return False
             time.sleep(poll)

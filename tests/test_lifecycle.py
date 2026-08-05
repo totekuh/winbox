@@ -238,20 +238,65 @@ class TestSnapshots:
 
 class TestWaitShutdown:
     def test_returns_true_once_shut_off(self, vm):
-        states = [VMState.RUNNING, VMState.RUNNING, VMState.SHUTOFF]
+        raws = ["running", "running", "shut off"]
         with (
-            patch.object(VM, "state", side_effect=states),
+            patch("winbox.vm.lifecycle.virsh_run", side_effect=[_proc(r) for r in raws]),
             patch("time.sleep"),
         ):
             assert vm.wait_shutdown(timeout=60, poll=0) is True
 
     def test_returns_false_on_timeout(self, vm):
         with (
-            patch.object(VM, "state", return_value=VMState.RUNNING),
+            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc("running")),
             patch("time.sleep"),
             patch("time.monotonic", side_effect=[0.0, 100.0]),
         ):
             assert vm.wait_shutdown(timeout=10, poll=0) is False
+
+
+class TestDiskIsFreePredicate:
+    """`wait_shutdown` is the *only* gate the offline-disk operations use to
+    decide that QEMU has released the qcow2 and guestfish may open it
+    read-write: `winbox setup` phase 2, `winbox av enable/disable`.
+
+    `state()` deliberately folds "in shutdown"/"dying"/"crashed"/"idle" onto
+    SHUTOFF so `ensure_running` doesn't treat them as fatal — but in all of
+    them the domain is still active and QEMU still holds the image open.
+    "crashed" is the dangerous one: it is not transient, so the old
+    `state() != SHUTOFF` loop returned True on its first poll and phase 2 then
+    wrote to a live disk.
+    """
+
+    @pytest.mark.parametrize("raw", ["in shutdown", "dying", "crashed", "idle"])
+    def test_active_domain_is_not_off_even_though_state_says_shutoff(self, vm, raw):
+        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(raw + "\n")):
+            assert vm.state() is VMState.SHUTOFF  # unchanged, on purpose
+            assert vm.is_off() is False
+
+    @pytest.mark.parametrize("raw", ["in shutdown", "dying", "crashed", "idle"])
+    def test_wait_shutdown_does_not_report_success_for_an_active_domain(self, vm, raw):
+        with (
+            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(raw + "\n")),
+            patch("time.sleep"),
+            patch("time.monotonic", side_effect=[0.0, 100.0]),
+        ):
+            assert vm.wait_shutdown(timeout=10, poll=0) is False
+
+    def test_shut_off_is_off(self, vm):
+        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc("  Shut off \n")):
+            assert vm.is_off() is True
+
+    def test_unqueryable_domain_is_not_off(self, vm):
+        """A dead libvirtd is not evidence that QEMU exited."""
+        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(returncode=1)):
+            assert vm.is_off() is False
+
+    def test_saved_domain_is_not_treated_as_free(self, vm):
+        """The disk is free, but the next start restores RAM captured before
+        whatever edit we are about to make — a hive edited underneath a saved
+        memory image is its own corruption."""
+        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc("shut off (saved)")):
+            assert vm.is_off() is False
 
 
 class TestDiskUsage:

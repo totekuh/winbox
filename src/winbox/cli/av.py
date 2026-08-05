@@ -104,6 +104,32 @@ def _defender_fully_on(ga: GuestAgent) -> bool:
     return "Defender: ON" in _status_text(ga)
 
 
+def _power_off_or_refuse(vm: VM, ga: GuestAgent) -> None:
+    """Shut the VM down for an offline hive edit, or exit rather than risk it.
+
+    Both offline paths (`av disable` and the enable-side power cycle) hand the
+    disk to guestfish --rw. Editing a disk a live QEMU still has open scrambles
+    the SYSTEM hive — an unbootable VM with no in-guest recovery — so a VM that
+    will not power off is a hard stop, never a "probably fine". This lives in
+    one place because the enable path once checked and the disable path didn't;
+    the two must not be able to drift again.
+    """
+    try:
+        ga.shutdown()
+    except GuestAgentError:
+        pass
+    if vm.wait_shutdown(timeout=300):
+        return
+    vm.force_stop()
+    if vm.wait_shutdown(timeout=60):
+        return
+    console.print(
+        "[red][-][/] VM would not shut down; refusing to edit a disk "
+        "that may still be in use."
+    )
+    raise SystemExit(1)
+
+
 def _disable_via_offline_hive(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Shut the VM down, disable Defender in its SYSTEM hive, boot it back.
 
@@ -123,18 +149,7 @@ def _disable_via_offline_hive(cfg: Config, vm: VM, ga: GuestAgent) -> None:
         raise SystemExit(1)
 
     console.print("[blue][*][/] Shutting VM down for the offline edit...")
-    try:
-        ga.shutdown()
-    except GuestAgentError:
-        pass
-    if not vm.wait_shutdown(timeout=300):
-        vm.force_stop()
-        if not vm.wait_shutdown(timeout=60):
-            console.print(
-                "[red][-][/] VM would not shut down; refusing to edit a disk "
-                "that may still be in use."
-            )
-            raise SystemExit(1)
+    _power_off_or_refuse(vm, ga)
 
     try:
         defender.disable_offline(cfg, progress=_step)
@@ -178,13 +193,7 @@ def _restart_clearing_tamper_protection(cfg: Config, vm: VM, ga: GuestAgent) -> 
     from winbox import offlinereg
 
     console.print("[blue][*][/] Shutting VM down (restart also clears Tamper Protection)...")
-    try:
-        ga.shutdown()
-    except GuestAgentError:
-        pass
-    if not vm.wait_shutdown(timeout=300):
-        vm.force_stop()
-        vm.wait_shutdown(timeout=60)
+    _power_off_or_refuse(vm, ga)
 
     # Restoring the service start types is not optional: Defender's
     # Services\*\Start values are ACL-protected, so reg.exe cannot undo an

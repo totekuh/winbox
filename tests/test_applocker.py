@@ -56,25 +56,40 @@ class TestAppLockerEnable:
 # ─── disable ─────────────────────────────────────────────────────────────────
 
 
+_OFF = ExecResult(exitcode=0, stdout="AppLocker: off (AppIDSvc Stopped)\n", stderr="")
+_ENFORCED = ExecResult(
+    exitcode=0,
+    stdout="AppLocker: ENFORCED\n  Exe: Enabled (3 rules)\n",
+    stderr="",
+)
+
+
+def _run_disable(runner, mock_env, *powershell_results):
+    """Invoke `applocker disable` with a scripted exec_powershell sequence.
+
+    Call order is: clear script, then the post-reboot status re-query.
+    """
+    mock_env.exec_powershell.side_effect = list(powershell_results)
+    mock_env.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+    with patch("winbox.cli.applocker.time.sleep"), \
+         patch("winbox.cli.applocker._ensure_z_drive"):
+        return runner.invoke(cli, ["applocker", "disable"])
+
+
 class TestAppLockerDisable:
     def test_disable_success(self, runner, mock_env):
         """Disable clears policy, nukes caches, reboots VM."""
-        mock_env.exec_powershell.return_value = ExecResult(
-            exitcode=0, stdout="", stderr=""
+        result = _run_disable(
+            runner, mock_env,
+            ExecResult(exitcode=0, stdout="", stderr=""),
+            _OFF,
         )
-        mock_env.exec.return_value = ExecResult(
-            exitcode=0, stdout="", stderr=""
-        )
-
-        with patch("winbox.cli.applocker.time.sleep"), \
-             patch("winbox.cli.applocker._ensure_z_drive"):
-            result = runner.invoke(cli, ["applocker", "disable"])
 
         assert result.exit_code == 0
         assert "AppLocker disabled" in result.output
 
         # Verify Set-AppLockerPolicy was called via exec_powershell
-        script = mock_env.exec_powershell.call_args[0][0]
+        script = mock_env.exec_powershell.call_args_list[0][0][0]
         assert "Set-AppLockerPolicy" in script
         assert "Stop-Service" in script
         assert ".AppLocker" in script  # cache deletion
@@ -85,6 +100,54 @@ class TestAppLockerDisable:
             if "shutdown" in c[0][0]
         ]
         assert len(shutdown_calls) == 1
+
+    def test_disable_aborts_when_clear_script_fails(self, runner, mock_env):
+        """Regression: the clear result was discarded, so a failed
+        Set-AppLockerPolicy (e.g. Z: not mounted, script exits 1) still
+        rebooted and printed "AppLocker disabled" with exit 0 while the
+        guest went on enforcing."""
+        result = _run_disable(
+            runner, mock_env,
+            ExecResult(
+                exitcode=1, stdout="",
+                stderr="Policy file not found: Z:\\.applocker-policy.xml",
+            ),
+        )
+
+        assert result.exit_code == 1
+        assert "AppLocker disabled" not in result.output
+        assert "Failed to clear" in result.output
+        assert "Policy file not found" in result.output
+        # And it must not have rebooted on the strength of a failed clear.
+        assert not [
+            c for c in mock_env.exec.call_args_list if "shutdown" in c[0][0]
+        ]
+
+    def test_disable_reports_failure_when_still_enforcing(self, runner, mock_env):
+        """Exit code 0 from the clear script is not proof the guest stopped
+        enforcing — the post-reboot status query is."""
+        result = _run_disable(
+            runner, mock_env,
+            ExecResult(exitcode=0, stdout="", stderr=""),
+            _ENFORCED,
+        )
+
+        assert result.exit_code == 1
+        assert "AppLocker disabled" not in result.output
+        assert "still active" in result.output
+        assert "ENFORCED" in result.output
+
+    def test_disable_warns_but_succeeds_when_status_unreadable(self, runner, mock_env):
+        """A flaky verification query must not be reported as a failed
+        disable — the clear itself did succeed."""
+        result = _run_disable(
+            runner, mock_env,
+            ExecResult(exitcode=0, stdout="", stderr=""),
+            ExecResult(exitcode=1, stdout="", stderr="WinRM hiccup"),
+        )
+
+        assert result.exit_code == 0
+        assert "could not verify" in result.output
 
 
 # ─── status ──────────────────────────────────────────────────────────────────
@@ -187,3 +250,26 @@ class TestPolicyContent:
         assert "Get-AppLockerPolicy" in _STATUS_SCRIPT
         assert "AppIDSvc" in _STATUS_SCRIPT
         assert "EnforcementMode" in _STATUS_SCRIPT
+
+
+class TestClearScriptExitCodeIsMeaningful:
+    """The clear script's teardown is all best-effort, and it ends with
+    `appidtel.exe stop` — telemetry, which returns non-zero routinely because
+    the service is already going away. Without an explicit `exit 0`,
+    PowerShell hands the caller that native exit code, so a perfectly good
+    clear reads as a failure. Whether the policy actually went away is
+    decided by the post-reboot status check, not by this exit code."""
+
+    def test_script_ends_with_an_explicit_success_exit(self):
+        from winbox.cli.applocker import _DISABLE_APPLY_SCRIPT
+
+        assert _DISABLE_APPLY_SCRIPT.rstrip().endswith("exit 0"), (
+            "clear script must not leak appidtel.exe's exit code to the caller"
+        )
+
+    def test_appidtel_stop_is_not_the_last_statement(self):
+        from winbox.cli.applocker import _DISABLE_APPLY_SCRIPT
+
+        body = _DISABLE_APPLY_SCRIPT.rstrip()
+        assert not body.endswith("appidtel.exe stop")
+        assert "appidtel.exe stop" in body  # still performed, just not last

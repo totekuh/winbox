@@ -19,6 +19,27 @@ if TYPE_CHECKING:
 console = Console()
 
 
+def _command_already_ran(err: GuestAgentError) -> bool:
+    """True when this GuestAgentError means the guest already launched the command.
+
+    The retry loop below exists for the GA pipe race, which fails *before* the
+    process starts — retrying is free. A timeout is the opposite: `exec` has
+    already run the command for the full timeout and taskkill'd its whole tree,
+    so a retry re-runs a half-completed, non-idempotent operation (installers,
+    registry writers, exploit PoCs) and kills it again. Same for the
+    foreign-result path: the command ran, we just couldn't collect its output.
+
+    Matched on the message because winbox.vm.guest raises one flat
+    GuestAgentError for every failure mode; a dedicated GuestExecTimeout
+    subclass there would let this be an `except` clause instead.
+    """
+    msg = str(err).lower()
+    return (
+        "timed out" in msg
+        or "could not obtain this command's own output" in msg
+    )
+
+
 def resolve_exe(exe: str, tools_dir: Path) -> str:
     """Resolve executable to Z:\\tools\\ path.
 
@@ -86,7 +107,9 @@ def run_command(
     for attempt in range(max_retries):
         try:
             attempt_result = ga.exec(full_cmd, timeout=timeout)
-        except GuestAgentError:
+        except GuestAgentError as e:
+            if _command_already_ran(e):
+                raise
             if attempt < max_retries - 1:
                 console.print(f"[yellow][!][/] GA error, retrying ({attempt + 1}/{max_retries})...")
                 time.sleep(0.5)

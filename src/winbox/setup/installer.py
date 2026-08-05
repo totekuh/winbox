@@ -35,20 +35,58 @@ REQUIRED_TOOLS = [
     # a raw FileNotFoundError from deep inside phase 2 instead of the
     # prereq list.
     "guestfish",
+    # The other half of the offline-registry machinery. It ships in a
+    # *different* package from guestfish (libwin-hivex-perl vs
+    # libguestfs-tools, and the latter does not depend on it), so
+    # "guestfish present, hivexregedit absent" is the normal state of a host
+    # that installed exactly what the setup command tells it to. Missing it
+    # used to surface ~40 minutes into a win11 build, as a best-effort
+    # warning during phase 2 that left Defender fully armed and failed the
+    # build two phases later for an apparently unrelated reason.
+    "hivexregedit",
     "7z",
     "wget",
 ]
+
+# Tools whose apt package name isn't guessable from the binary name. Reported
+# alongside the tool so the "Missing: ..." line is actually actionable.
+TOOL_PACKAGES = {"hivexregedit": "libwin-hivex-perl"}
+
+# Tools only some guest profiles need, and the profile flag that decides.
+# Offline hive edits are how a client SKU's Defender gets disabled; Server
+# 2022 never takes that path, so it shouldn't be blocked on the package.
+PROFILE_GATED_TOOLS = {"hivexregedit": "disable_defender_offline"}
 
 # virtiofsd is installed to /usr/libexec on Debian/Kali, not on PATH
 VIRTIOFSD_PATHS = ["/usr/libexec/virtiofsd", "/usr/lib/qemu/virtiofsd"]
 
 
-def check_prereqs() -> list[str]:
-    """Check for required system tools. Returns list of missing ones."""
+def _tool_required(tool: str, cfg: Config | None) -> bool:
+    """Is ``tool`` needed for the build ``cfg`` describes?
+
+    Without a cfg we cannot know which guest is about to be built, so every
+    gated tool counts as required: over-reporting costs one apt install,
+    under-reporting costs a 40-minute build that quietly comes out wrong.
+    """
+    flag = PROFILE_GATED_TOOLS.get(tool)
+    if flag is None or cfg is None:
+        return True
+    return bool(getattr(cfg.profile, flag))
+
+
+def check_prereqs(cfg: Config | None = None) -> list[str]:
+    """Check for required system tools. Returns list of missing ones.
+
+    Pass ``cfg`` to scope the check to the guest actually being built;
+    profile-gated tools are otherwise all assumed necessary.
+    """
     missing = []
     for tool in REQUIRED_TOOLS:
+        if not _tool_required(tool, cfg):
+            continue
         if shutil.which(tool) is None:
-            missing.append(tool)
+            package = TOOL_PACKAGES.get(tool)
+            missing.append(f"{tool} (apt install {package})" if package else tool)
     if not shutil.which("virtiofsd") and not any(Path(p).exists() for p in VIRTIOFSD_PATHS):
         missing.append("virtiofsd")
     if not Path("/dev/kvm").exists():

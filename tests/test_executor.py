@@ -1,10 +1,12 @@
-"""Tests for winbox.executor — path resolution."""
+"""Tests for winbox.executor — path resolution and the exec retry policy."""
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from winbox.exec.executor import resolve_exe
+from winbox.exec.executor import resolve_exe, run_command
+from winbox.vm.guest import ExecResult, GuestAgentError
 
 
 class TestResolveExe:
@@ -98,3 +100,54 @@ class TestResolveExe:
         result = resolve_exe("./foo.exe", tools_dir)
         assert result == "Z:\\tools\\foo.exe"
         assert (tools_dir / "foo.exe").read_bytes() == b"data"
+
+
+class TestRunCommandRetryPolicy:
+    """The retry loop exists for one thing: the guest-agent pipe race, which
+    fails before the guest process starts. Anything that means the command
+    already ran must not be retried — `winbox exec installer.exe /S` running
+    three partial installs off one command line is worse than one failure."""
+
+    def _ga(self):
+        ga = MagicMock()
+        ga.exec.side_effect = None
+        return ga
+
+    def test_timeout_is_not_retried(self, cfg):
+        """exec() taskkills the whole process tree on timeout, so a retry
+        re-runs a half-finished, state-mutating command from scratch."""
+        ga = self._ga()
+        ga.exec.side_effect = GuestAgentError("Command timed out after 60s (PID 4242)")
+
+        with pytest.raises(GuestAgentError, match="timed out"):
+            run_command(cfg, ga, "installer.exe", ("/S",), timeout=60)
+
+        assert ga.exec.call_count == 1, (
+            f"a timed-out command must run exactly once, ran {ga.exec.call_count} times"
+        )
+
+    def test_foreign_result_error_is_not_retried(self, cfg):
+        """Same reasoning: the command executed, we just couldn't collect its
+        output on a recycled PID."""
+        ga = self._ga()
+        ga.exec.side_effect = GuestAgentError(
+            "Could not obtain this command's own output on PID 4242 after 3 foreign results"
+        )
+
+        with pytest.raises(GuestAgentError):
+            run_command(cfg, ga, "installer.exe", (), timeout=60)
+
+        assert ga.exec.call_count == 1
+
+    def test_transient_ga_error_is_still_retried(self, cfg):
+        """The pipe race this loop was built for must keep working."""
+        ga = self._ga()
+        ga.exec.side_effect = [
+            GuestAgentError("Guest agent command failed: The handle is invalid."),
+            ExecResult(exitcode=0, stdout="ok", stderr=""),
+        ]
+
+        rc = run_command(cfg, ga, "whoami.exe", (), timeout=60)
+
+        assert rc == 0
+        assert ga.exec.call_count == 2

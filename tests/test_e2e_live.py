@@ -626,7 +626,14 @@ class TestDefender:
         original = tool("av_status")()
         out = tool("av_enable")()
         try:
-            assert "error" not in out.lower(), out
+            if "error" in out.lower():
+                # On a client SKU this tool legitimately cannot finish:
+                # Defender's Services\*\Start values are ACL-protected, so an
+                # offline disable can only be undone by the host CLI, which
+                # powers the VM down. Refusing and naming that remedy is the
+                # correct outcome — what must never happen is a false success.
+                assert profile.client_sku, out
+                assert "winbox av enable" in out, out
             assert "alive" in ga.exec("echo alive", timeout=90).stdout
         finally:
             if "Defender: ON" not in original:

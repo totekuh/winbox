@@ -177,3 +177,183 @@ class TestReap:
             c.get("execute") == "guest-exec-status"
             for c in calls[calls.index(kills[0]):]
         )
+
+
+class _QgaAgent:
+    """A model of qemu-ga's slot table for the ``exec_argv`` path.
+
+    Same rules as ``tests.conftest.FakeQemuGA`` (flat list keyed by Windows
+    PID, oldest matching entry wins, an entry is freed only when a status read
+    reports it exited) plus the one behaviour that decides whether an
+    ``exec_argv`` result can be identified at all: a status read for a PID the
+    agent has no entry for is an **error**, not a polite "not exited yet".
+    That is what ``qmp_guest_exec_status`` does, and it is how "the result I
+    just read was the only one" is told apart from "there is another entry
+    behind it".
+
+    ``lenient_unknown_pid=True`` models an agent that answers
+    ``exited: false`` instead — the assumption the orphan check leans on,
+    inverted, so the fallback path can be tested.
+    """
+
+    def __init__(self, *, output="", exitcode=0, polls_before_exit=0,
+                 lenient_unknown_pid=False):
+        self.slots: list[dict] = []
+        self.output = output
+        self.exitcode = exitcode
+        self.polls_before_exit = polls_before_exit
+        self.lenient_unknown_pid = lenient_unknown_pid
+        self.forced_pids: list[int] = []
+        self.payloads: list[dict] = []
+        self._next_pid = 2000
+
+    def seed_abandoned(self, pid: int, output: str, exitcode: int = 1) -> None:
+        self.slots.append(
+            {"pid": pid, "polls_left": 0, "out": output, "exitcode": exitcode}
+        )
+
+    def force_next_pid(self, pid: int) -> None:
+        self.forced_pids.append(pid)
+
+    def __call__(self, payload, **kwargs):
+        self.payloads.append(payload)
+        cmd = payload.get("execute")
+        if cmd == "guest-exec":
+            pid = self.forced_pids.pop(0) if self.forced_pids else self._next_pid
+            self._next_pid += 1
+            # taskkill is fire-and-forget; give it its own instant slot.
+            is_kill = payload["arguments"]["path"] == "taskkill"
+            self.slots.append({
+                "pid": pid,
+                "polls_left": 0 if is_kill else self.polls_before_exit,
+                "out": "" if is_kill else self.output,
+                "exitcode": 0 if is_kill else self.exitcode,
+            })
+            return {"return": {"pid": pid}}
+        if cmd == "guest-exec-status":
+            want = payload["arguments"]["pid"]
+            for i, slot in enumerate(self.slots):
+                if slot["pid"] != want:
+                    continue
+                if slot["polls_left"] > 0:
+                    slot["polls_left"] -= 1
+                    return {"return": {"exited": False}}
+                self.slots.pop(i)  # freed on read, like qemu-ga
+                return {"return": {
+                    "exited": True,
+                    "exitcode": slot["exitcode"],
+                    "out-data": _b64(slot["out"]),
+                    "err-data": "",
+                }}
+            if self.lenient_unknown_pid:
+                return {"return": {"exited": False}}
+            raise GuestAgentError(f"PID {want} does not exist")
+        return {"return": {}}
+
+
+def _b64(text: str) -> str:
+    import base64
+    return base64.b64encode(text.encode()).decode()
+
+
+class TestExecArgvIdentity:
+    """``exec_argv`` cannot carry ``exec``'s echoed nonce — bypassing cmd.exe
+    is the whole point of it — so it establishes identity out of band. Without
+    that, `winbox msi install` and `winbox av status` could report an orphan's
+    exit code as their own."""
+
+    def test_does_not_return_an_orphans_result(self, monkeypatch):
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+        # Ours takes two polls to finish; the orphan is already sitting there.
+        fake = _QgaAgent(output="ours\r\n", exitcode=0, polls_before_exit=2)
+        fake.seed_abandoned(4242, "someone else's output\r\n", exitcode=1)
+        fake.force_next_pid(4242)
+
+        result = _ga(monkeypatch, fake).exec_argv("msiexec.exe", ["/i", "x.msi"])
+
+        assert result.stdout == "ours\r\n"
+        assert result.exitcode == 0
+
+    def test_plain_fast_command_is_unaffected(self, monkeypatch):
+        """reg.exe finishes long before the first poll — no orphan involved,
+        and the identity check must not turn that into a failure or a wait."""
+        fake = _QgaAgent(output="value\r\n", exitcode=0)
+
+        result = _ga(monkeypatch, fake).exec_argv("reg.exe", ["query", "HKLM"], timeout=15)
+
+        assert result.stdout == "value\r\n"
+        assert result.exitcode == 0
+
+    def test_does_not_discard_a_result_against_a_lenient_agent(self, monkeypatch):
+        """The check reads "not exited" as proof that a second entry exists.
+        Against an agent that answers "not exited" for PIDs it holds nothing
+        for, that inference is backwards — and acting on it would throw away
+        the command's real output. It must detect that and keep the result."""
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+        fake = _QgaAgent(output="value\r\n", exitcode=0, lenient_unknown_pid=True)
+
+        result = _ga(monkeypatch, fake).exec_argv("reg.exe", ["query", "HKLM"], timeout=15)
+
+        assert result.stdout == "value\r\n"
+        assert result.exitcode == 0
+        assert not any(
+            p.get("arguments", {}).get("path") == "taskkill" for p in fake.payloads
+        ), "a completed command must not be killed"
+
+
+class TestExecArgvPollResilience:
+    """``exec`` has tolerated brief virtio-serial hiccups since the poll-loop
+    audit; ``exec_argv`` did not, and `winbox provision` runs a 30-minute
+    script through it."""
+
+    def test_tolerates_a_transient_error_mid_poll(self, monkeypatch):
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+        fake = _QgaAgent(output="done\r\n", polls_before_exit=1)
+        real = fake.__call__
+        state = {"n": 0}
+
+        def flaky(payload, **kwargs):
+            if payload.get("execute") == "guest-exec-status":
+                state["n"] += 1
+                if state["n"] == 1:
+                    raise GuestAgentError("Guest agent command failed: hiccup")
+            return real(payload, **kwargs)
+
+        result = _ga(monkeypatch, flaky).exec_argv(
+            "powershell.exe", ["-File", "C:\\bootstrap.ps1"], timeout=1800
+        )
+
+        assert result.stdout == "done\r\n"
+
+    def test_abandoning_a_pid_kills_and_reaps_it(self, monkeypatch):
+        """An abandoned PID's entry lives in the agent forever and becomes the
+        orphan the next command to land on that PID inherits."""
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+        calls: list[dict] = []
+
+        def dead_agent(payload, **kwargs):
+            calls.append(payload)
+            if payload.get("execute") == "guest-exec":
+                return {"return": {"pid": 4242}}
+            raise GuestAgentError("Guest agent command failed: agent gone")
+
+        with pytest.raises(GuestAgentError):
+            _ga(monkeypatch, dead_agent).exec_argv("msiexec.exe", ["/i", "x.msi"])
+
+        kills = [
+            c for c in calls
+            if c.get("arguments", {}).get("path") == "taskkill"
+        ]
+        assert kills, "a PID we stop polling must not be left running and unreaped"
+        assert "/T" in kills[0]["arguments"]["arg"]
+
+    def test_timeout_still_kills_and_reaps(self, monkeypatch):
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+        fake = _QgaAgent(output="", polls_before_exit=10_000)
+
+        with pytest.raises(GuestAgentError, match="timed out"):
+            _ga(monkeypatch, fake).exec_argv("hang.exe", [], timeout=0)
+
+        assert any(
+            p.get("arguments", {}).get("path") == "taskkill" for p in fake.payloads
+        )

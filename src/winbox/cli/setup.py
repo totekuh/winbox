@@ -13,7 +13,7 @@ from winbox.setup import installer
 from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
 from winbox.osprofile import OS_PROFILES
-from winbox.vm import GuestAgent
+from winbox.vm import GuestAgent, GuestAgentError
 from winbox.setup.iso import download_iso
 from winbox.vm import VM
 
@@ -90,14 +90,17 @@ def _setup_inner(
     console.print("[bold]winbox setup[/] — building Windows VM\n")
     t0 = time.monotonic()
 
-    # Check prereqs
-    missing = installer.check_prereqs()
+    # Check prereqs. Pass cfg — some tools are only needed by one guest
+    # profile, and without it every gated tool counts as required, which
+    # blocks a Server 2022 build on packages only the Win11 path uses.
+    missing = installer.check_prereqs(cfg)
     if missing:
         console.print(f"[red][-][/] Missing: {', '.join(missing)}")
         console.print(
             "    Install with: [bold]apt install "
             "qemu-system-x86 qemu-utils libvirt-daemon-system virtinst "
-            "libguestfs-tools virtiofsd p7zip-full genisoimage wget[/]"
+            "libguestfs-tools libwin-hivex-perl virtiofsd p7zip-full "
+            "genisoimage wget[/]"
         )
         raise SystemExit(1)
 
@@ -203,9 +206,24 @@ def _setup_inner(
             f"[bold]winbox destroy -y[/], then re-run [bold]winbox setup[/]."
         )
         raise SystemExit(130)
-    except (subprocess.CalledProcessError, RuntimeError) as e:
+    # GuestAgentError and OSError are in here for the same reason
+    # CalledProcessError is: they are infrastructure failures the pipeline
+    # raises in normal operation (`ga.wait` on the provisioning boot,
+    # PermissionError building the unattend image), and GuestAgentError is a
+    # plain Exception rather than a RuntimeError, so it used to sail past this
+    # handler as a raw traceback — no recovery guidance, and the half-built VM
+    # left running for the next command to auto-start into.
+    except (subprocess.CalledProcessError, RuntimeError, GuestAgentError, OSError) as e:
         console.print()
         console.print(f"[red][-][/] Setup failed: {e}")
+        # Never leave a running half-provisioned guest behind: the next
+        # `winbox av`/`exec` would happily attach to it.
+        try:
+            if vm.is_running():
+                console.print("[blue][*][/] Powering the half-built VM off...")
+                vm.force_stop()
+        except Exception:
+            pass  # best-effort — the recovery guidance below still applies
         console.print(
             f"    The VM may be partially built. Clean up with "
             f"[bold]winbox destroy -y[/] before re-running [bold]winbox setup[/]."
