@@ -26,7 +26,7 @@ import time
 import pytest
 from click.testing import CliRunner
 
-from winbox.cli import cli, reboot_and_wait
+from winbox.cli import cli
 from winbox.config import Config
 from winbox.vm import VM, GuestAgent, VMState
 
@@ -880,7 +880,17 @@ class TestKdbg:
         finally:
             run("kdbg", "stop", expect_ok=False)
 
-        reboot_and_wait(cfg, ga, msg="Rebooting to move the ASLR bases...")
+        # Reboot the way the rest of this suite does, not via the CLI's
+        # reboot_and_wait: that helper waits 120s and raises SystemExit when
+        # the agent is late, which is right for a command and wrong for a
+        # test — Win11 routinely needs longer, and aborting mid-suite leaves
+        # every later test staring at a guest that was merely still booting.
+        try:
+            ga.exec("shutdown /r /t 0", timeout=10)
+        except Exception:
+            pass  # the VM dies before it can ACK
+        time.sleep(10)
+        ga.wait(timeout=420)
 
         run("kdbg", "start")
         try:
