@@ -1656,6 +1656,12 @@ def fork_daemon(
         # Resolve target now that we're inside the daemon (parent doesn't
         # need to talk to gdb).
         store = SymbolStore(cfg.symbols_dir)
+        # Before anything resolves a kernel symbol. list_processes below
+        # reads PsActiveProcessHead off the cached nt base, so a base left
+        # over from a previous boot fails here as "PDPTE not present" —
+        # long before the staleness check further down could say so.
+        from winbox.kdbg.symbols import ensure_nt_base_current
+        ensure_nt_base_current(cfg, store)
         procs = list_processes(cfg.vm_name, store)
         target = next((p for p in procs if p.pid == target_pid), None)
         if target is None:

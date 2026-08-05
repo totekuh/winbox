@@ -188,7 +188,16 @@ def kdbg_status(ctx: click.Context, port: int) -> None:
 
 
 def _get_store(cfg: Config) -> SymbolStore:
-    return SymbolStore(cfg.symbols_dir)
+    """The symbol store, with its nt base re-pointed if ASLR moved it.
+
+    See the MCP twin: a base from a previous boot makes every walker fail
+    with an error that names the page-table layer, not the actual cause.
+    """
+    from winbox.kdbg.symbols import ensure_nt_base_current
+
+    store = SymbolStore(cfg.symbols_dir)
+    ensure_nt_base_current(cfg, store)
+    return store
 
 
 @kdbg.command("symbols")

@@ -2162,8 +2162,19 @@ from winbox.kdbg.walk import list_user_modules as _kdbg_list_user_modules
 
 
 def _kdbg_get_store() -> _KdbgStore:
+    """The symbol store, with its nt base re-pointed if ASLR moved it.
+
+    Every kdbg tool that walks kernel structures comes through here, and
+    every one of them fails as "PDPTE not present" against a base left over
+    from a previous boot. Correcting it here means a reboot no longer breaks
+    kdbg until the user knows to run kdbg_base_refresh by hand.
+    """
+    from winbox.kdbg.symbols import ensure_nt_base_current
+
     cfg, _, _ = _get_state()
-    return _KdbgStore(cfg.symbols_dir)
+    store = _KdbgStore(cfg.symbols_dir)
+    ensure_nt_base_current(cfg, store)
+    return store
 
 
 @mcp.tool()
