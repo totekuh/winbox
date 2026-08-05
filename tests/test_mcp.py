@@ -818,6 +818,141 @@ class TestServiceTools:
             assert list(mcp_root.rglob("script.py")) == []
 
 
+# ─── av_enable / av_disable / av_status tools ────────────────────────────────
+
+
+class TestAvTools:
+    def test_status_returns_summary(self, mock_mcp):
+        from winbox.mcp import av_status
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout="Defender: ON\n  RealTimeProtection: True\n",
+            stderr="",
+        )
+
+        result = av_status()
+        assert "Defender: ON" in result
+        assert "RealTimeProtection: True" in result
+
+    def test_enable_drives_all_steps(self, mock_mcp):
+        from winbox.mcp import av_enable
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+
+        result = av_enable()
+        assert "Defender enabled" in result
+
+        # 3 PowerShell steps (registry cleanup, exclusions, prefs) + sc.exe start.
+        assert ga.exec_powershell.call_count == 3
+        assert "sc.exe start WinDefend" in ga.exec.call_args[0][0]
+
+    def test_enable_start_failure_surfaces_error(self, mock_mcp):
+        from winbox.mcp import av_enable
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec.return_value = ExecResult(
+            exitcode=5, stdout="Access is denied", stderr=""
+        )
+
+        result = av_enable()
+        assert result.startswith("error:")
+        assert "Failed to start WinDefend" in result
+        assert "Access is denied" in result
+
+    def test_disable_requires_confirm(self, mock_mcp):
+        from winbox.mcp import av_disable
+        ga, vm, cfg = mock_mcp
+
+        result = av_disable()
+        assert "confirm=True" in result
+        # No reboot, no registry writes without confirmation.
+        ga.exec_argv.assert_not_called()
+        ga.exec.assert_not_called()
+
+    def test_disable_sets_regkeys_then_reboots(self, mock_mcp):
+        from winbox.mcp import av_disable
+        from winbox.defender import DISABLE_REG_ARGS
+        ga, vm, cfg = mock_mcp
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        # exec_powershell serves both the pre-flight Tamper-Protection probe
+        # (needs no TAMPER_ON) and the post-reboot verification (needs an OFF
+        # status), so one benign payload satisfies both.
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout="TAMPER_OFF\nDefender: OFF (all protections disabled)\n",
+            stderr="",
+        )
+
+        with patch("time.sleep"):
+            result = av_disable(confirm=True)
+
+        assert "Defender disabled" in result
+        assert ga.exec_argv.call_count == len(DISABLE_REG_ARGS)
+        reboot_calls = [c for c in ga.exec.call_args_list if "shutdown" in c[0][0]]
+        assert len(reboot_calls) == 1
+        ga.wait.assert_called_once()
+
+    def test_disable_refuses_when_tamper_protection_on(self, mock_mcp):
+        from winbox.mcp import av_disable
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="TAMPER_ON\n", stderr=""
+        )
+
+        result = av_disable(confirm=True)
+
+        assert result.startswith("error:")
+        assert "Tamper Protection" in result
+        # Gate must trip before any registry write or reboot.
+        ga.exec_argv.assert_not_called()
+        ga.exec.assert_not_called()
+
+    def test_disable_reports_when_defender_survives_reboot(self, mock_mcp):
+        from winbox.mcp import av_disable
+        ga, vm, cfg = mock_mcp
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        # TP probe passes, but the post-reboot status still shows Defender up.
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout="TAMPER_OFF\nDefender: ON (real-time protection enabled)\n",
+            stderr="",
+        )
+
+        with patch("time.sleep"):
+            result = av_disable(confirm=True)
+
+        assert "still reports active" in result
+        assert "Defender disabled" not in result
+
+    def test_disable_reg_failure_aborts_before_reboot(self, mock_mcp):
+        from winbox.mcp import av_disable
+        ga, vm, cfg = mock_mcp
+        ga.exec_argv.return_value = ExecResult(
+            exitcode=1, stdout="", stderr="Access denied"
+        )
+
+        result = av_disable(confirm=True)
+        assert result.startswith("error:")
+        # Should not have rebooted.
+        ga.exec.assert_not_called()
+
+    def test_disable_reboot_wait_failure(self, mock_mcp):
+        from winbox.mcp import av_disable
+        from winbox.vm import GuestAgentError
+        ga, vm, cfg = mock_mcp
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.wait.side_effect = GuestAgentError("timeout")
+
+        with patch("time.sleep"):
+            result = av_disable(confirm=True)
+        assert "did not" in result and "come back" in result
+
+
 # ─── net_isolate / net_unplug / net_connect tools ───────────────────────────
 
 
@@ -2172,3 +2307,123 @@ class TestKdbgDaemonTools:
              patch("winbox.kdbg.hmp.probe_port", return_value=False):
             result = kdbg_resume()
         assert "gdbstub not listening" in result
+
+
+class TestReadmeToolCount:
+    """The README advertises how many MCP tools ship; it has drifted before.
+
+    Comparing against the README's own number (rather than a literal here)
+    means adding a tool fails this test until the docs are updated, without
+    needing two magic numbers kept in sync.
+    """
+
+    def _readme(self):
+        import pathlib
+
+        path = pathlib.Path(__file__).resolve().parents[1] / "README.md"
+        if not path.exists():
+            import pytest
+
+            pytest.skip("README.md not present (installed package)")
+        return path.read_text(encoding="utf-8")
+
+    def test_readme_count_matches_registered_tools(self):
+        import asyncio
+        import re
+
+        from winbox.mcp import mcp
+
+        tools = asyncio.run(mcp.list_tools())
+        m = re.search(r"\*\*MCP server\*\* — (\d+) tools", self._readme())
+        assert m, "README no longer states an MCP tool count in the expected form"
+        assert int(m.group(1)) == len(tools), (
+            f"README says {m.group(1)} MCP tools but {len(tools)} are registered"
+        )
+
+    def test_tool_names_are_unique(self):
+        import asyncio
+
+        from winbox.mcp import mcp
+
+        names = [t.name for t in asyncio.run(mcp.list_tools())]
+        assert len(names) == len(set(names))
+
+    def test_every_tool_has_a_description(self):
+        """Tool docstrings are the only thing an agent sees when choosing."""
+        import asyncio
+
+        from winbox.mcp import mcp
+
+        undocumented = [
+            t.name for t in asyncio.run(mcp.list_tools()) if not (t.description or "").strip()
+        ]
+        assert undocumented == []
+
+
+class TestFormatExecResultDiagnostics:
+    """A non-zero exit with nothing on either stream used to render as the
+    bare string "\\n[exit code: 1]" — indistinguishable from a tool that
+    simply had nothing to say, and the exact shape an externally killed
+    in-guest process leaves behind (Python block-buffers stdout to a pipe,
+    so a kill before interpreter shutdown discards it)."""
+
+    def test_silent_failure_explains_itself(self):
+        from winbox.mcp import _format_exec_result
+
+        out = _format_exec_result({"stdout": "", "stderr": "", "exitcode": 1})
+
+        assert "[exit code: 1]" in out
+        assert "no output on either stream" in out
+        assert "flush" in out
+
+    def test_failure_with_stderr_is_left_alone(self):
+        from winbox.mcp import _format_exec_result
+
+        out = _format_exec_result(
+            {"stdout": "", "stderr": "Traceback...", "exitcode": 1}
+        )
+
+        assert "Traceback..." in out
+        assert "no output on either stream" not in out
+
+    def test_failure_with_stdout_is_left_alone(self):
+        from winbox.mcp import _format_exec_result
+
+        out = _format_exec_result({"stdout": "partial", "stderr": "", "exitcode": 1})
+
+        assert "partial" in out
+        assert "no output on either stream" not in out
+
+    def test_success_with_no_output_is_unchanged(self):
+        from winbox.mcp import _format_exec_result
+
+        assert _format_exec_result(
+            {"stdout": "", "stderr": "", "exitcode": 0}
+        ) == "(no output)"
+
+
+class TestRegSetTypeLeniency:
+    """A registry write should not fail over the spelling of its type."""
+
+    def _script_for(self, value_type):
+        import winbox.mcp as m
+
+        captured = {}
+
+        def fake_exec_python(script, timeout=30):
+            captured["script"] = script
+            return {"stdout": "", "stderr": "", "exitcode": 0}
+
+        fn = m.reg_set.fn if hasattr(m.reg_set, "fn") else m.reg_set
+        with patch.object(m, "_exec_python", fake_exec_python):
+            fn(r"HKLM\SOFTWARE\X", "V", "1", value_type)
+        return captured["script"]
+
+    def test_shorthand_is_normalized(self):
+        script = self._script_for("dword")
+        assert 'reg_type_name.strip().upper()' in script
+        assert 'reg_type_name = "REG_" + reg_type_name' in script
+
+    def test_unknown_type_lists_the_valid_ones(self):
+        script = self._script_for("frobnicate")
+        assert "Expected one of" in script

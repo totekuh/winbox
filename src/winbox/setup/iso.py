@@ -1,4 +1,10 @@
-"""Windows Server 2022 Evaluation ISO downloader."""
+"""Windows Evaluation ISO downloader (Server 2022 / Windows 11).
+
+The specific ISO — URL, filename, and truncation floor — comes from the
+active :class:`~winbox.osprofile.OSProfile` (``cfg.profile``). The
+module-level constants below mirror the Server 2022 profile so existing
+callers and tests that import them keep working.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +24,7 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
+from winbox.osprofile import OS_PROFILES
 from winbox.utils import human_size
 
 if TYPE_CHECKING:
@@ -25,14 +32,11 @@ if TYPE_CHECKING:
 
 console = Console()
 
-# Microsoft go.microsoft.com redirect — resolves to a direct CDN link
-# for the Windows Server 2022 Evaluation ISO (en-US, x64).
-EVAL_REDIRECT_URL = (
-    "https://go.microsoft.com/fwlink/p/"
-    "?LinkID=2195280&clcid=0x409&culture=en-us&country=US"
-)
-
-ISO_FILENAME = "SERVER_EVAL_x64FRE_en-us.iso"
+# Server 2022 profile values, re-exported for callers/tests that import
+# them directly. The download path itself is profile-driven (see
+# `download_iso`), so Win11 builds don't touch these.
+EVAL_REDIRECT_URL = OS_PROFILES["server2022"].iso_url
+ISO_FILENAME = OS_PROFILES["server2022"].iso_filename
 
 
 def resolve_download_url(redirect_url: str = EVAL_REDIRECT_URL) -> str:
@@ -69,13 +73,15 @@ def download_iso(
     *,
     force: bool = False,
 ) -> Path:
-    """Download the Windows Server 2022 Evaluation ISO.
+    """Download the active profile's Windows Evaluation ISO.
 
-    Downloads to ~/.winbox/iso/SERVER_EVAL_x64FRE_en-us.iso with resume
-    support and a progress bar. Returns the path to the downloaded ISO.
+    Downloads to ~/.winbox/iso/<profile filename> with resume support and a
+    progress bar. Returns the path to the downloaded ISO. The URL, filename,
+    and truncation floor all come from ``cfg.profile``.
     """
+    profile = cfg.profile
     cfg.iso_dir.mkdir(parents=True, exist_ok=True)
-    dest = cfg.iso_dir / ISO_FILENAME
+    dest = cfg.iso_dir / profile.iso_filename
     url: str | None = None
 
     # Already downloaded?
@@ -83,7 +89,7 @@ def download_iso(
         remote_size = None
         try:
             console.print("[blue][*][/] Resolving download URL...")
-            url = resolve_download_url()
+            url = resolve_download_url(profile.iso_url)
             remote_size = get_remote_size(url)
         except RuntimeError:
             pass
@@ -103,9 +109,9 @@ def download_iso(
                 f"({human_size(remote_size)}). Delete {dest} and re-download, "
                 f"or use --force."
             )
-        elif not remote_size and local_size >= 4_500_000_000:
-            # Can't verify size against remote, but ~4.7GB is the actual
-            # eval-ISO size; anything below this is a partial that previous
+        elif not remote_size and local_size >= profile.iso_min_size:
+            # Can't verify size against remote, but the eval ISO is several
+            # GB; anything below the profile floor is a partial that previous
             # ">1GB" leniency would have happily reused.
             console.print(f"[green][+][/] ISO already downloaded: {dest}")
             return dest
@@ -113,7 +119,7 @@ def download_iso(
     # Resolve URL if we haven't already
     if url is None:
         console.print("[blue][*][/] Resolving download URL...")
-        url = resolve_download_url()
+        url = resolve_download_url(profile.iso_url)
 
     console.print(f"[blue][*][/] Downloading from Microsoft CDN...")
 
@@ -175,7 +181,7 @@ def download_iso(
             console=console,
         ) as progress:
             task = progress.add_task(
-                ISO_FILENAME,
+                profile.iso_filename,
                 total=progress_total,
                 completed=existing_size,
             )
@@ -198,8 +204,8 @@ def download_iso(
         resp.close()
 
     final_size = dest.stat().st_size
-    # Sanity check — Windows Server 2022 eval ISO is ~4.7GB
-    if final_size < 4_500_000_000:
+    # Sanity check against the profile's expected minimum ISO size.
+    if final_size < profile.iso_min_size:
         raise RuntimeError(
             f"Downloaded ISO appears truncated ({human_size(final_size)}). "
             f"Delete {dest} and retry."

@@ -145,6 +145,10 @@ def status(ctx: click.Context) -> None:
     console.print(f"[bold]winbox status[/]")
     console.print("\u2500" * 32)
     console.print(f"  VM:      [bold]{cfg.vm_name}[/]")
+    # Which Windows this is decides the install layout, the VirtIO drivers,
+    # and how Defender behaves — with two possible images it should not take
+    # a config-file read to find out which one is on disk.
+    console.print(f"  OS:      {cfg.vm_os}")
     console.print(f"  State:   [{state_color}]{state.value}[/]")
 
     if state == VMState.RUNNING:

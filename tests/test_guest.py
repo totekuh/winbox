@@ -88,17 +88,13 @@ class TestExecPollTolerance:
         #   1. guest-exec  -> {return: {pid: 42}}
         #   2. guest-exec-status -> raise (transient)
         #   3. guest-exec-status -> {return: {exited: True, exitcode: 0}}
-        responses = iter([
+        from tests.conftest import nonce_aware
+
+        fake_raw = nonce_aware([
             {"return": {"pid": 42}},
             GuestAgentError("transient"),
             {"return": {"exited": True, "exitcode": 0}},
         ])
-
-        def fake_raw(payload, **kwargs):
-            r = next(responses)
-            if isinstance(r, Exception):
-                raise r
-            return r
 
         monkeypatch.setattr(ga, "_raw_command", fake_raw)
         # poll_interval=0 so the test doesn't actually sleep on retry
@@ -124,3 +120,148 @@ class TestExecPollTolerance:
             ga.exec("whoami", timeout=10, poll_interval=0)
         # Initial guest-exec + 6 status polls (5 tolerated, 6th raises)
         assert call_count[0] >= 6
+
+
+class TestPowershellStderrHygiene:
+    """With stderr redirected, PowerShell serializes its *progress* stream as
+    a CLIXML document onto stderr. Callers then saw hundreds of bytes of XML
+    on every Defender query and had to treat it as if it were an error."""
+
+    def test_progress_preference_is_disabled_in_the_script(self, monkeypatch):
+        import base64
+
+        from winbox.config import Config
+        from winbox.vm.guest import ExecResult, GuestAgent
+
+        ga = GuestAgent(Config())
+        seen = {}
+
+        def fake_exec(cmd, *, timeout=300):
+            encoded = cmd.split("-EncodedCommand ")[1]
+            seen["script"] = base64.b64decode(encoded).decode("utf-16-le")
+            return ExecResult(exitcode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(ga, "exec", fake_exec)
+        ga.exec_powershell("Get-MpComputerStatus")
+
+        assert seen["script"].startswith("$ProgressPreference = 'SilentlyContinue'")
+        assert "Get-MpComputerStatus" in seen["script"]
+
+    def test_progress_only_clixml_is_dropped(self):
+        from winbox.vm.guest import _strip_clixml_progress
+
+        noise = (
+            '#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft'
+            '.com/powershell/2004/04"><Obj S="progress" RefId="0"><MS><PR N="Record">'
+            "<AV>Preparing modules for first use.</AV></PR></MS></Obj></Objs>"
+        )
+        assert _strip_clixml_progress(noise) == ""
+
+    def test_real_errors_are_preserved(self):
+        """Losing a genuine PowerShell error to cosmetics would be worse."""
+        from winbox.vm.guest import _strip_clixml_progress
+
+        err = (
+            '#< CLIXML\r\n<Objs Version="1.1.0.1"><S S="Error">'
+            "Set-MpPreference : Access denied</S></Objs>"
+        )
+        assert _strip_clixml_progress(err) == err
+
+    def test_warnings_are_preserved(self):
+        from winbox.vm.guest import _strip_clixml_progress
+
+        warn = '#< CLIXML\r\n<Objs><S S="Warning">deprecated</S></Objs>'
+        assert _strip_clixml_progress(warn) == warn
+
+    def test_plain_stderr_untouched(self):
+        from winbox.vm.guest import _strip_clixml_progress
+
+        assert _strip_clixml_progress("boom\r\n") == "boom\r\n"
+        assert _strip_clixml_progress("") == ""
+
+    def test_exec_powershell_returns_cleaned_stderr(self, monkeypatch):
+        from winbox.config import Config
+        from winbox.vm.guest import ExecResult, GuestAgent
+
+        ga = GuestAgent(Config())
+        monkeypatch.setattr(
+            ga, "exec",
+            lambda cmd, *, timeout=300: ExecResult(
+                exitcode=0,
+                stdout="Defender: ON\n",
+                stderr='#< CLIXML\r\n<Objs><Obj S="progress"/></Objs>',
+            ),
+        )
+
+        result = ga.exec_powershell("x")
+
+        assert result.stdout == "Defender: ON\n"
+        assert result.stderr == ""
+
+
+class TestExecPowershellFile:
+    """Script paths must never traverse cmd.exe.
+
+    The guest agent escapes embedded quotes as \\" when it builds the Windows
+    command line, and cmd.exe has no backslash-escape rule — so it forwarded
+    them verbatim and PowerShell got a path with literal quote characters,
+    failing every `winbox provision` with "Illegal characters in path".
+    """
+
+    def _ga(self, monkeypatch):
+        from winbox.config import Config
+        from winbox.vm.guest import ExecResult, GuestAgent
+
+        ga = GuestAgent(Config())
+        seen = {}
+
+        def fake_exec_argv(path, args, *, timeout=300, poll_interval=0.5):
+            seen["path"] = path
+            seen["args"] = args
+            return ExecResult(exitcode=0, stdout="", stderr="")
+
+        def fail_exec(*a, **kw):
+            raise AssertionError("must not route a script path through cmd.exe")
+
+        monkeypatch.setattr(ga, "exec_argv", fake_exec_argv)
+        monkeypatch.setattr(ga, "exec", fail_exec)
+        return ga, seen
+
+    def test_path_is_passed_as_argv_not_a_shell_string(self, monkeypatch):
+        ga, seen = self._ga(monkeypatch)
+
+        ga.exec_powershell_file(r"Z:\tools\provision.ps1")
+
+        assert seen["path"] == "powershell.exe"
+        assert seen["args"] == [
+            "-ExecutionPolicy", "Bypass", "-File", r"Z:\tools\provision.ps1",
+        ]
+
+    def test_path_is_not_wrapped_in_quotes(self, monkeypatch):
+        ga, seen = self._ga(monkeypatch)
+
+        ga.exec_powershell_file(r"Z:\tools\provision.ps1")
+
+        assert '"' not in seen["args"][-1]
+
+    def test_path_with_spaces_needs_no_escaping(self, monkeypatch):
+        ga, seen = self._ga(monkeypatch)
+
+        ga.exec_powershell_file(r"C:\Program Files\x\s.ps1")
+
+        assert seen["args"][-1] == r"C:\Program Files\x\s.ps1"
+
+    def test_timeout_is_forwarded(self, monkeypatch):
+        from winbox.config import Config
+        from winbox.vm.guest import ExecResult, GuestAgent
+
+        ga = GuestAgent(Config())
+        seen = {}
+        monkeypatch.setattr(
+            ga, "exec_argv",
+            lambda p, a, *, timeout=300, poll_interval=0.5: (
+                seen.update(timeout=timeout) or ExecResult(0, "", "")
+            ),
+        )
+        ga.exec_powershell_file("x.ps1", timeout=42)
+        assert seen["timeout"] == 42

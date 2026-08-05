@@ -997,8 +997,13 @@ class TestGAExecMonotonicDeadline:
             0.0,   # time.monotonic() for deadline calculation
         ]
 
+        from tests.conftest import nonce_aware
+
         with (
-            patch.object(ga, "_raw_command", side_effect=[exec_response, poll_response]),
+            patch.object(
+                ga, "_raw_command",
+                side_effect=nonce_aware([exec_response, poll_response]),
+            ),
             patch("time.monotonic", side_effect=monotonic_values),
         ):
             result = ga.exec("fast-command", timeout=10, poll_interval=0.5)
@@ -1025,8 +1030,15 @@ class TestGAExecMonotonicDeadline:
             4.0,   # second poll check: 4 < 10, continue
         ]
 
+        from tests.conftest import nonce_aware
+
         with (
-            patch.object(ga, "_raw_command", side_effect=[exec_response, poll_not_done, poll_not_done, poll_done]),
+            patch.object(
+                ga, "_raw_command",
+                side_effect=nonce_aware(
+                    [exec_response, poll_not_done, poll_not_done, poll_done]
+                ),
+            ),
             patch("time.monotonic", side_effect=monotonic_values),
             patch("time.sleep"),
         ):

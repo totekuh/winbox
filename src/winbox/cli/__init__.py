@@ -78,6 +78,12 @@ def needs_vm(*, auto_start: bool = True):
             cfg: Config = ctx.obj["cfg"]
             vm = VM(cfg)
             ga = GuestAgent(cfg)
+            # A group callback that is only dispatching must not touch the VM:
+            # click runs it before the subcommand, so `winbox eventlogs clear
+            # --help` would boot and wait on the guest just to print help. The
+            # subcommand carries its own @needs_vm and will do this itself.
+            if ctx.invoked_subcommand is not None:
+                return fn(cfg, vm, ga, *args, **kwargs)
             if auto_start:
                 ensure_running(vm, ga, cfg)
             else:

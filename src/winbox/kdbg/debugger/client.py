@@ -112,11 +112,20 @@ class DaemonClient:
                     f"kdbg daemon unreachable ({e}); "
                     "the daemon may have died — re-run `winbox kdbg attach <pid>`"
                 ) from e
-            s.sendall(encode(request(op, **args)))
             try:
+                s.sendall(encode(request(op, **args)))
                 line = read_line(s)
             except ProtocolError as e:
                 raise ClientError(f"reply parse: {e}") from e
+            except OSError as e:
+                # The daemon can die *after* we connect — tearing down a
+                # session is exactly when that happens. Without this the
+                # caller got a raw ConnectionResetError traceback instead of
+                # something it could act on.
+                raise ClientError(
+                    f"kdbg daemon went away mid-request ({e}); "
+                    "re-run `winbox kdbg attach <pid>` if you still need a session"
+                ) from e
         finally:
             try:
                 s.close()

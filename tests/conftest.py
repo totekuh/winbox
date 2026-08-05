@@ -109,3 +109,125 @@ def mock_env(cfg):
 
         ga._vm = vm
         yield ga
+
+
+# ─── Guest-agent test doubles ───────────────────────────────────────────────
+# `GuestAgent.exec` tags each command with an identity nonce and rejects a
+# completed result that doesn't carry it, because the guest agent keys
+# buffered results by a Windows PID it readily recycles. Test doubles have to
+# model that or every canned "exited" response looks like another process's
+# leftovers.
+
+import base64 as _base64
+import re as _re
+
+NONCE_RE = _re.compile(r"__wbx[0-9a-f]{16}__")
+
+
+def extract_nonce(payload) -> str | None:
+    """Pull the identity nonce out of a ``guest-exec`` payload, if present."""
+    for arg in payload.get("arguments", {}).get("arg") or []:
+        m = NONCE_RE.search(str(arg))
+        if m:
+            return m.group(0)
+    return None
+
+
+def nonce_aware(responses):
+    """Wrap a canned ``_raw_command`` response sequence for ``GuestAgent.exec``.
+
+    Replays ``responses`` in order (an ``Exception`` element is raised), but
+    rewrites any ``exited`` result so its stdout is prefixed with the nonce
+    the call under test actually generated — which is what the real guest
+    does, since ``exec`` prepends an ``echo`` of it to the command line.
+    """
+    seq = iter(responses)
+    state: dict[str, str | None] = {"nonce": None}
+
+    def fake(payload, **kwargs):
+        if payload.get("execute") == "guest-exec":
+            found = extract_nonce(payload)
+            if found:
+                state["nonce"] = found
+        r = next(seq)
+        if isinstance(r, Exception):
+            raise r
+        ret = r.get("return", {})
+        if ret.get("exited") and state["nonce"]:
+            prior = ret.get("out-data") or ""
+            decoded = _base64.b64decode(prior).decode() if prior else ""
+            tagged = f"{state['nonce']}\r\n{decoded}"
+            r = {
+                **r,
+                "return": {
+                    **ret,
+                    "out-data": _base64.b64encode(tagged.encode()).decode(),
+                },
+            }
+        return r
+
+    return fake
+
+
+class FakeQemuGA:
+    """A faithful-enough model of qemu-ga's guest-exec slot table.
+
+    The behavior that matters, mirroring ``qga/commands.c``:
+
+    * results live in one flat list keyed by the guest's **OS PID**;
+    * a lookup returns the **first** entry matching that PID, so an older
+      abandoned entry shadows a newer one;
+    * an entry is freed only when a status read reports it as exited, so a
+      result nobody reads is retained indefinitely.
+
+    Together those let a recycled PID hand one command another command's
+    output — the contamination this models.
+    """
+
+    def __init__(self, output: str = "", exitcode: int = 0):
+        self.slots: list[dict] = []
+        self.output = output
+        self.exitcode = exitcode
+        self.pids: list[int] = []
+        self._next_pid = 1000
+
+    def seed_abandoned(self, pid: int, output: str, exitcode: int = 1) -> None:
+        """Park a completed result nobody ever read on ``pid``."""
+        self.slots.append(
+            {"pid": pid, "exited": True, "out": output, "exitcode": exitcode}
+        )
+
+    def force_next_pid(self, pid: int) -> None:
+        """Make the next ``guest-exec`` return ``pid`` (simulates recycling)."""
+        self.pids.append(pid)
+
+    def __call__(self, payload, **kwargs):
+        cmd = payload.get("execute")
+        if cmd == "guest-exec":
+            pid = self.pids.pop(0) if self.pids else self._next_pid
+            self._next_pid += 1
+            nonce = extract_nonce(payload)
+            out = f"{nonce}\r\n{self.output}" if nonce else self.output
+            self.slots.append(
+                {"pid": pid, "exited": True, "out": out, "exitcode": self.exitcode}
+            )
+            return {"return": {"pid": pid}}
+        if cmd == "guest-exec-status":
+            want = payload["arguments"]["pid"]
+            for i, slot in enumerate(self.slots):
+                if slot["pid"] != want:
+                    continue
+                if slot["exited"]:
+                    self.slots.pop(i)  # freed on read, like qemu-ga
+                return {
+                    "return": {
+                        "exited": slot["exited"],
+                        "exitcode": slot["exitcode"],
+                        "out-data": _base64.b64encode(
+                            slot["out"].encode()
+                        ).decode(),
+                        "err-data": "",
+                    }
+                }
+            return {"return": {"exited": False}}
+        return {"return": {}}

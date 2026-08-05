@@ -58,8 +58,73 @@ def hmp(
     return result.stdout
 
 
+def _hex_to_ipv4(hex_addr: str) -> str | None:
+    """Decode /proc's little-endian hex IPv4 (``0100007F`` -> ``127.0.0.1``)."""
+    if len(hex_addr) != 8:
+        return None
+    try:
+        octets = [int(hex_addr[i:i + 2], 16) for i in (6, 4, 2, 0)]
+    except ValueError:
+        return None
+    return ".".join(str(o) for o in octets)
+
+
+def _listening_sockets() -> set[tuple[str | None, int]] | None:
+    """``(address, port)`` pairs in LISTEN state, read passively from /proc.
+
+    Address is the decoded dotted-quad for IPv4, or ``None`` for IPv6 and
+    anything unparseable — callers treat ``None`` as "matches any host", which
+    keeps a v6 wildcard listener from reading as absent.
+
+    Returns None if /proc is unavailable, so callers can fall back.
+    """
+    listen_state = "0A"  # TCP_LISTEN
+    sockets: set[tuple[str | None, int]] = set()
+    found_any = False
+    for proc_file, is_v4 in (("/proc/net/tcp", True), ("/proc/net/tcp6", False)):
+        try:
+            with open(proc_file, "r") as fh:
+                lines = fh.readlines()[1:]
+        except OSError:
+            continue
+        found_any = True
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 4 or fields[3] != listen_state:
+                continue
+            local = fields[1]
+            if ":" not in local:
+                continue
+            addr_hex, _, port_hex = local.rpartition(":")
+            try:
+                port = int(port_hex, 16)
+            except ValueError:
+                continue
+            sockets.add((_hex_to_ipv4(addr_hex) if is_v4 else None, port))
+    return sockets if found_any else None
+
+
 def probe_port(host: str, port: int, timeout: float = 0.5) -> bool:
-    """True if something is accepting TCP on host:port."""
+    """True if something is listening on host:port.
+
+    Deliberately does **not** open a connection. QEMU's gdbstub halts the
+    guest CPU the moment a client attaches, so the obvious implementation —
+    ``socket.create_connection`` — turned a read-only ``kdbg status`` into
+    something that paused the VM. Worse, ``kdbg stop`` then refused to run
+    ("VM is not running"), so a status check could wedge the guest until
+    someone found ``kdbg resume``.
+
+    Reads LISTEN sockets out of /proc instead, which is passive. Falls back
+    to a connect probe only where /proc is unavailable.
+    """
+    sockets = _listening_sockets()
+    if sockets is not None:
+        return any(
+            sock_port == port
+            # None (IPv6/unparsed) and 0.0.0.0 both cover the requested host.
+            and (sock_addr is None or sock_addr in (host, "0.0.0.0"))
+            for sock_addr, sock_port in sockets
+        )
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -112,3 +177,57 @@ def read_cpu_state(vm_name: str) -> dict[str, int]:
     idt_base, _ = parse_idt(text)
     regs["IDT_BASE"] = idt_base
     return regs
+
+
+def ensure_not_paused(vm_name: str, port: int = 1234) -> str | None:
+    """Resume ``vm_name`` if a debug session left it paused.
+
+    Detaching is supposed to resume the VM, but that only happens if the
+    daemon shuts down cleanly — when it doesn't, the gdbstub keeps the CPU
+    stopped and the VM is left in ``paused`` with no indication beyond a
+    warning. Every later winbox command then hangs or reports the VM as
+    down. Called at the end of the detach paths as a safety net.
+
+    Returns a short description of what it did, or ``None`` if the VM was
+    already running (the overwhelmingly common case). Never raises: this
+    runs during teardown, where masking the original problem would be worse
+    than failing to tidy up.
+    """
+    try:
+        state = subprocess.run(
+            ["virsh", "-c", "qemu:///system", "domstate", vm_name],
+            capture_output=True, text=True, check=False,
+        )
+        if state.stdout.strip() != "paused":
+            return None
+
+        if probe_port("127.0.0.1", port):
+            # Preferred: let the stub run gdb_continue() so the CPU resumes
+            # through the same path a clean detach would have used. Imported
+            # here because the debugger package imports this module.
+            try:
+                from winbox.kdbg.debugger import RspClient
+
+                client = RspClient.connect("127.0.0.1", port, timeout=5)
+                try:
+                    client.handshake()
+                    client.cont()
+                finally:
+                    client.close()
+                return "VM was left paused by the debug session; resumed via gdbstub"
+            except Exception:
+                pass
+
+        # Stub is gone or unreachable — fall back to libvirt.
+        resumed = subprocess.run(
+            ["virsh", "-c", "qemu:///system", "resume", vm_name],
+            capture_output=True, text=True, check=False,
+        )
+        if resumed.returncode == 0:
+            return "VM was left paused by the debug session; resumed via virsh"
+        return (
+            "VM is left PAUSED and could not be resumed automatically — "
+            f"run `virsh -c qemu:///system resume {vm_name}`"
+        )
+    except Exception:
+        return None

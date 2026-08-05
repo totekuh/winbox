@@ -2,6 +2,8 @@
 
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from winbox.cli import cli
 from winbox.vm import VMState
 
@@ -155,3 +157,22 @@ class TestVnc:
         assert result.exit_code != 0
         assert "virt-manager not found" in result.output
         assert "apt install virt-manager" in result.output
+
+
+class TestStatusShowsTheGuestOs:
+    """With two possible images, which one is on disk should not require
+    reading ~/.winbox/config — it decides the install layout, the VirtIO
+    drivers, and how Defender behaves."""
+
+    @pytest.mark.parametrize("os_key", ["server2022", "win11"])
+    def test_os_line_reflects_the_configured_profile(
+        self, runner, cfg, mock_env, os_key
+    ):
+        cfg.vm_os = os_key
+        result = runner.invoke(cli, ["status"])
+        assert result.exit_code == 0
+        assert f"OS:      {os_key}" in result.output
+
+    def test_os_line_appears_before_state(self, runner, cfg, mock_env):
+        out = runner.invoke(cli, ["status"]).output
+        assert out.index("OS:") < out.index("State:")

@@ -18,7 +18,7 @@ mcp = FastMCP(
     instructions=(
         "Windows VM execution proxy for vulnerability research. "
         "Run Python code, send IOCTLs, query/set registry, list processes — "
-        "all executing inside a Windows Server 2022 VM managed by QEMU/KVM."
+        "all executing inside a Windows (Server 2022 or 11) VM managed by QEMU/KVM."
     ),
 )
 
@@ -159,6 +159,17 @@ def _format_exec_result(result: dict) -> str:
         parts.append(f"\n[stderr]\n{stderr}")
     if exitcode != 0:
         parts.append(f"\n[exit code: {exitcode}]")
+        if not stdout and not stderr:
+            # A bare "[exit code: 1]" is indistinguishable from a tool that
+            # simply says nothing, and it is exactly what an externally
+            # killed process leaves behind: Python block-buffers stdout to a
+            # pipe, so a kill before interpreter shutdown discards it. Say so
+            # rather than handing back a near-blank string.
+            parts.append(
+                "\n(no output on either stream — the in-guest process most "
+                "likely died before it could flush: killed externally, e.g. "
+                "by Defender behavior monitoring, or crashed in native code)"
+            )
     return "".join(parts) or "(no output)"
 
 
@@ -456,8 +467,17 @@ def reg_set(
         + _REG_HIVE_LOOKUP
         + _REG_TYPE_MAP
         + textwrap.dedent('''\
+            # Accept the obvious shorthands ("dword", "reg_dword") rather than
+            # failing a write over spelling.
+            reg_type_name = reg_type_name.strip().upper()
+            if not reg_type_name.startswith("REG_"):
+                reg_type_name = "REG_" + reg_type_name
             if reg_type_name not in type_map:
-                print(f"Unknown type: {reg_type_name}", file=sys.stderr)
+                print(
+                    f"Unknown type: {reg_type_name}. "
+                    f"Expected one of: {', '.join(sorted(type_map))}",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
 
             reg_type, converter = type_map[reg_type_name]
@@ -1020,6 +1040,137 @@ def service_start(name: str, timeout: int = 30) -> str:
     cfg, vm, ga = _ensure_vm_ready()
     result = ga.exec(f"sc.exe start {name}", timeout=timeout)
     return _format_exec_result(result)
+
+
+# ─── Tool 8b: av_enable / av_disable / av_status ────────────────────────────
+# Thin frontends over winbox.defender — the same enable/disable/status
+# operations the `winbox av` CLI group calls, so the two never drift.
+
+@mcp.tool()
+def av_status(timeout: int = 15) -> str:
+    """Report Windows Defender / AMSI protection state in the VM.
+
+    Runs Get-MpComputerStatus + Get-MpPreference and summarises as
+    ON / OFF / partial plus the individual RealTimeProtection, AMSI
+    (ScriptScanning), BehaviorMonitoring, and IOAVProtection flags.
+    Read-only — safe to call any time.
+
+    Args:
+        timeout: Execution timeout in seconds (default 15).
+    """
+    from winbox import defender
+
+    cfg, vm, ga = _ensure_vm_ready()
+    return _format_exec_result(defender.status(ga, timeout=timeout))
+
+
+@mcp.tool()
+def av_enable() -> str:
+    """Re-enable Windows Defender real-time protection, AMSI, and behavior monitoring.
+
+    Removes the GP / non-policy registry overrides, starts the WinDefend
+    service via sc.exe (PowerShell Start-Service is ACL-blocked), adds
+    exclusions for the QEMU guest agent and the Z:\\ VirtIO-FS share so
+    winbox tooling keeps working, then re-asserts the Set-MpPreference
+    flags. Persists across reboots. Undo with av_disable. No reboot needed.
+    """
+    from winbox import defender
+
+    cfg, vm, ga = _ensure_vm_ready()
+    steps: list[str] = []
+    try:
+        needs_reboot = defender.enable(ga, progress=steps.append)
+    except defender.DefenderError as e:
+        detail = _format_exec_result(e.result) if e.result is not None else ""
+        return f"error: {e}\n{detail}".rstrip()
+
+    if needs_reboot:
+        # A Win11 image built with the offline Defender disable keeps
+        # WinDefend marked disabled in the SCM for the life of this boot, so
+        # the corrected start types only apply after a restart.
+        return (
+            "Defender service start types restored, but WinDefend is still "
+            "disabled in this boot's SCM. Reboot the VM and call av_enable "
+            "again to finish (the CLI `winbox av enable` does this for you)."
+        )
+    return "Defender enabled (real-time, AMSI, behavior monitoring). Undo with av_disable."
+
+
+@mcp.tool()
+def av_disable(confirm: bool = False) -> str:
+    """Disable Windows Defender completely — sets GP registry keys then REBOOTS the VM.
+
+    WinDefend is a protected process (PPL) that no user-mode caller,
+    including SYSTEM, can stop while running — only a reboot with the
+    GP keys set (DisableAntiSpyware + Real-Time Protection overrides)
+    actually kills it. This tool therefore reboots the VM, which DROPS
+    any live kdbg session and open named-pipe handles.
+
+    Because of the reboot, ``confirm`` must be True or the call is a
+    no-op. Undo with av_enable.
+
+    Args:
+        confirm: Must be True to actually run (guards the reboot).
+    """
+    from winbox import defender
+
+    if not confirm:
+        return (
+            "error: av_disable reboots the VM (kills live kdbg / pipe sessions). "
+            "Pass confirm=True to proceed."
+        )
+
+    cfg, vm, ga = _ensure_vm_ready()
+
+    # Step 0: On Win11 client, Tamper Protection silently neuters the GP-key
+    # disable. Refuse rather than reboot into a still-protected VM.
+    if defender.tamper_protection_on(ga):
+        return (
+            "error: Tamper Protection is ON — Defender cannot be disabled from the "
+            "running OS. It should have been cleared offline by `winbox setup --os "
+            "win11`; otherwise turn it off in Windows Security (Virus & threat "
+            "protection > Manage settings > Tamper Protection) and retry."
+        )
+
+    # Step 1: Set the GP registry keys (shared with the CLI).
+    try:
+        defender.set_disable_regkeys(ga)
+    except defender.DefenderError as e:
+        detail = _format_exec_result(e.result) if e.result is not None else ""
+        return f"error: {e}\n{detail}".rstrip()
+
+    # Step 2: Reboot — the only way to actually stop the WinDefend service.
+    # The MCP server does its own wait (no console) rather than the CLI's
+    # reboot_and_wait, but the reason it must reboot lives in winbox.defender.
+    try:
+        ga.exec("shutdown /r /t 0", timeout=10)
+    except GuestAgentError:
+        # Expected: the VM dies before the GA can ACK.
+        pass
+
+    import time as _time
+    _time.sleep(10)
+    try:
+        ga.wait(timeout=120)
+    except GuestAgentError:
+        return (
+            "Registry keys set and reboot issued, but the guest agent did not "
+            "come back within 120s. Check with: virsh console " + cfg.vm_name
+        )
+
+    # Step 3: Verify — Win11 can ignore the keys even with TP off, so confirm
+    # rather than assert a disable we may not have achieved.
+    try:
+        out = (defender.status(ga, timeout=20).stdout or "").strip()
+    except GuestAgentError:
+        out = ""
+    if "Defender: OFF" in out or "Defender: off" in out:
+        return "Defender disabled — GP keys set and VM rebooted; protections off."
+    return (
+        "Registry keys set and VM rebooted, but Defender still reports active "
+        "(on Win11 the DisableAntiSpyware key is ignored on client SKUs). "
+        "Current status:\n" + (out or "(status unavailable)")
+    )
 
 
 # ─── Tool 9: net_isolate / net_unplug / net_connect ─────────────────────────
@@ -2634,12 +2785,19 @@ def kdbg_detach() -> str:
         pass
     # Wait for lock release (daemon exit) up to 5s.
     import time as _time
+    from winbox.kdbg.hmp import ensure_not_paused
+
     deadline = _time.monotonic() + 5.0
+    result = "warning: daemon didn't exit within 5s; lock may be stale"
     while _time.monotonic() < deadline:
         if not client.session_alive():
-            return "detached"
+            result = "detached"
+            break
         _time.sleep(0.1)
-    return "warning: daemon didn't exit within 5s; lock may be stale"
+    # A daemon that didn't shut down cleanly never resumed the CPU, so the VM
+    # is left paused and every later tool call sees it as down.
+    note = ensure_not_paused(cfg.vm_name)
+    return f"{result} ({note})" if note else result
 
 
 @mcp.tool()

@@ -436,18 +436,32 @@ def hosts_delete(cfg: Config, vm: VM, ga: GuestAgent, hostname: str) -> None:
     _validate_hostname(hostname)
 
     hostname_escaped = hostname.replace('.', '\\.').replace('-', '\\-')
+    # Report what actually changed, and skip the write when nothing matched —
+    # claiming "Removed <host>" for an entry that was never there reads as
+    # confirmation that the hosts file no longer routes it, which is a
+    # different (and unverified) statement.
     script = (
         f"$f = '{HOSTS_PATH}'\n"
-        f"$lines = Get-Content $f\n"
-        f"$lines = @($lines | Where-Object {{ $_ -match '^\\s*#' -or $_ -notmatch '\\s{hostname_escaped}(\\s|$)' }})\n"
-        f"Set-Content -Path $f -Value $lines"
+        f"$lines = @(Get-Content $f)\n"
+        f"$keep = @($lines | Where-Object {{ $_ -match '^\\s*#' -or $_ -notmatch '\\s{hostname_escaped}(\\s|$)' }})\n"
+        f"$removed = $lines.Count - $keep.Count\n"
+        f"if ($removed -gt 0) {{ Set-Content -Path $f -Value $keep }}\n"
+        f"Write-Host \"REMOVED=$removed\""
     )
     result = ga.exec_powershell(script, timeout=15)
     if result.exitcode != 0:
         console.print(f"[red][-][/] {result.stderr.strip()}")
         raise SystemExit(1)
 
-    console.print(f"[green][+][/] Removed {hostname}")
+    removed = 0
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("REMOVED="):
+            removed = int(line.split("=", 1)[1].strip() or 0)
+    if removed:
+        plural = "entry" if removed == 1 else "entries"
+        console.print(f"[green][+][/] Removed {removed} {plural} for {hostname}")
+    else:
+        console.print(f"[yellow][!][/] No hosts entry for {hostname} — nothing to remove")
 
 
 # ─── domain ──────────────────────────────────────────────────────────────────

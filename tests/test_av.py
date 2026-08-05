@@ -1,20 +1,22 @@
 """Tests for winbox.cli.av — enable/disable/status commands."""
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from winbox.cli import cli
-from winbox.cli.av import (
-    _DISABLE_REG_ARGS,
-    _ENABLE_SCRIPT,
-    _EXCLUSION_SCRIPT,
-    _GP_DEFENDER,
-    _GP_DEFENDER_REG,
-    _GP_RTP,
-    _GP_RTP_REG,
-    _MS_RTP,
-    _MS_RTP_REG,
-    _PREFS_ENABLE_SCRIPT,
-    _STATUS_SCRIPT,
+from winbox.defender import (
+    DISABLE_REG_ARGS as _DISABLE_REG_ARGS,
+    ENABLE_SCRIPT as _ENABLE_SCRIPT,
+    EXCLUSION_SCRIPT as _EXCLUSION_SCRIPT,
+    GP_DEFENDER as _GP_DEFENDER,
+    GP_DEFENDER_REG as _GP_DEFENDER_REG,
+    GP_RTP as _GP_RTP,
+    GP_RTP_REG as _GP_RTP_REG,
+    MS_RTP as _MS_RTP,
+    MS_RTP_REG as _MS_RTP_REG,
+    PREFS_ENABLE_SCRIPT as _PREFS_ENABLE_SCRIPT,
+    STATUS_SCRIPT as _STATUS_SCRIPT,
 )
 from winbox.vm.guest import ExecResult
 
@@ -135,9 +137,16 @@ class TestAvDisable:
         mock_env.exec.return_value = ExecResult(
             exitcode=0, stdout="", stderr=""
         )
+        # Benign reads: TP off (no TAMPER_ON) before disable, and Defender
+        # reports OFF on the post-reboot verification.
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout="TAMPER_OFF\nDefender: OFF (all protections disabled)\n",
+            stderr="",
+        )
 
-        with patch("winbox.cli.av.time.sleep"), \
-             patch("winbox.cli.av._ensure_z_drive"):
+        with patch("winbox.cli.time.sleep"), \
+             patch("winbox.cli._ensure_z_drive"):
             result = runner.invoke(cli, ["av", "disable"])
 
         assert result.exit_code == 0
@@ -182,27 +191,43 @@ class TestAvDisable:
         )
         mock_env.wait.side_effect = GuestAgentError("timeout")
 
-        with patch("winbox.cli.av.time.sleep"), \
-             patch("winbox.cli.av._ensure_z_drive"):
+        with patch("winbox.cli.time.sleep"), \
+             patch("winbox.cli._ensure_z_drive"):
             result = runner.invoke(cli, ["av", "disable"])
 
         assert result.exit_code != 0
         assert "not responding" in result.output
 
-    def test_disable_uses_no_encoded_powershell(self, runner, mock_env):
-        """AMSI blocks encoded PowerShell — disable uses reg.exe only."""
+    def test_disable_mutation_uses_no_encoded_powershell(self, runner, mock_env):
+        """AMSI flags `Set-MpPreference -Disable* $true` inside encoded PS, so the
+        disable *mutation* must go through reg.exe (exec_argv). Benign reads
+        (Tamper-Protection / status) via exec_powershell are allowed — the same
+        reads `av status` already does while Defender is live."""
         mock_env.exec_argv.return_value = ExecResult(
             exitcode=0, stdout="", stderr=""
         )
         mock_env.exec.return_value = ExecResult(
             exitcode=0, stdout="", stderr=""
         )
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout="TAMPER_OFF\nDefender: OFF (all protections disabled)\n",
+            stderr="",
+        )
 
-        with patch("winbox.cli.av.time.sleep"), \
-             patch("winbox.cli.av._ensure_z_drive"):
+        with patch("winbox.cli.time.sleep"), \
+             patch("winbox.cli._ensure_z_drive"):
             runner.invoke(cli, ["av", "disable"])
 
-        mock_env.exec_powershell.assert_not_called()
+        # No exec_powershell call may carry a mutating Set-MpPreference payload
+        # (that's what AMSI blocks); only benign reads are allowed. Ignore
+        # comment lines, which may mention the cmdlet in prose.
+        for call in mock_env.exec_powershell.call_args_list:
+            script = call[0][0] if call[0] else ""
+            code = "\n".join(
+                ln for ln in script.splitlines() if not ln.lstrip().startswith("#")
+            )
+            assert "Set-MpPreference" not in code
 
 
 # ─── status ──────────────────────────────────────────────────────────────────
@@ -338,3 +363,94 @@ class TestScriptContent:
         assert "RealTimeProtection" in _STATUS_SCRIPT
         assert "AMSI" in _STATUS_SCRIPT
         assert "BehaviorMonitor" in _STATUS_SCRIPT
+
+
+class TestEnableNeedsRebootWhenServiceDisabled:
+    """A Win11 image built with the offline Defender disable has WinDefend
+    marked disabled in the SCM for the whole boot. The start types get
+    corrected, but `sc start` still returns 1058 (ERROR_SERVICE_DISABLED) —
+    and treating that as fatal meant `av enable` could never re-enable
+    Defender on Win11 at all.
+    """
+
+    def _ga(self, start_exitcodes):
+        from winbox.vm.guest import ExecResult
+
+        ga = MagicMock()
+        codes = list(start_exitcodes)
+
+        def fake_exec(cmd, **kw):
+            if "sc.exe start WinDefend" in cmd:
+                return ExecResult(exitcode=codes.pop(0), stdout="", stderr="")
+            return ExecResult(exitcode=0, stdout="", stderr="")
+
+        ga.exec.side_effect = fake_exec
+        ga.exec_powershell.return_value = ExecResult(0, "", "")
+        ga.exec_argv.return_value = ExecResult(0, "", "")
+        return ga
+
+    def test_1058_reports_reboot_required_instead_of_raising(self):
+        from winbox import defender
+
+        assert defender.enable(self._ga([1058])) is True
+
+    @pytest.mark.parametrize("code", [0, 1056])
+    def test_started_or_already_running_completes(self, code):
+        from winbox import defender
+
+        assert defender.enable(self._ga([code])) is False
+
+    def test_other_failures_still_raise(self):
+        from winbox import defender
+
+        with pytest.raises(defender.DefenderError, match="Failed to start WinDefend"):
+            defender.enable(self._ga([5]))
+
+    def test_1058_skips_the_steps_that_need_a_running_service(self):
+        """Setting preferences against a stopped WinDefend just errors."""
+        from winbox import defender
+
+        ga = self._ga([1058])
+        defender.enable(ga)
+        scripts = [c[0][0] for c in ga.exec_powershell.call_args_list]
+        assert not any("Set-MpPreference" in s for s in scripts)
+
+    def test_cli_reboots_and_retries(self, runner, mock_env):
+        from winbox.vm.guest import ExecResult
+
+        mock_env.exec_powershell.return_value = ExecResult(
+            0, "TAMPER_OFF\nDefender: ON\n", ""
+        )
+        with (
+            patch("winbox.cli.av.defender.enable", side_effect=[True, False]) as enable,
+            patch("winbox.cli.av.reboot_and_wait") as reboot,
+        ):
+            result = runner.invoke(cli, ["av", "enable"])
+
+        assert result.exit_code == 0
+        reboot.assert_called_once()
+        assert enable.call_count == 2
+        assert "Defender enabled" in result.output
+
+    def test_cli_gives_up_after_one_reboot(self, runner, mock_env):
+        with (
+            patch("winbox.cli.av.defender.enable", side_effect=[True, True]),
+            patch("winbox.cli.av.reboot_and_wait"),
+        ):
+            result = runner.invoke(cli, ["av", "enable"])
+
+        assert result.exit_code != 0
+        assert "still disabled after a reboot" in result.output
+
+    def test_mcp_reports_the_reboot_requirement(self):
+        import winbox.mcp as m
+
+        fn = m.av_enable.fn if hasattr(m.av_enable, "fn") else m.av_enable
+        with (
+            patch.object(m, "_ensure_vm_ready", return_value=(MagicMock(),) * 3),
+            patch("winbox.defender.enable", return_value=True),
+        ):
+            out = fn()
+
+        assert "Reboot the VM" in out
+        assert "av_enable" in out
