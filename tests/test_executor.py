@@ -6,7 +6,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from winbox.exec.executor import resolve_exe, run_command
-from winbox.vm.guest import ExecResult, GuestAgentError
+from winbox.vm.guest import (
+    ExecResult,
+    GuestAgentError,
+    GuestAgentUnreachable,
+    GuestExecAbandoned,
+    GuestExecTimeout,
+)
 
 
 class TestResolveExe:
@@ -117,9 +123,14 @@ class TestRunCommandRetryPolicy:
         """exec() taskkills the whole process tree on timeout, so a retry
         re-runs a half-finished, state-mutating command from scratch."""
         ga = self._ga()
-        ga.exec.side_effect = GuestAgentError("Command timed out after 60s (PID 4242)")
+        # The *type* is what marks this as already-run; matching the message
+        # was the bug (libvirt says "operation timed out" for failures that
+        # never launched anything).
+        ga.exec.side_effect = GuestExecTimeout(
+            "Command timed out after 60s (PID 4242)", pid=4242
+        )
 
-        with pytest.raises(GuestAgentError, match="timed out"):
+        with pytest.raises(GuestExecTimeout, match="timed out"):
             run_command(cfg, ga, "installer.exe", ("/S",), timeout=60)
 
         assert ga.exec.call_count == 1, (
@@ -130,11 +141,13 @@ class TestRunCommandRetryPolicy:
         """Same reasoning: the command executed, we just couldn't collect its
         output on a recycled PID."""
         ga = self._ga()
-        ga.exec.side_effect = GuestAgentError(
-            "Could not obtain this command's own output on PID 4242 after 3 foreign results"
+        ga.exec.side_effect = GuestExecAbandoned(
+            "Could not obtain this command's own output on PID 4242 after 3 "
+            "foreign results",
+            pid=4242,
         )
 
-        with pytest.raises(GuestAgentError):
+        with pytest.raises(GuestExecAbandoned):
             run_command(cfg, ga, "installer.exe", (), timeout=60)
 
         assert ga.exec.call_count == 1
@@ -143,7 +156,8 @@ class TestRunCommandRetryPolicy:
         """The pipe race this loop was built for must keep working."""
         ga = self._ga()
         ga.exec.side_effect = [
-            GuestAgentError("Guest agent command failed: The handle is invalid."),
+            # Pre-launch transport failure — nothing ran, so retry is free.
+            GuestAgentUnreachable("Guest agent command failed: The handle is invalid."),
             ExecResult(exitcode=0, stdout="ok", stderr=""),
         ]
 
@@ -151,3 +165,29 @@ class TestRunCommandRetryPolicy:
 
         assert rc == 0
         assert ga.exec.call_count == 2
+
+
+class TestPreLaunchTimeoutTextIsStillRetried:
+    """libvirt renders its own pre-launch failures as "operation timed out".
+
+    The old classifier matched on that substring, so a transport failure that
+    never started anything was treated as "already ran" and the retry loop —
+    the entire reason this code exists — silently switched itself off.
+    """
+
+    def test_libvirt_operation_timeout_is_retried(self, cfg):
+        ga = MagicMock()
+        ga.exec.side_effect = [
+            GuestAgentUnreachable(
+                "Guest agent command failed: error: operation timed out"
+            ),
+            ExecResult(exitcode=0, stdout="ok", stderr=""),
+        ]
+
+        rc = run_command(cfg, ga, "whoami.exe", (), timeout=60)
+
+        assert rc == 0
+        assert ga.exec.call_count == 2, (
+            "a pre-launch failure whose message says 'timed out' must still "
+            "be retried — nothing ran"
+        )

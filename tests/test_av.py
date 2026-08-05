@@ -5,6 +5,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from winbox.cli import cli
+from winbox.defender import EnableOutcome
+
+# enable() reports two facts now; these are the two shapes the tests use.
+_OUT_REBOOT = EnableOutcome(reboot_required=True)
+_OUT_DONE = EnableOutcome(reboot_required=False)
 from winbox.defender import (
     DISABLE_REG_ARGS as _DISABLE_REG_ARGS,
     ENABLE_SCRIPT as _ENABLE_SCRIPT,
@@ -403,13 +408,13 @@ class TestEnableNeedsRebootWhenServiceDisabled:
     def test_1058_reports_reboot_required_instead_of_raising(self):
         from winbox import defender
 
-        assert defender.enable(self._ga([1058])) is True
+        assert defender.enable(self._ga([1058])).reboot_required is True
 
     @pytest.mark.parametrize("code", [0, 1056])
     def test_started_or_already_running_completes(self, code):
         from winbox import defender
 
-        assert defender.enable(self._ga([code])) is False
+        assert defender.enable(self._ga([code])).reboot_required is False
 
     def test_other_failures_still_raise(self):
         from winbox import defender
@@ -433,7 +438,7 @@ class TestEnableNeedsRebootWhenServiceDisabled:
             0, "TAMPER_OFF\nDefender: ON\n", ""
         )
         with (
-            patch("winbox.cli.av.defender.enable", side_effect=[True, False]) as enable,
+            patch("winbox.cli.av.defender.enable", side_effect=[_OUT_REBOOT, _OUT_DONE]) as enable,
             patch("winbox.cli.av.reboot_and_wait") as reboot,
         ):
             result = runner.invoke(cli, ["av", "enable"])
@@ -445,7 +450,7 @@ class TestEnableNeedsRebootWhenServiceDisabled:
 
     def test_cli_gives_up_after_one_reboot(self, runner, mock_env):
         with (
-            patch("winbox.cli.av.defender.enable", side_effect=[True, True]),
+            patch("winbox.cli.av.defender.enable", side_effect=[_OUT_REBOOT, _OUT_REBOOT]),
             patch("winbox.cli.av.reboot_and_wait"),
         ):
             result = runner.invoke(cli, ["av", "enable"])
@@ -453,13 +458,21 @@ class TestEnableNeedsRebootWhenServiceDisabled:
         assert result.exit_code != 0
         assert "still disabled after a reboot" in result.output
 
-    def _mcp_enable(self, ga):
+    def _mcp_enable(self, ga, unwritten=()):
+        """Drive the MCP tool with a real `ga` behind the readback.
+
+        `enable()` performs the readback itself now, so the outcome is what
+        carries the answer to the frontend.
+        """
         import winbox.mcp as m
 
         fn = m.av_enable.fn if hasattr(m.av_enable, "fn") else m.av_enable
+        outcome = EnableOutcome(
+            reboot_required=True, start_types_unwritten=tuple(unwritten)
+        )
         with (
             patch.object(m, "_ensure_vm_ready", return_value=(MagicMock(), MagicMock(), ga)),
-            patch("winbox.defender.enable", return_value=True),
+            patch("winbox.defender.enable", return_value=outcome),
         ):
             return fn()
 
@@ -499,7 +512,9 @@ class TestEnableNeedsRebootWhenServiceDisabled:
         tool used to report them restored and ask for a reboot — an
         unbreakable loop, since the reboot changes nothing."""
         ga = self._start_readback({"WinDefend": 4, "WdFilter": 4, "WdNisSvc": 4, "WdNisDrv": 4})
-        out = self._mcp_enable(ga)
+        out = self._mcp_enable(
+            ga, unwritten=("WinDefend", "WdFilter", "WdNisSvc", "WdNisDrv")
+        )
 
         assert "restored" not in out or "could NOT be restored" in out
         assert "WinDefend" in out
@@ -601,7 +616,7 @@ class TestEnableClearsTamperProtection:
     ):
         cfg.vm_os = "win11"
         with (
-            patch("winbox.cli.av.defender.enable", side_effect=[True, False]),
+            patch("winbox.cli.av.defender.enable", side_effect=[_OUT_REBOOT, _OUT_DONE]),
             patch("winbox.cli.av._restart_clearing_tamper_protection") as restart,
             patch("winbox.cli.av.reboot_and_wait") as warm,
         ):
@@ -614,7 +629,7 @@ class TestEnableClearsTamperProtection:
     def test_server_still_warm_reboots(self, runner, mock_env, cfg):
         cfg.vm_os = "server2022"
         with (
-            patch("winbox.cli.av.defender.enable", side_effect=[True, False]),
+            patch("winbox.cli.av.defender.enable", side_effect=[_OUT_REBOOT, _OUT_DONE]),
             patch("winbox.cli.av._restart_clearing_tamper_protection") as restart,
             patch("winbox.cli.av.reboot_and_wait") as warm,
         ):
@@ -690,7 +705,7 @@ class TestEnableVerifiesWhatItClaims:
 
     def _run(self, runner, statuses):
         with (
-            patch("winbox.cli.av.defender.enable", return_value=False),
+            patch("winbox.cli.av.defender.enable", return_value=_OUT_DONE),
             patch("winbox.cli.av._status_text", side_effect=statuses),
             patch("winbox.cli.av.reboot_and_wait") as reboot,
         ):
@@ -785,3 +800,108 @@ class TestOfflineEditNeverTouchesALiveDisk:
             _disable_via_offline_hive(cfg, vm, ga)
 
         edit.assert_not_called()
+
+
+class TestEnableChecksItsOwnWrites:
+    """`Services\\*\\Start` is ACL-protected. `enable()` wrote those four
+    values and discarded every exit code, so on a guest built with the offline
+    Defender disable it reported a restore that never happened — and the
+    caller then asked for a reboot that could not possibly help."""
+
+    def _ga(self, *, write_rc=0, readback):
+        from winbox.vm.guest import ExecResult
+
+        ga = MagicMock()
+
+        def fake_argv(exe, args, **kw):
+            svc = args[1].rsplit("\\", 1)[-1]
+            if args[0] == "add":
+                return ExecResult(exitcode=write_rc, stdout="", stderr="Access is denied.")
+            return ExecResult(
+                exitcode=0,
+                stdout=f"    Start    REG_DWORD    0x{readback[svc]:x}\n",
+                stderr="",
+            )
+
+        ga.exec_argv.side_effect = fake_argv
+        ga.exec.return_value = ExecResult(exitcode=1058, stdout="", stderr="")
+        ga.exec_powershell.return_value = ExecResult(0, "", "")
+        return ga
+
+    SHIPPED = {"WinDefend": 2, "WdFilter": 0, "WdNisSvc": 3, "WdNisDrv": 3}
+    DISABLED = {"WinDefend": 4, "WdFilter": 4, "WdNisSvc": 4, "WdNisDrv": 4}
+
+    def test_reports_every_service_it_could_not_write(self):
+        from winbox import defender
+
+        outcome = defender.enable(self._ga(write_rc=1, readback=self.DISABLED))
+
+        assert outcome.reboot_required is True
+        assert set(outcome.start_types_unwritten) == set(self.SHIPPED)
+
+    def test_reports_nothing_unwritten_when_the_values_did_land(self):
+        from winbox import defender
+
+        outcome = defender.enable(self._ga(readback=self.SHIPPED))
+
+        assert outcome.reboot_required is True
+        assert outcome.start_types_unwritten == ()
+
+    def test_verifies_by_reading_back_not_by_trusting_the_exit_code(self):
+        """reg.exe has been seen returning 0 while changing nothing."""
+        from winbox import defender
+
+        outcome = defender.enable(self._ga(write_rc=0, readback=self.DISABLED))
+
+        assert set(outcome.start_types_unwritten) == set(self.SHIPPED)
+
+    def test_a_service_that_cannot_be_read_counts_as_unwritten(self):
+        """Failing closed only ever downgrades a success claim."""
+        from winbox import defender
+        from winbox.vm.guest import ExecResult
+
+        ga = MagicMock()
+        ga.exec_argv.side_effect = lambda *a, **kw: ExecResult(1, "", "boom")
+        ga.exec.return_value = ExecResult(exitcode=1058, stdout="", stderr="")
+        ga.exec_powershell.return_value = ExecResult(0, "", "")
+
+        assert set(defender.enable(ga).start_types_unwritten) == set(self.SHIPPED)
+
+    def test_cli_refuses_to_send_the_user_round_a_pointless_reboot(
+        self, runner, mock_env
+    ):
+        from winbox.defender import EnableOutcome
+
+        with (
+            patch(
+                "winbox.cli.av.defender.enable",
+                return_value=EnableOutcome(
+                    reboot_required=True,
+                    start_types_unwritten=("WinDefend", "WdFilter"),
+                ),
+            ),
+            patch("winbox.cli.av.reboot_and_wait") as reboot,
+            patch("winbox.cli.av._restart_clearing_tamper_protection") as restart,
+        ):
+            result = runner.invoke(cli, ["av", "enable"])
+
+        assert result.exit_code != 0
+        assert "ACL-protected" in result.output
+        assert "WinDefend" in result.output
+        reboot.assert_not_called()
+        restart.assert_not_called()
+
+    def test_the_start_type_table_has_one_definition(self):
+        """Two hardcoded copies, in the module whose job is verifying the
+        other one wrote them, is how they drift."""
+        import inspect
+
+        import winbox.mcp as mcp_mod
+        from winbox import defender
+
+        assert not hasattr(mcp_mod, "_DEFENDER_DEFAULT_START")
+        assert defender._DEFENDER_DEFAULT_START == {
+            "WinDefend": 2, "WdFilter": 0, "WdNisSvc": 3, "WdNisDrv": 3
+        }
+        # enable() must drive its writes from that table, not its own literal.
+        assert "_DEFENDER_DEFAULT_START.items()" in inspect.getsource(defender.enable)

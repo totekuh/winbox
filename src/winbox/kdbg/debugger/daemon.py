@@ -1500,12 +1500,19 @@ def _validate_module_bases(
                 )
             else:
                 if live_nt_base != cached_nt_base:
-                    raise DaemonError(
-                        f"stale nt base: cached 0x{cached_nt_base:x}, "
-                        f"actual 0x{live_nt_base:x}. ASLR moved the kernel "
-                        f"since symbols were loaded (typically a VM reboot). "
-                        f"Run `winbox kdbg base` to refresh nt base, then "
-                        f"`winbox kdbg symbols load -m nt` to repull."
+                    # ASLR moves the kernel every boot, and the symbol store
+                    # outlives the boot that produced it — so this fires after
+                    # any restart. Only the *base* moved; every RVA in the
+                    # store is still correct, so re-pointing it is the whole
+                    # repair. Telling the user to run two commands that do
+                    # exactly this was busywork standing between them and a
+                    # working debugger.
+                    store.set_base("nt", live_nt_base)
+                    print(
+                        f"note: nt base moved 0x{cached_nt_base:x} -> "
+                        f"0x{live_nt_base:x} (ASLR, typically a VM reboot); "
+                        f"refreshed automatically",
+                        file=sys.stderr,
                     )
 
     # ── Step 2: collect user-mode candidates with cached bases ──
@@ -1569,15 +1576,33 @@ def _validate_module_bases(
             stale.append((mod_name, cached_base, actual_base))
 
     if stale:
-        details = ", ".join(
-            f"{name} (cached 0x{cached:x}, actual 0x{actual:x})"
-            for name, cached, actual in stale
-        )
-        raise DaemonError(
-            f"stale module bases for {target.name}: {details}. "
-            f"ASLR moved them since symbols were loaded. "
-            f"Re-run kdbg_user_symbols_load for each stale module before retrying."
-        )
+        # Same story as the kernel above: ASLR relocated the images, but the
+        # symbols themselves are still valid — only the base each RVA is added
+        # to has changed, and the live value is right here in `target_loaded`.
+        # The documented remedy (kdbg_user_symbols_load per module) re-copied
+        # the PE and re-parsed its PDB purely to arrive at this same number.
+        repaired: list[str] = []
+        failed: list[str] = []
+        for name, cached, actual in stale:
+            try:
+                store.set_base(name, actual)
+            except Exception as e:  # store unwritable, malformed, ...
+                failed.append(f"{name} ({type(e).__name__}: {e})")
+            else:
+                repaired.append(f"{name} 0x{cached:x} -> 0x{actual:x}")
+
+        if repaired:
+            print(
+                f"note: refreshed {len(repaired)} stale module base(s) for "
+                f"{target.name} after ASLR: {', '.join(repaired)}",
+                file=sys.stderr,
+            )
+        if failed:
+            raise DaemonError(
+                f"stale module bases for {target.name} could not be "
+                f"refreshed: {', '.join(failed)}. Re-run "
+                f"kdbg_user_symbols_load for each before retrying."
+            )
 
 
 def fork_daemon(

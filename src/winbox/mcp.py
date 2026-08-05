@@ -1064,54 +1064,6 @@ def av_status(timeout: int = 15) -> str:
     return _format_exec_result(defender.status(ga, timeout=timeout))
 
 
-# The start types defender.enable() writes back with reg.exe, and the values
-# it writes. Kept here so the MCP tool can *verify* the write instead of
-# trusting it — see _defender_start_types_unwritten.
-_DEFENDER_DEFAULT_START = {"WinDefend": 2, "WdFilter": 0, "WdNisSvc": 3, "WdNisDrv": 3}
-
-
-def _defender_start_types_unwritten(ga: GuestAgent) -> list[str]:
-    """Return the Defender services whose Services\\*\\Start is still wrong.
-
-    defender.enable() writes these with reg.exe and discards the exit codes,
-    but those values are ACL-protected: on a guest built with the offline
-    Defender disable the write silently fails. Read them back rather than
-    trusting the write — claiming "start types restored" when nothing was
-    written sent agents into an unbreakable loop (reboot, retry, identical
-    ERROR_SERVICE_DISABLED, forever) with no hint that the real fix is the
-    host-side offline hive edit.
-
-    A service we cannot read is reported as unwritten: this gate only ever
-    downgrades a success claim, so failing closed is the safe direction.
-    """
-    import re as _re
-
-    unwritten: list[str] = []
-    for svc, want in _DEFENDER_DEFAULT_START.items():
-        try:
-            result = ga.exec_argv(
-                "reg.exe",
-                ["query", rf"HKLM\SYSTEM\CurrentControlSet\Services\{svc}",
-                 "/v", "Start"],
-                timeout=15,
-            )
-            match = _re.search(
-                r"Start\s+REG_DWORD\s+0x([0-9a-fA-F]+)", result.stdout or ""
-            )
-            ok = (
-                result.exitcode == 0
-                and match is not None
-                and int(match.group(1), 16) == want
-            )
-        except Exception:
-            # Any probe failure counts as "could not confirm" — a crash inside
-            # an MCP tool is worse than a downgraded success claim.
-            ok = False
-        if not ok:
-            unwritten.append(svc)
-    return unwritten
-
-
 @mcp.tool()
 def av_enable() -> str:
     """Re-enable Windows Defender real-time protection, AMSI, and behavior monitoring.
@@ -1129,17 +1081,17 @@ def av_enable() -> str:
     cfg, vm, ga = _ensure_vm_ready()
     steps: list[str] = []
     try:
-        needs_reboot = defender.enable(ga, progress=steps.append)
+        outcome = defender.enable(ga, progress=steps.append)
     except defender.DefenderError as e:
         detail = _format_exec_result(e.result) if e.result is not None else ""
         return f"error: {e}\n{detail}".rstrip()
 
-    if needs_reboot:
+    if outcome.reboot_required:
         # A Win11 image built with the offline Defender disable keeps
         # WinDefend marked disabled in the SCM for the life of this boot, so
         # the corrected start types only apply after a restart — *if* they
         # were corrected at all. Verify before promising a reboot will help.
-        unwritten = _defender_start_types_unwritten(ga)
+        unwritten = outcome.start_types_unwritten
         if unwritten:
             return (
                 "error: WinDefend is disabled in this boot's SCM and the service "

@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from winbox.vm.guest import ExecResult, GuestAgent, GuestAgentError
+from winbox.vm.guest import (
+    ExecResult,
+    GuestAgent,
+    GuestAgentError,
+    GuestExecAbandoned,
+    GuestExecTimeout,
+)
 from winbox.jobs import Job, JobMode, JobStatus, JobStore
 from winbox.utils import human_size
 
@@ -20,24 +26,20 @@ console = Console()
 
 
 def _command_already_ran(err: GuestAgentError) -> bool:
-    """True when this GuestAgentError means the guest already launched the command.
+    """True when this error means the guest already launched the command.
 
     The retry loop below exists for the GA pipe race, which fails *before* the
-    process starts — retrying is free. A timeout is the opposite: `exec` has
-    already run the command for the full timeout and taskkill'd its whole tree,
-    so a retry re-runs a half-completed, non-idempotent operation (installers,
-    registry writers, exploit PoCs) and kills it again. Same for the
-    foreign-result path: the command ran, we just couldn't collect its output.
+    process starts — retrying is free. Anything that already ran is the
+    opposite: a retry re-runs a half-completed, non-idempotent operation
+    (installers, registry writers, exploit PoCs).
 
-    Matched on the message because winbox.vm.guest raises one flat
-    GuestAgentError for every failure mode; a dedicated GuestExecTimeout
-    subclass there would let this be an `except` clause instead.
+    The axis is launch-phase vs poll-phase, not transport vs timeout. A
+    transport failure during the *poll* means the command started and was then
+    killed, which is why guest.py raises GuestExecAbandoned there rather than
+    letting the transport error through — classifying that as retryable would
+    be a licence to run it twice.
     """
-    msg = str(err).lower()
-    return (
-        "timed out" in msg
-        or "could not obtain this command's own output" in msg
-    )
+    return isinstance(err, (GuestExecTimeout, GuestExecAbandoned))
 
 
 def resolve_exe(exe: str, tools_dir: Path) -> str:

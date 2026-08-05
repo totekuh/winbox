@@ -209,10 +209,12 @@ def _setup_inner(
     # GuestAgentError and OSError are in here for the same reason
     # CalledProcessError is: they are infrastructure failures the pipeline
     # raises in normal operation (`ga.wait` on the provisioning boot,
-    # PermissionError building the unattend image), and GuestAgentError is a
-    # plain Exception rather than a RuntimeError, so it used to sail past this
-    # handler as a raw traceback — no recovery guidance, and the half-built VM
-    # left running for the next command to auto-start into.
+    # PermissionError building the unattend image), and GuestAgentError used
+    # to be a plain Exception, so it sailed past this handler as a raw
+    # traceback — no recovery guidance, and the half-built VM left running for
+    # the next command to auto-start into. It is a RuntimeError now, so the
+    # explicit entry below is belt-and-braces rather than load-bearing; it
+    # stays because the tuple documents what this pipeline can actually throw.
     except (subprocess.CalledProcessError, RuntimeError, GuestAgentError, OSError) as e:
         console.print()
         console.print(f"[red][-][/] Setup failed: {e}")

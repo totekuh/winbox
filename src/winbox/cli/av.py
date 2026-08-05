@@ -32,7 +32,7 @@ def av_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     and VirtIO-FS share so winbox commands keep working.
     Undo with: winbox av disable
     """
-    def _enable() -> bool:
+    def _enable():
         try:
             return defender.enable(ga, progress=_step)
         except DefenderError as e:
@@ -43,7 +43,23 @@ def av_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
                 )
             raise SystemExit(1)
 
-    if _enable():
+    outcome = _enable()
+    if outcome.reboot_required:
+        if outcome.start_types_unwritten:
+            # A reboot cannot help: these keys are ACL-protected and reg.exe
+            # never wrote them. Say so instead of sending the user round a
+            # loop that ends in the identical error every time.
+            console.print(
+                "[red][-][/] Could not restore the Defender service start "
+                f"types from inside the guest ({', '.join(outcome.start_types_unwritten)} "
+                "still wrong) — those keys are ACL-protected."
+            )
+            console.print(
+                "    A reboot will not change this. The offline hive edit is "
+                "the only way: this command does it for you on a client SKU, "
+                "so re-run it with the VM able to shut down."
+            )
+            raise SystemExit(1)
         # A Win11 image built with the offline Defender disable has WinDefend
         # marked disabled in the SCM for the life of this boot, so the start
         # types we just corrected only take effect after a restart.
@@ -61,7 +77,7 @@ def av_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
                 cfg, ga,
                 msg="Rebooting so the SCM picks up the restored service start types...",
             )
-        if _enable():
+        if _enable().reboot_required:
             console.print(
                 "[red][-][/] WinDefend is still disabled after a reboot.\n"
                 "    Check [bold]HKLM\\SYSTEM\\CurrentControlSet\\Services\\WinDefend\\Start[/] "

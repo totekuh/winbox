@@ -26,7 +26,7 @@ import time
 import pytest
 from click.testing import CliRunner
 
-from winbox.cli import cli
+from winbox.cli import cli, reboot_and_wait
 from winbox.config import Config
 from winbox.vm import VM, GuestAgent, VMState
 
@@ -243,6 +243,27 @@ class TestExec:
             assert "e2e-psfile-ok" in result.stdout
         finally:
             script.unlink(missing_ok=True)
+
+    def test_a_timed_out_command_raises_the_timeout_type(self, ga):
+        """The type is what tells callers the command already ran — matching
+        on "timed out" also matched libvirt's own pre-launch failures."""
+        from winbox.vm import GuestAgentUnreachable, GuestExecTimeout
+
+        with pytest.raises(GuestExecTimeout) as excinfo:
+            ga.exec("ping -n 30 127.0.0.1", timeout=3, poll_interval=0.5)
+
+        assert excinfo.value.pid is not None
+        assert not isinstance(excinfo.value, GuestAgentUnreachable)
+
+    def test_the_guest_is_still_usable_after_a_timeout(self, ga):
+        """The timed-out tree is killed and reaped, so the next command must
+        get its own output rather than the dead one's."""
+        from winbox.vm import GuestExecTimeout
+
+        with pytest.raises(GuestExecTimeout):
+            ga.exec("ping -n 30 127.0.0.1", timeout=3, poll_interval=0.5)
+
+        assert ga.exec("echo after-timeout", timeout=60).stdout.strip() == "after-timeout"
 
     def test_status_reports_a_running_vm(self, run):
         out = run("status").output
@@ -617,6 +638,34 @@ class TestDefender:
                 + result.output
             )
 
+    def test_enable_never_claims_start_types_it_did_not_write(self, ga, profile):
+        """`Services\\*\\Start` is ACL-protected. enable() used to write those
+        four values, discard every exit code, and report a restore that never
+        happened — sending the caller into a reboot loop that could not help."""
+        from winbox import defender
+
+        unwritten = defender.start_types_unwritten(ga)
+
+        # Whatever it reports must match what the guest actually holds.
+        for svc in defender._DEFENDER_DEFAULT_START:
+            want = defender._DEFENDER_DEFAULT_START[svc]
+            result = ga.exec_argv(
+                "reg.exe",
+                ["query", rf"HKLM\SYSTEM\CurrentControlSet\Services\{svc}",
+                 "/v", "Start"],
+                timeout=30,
+            )
+            import re as _re
+            match = _re.search(r"Start\s+REG_DWORD\s+0x([0-9a-fA-F]+)", result.stdout or "")
+            actually_right = (
+                result.exitcode == 0 and match is not None
+                and int(match.group(1), 16) == want
+            )
+            assert (svc in unwritten) is not actually_right, (
+                f"{svc}: reported unwritten={svc in unwritten} but the guest "
+                f"says correct={actually_right}"
+            )
+
     def test_av_status_stderr_is_clean(self, tool):
         assert "#< CLIXML" not in tool("av_status")()
 
@@ -713,19 +762,16 @@ class TestJobs:
 
 class TestKdbg:
     @staticmethod
-    def _fresh_target(tool, module="winlogon.exe"):
-        """Return a PID whose symbol bases match this boot.
+    def _target_pid(tool, module="winlogon.exe"):
+        """A PID to attach to. Nothing more.
 
-        ASLR re-randomizes the nt and user-module load bases on every boot,
-        and the symbol store persists across reboots and rebuilds — so after
-        any reboot the cached bases are stale and the walkers refuse to run
-        rather than read the wrong addresses. Refreshing is the documented
-        remedy; several tests here run after a Defender reboot.
+        This used to also force `kdbg_base_refresh` and a full
+        `kdbg_user_symbols_load` first, because ASLR moves every base on each
+        boot while the symbol store survives — so a post-reboot attach failed
+        until the caches were manually re-pointed. The daemon repairs them
+        itself now, and the absence of that dance here is what proves it.
         """
-        tool("kdbg_base_refresh")()
-        pid = json.loads(tool("ps")(module.split(".")[0]))[0]["pid"]
-        tool("kdbg_user_symbols_load")(pid, module)
-        return pid
+        return json.loads(tool("ps")(module.split(".")[0]))[0]["pid"]
 
     def test_stub_start_status_stop(self, run):
         run("kdbg", "stop", expect_ok=False)  # ensure a clean slate
@@ -758,7 +804,7 @@ class TestKdbg:
         which left the guest paused behind a warning."""
         run("kdbg", "start")
         try:
-            pid = self._fresh_target(tool)
+            pid = self._target_pid(tool)
             session = json.loads(tool("kdbg_attach")(pid))
             assert session["target"]["pid"] == pid
 
@@ -784,7 +830,7 @@ class TestKdbg:
     def test_breakpoint_add_and_remove(self, tool, run, cfg):
         run("kdbg", "start")
         try:
-            pid = self._fresh_target(tool)
+            pid = self._target_pid(tool)
             tool("kdbg_attach")(pid)
             tool("kdbg_symbols_load")()
             try:
@@ -812,6 +858,49 @@ class TestKdbg:
             run("kdbg", "stop", expect_ok=False)
         assert _domstate(cfg.vm_name) == "running"
 
+    def test_attach_works_after_a_reboot_without_a_manual_refresh(
+        self, tool, run, cfg, ga, vm
+    ):
+        """ASLR re-randomizes every base each boot, but the symbol store
+        survives — so an attach after a restart used to fail with
+        `PageWalkError` or "stale module bases … ASLR moved them" until the
+        user knew to run `kdbg base` and `kdbg user-symbols`. The daemon
+        repairs its own caches now.
+
+        This is the fix's real test: the reboot happens *between* loading
+        symbols and using them, and nothing refreshes them in between.
+        """
+        run("kdbg", "start")
+        try:
+            # Load symbols against this boot, then move every base underneath
+            # them.
+            tool("kdbg_symbols_load")()
+            pid = self._target_pid(tool)
+            tool("kdbg_user_symbols_load")(pid, "winlogon.exe")
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+
+        reboot_and_wait(cfg, ga, msg="Rebooting to move the ASLR bases...")
+
+        run("kdbg", "start")
+        try:
+            # No kdbg_base_refresh, no kdbg_user_symbols_load. Just attach.
+            fresh_pid = self._target_pid(tool)
+            session = json.loads(tool("kdbg_attach")(fresh_pid))
+            assert session["target"]["pid"] == fresh_pid
+            try:
+                procs = json.loads(tool("kdbg_ps")())
+                assert any(p["name"] == "System" for p in procs), (
+                    "walkers still using a stale nt base"
+                )
+                assert "winlogon.exe" in tool("kdbg_user_lm")(fresh_pid)
+            finally:
+                tool("kdbg_detach")()
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+
+        assert _domstate(cfg.vm_name) == "running"
+
     def test_session_reports_nothing_attached_when_idle(self, tool):
         assert json.loads(tool("kdbg_session")())["attached"] is False
 
@@ -822,7 +911,7 @@ class TestKdbg:
     def test_user_symbols_load(self, tool, run):
         run("kdbg", "start")
         try:
-            pid = self._fresh_target(tool)
+            pid = self._target_pid(tool)
             tool("kdbg_attach")(pid)
             try:
                 out = tool("kdbg_user_symbols_load")(pid, "winlogon.exe")
@@ -855,7 +944,7 @@ class TestKdbg:
             run("kdbg", "base")
             run("kdbg", "session")
 
-            pid = str(self._fresh_target(tool))
+            pid = str(self._target_pid(tool))
             run("kdbg", "attach", pid)
             try:
                 run("kdbg", "regs")

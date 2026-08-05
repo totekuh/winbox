@@ -11,7 +11,12 @@ here — it's generic VM lifecycle the two frontends already do differently
 
 from __future__ import annotations
 
+import logging
+import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from winbox.vm import GuestAgent
@@ -137,6 +142,29 @@ def _noop(_msg: str) -> None:
     pass
 
 
+@dataclass(frozen=True)
+class EnableOutcome:
+    """What ``enable`` actually achieved.
+
+    Two facts have to travel now, and only one of them fits in a bool. The
+    MCP frontend cannot use the ``progress`` callback for the second — it
+    collects those messages into a list it never reads — so they go here.
+    """
+
+    reboot_required: bool
+    """The SCM still has WinDefend disabled for this boot; restart and re-run."""
+
+    start_types_unwritten: tuple[str, ...] = ()
+    """Services whose ``Start`` value could not be restored from inside the
+    guest. Non-empty means a reboot will NOT help: these keys are
+    ACL-protected and only the offline hive edit can change them."""
+
+    def __bool__(self) -> bool:  # pragma: no cover - convenience only
+        raise TypeError(
+            "EnableOutcome is not a bool; check .reboot_required explicitly"
+        )
+
+
 class DefenderError(Exception):
     """A Defender operation step failed. ``result`` carries the failing
     ExecResult (may be None) so the frontend can format stdout/stderr/exit."""
@@ -169,11 +197,12 @@ def tamper_protection_on(ga: "GuestAgent", *, timeout: int = 15) -> bool:
     return "TAMPER_ON" in (result.stdout or "")
 
 
-def enable(ga: "GuestAgent", *, progress: ProgressFn = _noop) -> bool:
+def enable(ga: "GuestAgent", *, progress: ProgressFn = _noop) -> EnableOutcome:
     """Re-enable real-time protection, AMSI, and behavior monitoring.
 
-    Returns True if a reboot is required to finish (see below), False if the
-    operation completed.
+    Returns an :class:`EnableOutcome` describing what actually happened —
+    whether a reboot is still needed, and which service start types could not
+    be written from inside the guest.
 
     Removes the registry overrides, starts WinDefend (sc.exe — PowerShell
     Start-Service is ACL-blocked), adds the QEMU-GA / Z:\\ exclusions
@@ -194,13 +223,22 @@ def enable(ga: "GuestAgent", *, progress: ProgressFn = _noop) -> bool:
     # is a boot-start driver, so real-time protection only fully re-arms after
     # a reboot (harmless no-op on Server 2022, where these are already set).
     progress("Re-enabling Defender service start types...")
-    for svc, start in (("WinDefend", "2"), ("WdNisSvc", "3"), ("WdNisDrv", "3"), ("WdFilter", "0")):
-        ga.exec_argv(
+    for svc, start in _DEFENDER_DEFAULT_START.items():
+        result = ga.exec_argv(
             "reg.exe",
             ["add", rf"HKLM\SYSTEM\CurrentControlSet\Services\{svc}",
-             "/v", "Start", "/t", "REG_DWORD", "/d", start, "/f"],
+             "/v", "Start", "/t", "REG_DWORD", "/d", str(start), "/f"],
             timeout=15,
         )
+        if result.exitcode != 0:
+            # Expected on a guest built with the offline Defender disable —
+            # these keys are ACL-protected. Not fatal here, because the caller
+            # may still want the rest of the operation; it is reported in the
+            # outcome so nobody claims a restore that did not happen.
+            logger.debug(
+                "reg.exe could not set %s Start=%s: %s",
+                svc, start, (result.stderr or result.stdout or "").strip(),
+            )
 
     # Step 2: Start WinDefend (0 = started, 1056 = already running; both fine).
     progress("Starting WinDefend service...")
@@ -212,7 +250,12 @@ def enable(ga: "GuestAgent", *, progress: ProgressFn = _noop) -> bool:
         # this SCM instance is concerned. A reboot is the only way through,
         # and without it `av enable` could never re-enable Defender at all.
         progress("WinDefend still disabled in this boot's SCM — reboot required")
-        return True
+        # Only worth probing on the path where it changes the answer: if the
+        # writes did not land, no number of reboots will start the service.
+        return EnableOutcome(
+            reboot_required=True,
+            start_types_unwritten=start_types_unwritten(ga),
+        )
     if result.exitcode not in (0, 1056):
         raise DefenderError("Failed to start WinDefend", result)
 
@@ -224,7 +267,7 @@ def enable(ga: "GuestAgent", *, progress: ProgressFn = _noop) -> bool:
     # "enabled" once the overrides are gone and the service is up).
     progress("Enabling protections...")
     ga.exec_powershell(PREFS_ENABLE_SCRIPT, timeout=30)
-    return False
+    return EnableOutcome(reboot_required=False)
 
 
 def set_disable_regkeys(ga: "GuestAgent", *, progress: ProgressFn = _noop) -> None:
@@ -306,6 +349,46 @@ TAMPER_OFF_SOFTWARE_REG = (
     '"TamperProtection"=dword:00000004\r\n'
     '"TamperProtectionSource"=dword:00000002\r\n'
 )
+
+
+def start_types_unwritten(ga: "GuestAgent", *, timeout: int = 15) -> tuple[str, ...]:
+    """Return the Defender services whose ``Services\\*\\Start`` is still wrong.
+
+    ``enable`` writes these with reg.exe, but they are ACL-protected: on a
+    guest built with the offline Defender disable the write fails with
+    "Access is denied" and reg.exe's exit code is the only sign. Read them
+    back rather than trusting the write — claiming "start types restored"
+    when nothing was written sent callers into an unbreakable loop (reboot,
+    retry, identical ERROR_SERVICE_DISABLED, forever) with no hint that the
+    real fix is the host-side offline hive edit.
+
+    A service that cannot be read is reported as unwritten: this only ever
+    downgrades a success claim, so failing closed is the safe direction.
+    """
+    unwritten: list[str] = []
+    for svc, want in _DEFENDER_DEFAULT_START.items():
+        try:
+            result = ga.exec_argv(
+                "reg.exe",
+                ["query", rf"HKLM\SYSTEM\CurrentControlSet\Services\{svc}",
+                 "/v", "Start"],
+                timeout=timeout,
+            )
+            match = re.search(
+                r"Start\s+REG_DWORD\s+0x([0-9a-fA-F]+)", result.stdout or ""
+            )
+            ok = (
+                result.exitcode == 0
+                and match is not None
+                and int(match.group(1), 16) == want
+            )
+        except Exception:
+            # A probe failure counts as "could not confirm". Raising here
+            # would turn a downgraded claim into a broken command.
+            ok = False
+        if not ok:
+            unwritten.append(svc)
+    return tuple(unwritten)
 
 
 # ─── Offline operations (VM must be shut down) ──────────────────────────────

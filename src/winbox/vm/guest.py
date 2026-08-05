@@ -31,6 +31,30 @@ _NEVER_SPAWNED_PID = 0xFFFFFFF0
 # by the first one, even though the in-VM process was still running fine.
 _MAX_TRANSIENT_ERRORS = 5
 
+# How many times the unknown-PID probe retries before giving up. Only an
+# answer from the agent settles it; a transport failure is not an answer.
+_UNKNOWN_PID_PROBE_ATTEMPTS = 3
+
+
+# virsh stderr fragments that mean the agent was never reached. Everything
+# else on a non-zero exit is the agent answering with an error of its own —
+# including "PID does not exist", which the unknown-PID probe depends on
+# being able to recognise as an answer.
+_UNREACHABLE_SIGNS = (
+    "not connected",
+    "not responding",
+    "not available",
+    "failed to connect",
+    "domain is not running",
+    "domain not found",
+)
+
+
+def _is_unreachable(virsh_stderr: str) -> bool:
+    """True when virsh's error means the agent was never reached."""
+    lowered = virsh_stderr.lower()
+    return any(sign in lowered for sign in _UNREACHABLE_SIGNS)
+
 
 @dataclass
 class ExecResult:
@@ -41,8 +65,54 @@ class ExecResult:
     stderr: str
 
 
-class GuestAgentError(Exception):
-    pass
+class GuestAgentError(RuntimeError):
+    """A guest-agent operation failed.
+
+    Subclasses ``RuntimeError`` to match the convention ``lifecycle.virsh_run``
+    already sets for the same subprocess, so callers don't need
+    ``except (RuntimeError, GuestAgentError)``.
+
+    The subclasses below exist for one question callers actually have to
+    answer: **did the command reach the guest?** Retrying something that
+    already ran means running an installer or an exploit PoC twice; declining
+    to retry something that never started turns a transient into a hard
+    failure. That distinction cannot be recovered from the message text —
+    libvirt renders its own timeouts as "operation timed out" too, which is
+    exactly how string matching got it wrong.
+    """
+
+
+class GuestAgentUnreachable(GuestAgentError):
+    """The agent could not be reached, or answered with something unusable.
+
+    The command did **not** run: this is raised where the transport itself
+    fails, before any guest process exists. Safe to retry.
+    """
+
+
+class GuestExecTimeout(GuestAgentError):
+    """A command exceeded its own deadline and was killed.
+
+    It **did** run — for the full timeout — and its process tree was
+    taskkill'd. Retrying re-runs a half-completed operation.
+    """
+
+    def __init__(self, message: str, pid: int | None = None) -> None:
+        super().__init__(message)
+        self.pid = pid
+
+
+class GuestExecAbandoned(GuestAgentError):
+    """A command ran but its output could not be collected.
+
+    Raised when the transport dies mid-poll (the process is killed and reaped
+    on the way out) or when the agent kept handing back another command's
+    result. Like a timeout, the guest-side work already happened.
+    """
+
+    def __init__(self, message: str, pid: int | None = None) -> None:
+        super().__init__(message)
+        self.pid = pid
 
 
 class GuestAgent:
@@ -66,13 +136,20 @@ class GuestAgent:
         )
         if result.returncode != 0:
             error_msg = result.stderr.strip() or f"(virsh exit code {result.returncode})"
-            raise GuestAgentError(
-                f"Guest agent command failed: {error_msg}"
-            )
+            message = f"Guest agent command failed: {error_msg}"
+            # virsh reports "we could not talk to the agent" and "the agent
+            # ran your command and it failed" through the same non-zero exit,
+            # but they mean opposite things: the first is retryable and
+            # answers nothing, the second *is* an answer. Callers that need to
+            # know (the unknown-PID probe, the exec retry loop) cannot tell
+            # them apart from the exception type unless we split them here.
+            if _is_unreachable(error_msg):
+                raise GuestAgentUnreachable(message)
+            raise GuestAgentError(message)
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as e:
-            raise GuestAgentError(f"Invalid JSON from guest agent: {e}") from e
+            raise GuestAgentUnreachable(f"Invalid JSON from guest agent: {e}") from e
 
     def ping(self) -> bool:
         """Check if the guest agent is responding."""
@@ -223,14 +300,24 @@ class GuestAgent:
             try:
                 status = self._raw_command(status_payload)
                 consecutive_errors = 0
-            except GuestAgentError:
+            except GuestAgentError as e:
                 consecutive_errors += 1
                 if (
                     consecutive_errors > _MAX_TRANSIENT_ERRORS
                     or time.monotonic() >= deadline
                 ):
                     self._kill_and_reap(pid)
-                    raise
+                    # The transport died, but this is the *poll* phase — the
+                    # command launched and was just killed. Re-raising the
+                    # transport error as-is told callers "nothing ran", and
+                    # `run_command` would happily re-run a half-completed,
+                    # non-idempotent operation.
+                    raise GuestExecAbandoned(
+                        f"Lost contact with the guest agent while waiting on "
+                        f"PID {pid}; the command had already started and has "
+                        f"been killed: {e}",
+                        pid=pid,
+                    ) from e
                 time.sleep(poll_interval)
                 continue
             ret = status.get("return", {})
@@ -250,15 +337,16 @@ class GuestAgent:
                 )
                 if stale_discards >= _MAX_STALE_DISCARDS:
                     self._kill_and_reap(pid)
-                    raise GuestAgentError(
+                    raise GuestExecAbandoned(
                         f"Could not obtain this command's own output on PID "
-                        f"{pid} after {stale_discards} foreign results"
+                        f"{pid} after {stale_discards} foreign results",
+                        pid=pid,
                     )
                 continue
             if time.monotonic() >= deadline:
                 self._kill_and_reap(pid)
-                raise GuestAgentError(
-                    f"Command timed out after {timeout}s (PID {pid})"
+                raise GuestExecTimeout(
+                    f"Command timed out after {timeout}s (PID {pid})", pid=pid
                 )
             time.sleep(poll_interval)
 
@@ -273,15 +361,35 @@ class GuestAgent:
 
         Probes with a PID the agent cannot have spawned: its table only holds
         processes it started itself.
+
+        Only an answer *from the agent* settles this. A transport failure used
+        to count as "yes, it errors" — so one virtio hiccup during the probe
+        discarded a result the preceding read had already freed, losing the
+        command's output for good. Retries the probe, and raises rather than
+        guessing if it still cannot be settled: the caller can survive an
+        error, but not a silently wrong answer.
         """
-        try:
-            self._raw_command({
-                "execute": "guest-exec-status",
-                "arguments": {"pid": _NEVER_SPAWNED_PID},
-            }, timeout=5)
-        except GuestAgentError:
-            return True
-        return False
+        last: GuestAgentUnreachable | None = None
+        for attempt in range(_UNKNOWN_PID_PROBE_ATTEMPTS):
+            try:
+                self._raw_command({
+                    "execute": "guest-exec-status",
+                    "arguments": {"pid": _NEVER_SPAWNED_PID},
+                }, timeout=5)
+            except GuestAgentUnreachable as e:
+                # Transport, not an answer. Try again.
+                last = e
+                if attempt < _UNKNOWN_PID_PROBE_ATTEMPTS - 1:
+                    time.sleep(0.25)
+                continue
+            except GuestAgentError:
+                # The agent answered, and the answer was an error.
+                return True
+            return False
+        raise GuestAgentUnreachable(
+            f"Could not determine how the guest agent answers for an unknown "
+            f"PID after {_UNKNOWN_PID_PROBE_ATTEMPTS} attempts: {last}"
+        )
 
     def exec_status(self, pid: int) -> dict:
         """Query the status of a previously started guest-exec process.

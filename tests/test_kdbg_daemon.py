@@ -826,14 +826,22 @@ def test_op_write_mem_restores_cr3_even_on_failure():
 
 
 class _StoreForValidation:
-    def __init__(self, modules: dict[str, dict]) -> None:
+    def __init__(self, modules: dict[str, dict], *, set_base_fails=False) -> None:
         self._modules = modules
+        self.rebased: list[tuple[str, int]] = []
+        self._set_base_fails = set_base_fails
 
     def list_modules(self):
         return list(self._modules.keys())
 
     def load(self, name):
         return self._modules[name]
+
+    def set_base(self, name, base):
+        if self._set_base_fails:
+            raise OSError("store is read-only")
+        self.rebased.append((name, base))
+        self._modules.setdefault(name, {})["base"] = base
 
 
 class _FakeUserModule:
@@ -887,22 +895,39 @@ def test_validate_passes_when_cached_base_matches_loaded(monkeypatch):
     _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
 
 
-def test_validate_raises_on_base_mismatch(monkeypatch):
-    """Module loaded in target at a DIFFERENT base than cached → stale."""
-    from winbox.kdbg.debugger.daemon import _validate_module_bases, DaemonError
+def test_validate_refreshes_a_stale_user_module_base(monkeypatch):
+    """ASLR relocates images every boot, but the symbols stay valid — only
+    the base each RVA is added to changed, and the live value is already in
+    hand. Raising here made every post-reboot attach fail on a repair the
+    daemon could just do."""
+    from winbox.kdbg.debugger.daemon import _validate_module_bases
     _patch_validator(monkeypatch, [
         _FakeUserModule("ntdll.dll", 0x7ff_99999000),  # actual base
     ])
     store = _StoreForValidation({
         "ntdll": {"base": 0x7ff800000000},  # cached base — stale
     })
+
+    _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
+
+    assert store.rebased == [("ntdll", 0x7ff_99999000)]
+
+
+def test_validate_raises_when_it_cannot_refresh(monkeypatch):
+    """Only an unrepairable store is worth blocking the attach for."""
+    from winbox.kdbg.debugger.daemon import _validate_module_bases, DaemonError
+    _patch_validator(monkeypatch, [
+        _FakeUserModule("ntdll.dll", 0x7ff_99999000),
+    ])
+    store = _StoreForValidation(
+        {"ntdll": {"base": 0x7ff800000000}}, set_base_fails=True
+    )
+
     with pytest.raises(DaemonError) as exc:
         _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
+
     msg = str(exc.value)
-    assert "stale" in msg.lower()
     assert "ntdll" in msg
-    assert "0x7ff800000000" in msg
-    assert "0x7ff99999000" in msg
     assert "kdbg_user_symbols_load" in msg
 
 
@@ -972,11 +997,12 @@ def test_validate_nt_passes_when_live_base_matches(monkeypatch):
     _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
 
 
-def test_validate_nt_raises_on_stale_kernel_base(monkeypatch):
-    """THE FIX: cached nt base differs from live IDT-derived base
-    (typical post-VM-reboot state) → raise DaemonError naming the
-    `winbox kdbg base` + `kdbg symbols load -m nt` remediation."""
-    from winbox.kdbg.debugger.daemon import _validate_module_bases, DaemonError
+def test_validate_refreshes_a_stale_nt_base(monkeypatch, capsys):
+    """The post-VM-reboot state: cached nt base differs from the live
+    IDT-derived one. ASLR moved the kernel, but every RVA in the store is
+    still correct — so re-pointing the base is the entire repair, and the two
+    commands the old error named did exactly that and nothing more."""
+    from winbox.kdbg.debugger.daemon import _validate_module_bases
     _patch_validator(monkeypatch, [])
 
     cached_nt_base = 0xfffff80608628000  # what the store thinks
@@ -994,14 +1020,15 @@ def test_validate_nt_raises_on_stale_kernel_base(monkeypatch):
             "symbols": {"KiDivideErrorFault": 0x10000},
         },
     })
-    with pytest.raises(DaemonError) as exc:
-        _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
-    msg = str(exc.value)
-    assert "stale nt base" in msg.lower()
-    assert f"0x{cached_nt_base:x}" in msg
-    assert f"0x{live_nt_base:x}" in msg
-    assert "winbox kdbg base" in msg
-    assert "symbols load -m nt" in msg
+
+    _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
+
+    assert store.rebased == [("nt", live_nt_base)]
+    # Say what happened — a silent rebase would hide a genuinely surprising
+    # event (the guest rebooted under an attached debugger).
+    err = capsys.readouterr().err
+    assert f"0x{cached_nt_base:x}" in err
+    assert f"0x{live_nt_base:x}" in err
 
 
 def test_validate_nt_resolve_failure_warns_and_continues(monkeypatch, capsys):

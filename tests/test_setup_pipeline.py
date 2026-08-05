@@ -1,9 +1,11 @@
 """Tests for the `winbox setup` pipeline's failure handling (cli/setup.py).
 
 The pipeline's job on failure is to say what broke, tell the user the one
-recovery command, and not leave a half-built VM running. GuestAgentError is a
-plain Exception (not a RuntimeError), so it used to escape the handler as a
-raw traceback with the guest still powered on.
+recovery command, and not leave a half-built VM running. GuestAgentError was
+a plain Exception when this was written, so it escaped the handler as a raw
+traceback with the guest still powered on. It subclasses RuntimeError now, but
+these tests pin the behaviour rather than the class, so they keep their value
+either way.
 """
 
 from unittest.mock import MagicMock, patch

@@ -23,7 +23,7 @@ import pytest
 
 from tests.conftest import FakeQemuGA
 from winbox.config import Config
-from winbox.vm.guest import GuestAgent, GuestAgentError
+from winbox.vm.guest import GuestAgent, GuestAgentError, GuestAgentUnreachable
 
 
 def _ga(monkeypatch, fake) -> GuestAgent:
@@ -247,6 +247,9 @@ class _QgaAgent:
                 }}
             if self.lenient_unknown_pid:
                 return {"return": {"exited": False}}
+            # The agent *answered*, and the answer was an error — that is
+            # exactly what _errors_on_unknown_pid probes for. A transport
+            # failure here would be GuestAgentUnreachable, a different thing.
             raise GuestAgentError(f"PID {want} does not exist")
         return {"return": {}}
 
@@ -316,7 +319,7 @@ class TestExecArgvPollResilience:
             if payload.get("execute") == "guest-exec-status":
                 state["n"] += 1
                 if state["n"] == 1:
-                    raise GuestAgentError("Guest agent command failed: hiccup")
+                    raise GuestAgentUnreachable("Guest agent command failed: hiccup")
             return real(payload, **kwargs)
 
         result = _ga(monkeypatch, flaky).exec_argv(
@@ -335,7 +338,7 @@ class TestExecArgvPollResilience:
             calls.append(payload)
             if payload.get("execute") == "guest-exec":
                 return {"return": {"pid": 4242}}
-            raise GuestAgentError("Guest agent command failed: agent gone")
+            raise GuestAgentUnreachable("Guest agent command failed: agent gone")
 
         with pytest.raises(GuestAgentError):
             _ga(monkeypatch, dead_agent).exec_argv("msiexec.exe", ["/i", "x.msi"])
@@ -357,3 +360,170 @@ class TestExecArgvPollResilience:
         assert any(
             p.get("arguments", {}).get("path") == "taskkill" for p in fake.payloads
         )
+
+
+class TestErrorTypesDistinguishLaunchFromTransport:
+    """The one question callers must answer is "did it reach the guest?".
+
+    Message text cannot answer it — libvirt renders its own pre-launch
+    failures as "operation timed out", which is exactly how the string match
+    in executor.py got it wrong and disabled the retry loop.
+    """
+
+    def _agent(self, monkeypatch, stderr):
+        import subprocess
+
+        from winbox.config import Config
+        from winbox.vm.guest import GuestAgent
+
+        ga = GuestAgent(Config())
+        monkeypatch.setattr(
+            "winbox.vm.guest.subprocess.run",
+            lambda *a, **kw: subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr=stderr
+            ),
+        )
+        return ga
+
+    @pytest.mark.parametrize(
+        "stderr",
+        [
+            "error: Guest agent is not responding: QEMU guest agent is not connected",
+            "error: argument unsupported: QEMU guest agent is not available",
+            "error: failed to connect to the hypervisor",
+            "error: Requested operation is not valid: domain is not running",
+        ],
+    )
+    def test_transport_failures_are_unreachable(self, monkeypatch, stderr):
+        from winbox.vm.guest import GuestAgentUnreachable
+
+        ga = self._agent(monkeypatch, stderr)
+        with pytest.raises(GuestAgentUnreachable):
+            ga._raw_command({"execute": "guest-ping"})
+
+    def test_an_agent_error_is_not_unreachable(self, monkeypatch):
+        """"PID does not exist" is the agent *answering*. The unknown-PID
+        probe depends on being able to tell that apart from silence."""
+        from winbox.vm.guest import GuestAgentError, GuestAgentUnreachable
+
+        ga = self._agent(
+            monkeypatch,
+            "error: internal error: unable to execute QEMU agent command "
+            "'guest-exec-status': PID 4242 does not exist",
+        )
+        with pytest.raises(GuestAgentError) as excinfo:
+            ga._raw_command({"execute": "guest-exec-status"})
+        assert not isinstance(excinfo.value, GuestAgentUnreachable)
+
+    def test_libvirt_operation_timeout_is_not_an_exec_timeout(self, monkeypatch):
+        """The precise regression: a pre-launch failure whose text says
+        "timed out" must not be classified as a command that already ran."""
+        from winbox.vm.guest import GuestExecTimeout
+
+        ga = self._agent(monkeypatch, "error: operation timed out")
+        with pytest.raises(Exception) as excinfo:
+            ga._raw_command({"execute": "guest-ping"})
+        assert not isinstance(excinfo.value, GuestExecTimeout)
+
+    def test_guest_agent_error_is_a_runtime_error(self):
+        """Matches lifecycle.virsh_run, which wraps the same subprocess."""
+        from winbox.vm.guest import GuestAgentError
+
+        assert issubclass(GuestAgentError, RuntimeError)
+
+
+class TestUnknownPidProbeDoesNotGuess:
+    """A transport hiccup during the probe used to read as "yes, this agent
+    errors on unknown PIDs", which made the caller discard a result the
+    preceding read had already freed from the agent — gone for good."""
+
+    def _agent(self, monkeypatch, side_effect):
+        from winbox.config import Config
+        from winbox.vm.guest import GuestAgent
+
+        ga = GuestAgent(Config())
+        monkeypatch.setattr(ga, "_raw_command", side_effect)
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+        return ga
+
+    def test_agent_error_means_yes(self, monkeypatch):
+        from winbox.vm.guest import GuestAgentError
+
+        def answers_with_error(payload, **kw):
+            raise GuestAgentError("PID does not exist")
+
+        assert self._agent(monkeypatch, answers_with_error)._errors_on_unknown_pid()
+
+    def test_a_clean_answer_means_no(self, monkeypatch):
+        ga = self._agent(monkeypatch, lambda p, **kw: {"return": {"exited": False}})
+        assert ga._errors_on_unknown_pid() is False
+
+    def test_a_transient_is_retried_not_treated_as_an_answer(self, monkeypatch):
+        from winbox.vm.guest import GuestAgentError, GuestAgentUnreachable
+
+        calls = []
+
+        def flaky(payload, **kw):
+            calls.append(payload)
+            if len(calls) == 1:
+                raise GuestAgentUnreachable("hiccup")
+            raise GuestAgentError("PID does not exist")
+
+        assert self._agent(monkeypatch, flaky)._errors_on_unknown_pid() is True
+        assert len(calls) == 2
+
+    def test_an_unsettleable_probe_raises_rather_than_guessing(self, monkeypatch):
+        from winbox.vm.guest import GuestAgentUnreachable
+
+        def always_unreachable(payload, **kw):
+            raise GuestAgentUnreachable("agent gone")
+
+        ga = self._agent(monkeypatch, always_unreachable)
+        with pytest.raises(GuestAgentUnreachable, match="Could not determine"):
+            ga._errors_on_unknown_pid()
+
+
+class TestPollPhaseTransportMeansTheCommandRan:
+    """Losing the transport mid-poll is not the same as never launching.
+
+    The command started and gets killed on the way out, so reporting it as a
+    plain transport error let run_command re-run a non-idempotent operation.
+    """
+
+    def test_transport_death_mid_poll_is_abandoned_not_unreachable(self, monkeypatch):
+        from winbox.config import Config
+        from winbox.vm.guest import (
+            GuestAgent, GuestAgentUnreachable, GuestExecAbandoned,
+        )
+
+        ga = GuestAgent(Config())
+        calls = []
+
+        def fake(payload, **kw):
+            calls.append(payload)
+            if payload.get("execute") == "guest-exec":
+                return {"return": {"pid": 4242}}
+            raise GuestAgentUnreachable("Guest agent command failed: agent gone")
+
+        monkeypatch.setattr(ga, "_raw_command", fake)
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+
+        with pytest.raises(GuestExecAbandoned) as excinfo:
+            ga.exec("installer.exe /S", timeout=1, poll_interval=0)
+
+        assert excinfo.value.pid == 4242
+        assert not isinstance(excinfo.value, GuestAgentUnreachable)
+
+    def test_executor_will_not_retry_it(self):
+        """The point of the type: this is what stops a second install."""
+        from winbox.exec.executor import _command_already_ran
+        from winbox.vm.guest import (
+            GuestAgentError, GuestAgentUnreachable, GuestExecAbandoned,
+            GuestExecTimeout,
+        )
+
+        assert _command_already_ran(GuestExecAbandoned("x", pid=1)) is True
+        assert _command_already_ran(GuestExecTimeout("x", pid=1)) is True
+        assert _command_already_ran(GuestAgentUnreachable("x")) is False
+        # A pre-launch "no PID returned" must stay retryable.
+        assert _command_already_ran(GuestAgentError("no PID returned")) is False
