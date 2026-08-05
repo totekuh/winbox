@@ -168,55 +168,13 @@ Round-tripped afterwards on a pristine Win11 snapshot: **80 passed, 1 skipped,
 
 ---
 
-## 6. Known-flaky and not fixed
+## 6. Known issues
 
-* **The guest can wedge under sustained churn.** One e2e run left Windows
-  unresponsive (black console, agent gone) after a long sequence of reboots and
-  network reconfiguration; a hard `virsh destroy` + `start` recovered it with
-  no disk damage. Not reproducible in isolation — `applocker enable` alone is
-  fine, and a `status` right after it takes 2.1s. The likeliest contributor was
-  the `kdbg status` pause bug (now fixed) freezing the guest for minutes at a
-  time. Worth watching; the e2e suite now fails fast with a clear message
-  instead of cascading twenty confusing failures.
-* **Breakpoint mechanism differs by image, and neither is universal.** On
-  Win11, `--mode soft` fails with `RspError: read timed out` while `hw`
-  installs fine — almost certainly HVCI, which Win11 enables by default and
-  which protects kernel code pages from the 0xCC patch a software breakpoint
-  writes. On Server 2022 the reverse was observed: `hw` timed out ("the
-  4-slot DR0..3 budget may be exhausted") and `soft` worked. The e2e test now
-  accepts either mechanism. Both single-mode failures deserve a proper look —
-  in particular, `--mode auto` should probably fall back on a *timeout*, not
-  only on slot exhaustion, and the soft path should say "HVCI" rather than
-  "read timed out".
-
-* ~~On Win11, `av enable` is effectively one-way.~~ **Fixed.** Defender state
-  on a client SKU can only be changed while the VM is off — once WinDefend
-  has started, Tamper Protection is enforced by Defender's own kernel
-  components. `av disable` now powers the VM down and edits the SYSTEM hive
-  when TP is armed; `av enable` uses the restart it already needs to also
-  restore the service start types and clear TP, so the fast in-guest path
-  keeps working. Verified over repeated cycles on a real Win11 build.
-
-  One thing to know before touching Defender's service configuration:
-  **`reg.exe` cannot write `Services\WinDefend\Start` even with Defender
-  stopped and TP off** — those keys are ACL-protected. Enable only ever
-  appeared to work because the GP-key disable leaves the services intact and
-  Windows restarts Defender itself. A genuine offline disable therefore
-  *requires* an offline enable to undo it; the first cut of this fix shipped
-  without one and made the VM unrecoverable in the opposite direction. Caught
-  by running the enable/disable cycle repeatedly rather than once.
-
-* **The symbol store outlives the boot that produced it.** ASLR re-randomizes
-  the nt and user-module load bases every boot, and `~/.winbox/symbols/`
-  persists across reboots *and* rebuilds — so after any reboot the walkers
-  refuse to run (`PageWalkError`, or "stale module bases … ASLR moved them").
-  The errors are accurate and name the remedy, and `kdbg base` /
-  `kdbg user-symbols` fix it, but nothing invalidates the cache
-  automatically. The e2e suite refreshes explicitly before attaching. Worth
-  keying the user-module entries on boot id the way `load_nt` keys on build.
-* `/tmp` is a 16 GB tmpfs. Tests that write ISO-sized files will fill it —
-  `tests/test_iso.py` shrinks the profile floor to 4 KB for exactly this
-  reason.
+Moved to [ROADMAP.md](ROADMAP.md), which ranks them and says what fixing each
+one involves. Live at time of writing: typed guest-agent exceptions, unchecked
+Defender service writes, symbol-store staleness across reboots, the
+breakpoint-mechanism split between the two images, and one unreproduced guest
+wedge under sustained reboot churn.
 
 ---
 
