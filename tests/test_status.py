@@ -32,7 +32,8 @@ class TestStatusRunning:
 
     def test_shows_snapshot_count(self, runner, mock_env):
         result = runner.invoke(cli, ["status"])
-        assert "1" in result.output
+        # A bare "1" matched the IP, the disk size, almost anything on screen.
+        assert "Snaps:   1" in result.output
 
     def test_shows_tool_count(self, runner, mock_env, cfg):
         # Create some tool files (all non-hidden files counted)
@@ -125,7 +126,7 @@ class TestStatusOtherStates:
     def test_multiple_snapshots(self, runner, mock_env):
         mock_env._vm.snapshot_list.return_value = ["clean", "pre-attack", "post-pivot"]
         result = runner.invoke(cli, ["status"])
-        assert "3" in result.output
+        assert "Snaps:   3" in result.output
 
     def test_no_ip(self, runner, mock_env):
         mock_env._vm.ip.return_value = None

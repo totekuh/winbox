@@ -39,7 +39,9 @@ class TestVMDiskUsage:
         vm.cfg.disk_path.write_bytes(b"\x00" * 512)
         result = vm.disk_usage()
         assert result is not None
-        assert "B" in result
+        # "B" alone also matches KB/MB/GB, so it held whatever the unit was.
+        assert result.endswith(" B"), result
+        assert "512" in result
 
     def test_mb_disk(self, vm):
         # Create a sparse-ish file by seeking

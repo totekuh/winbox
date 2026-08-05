@@ -395,9 +395,12 @@ class TestMcpCore:
         )
         assert name, "no expected service was running in the guest"
 
-        # Query-only assertion for services other code depends on: stopping
-        # Winmgmt would break the very WMI calls this suite uses.
-        assert "SERVICE_NAME" in tool("service_stop")("NoSuchWinboxSvc") or True
+        # `... or True` made this unfailable. Stopping a service the suite
+        # depends on (Winmgmt backs the WMI calls) is not an option, so
+        # exercise service_stop against a name that cannot exist and assert
+        # it reports the service is unknown rather than claiming success.
+        stopped = tool("service_stop")("NoSuchWinboxSvc")
+        assert "1060" in stopped, stopped
         out = tool("service_start")(name)
         assert "1056" in out or "SUCCESS" in out.upper() or "START_PENDING" in out, out
 
@@ -444,7 +447,12 @@ class TestMcpPipes:
 
         assert "wrote" in tool("pipe_send")(sid, "0500")
         tool("pipe_recv")(sid, 16)  # may legitimately time out
-        assert "closed" in tool("pipe_close")(sid)
+        # "closed" alone was satisfied by the broker-leak case too — the very
+        # bug this covers. Require the session id, and that nothing reports
+        # the broker had to be killed.
+        closed = tool("pipe_close")(sid)
+        assert f"closed session {sid}" in closed, closed
+        assert "could not" not in closed.lower(), closed
 
         # Everything after a close must fail cleanly, not raise.
         assert "not found" in tool("pipe_close")(sid)

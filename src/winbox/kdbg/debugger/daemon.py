@@ -410,37 +410,40 @@ class DaemonSession:
         installed_hw = False
         elapsed_ms = 0.0
 
+        hw_error: Exception | None = None
         if mode in ("hw", "auto"):
-            # Try hw first.
+            # Try hw first: DR-register breakpoints are PatchGuard-safe and
+            # invisible to in-guest anti-debug, so they are always preferred.
             t0 = time.monotonic()
             try:
                 self.rsp.insert_breakpoint(va, kind=1, hardware=True)
                 installed_hw = True
                 elapsed_ms = (time.monotonic() - t0) * 1000.0
             except RspError as e:
+                hw_error = e
                 if mode == "hw":
-                    raise RuntimeError(
-                        f"hw bp install failed: {e}. The 4-slot DR0..3 budget "
-                        f"may be exhausted; set mode='soft' to use a software "
-                        f"breakpoint instead (unlimited but PG-visible / hash-"
-                        f"detectable)."
-                    ) from e
+                    raise RuntimeError(_hw_bp_failure(e)) from e
                 # mode == "auto" — fall through to soft path
 
         if not installed_hw:
             # Software path. Kernel VAs get plain Z0 (kernel pages are
             # in every CR3); user VAs need the CR3-masquerade dance.
             t0 = time.monotonic()
-            if is_user:
-                report = install_user_breakpoint(
-                    self.rsp, self.cfg.vm_name, self.store,
-                    target_dtb=self.target.dtb,
-                    user_va=va,
-                )
-                elapsed_ms = report.elapsed * 1000.0
-            else:
-                self.rsp.insert_breakpoint(va, kind=1)
-                elapsed_ms = (time.monotonic() - t0) * 1000.0
+            try:
+                if is_user:
+                    report = install_user_breakpoint(
+                        self.rsp, self.cfg.vm_name, self.store,
+                        target_dtb=self.target.dtb,
+                        user_va=va,
+                    )
+                    elapsed_ms = report.elapsed * 1000.0
+                else:
+                    self.rsp.insert_breakpoint(va, kind=1)
+                    elapsed_ms = (time.monotonic() - t0) * 1000.0
+            except (RspError, InstallError) as e:
+                raise RuntimeError(
+                    _soft_bp_failure(e, is_user=is_user, hw_error=hw_error)
+                ) from e
 
         bp_id = self._next_bp_id
         self._next_bp_id += 1
@@ -1430,6 +1433,56 @@ def _normalize_module_name(name: str) -> str:
     """
     n = name.lower().rsplit(".", 1)[0]
     return n
+
+
+def _looks_like_timeout(err: Exception) -> bool:
+    """A stalled gdbstub read, as opposed to the stub refusing outright."""
+    text = str(err).lower()
+    return "timed out" in text or "timeout" in text
+
+
+def _hw_bp_failure(err: Exception) -> str:
+    """Explain a failed hardware breakpoint without inventing a cause.
+
+    The old message asserted the DR0..3 budget was exhausted whatever
+    happened. A stalled read is the commoner failure and says nothing about
+    slots, so pointing at the budget sent people looking in the wrong place.
+    """
+    if _looks_like_timeout(err):
+        return (
+            f"hw bp install timed out: {err}. The stub stopped answering "
+            f"rather than refusing — the guest may be busy, or all four "
+            f"DR0..3 slots (per-vCPU) may already be taken. Check `kdbg bps`, "
+            f"and try mode='auto' to fall back to a software breakpoint."
+        )
+    return (
+        f"hw bp install failed: {err}. The 4-slot DR0..3 budget is the usual "
+        f"cause; check `kdbg bps`. mode='soft' uses a software breakpoint "
+        f"instead — unlimited, but PatchGuard-visible and hash-detectable."
+    )
+
+
+def _soft_bp_failure(
+    err: Exception, *, is_user: bool, hw_error: Exception | None
+) -> str:
+    """Explain a failed software breakpoint.
+
+    A software breakpoint writes 0xCC into the code page. Windows 11 enables
+    HVCI by default, which is precisely a guard against writing to kernel
+    code — so on a client SKU this path fails for a structural reason, and
+    reporting only "read timed out" left no way to know that.
+    """
+    parts = [f"soft bp install failed: {err}."]
+    if not is_user and _looks_like_timeout(err):
+        parts.append(
+            "A software breakpoint patches 0xCC into the kernel code page, "
+            "which HVCI exists to prevent — and HVCI is on by default on "
+            "Windows 11. If this guest is a client SKU, hardware breakpoints "
+            "(mode='hw') are the only ones that will install."
+        )
+    if hw_error is not None:
+        parts.append(f"The hardware path was tried first and also failed: {hw_error}")
+    return " ".join(parts)
 
 
 def _validate_module_bases(

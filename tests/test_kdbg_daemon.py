@@ -1755,3 +1755,67 @@ def test_op_bp_remove_leaves_registry_intact_on_rsp_error():
     assert rm2["ok"] is True
     assert bp_id not in session.bps
     assert va not in session._bp_by_va
+
+
+class TestBreakpointFailureExplanations:
+    """Neither mechanism installs on both images: HVCI blocks the software
+    path on Windows 11, and the 4-slot DR budget has been seen exhausted on
+    Server 2022. The messages have to say which wall you hit, because the
+    remedy is the opposite mode in each case."""
+
+    def test_hw_timeout_does_not_blame_the_slot_budget_alone(self):
+        from winbox.kdbg.debugger.daemon import _hw_bp_failure
+        from winbox.kdbg.debugger.rsp import RspError
+
+        msg = _hw_bp_failure(RspError("read timed out"))
+
+        assert "timed out" in msg
+        assert "stopped answering" in msg
+        # Slots are still a possibility, just not asserted as the cause.
+        assert "may" in msg
+        assert "auto" in msg
+
+    def test_hw_refusal_points_at_the_slot_budget(self):
+        from winbox.kdbg.debugger.daemon import _hw_bp_failure
+        from winbox.kdbg.debugger.rsp import RspError
+
+        msg = _hw_bp_failure(RspError("E22"))
+
+        assert "DR0..3" in msg
+        assert "soft" in msg
+
+    def test_soft_kernel_timeout_names_hvci(self):
+        """The Windows 11 case. "read timed out" alone gave no way to know a
+        software breakpoint structurally cannot work on that guest."""
+        from winbox.kdbg.debugger.daemon import _soft_bp_failure
+        from winbox.kdbg.debugger.rsp import RspError
+
+        msg = _soft_bp_failure(RspError("read timed out"), is_user=False, hw_error=None)
+
+        assert "HVCI" in msg
+        assert "0xCC" in msg
+        assert "hw" in msg
+
+    def test_soft_user_mode_does_not_blame_hvci(self):
+        """HVCI guards kernel code pages; a user-mode bp failing is something
+        else, and saying HVCI would send the user down a dead end."""
+        from winbox.kdbg.debugger.daemon import _soft_bp_failure
+        from winbox.kdbg.debugger.rsp import RspError
+
+        msg = _soft_bp_failure(RspError("read timed out"), is_user=True, hw_error=None)
+
+        assert "HVCI" not in msg
+
+    def test_auto_reports_both_failures(self):
+        """In auto mode the hw attempt already happened; hiding it makes the
+        soft error look like the only thing that was tried."""
+        from winbox.kdbg.debugger.daemon import _soft_bp_failure
+        from winbox.kdbg.debugger.rsp import RspError
+
+        msg = _soft_bp_failure(
+            RspError("soft boom"), is_user=False, hw_error=RspError("hw boom")
+        )
+
+        assert "soft boom" in msg
+        assert "hw boom" in msg
+        assert "tried first" in msg

@@ -2672,3 +2672,71 @@ class TestRegSetTypeLeniency:
     def test_unknown_type_lists_the_valid_ones(self):
         script = self._script_for("frobnicate")
         assert "Expected one of" in script
+
+
+class TestBrokerScriptExecutes:
+    """The in-guest broker was checked with ast.parse and substring greps.
+
+    That proves it is syntactically Python and mentions the right words — not
+    that it does the right thing. Its sequencing logic is the whole basis of
+    the desync fix (a recv that timed out must never be answered by the next
+    command's result), and it is pure Python over os.listdir, so it can be
+    run here rather than only on a Windows guest.
+    """
+
+    def _next_command(self, script_dir):
+        """Extract and bind the broker's `next_command` against a real dir."""
+        import os
+
+        from winbox.mcp import _BROKER_SCRIPT
+
+        lines = _BROKER_SCRIPT.splitlines()
+        start = next(i for i, l in enumerate(lines) if l.startswith("def next_command()"))
+        end = next(
+            (i for i in range(start + 1, len(lines))
+             if lines[i].startswith("def ") or lines[i].startswith("while ")),
+            len(lines),
+        )
+        ns = {"os": os, "script_dir": str(script_dir)}
+        exec("\n".join(lines[start:end]), ns)
+        return ns["next_command"]
+
+    def test_takes_the_lowest_pending_sequence(self, tmp_path):
+        """Out-of-order execution is the desync this protocol prevents."""
+        for seq in (7, 2, 5):
+            (tmp_path / f"cmd.{seq}.json").write_text("{}")
+
+        assert self._next_command(tmp_path)() == (2, "cmd.2.json")
+
+    def test_returns_none_when_nothing_is_pending(self, tmp_path):
+        assert self._next_command(tmp_path)() is None
+
+    def test_ignores_files_that_are_not_commands(self, tmp_path):
+        (tmp_path / "result.3.json").write_text("{}")
+        (tmp_path / "config.json").write_text("{}")
+        (tmp_path / "broker.pid").write_text("123")
+        (tmp_path / "cmd.9.json").write_text("{}")
+
+        assert self._next_command(tmp_path)() == (9, "cmd.9.json")
+
+    def test_skips_a_malformed_sequence_rather_than_crashing(self, tmp_path):
+        """A half-written or stray name must not take the broker down — it
+        would strand the session with no way to close it."""
+        (tmp_path / "cmd.notanumber.json").write_text("{}")
+        (tmp_path / "cmd..json").write_text("{}")
+        (tmp_path / "cmd.4.json").write_text("{}")
+
+        assert self._next_command(tmp_path)() == (4, "cmd.4.json")
+
+    def test_sequences_are_ordered_numerically_not_lexically(self, tmp_path):
+        """String ordering would run 10 before 9 and desync the session."""
+        for seq in (9, 10, 11):
+            (tmp_path / f"cmd.{seq}.json").write_text("{}")
+
+        assert self._next_command(tmp_path)() == (9, "cmd.9.json")
+
+    def test_a_vanished_directory_is_not_fatal(self, tmp_path):
+        """pipe_close rmtree's the session dir; the broker may still be in
+        its loop and must exit rather than raise."""
+        gone = tmp_path / "never-existed"
+        assert self._next_command(gone)() is None

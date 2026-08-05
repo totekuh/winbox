@@ -10,40 +10,19 @@ a roadmap whose top item nobody can start.
 
 ---
 
-## Now
+## Open
 
-Items 1-3 (typed guest-agent exceptions, Defender write verification,
-self-healing symbol bases) are **done** — see `git log`. What follows is what
-is left.
+Nothing is currently queued above item 8. Items 1-7 are done — `git log` is
+the record.
 
-## Next
-
-### 4. Neither breakpoint mechanism works on both images
-
-On Win11, `--mode soft` fails with `RspError: read timed out`; `hw` works. On
-Server 2022 the reverse was observed — `hw` timed out on the 4-slot DR0..3
-budget and `soft` worked. The e2e test accepts either mechanism, so this is
-covered but not solved.
-
-Almost certainly HVCI on the Win11 side: it is on by default and protects
-kernel code pages from the `0xCC` patch a software breakpoint writes. Two
-concrete pieces: `--mode auto` should fall back on a **timeout**, not only on
-slot exhaustion; and the soft path should detect HVCI and say so rather than
-reporting "read timed out". Wants investigation before implementation, which
-is why it is not in the top three.
-
-### 5. `tests/test_e2e_live.py:426` passes even in the bug it covers
-
-`assert "closed" in tool("pipe_close")(sid)` is satisfied by every outcome
-including the broker-leak case the stability round just fixed. Should assert
-the specific outcome. Same shape as the weakened `"cmd."` assertion caught
-during that round — worth a sweep for others rather than fixing this one alone.
-
-### 6. The in-guest broker script is barely covered
-
-The rewritten `_BROKER_SCRIPT` (`mcp.py`) is verified by `ast.parse` and
-substring greps. It is a non-trivial program running inside the guest with no
-real execution coverage. Could be exercised on the host with a fake pipe.
+One finding from the breakpoint work is worth keeping, because it shapes any
+future kdbg change: **neither breakpoint mechanism installs on both images.**
+Windows 11 runs HVCI by default, which exists precisely to stop the `0xCC`
+patch a software breakpoint writes into a kernel code page, so `--mode soft`
+cannot work there. Server 2022 has instead been seen exhausting the four
+per-vCPU DR0..3 slots, which is the hardware path's ceiling. `--mode auto`
+tries hardware first and falls back, so it works on both, and the failure
+messages now name the wall you actually hit instead of guessing at one.
 
 ---
 
