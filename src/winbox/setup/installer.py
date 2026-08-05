@@ -758,28 +758,10 @@ def provision_vm_disk(cfg: Config) -> None:
     console.print("[green][+][/] Provision files injected")
 
 
-# Windows-format registry file that disables Defender's services in the offline
-# SYSTEM hive (Start=4 = disabled), BEFORE the guest first boots. On Win11 every
-# in-VM disable is blocked by Tamper Protection, and editing the offline SOFTWARE
-# hive corrupts OOBE completion state. The SYSTEM hive holds no OOBE state, so it
-# boots clean — and a WinDefend that never starts never arms Tamper Protection,
-# so Defender is fully inert and can't quarantine winbox's tools. Targets
-# ControlSet001 (the current control set on a fresh install; see SYSTEM\Select).
-_DEFENDER_OFF_SYSTEM_REG = (
-    "Windows Registry Editor Version 5.00\r\n"
-    "\r\n"
-    "[HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\WinDefend]\r\n"
-    '"Start"=dword:00000004\r\n'
-    "\r\n"
-    "[HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\WdFilter]\r\n"
-    '"Start"=dword:00000004\r\n'
-    "\r\n"
-    "[HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\WdNisSvc]\r\n"
-    '"Start"=dword:00000004\r\n'
-    "\r\n"
-    "[HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\WdNisDrv]\r\n"
-    '"Start"=dword:00000004\r\n'
-)
+# The Defender-disable payload and the offline-hive mechanics both live
+# outside the installer now — `winbox av disable` needs the identical
+# operation at runtime. Re-exported so this module reads standalone.
+from winbox.defender import DEFENDER_OFF_SYSTEM_REG as _DEFENDER_OFF_SYSTEM_REG
 
 
 def _guestfish(disk_path: Path, env: dict[str, str], commands: list[str]) -> None:
@@ -810,53 +792,32 @@ def _disable_defender_offline(
 ) -> None:
     """Disable the Defender services in the offline SYSTEM hive (Start=4).
 
-    Downloads the SYSTEM hive from ``win_part``, merges the service-disable keys
-    with ``hivexregedit`` (a standalone hive edit — no OS inspection, unlike
-    virt-win-reg), uploads it back, and clears the hive's transaction logs so
-    Windows rebuilds them rather than replaying stale entries over the edit.
-    Both tools ship with libguestfs-tools. This is the only Defender-disable
-    that survives Win11 Tamper Protection without corrupting OOBE; failure is a
-    warning, not a hard abort.
-    """
-    console.print("[blue][*][/] Disabling Defender in the offline SYSTEM hive...")
-    if shutil.which("hivexregedit") is None:
-        console.print(
-            "[yellow][!][/] hivexregedit not found — skipping offline Defender disable.\n"
-            "    Install libguestfs-tools. Defender may stay active on Win11."
-        )
-        return
+    Delegates to :mod:`winbox.offlinereg`, which is the same machinery
+    ``winbox av disable`` uses at runtime — a client SKU can only have its
+    Defender state changed while the VM is off, so build time and run time
+    genuinely want the same operation.
 
-    hive = tmpdir_path / "SYSTEM"
-    reg_path = tmpdir_path / "defender-off.reg"
-    reg_path.write_text(_DEFENDER_OFF_SYSTEM_REG, encoding="utf-8")
+    Best-effort here, unlike the runtime path: a build should not abort over
+    this, and the caller is not a user who explicitly asked for it.
+    """
+    from winbox import defender, offlinereg
+
+    console.print("[blue][*][/] Disabling Defender in the offline SYSTEM hive...")
     try:
-        _guestfish(cfg.disk_path, env, [
-            f"mount {win_part} /",
-            f"download {_SYSTEM_HIVE} {hive}",
-        ])
-        merge = subprocess.run(
-            ["hivexregedit", "--merge", "--prefix", "HKEY_LOCAL_MACHINE\\SYSTEM",
-             str(hive), str(reg_path)],
-            capture_output=True, text=True, check=False,
+        offlinereg.merge_hive(
+            cfg.disk_path,
+            hive=offlinereg.SYSTEM_HIVE,
+            prefix="HKEY_LOCAL_MACHINE\\SYSTEM",
+            reg_body=defender.DEFENDER_OFF_SYSTEM_REG,
+            win_part=win_part,
         )
-        if merge.returncode != 0:
-            console.print(
-                "[yellow][!][/] hivexregedit merge failed "
-                f"({merge.stderr.strip()}) — Defender may stay active on Win11."
-            )
-            return
-        _guestfish(cfg.disk_path, env, [
-            f"mount {win_part} /",
-            f"upload {hive} {_SYSTEM_HIVE}",
-            f"rm-f {_SYSTEM_HIVE}.LOG1",
-            f"rm-f {_SYSTEM_HIVE}.LOG2",
-        ])
-        console.print("[green][+][/] Defender services disabled in offline SYSTEM hive")
-    except RuntimeError as e:
+    except offlinereg.OfflineRegistryError as e:
         console.print(
             f"[yellow][!][/] Offline Defender disable failed: {e}\n"
             "    Best-effort step — continuing; Defender may stay active on Win11."
         )
+        return
+    console.print("[green][+][/] Defender services disabled in offline SYSTEM hive")
 
 
 def _settle_firstlogon_boot(cfg: "Config", vm: VM, ga: GuestAgent) -> None:

@@ -189,12 +189,23 @@ Round-tripped afterwards on a pristine Win11 snapshot: **80 passed, 1 skipped,
   only on slot exhaustion, and the soft path should say "HVCI" rather than
   "read timed out".
 
-* **On Win11, `av enable` is effectively one-way.** Enabling Defender lets
-  Tamper Protection re-arm, and `av disable` then correctly refuses ("Tamper
-  Protection is ON"). Getting back to a disabled state means turning TP off
-  in the Windows Security UI, or rebuilding. The refusal is honest and the
-  message says what to do, but it is a sharp edge worth knowing before you
-  run `av enable` on a Win11 box you want to keep quiet.
+* ~~On Win11, `av enable` is effectively one-way.~~ **Fixed.** Defender state
+  on a client SKU can only be changed while the VM is off — once WinDefend
+  has started, Tamper Protection is enforced by Defender's own kernel
+  components. `av disable` now powers the VM down and edits the SYSTEM hive
+  when TP is armed; `av enable` uses the restart it already needs to also
+  restore the service start types and clear TP, so the fast in-guest path
+  keeps working. Verified over repeated cycles on a real Win11 build.
+
+  One thing to know before touching Defender's service configuration:
+  **`reg.exe` cannot write `Services\WinDefend\Start` even with Defender
+  stopped and TP off** — those keys are ACL-protected. Enable only ever
+  appeared to work because the GP-key disable leaves the services intact and
+  Windows restarts Defender itself. A genuine offline disable therefore
+  *requires* an offline enable to undo it; the first cut of this fix shipped
+  without one and made the VM unrecoverable in the opposite direction. Caught
+  by running the enable/disable cycle repeatedly rather than once.
+
 * **The symbol store outlives the boot that produced it.** ASLR re-randomizes
   the nt and user-module load bases every boot, and `~/.winbox/symbols/`
   persists across reboots *and* rebuilds — so after any reboot the walkers

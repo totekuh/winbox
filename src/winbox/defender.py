@@ -242,3 +242,129 @@ def set_disable_regkeys(ga: "GuestAgent", *, progress: ProgressFn = _noop) -> No
         result = ga.exec_argv("reg.exe", args, timeout=15)
         if result.exitcode != 0:
             raise DefenderError(f"reg.exe {' '.join(args)} failed", result)
+
+
+# ─── Offline (VM powered off) registry payloads ─────────────────────────────
+# On a client SKU, Defender state can only be changed while the VM is off:
+# once WinDefend has started, Tamper Protection is enforced by Defender's own
+# kernel components and every in-guest disable is ignored or refused. These
+# are merged into the offline hives by `winbox.offlinereg` — see that module
+# for the mechanics and for why the disk must be shut down first.
+#
+# ControlSet001 is the current control set on these images (see SYSTEM\Select).
+
+_DEFENDER_SERVICES = ("WinDefend", "WdFilter", "WdNisSvc", "WdNisDrv")
+
+# Default start types, restored by the offline enable path. WdFilter is a
+# boot-start driver (0); WinDefend is automatic (2); the network-inspection
+# pair are demand-start (3).
+_DEFENDER_DEFAULT_START = {
+    "WinDefend": 2,
+    "WdFilter": 0,
+    "WdNisSvc": 3,
+    "WdNisDrv": 3,
+}
+
+
+def _system_services_reg(start_values: dict[str, int]) -> str:
+    """Render a .reg document setting Services\\<name>\\Start in SYSTEM."""
+    lines = ["Windows Registry Editor Version 5.00", ""]
+    for name, start in start_values.items():
+        lines.append(
+            f"[HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\{name}]"
+        )
+        lines.append(f'"Start"=dword:{start:08x}')
+        lines.append("")
+    # Drop the trailing blank so the rendered document is byte-identical to
+    # the hand-written payload this replaced — the build path is proven with
+    # exactly those bytes.
+    return "\r\n".join(lines).rstrip("\r\n") + "\r\n"
+
+
+# Start=4 is "disabled". A WinDefend that never starts never arms Tamper
+# Protection, so Defender stays fully inert and cannot quarantine winbox's
+# tools. This is what `winbox setup` applies before the guest's first boot.
+DEFENDER_OFF_SYSTEM_REG = _system_services_reg(
+    {name: 4 for name in _DEFENDER_SERVICES}
+)
+
+# The inverse, for completeness — restoring the shipped start types offline.
+DEFENDER_ON_SYSTEM_REG = _system_services_reg(_DEFENDER_DEFAULT_START)
+
+# Tamper Protection lives in SOFTWARE, not SYSTEM. 5 = on, 4 = off. Clearing
+# it offline (while Defender cannot defend it) is what keeps a subsequent
+# in-guest `av disable` viable instead of forcing another power cycle.
+#
+# Note the build-time path deliberately avoids the SOFTWARE hive: editing it
+# *before OOBE has completed* corrupts OOBE state. That constraint is about
+# when, not about the hive itself — on a fully provisioned guest OOBE is long
+# finished.
+TAMPER_OFF_SOFTWARE_REG = (
+    "Windows Registry Editor Version 5.00\r\n"
+    "\r\n"
+    "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows Defender\\Features]\r\n"
+    '"TamperProtection"=dword:00000004\r\n'
+    '"TamperProtectionSource"=dword:00000002\r\n'
+)
+
+
+# ─── Offline operations (VM must be shut down) ──────────────────────────────
+
+
+def disable_offline(cfg, *, progress: ProgressFn = _noop) -> None:
+    """Disable Defender by editing the powered-off guest's SYSTEM hive.
+
+    The only disable that works on a client SKU once Defender has run: with
+    the VM off, Tamper Protection has nothing enforcing it. Caller must have
+    shut the VM down.
+    """
+    from winbox import offlinereg
+
+    progress("Disabling Defender services in the offline SYSTEM hive...")
+    offlinereg.merge_hive(
+        cfg.disk_path,
+        hive=offlinereg.SYSTEM_HIVE,
+        prefix="HKEY_LOCAL_MACHINE\\SYSTEM",
+        reg_body=DEFENDER_OFF_SYSTEM_REG,
+        win_part=offlinereg.windows_partition(cfg),
+    )
+
+
+def enable_offline(cfg, *, progress: ProgressFn = _noop) -> None:
+    """Restore the Defender services' shipped start types in the offline hive.
+
+    The mirror of :func:`disable_offline`, and required rather than optional:
+    Defender's ``Services\\*\\Start`` values are ACL-protected, so ``reg.exe``
+    cannot undo an offline disable from inside the guest even with Defender
+    stopped and Tamper Protection off. Without this, an offline disable would
+    be one-way — exactly the trap the offline disable exists to remove.
+    """
+    from winbox import offlinereg
+
+    progress("Restoring Defender service start types in the offline SYSTEM hive...")
+    offlinereg.merge_hive(
+        cfg.disk_path,
+        hive=offlinereg.SYSTEM_HIVE,
+        prefix="HKEY_LOCAL_MACHINE\\SYSTEM",
+        reg_body=DEFENDER_ON_SYSTEM_REG,
+        win_part=offlinereg.windows_partition(cfg),
+    )
+
+
+def clear_tamper_protection_offline(cfg, *, progress: ProgressFn = _noop) -> None:
+    """Turn Tamper Protection off in the powered-off guest's SOFTWARE hive.
+
+    Lets Defender come back up without TP armed, so a later in-guest
+    ``av disable`` still works instead of needing another power cycle. Caller
+    must have shut the VM down.
+    """
+    from winbox import offlinereg
+
+    progress("Clearing Tamper Protection in the offline SOFTWARE hive...")
+    offlinereg.merge_hive(
+        cfg.disk_path,
+        hive=offlinereg.SOFTWARE_HIVE,
+        prefix="HKEY_LOCAL_MACHINE\\SOFTWARE",
+        reg_body=TAMPER_OFF_SOFTWARE_REG,
+        win_part=offlinereg.windows_partition(cfg),
+    )

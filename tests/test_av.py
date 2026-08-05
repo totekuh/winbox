@@ -25,6 +25,17 @@ from winbox.vm.guest import ExecResult
 
 
 class TestAvEnable:
+    @pytest.fixture(autouse=True)
+    def _already_fully_on(self):
+        """These tests are about the enable *steps*, not the verification.
+
+        `av enable` now checks Defender's real state afterwards and reboots
+        once if the boot-start filter driver hasn't loaded; pinning that to
+        "already on" keeps these focused on what they name.
+        """
+        with patch("winbox.cli.av._status_text", return_value="Defender: ON"):
+            yield
+
     def test_enable_success(self, runner, mock_env):
         """Full enable flow: registry, sc.exe start, exclusions, preferences."""
         mock_env.exec_powershell.side_effect = [
@@ -454,3 +465,223 @@ class TestEnableNeedsRebootWhenServiceDisabled:
 
         assert "Reboot the VM" in out
         assert "av_enable" in out
+
+
+class TestOfflineDisableOnClientSku:
+    """Once Defender has run on a client SKU, Tamper Protection is enforced by
+    its own kernel components and every in-guest disable is ignored. Refusing
+    was honest but left the VM in a state only a rebuild escaped. The disable
+    now happens with the VM powered off, where nothing enforces TP."""
+
+    def test_client_with_tp_on_goes_offline(self, runner, mock_env, cfg):
+        cfg.vm_os = "win11"
+        with (
+            patch("winbox.cli.av.defender.tamper_protection_on", return_value=True),
+            patch("winbox.cli.av._disable_via_offline_hive") as offline,
+            patch("winbox.cli.av.defender.set_disable_regkeys") as gp_keys,
+        ):
+            result = runner.invoke(cli, ["av", "disable"])
+
+        assert result.exit_code == 0
+        offline.assert_called_once()
+        # The in-guest path cannot work here; it must not even be attempted.
+        gp_keys.assert_not_called()
+
+    def test_client_without_tp_uses_the_fast_in_guest_path(self, runner, mock_env, cfg):
+        """Clearing TP during enable is what makes this reachable."""
+        cfg.vm_os = "win11"
+        with (
+            patch("winbox.cli.av.defender.tamper_protection_on", return_value=False),
+            patch("winbox.cli.av._disable_via_offline_hive") as offline,
+            patch("winbox.cli.av.defender.set_disable_regkeys"),
+            patch("winbox.cli.av.reboot_and_wait"),
+        ):
+            runner.invoke(cli, ["av", "disable"])
+
+        offline.assert_not_called()
+
+    def test_server_never_takes_the_offline_path(self, runner, mock_env, cfg):
+        """Server 2022 has no Tamper Protection; its proven path is untouched."""
+        cfg.vm_os = "server2022"
+        with (
+            patch("winbox.cli.av.defender.tamper_protection_on", return_value=True),
+            patch("winbox.cli.av._disable_via_offline_hive") as offline,
+            patch("winbox.cli.av.defender.set_disable_regkeys"),
+            patch("winbox.cli.av.reboot_and_wait"),
+        ):
+            runner.invoke(cli, ["av", "disable"])
+
+        offline.assert_not_called()
+
+    def test_offline_edit_refuses_while_the_disk_may_be_in_use(self, cfg):
+        """guestfish opens the disk read-write; running it against a live VM
+        risks corruption."""
+        from winbox.cli.av import _disable_via_offline_hive
+
+        vm, ga = MagicMock(), MagicMock()
+        vm.wait_shutdown.return_value = False  # never shuts down
+
+        with (
+            patch("winbox.offlinereg.tools_available", return_value=None),
+            patch("winbox.cli.av.defender.disable_offline") as edit,
+            pytest.raises(SystemExit),
+        ):
+            _disable_via_offline_hive(cfg, vm, ga)
+
+        edit.assert_not_called()
+        vm.force_stop.assert_called_once()
+
+    def test_missing_libguestfs_fails_with_guidance(self, cfg):
+        from winbox.cli.av import _disable_via_offline_hive
+
+        with (
+            patch("winbox.offlinereg.tools_available", return_value="hivexregedit"),
+            patch("winbox.cli.av.defender.disable_offline") as edit,
+            pytest.raises(SystemExit),
+        ):
+            _disable_via_offline_hive(cfg, MagicMock(), MagicMock())
+
+        edit.assert_not_called()
+
+
+class TestEnableClearsTamperProtection:
+    @pytest.fixture(autouse=True)
+    def _already_fully_on(self):
+        with patch("winbox.cli.av._status_text", return_value="Defender: ON"):
+            yield
+
+    """Enabling Defender on a client SKU used to be one-way: TP armed the
+    moment WinDefend started. The restart the SCM already forces is the one
+    window where TP can still be cleared."""
+
+    def test_client_restart_clears_tp_instead_of_warm_rebooting(
+        self, runner, mock_env, cfg
+    ):
+        cfg.vm_os = "win11"
+        with (
+            patch("winbox.cli.av.defender.enable", side_effect=[True, False]),
+            patch("winbox.cli.av._restart_clearing_tamper_protection") as restart,
+            patch("winbox.cli.av.reboot_and_wait") as warm,
+        ):
+            result = runner.invoke(cli, ["av", "enable"])
+
+        assert result.exit_code == 0
+        restart.assert_called_once()
+        warm.assert_not_called()
+
+    def test_server_still_warm_reboots(self, runner, mock_env, cfg):
+        cfg.vm_os = "server2022"
+        with (
+            patch("winbox.cli.av.defender.enable", side_effect=[True, False]),
+            patch("winbox.cli.av._restart_clearing_tamper_protection") as restart,
+            patch("winbox.cli.av.reboot_and_wait") as warm,
+        ):
+            runner.invoke(cli, ["av", "enable"])
+
+        warm.assert_called_once()
+        restart.assert_not_called()
+
+    def test_a_failed_tp_clear_does_not_fail_the_enable(self, cfg):
+        """Defender still comes up; av disable just falls back to its own
+        power cycle. Failing here would trade a working outcome for a tidy one."""
+        from winbox.cli.av import _restart_clearing_tamper_protection
+        from winbox.offlinereg import OfflineRegistryError
+
+        vm, ga = MagicMock(), MagicMock()
+        vm.wait_shutdown.return_value = True
+
+        with (
+            patch("winbox.cli.av.defender.enable_offline"),
+            patch(
+                "winbox.cli.av.defender.clear_tamper_protection_offline",
+                side_effect=OfflineRegistryError("hive locked"),
+            ),
+        ):
+            _restart_clearing_tamper_protection(cfg, vm, ga)  # must not raise
+
+        vm.start.assert_called_once()
+
+    def test_a_failed_service_restore_does_fail_the_enable(self, cfg):
+        """Unlike the TP clear, this one is load-bearing: Defender's
+        Services\\*\\Start values are ACL-protected, so if the offline restore
+        does not land there is no in-guest way back."""
+        from winbox.cli.av import _restart_clearing_tamper_protection
+        from winbox.offlinereg import OfflineRegistryError
+
+        vm, ga = MagicMock(), MagicMock()
+        vm.wait_shutdown.return_value = True
+
+        with (
+            patch(
+                "winbox.cli.av.defender.enable_offline",
+                side_effect=OfflineRegistryError("hive locked"),
+            ),
+            pytest.raises(SystemExit),
+        ):
+            _restart_clearing_tamper_protection(cfg, vm, ga)
+
+        vm.start.assert_not_called()
+
+    def test_service_restore_happens_before_the_tp_clear(self, cfg):
+        from winbox.cli.av import _restart_clearing_tamper_protection
+
+        vm, ga = MagicMock(), MagicMock()
+        vm.wait_shutdown.return_value = True
+        order = []
+
+        with (
+            patch("winbox.cli.av.defender.enable_offline",
+                  side_effect=lambda *a, **k: order.append("services")),
+            patch("winbox.cli.av.defender.clear_tamper_protection_offline",
+                  side_effect=lambda *a, **k: order.append("tamper")),
+        ):
+            _restart_clearing_tamper_protection(cfg, vm, ga)
+
+        assert order == ["services", "tamper"]
+
+
+class TestEnableVerifiesWhatItClaims:
+    """WdFilter is a boot-start driver. If it was disabled when the current
+    boot began, real-time protection cannot come up until the next one — so
+    `av enable` was reporting "real-time, AMSI, behavior monitoring" while
+    RealTimeProtection was still False."""
+
+    def _run(self, runner, statuses):
+        with (
+            patch("winbox.cli.av.defender.enable", return_value=False),
+            patch("winbox.cli.av._status_text", side_effect=statuses),
+            patch("winbox.cli.av.reboot_and_wait") as reboot,
+        ):
+            result = runner.invoke(cli, ["av", "enable"])
+        return result, reboot
+
+    def test_reboots_when_protections_are_not_all_up(self, runner, mock_env):
+        result, reboot = self._run(
+            runner, ["Defender: partial", "Defender: ON"]
+        )
+        assert result.exit_code == 0
+        reboot.assert_called_once()
+        assert "Defender enabled" in result.output
+
+    def test_no_reboot_when_already_fully_on(self, runner, mock_env):
+        result, reboot = self._run(runner, ["Defender: ON", "Defender: ON"])
+        reboot.assert_not_called()
+
+    def test_reports_honestly_when_a_reboot_did_not_fix_it(self, runner, mock_env):
+        """Claiming success we didn't achieve is the failure mode this whole
+        verification exists to prevent."""
+        result, _ = self._run(
+            runner,
+            ["Defender: partial",
+             "Defender: partial\n  RealTimeProtection: False"],
+        )
+        assert "not every protection is active" in result.output
+        assert "RealTimeProtection: False" in result.output
+
+    def test_status_text_survives_an_unreachable_guest(self):
+        from winbox.cli.av import _status_text
+        from winbox.vm import GuestAgentError
+
+        ga = MagicMock()
+        ga.exec_powershell.side_effect = GuestAgentError("gone")
+        assert _status_text(ga) == ""
