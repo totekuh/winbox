@@ -24,17 +24,17 @@ console = Console()
 
 
 
-def run(cmd: list[str], *, check: bool = True, **kwargs) -> subprocess.CompletedProcess[str]:
-    """Run a shell command with text output."""
-    return subprocess.run(cmd, text=True, check=check, **kwargs)
-
-
 REQUIRED_TOOLS = [
     "qemu-system-x86_64",
     "qemu-img",
     "virsh",
     "virt-install",
-    "virt-customize",
+    # Offline provisioning uses guestfish directly, not virt-customize:
+    # virt-customize auto-inspects the guest OS, and inspection fails on the
+    # Win11 install image. Without this entry a missing guestfish surfaced as
+    # a raw FileNotFoundError from deep inside phase 2 instead of the
+    # prereq list.
+    "guestfish",
     "7z",
     "wget",
 ]
@@ -189,6 +189,14 @@ WINFSP_MSI = "winfsp.msi"
 PYTHON_URL = "https://www.python.org/ftp/python/3.13.13/python-3.13.13-amd64.exe"
 PYTHON_EXE = "python-3.13.13-amd64.exe"
 
+# Windows 11 can't run the Python WiX *bundle* installer under the SYSTEM /
+# session-0 context the guest agent provides (it deadlocks / returns 1601 —
+# single MSIs like WinFsp are fine, only the Burn bootstrapper breaks). The
+# embeddable distribution is a plain zip with no installer, so provision.ps1
+# extracts it on client SKUs instead. Same version as PYTHON_EXE.
+PYTHON_EMBED_URL = "https://www.python.org/ftp/python/3.13.13/python-3.13.13-embed-amd64.zip"
+PYTHON_EMBED_ZIP = "python-3.13.13-embed-amd64.zip"
+
 X64DBG_URL = (
     "https://github.com/x64dbg/x64dbg/releases/download/2025.08.19/"
     "snapshot_2025-08-19_19-40.zip"
@@ -253,6 +261,24 @@ def download_python(cfg: Config) -> Path:
     return dest
 
 
+def download_python_embed(cfg: Config) -> Path:
+    """Download the Python embeddable zip (used on Win11) if not cached."""
+    dest = cfg.iso_dir / PYTHON_EMBED_ZIP
+    if dest.exists() and dest.stat().st_size > 5_000_000:
+        console.print("[green][+][/] Python embeddable cached")
+        return dest
+
+    console.print("[blue][*][/] Downloading Python embeddable...")
+    subprocess.run(
+        ["wget", "-q", "--show-progress", "-O", str(dest), PYTHON_EMBED_URL],
+        check=True,
+    )
+    if not dest.exists() or dest.stat().st_size < 5_000_000:
+        raise RuntimeError(f"Python embeddable download appears truncated: {dest}")
+    console.print("[green][+][/] Python embeddable downloaded")
+    return dest
+
+
 def download_x64dbg(cfg: Config) -> Path:
     """Download the x64dbg snapshot zip if not cached."""
     dest = cfg.iso_dir / X64DBG_ZIP
@@ -271,22 +297,45 @@ def download_x64dbg(cfg: Config) -> Path:
     return dest
 
 
-VIRTIOFS_ISO_PATH = "viofs/2k22/amd64/virtiofs.exe"
+# Arcname of virtiofs.exe inside provision.zip (what provision.ps1 expects).
 VIRTIOFS_EXE = "virtiofs.exe"
+
+
+def _virtiofs_iso_member(cfg: Config) -> str:
+    """Path of virtiofs.exe inside the virtio-win ISO, per active OS profile."""
+    return f"viofs/{cfg.profile.virtio_subdir}/amd64/virtiofs.exe"
+
+
+def _virtiofs_cache_path(cfg: Config) -> Path:
+    """Host cache path for the extracted virtiofs.exe.
+
+    Namespaced by VirtIO subdir so a Server (``2k22``) cache is never reused
+    for a Win11 (``w11``) build when the ISO dir survives a destroy/rebuild.
+    """
+    return cfg.iso_dir / f"virtiofs-{cfg.profile.virtio_subdir}.exe"
 
 
 def extract_virtiofs(cfg: Config) -> Path:
     """Extract virtiofs.exe from the VirtIO ISO. Returns path to extracted exe."""
-    dest = cfg.iso_dir / VIRTIOFS_EXE
+    dest = _virtiofs_cache_path(cfg)
     if dest.exists():
         console.print("[green][+][/] virtiofs.exe cached")
         return dest
 
     console.print("[blue][*][/] Extracting virtiofs.exe from VirtIO ISO...")
-    subprocess.run(
-        ["7z", "e", str(cfg.virtio_iso), f"-o{cfg.iso_dir}", VIRTIOFS_ISO_PATH, "-y"],
-        capture_output=True, check=True,
-    )
+    # `7z e` flattens to the basename; extract into a temp dir then move to
+    # the subdir-namespaced cache path so 2k22 and w11 don't collide.
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            ["7z", "e", str(cfg.virtio_iso), f"-o{tmp}", _virtiofs_iso_member(cfg), "-y"],
+            capture_output=True, check=True,
+        )
+        extracted = Path(tmp) / "virtiofs.exe"
+        if not extracted.exists():
+            raise RuntimeError(
+                f"virtiofs.exe not found in VirtIO ISO at {_virtiofs_iso_member(cfg)}"
+            )
+        shutil.move(str(extracted), str(dest))
     console.print("[green][+][/] virtiofs.exe extracted")
     return dest
 
@@ -315,13 +364,179 @@ def copy_setup_files(cfg: Config) -> None:
         shutil.copy2(cfg.ssh_pubkey, cfg.tools_dir / ".ssh_pubkey")
 
 
+# LabConfig bypass keys injected in the WinPE pass for Win11 so setup
+# proceeds without TPM 2.0 / Secure Boot / the RAM/storage/CPU gates.
+# Emitted into the {LABCONFIG_BLOCK} placeholder of unattend.xml; empty
+# for Server 2022 (whose rendered XML is then byte-identical to before).
+_LABCONFIG_KEYS = (
+    "BypassTPMCheck",
+    "BypassSecureBootCheck",
+    "BypassRAMCheck",
+    "BypassStorageCheck",
+    "BypassCPUCheck",
+)
+
+
+def _specialize_deploy_block() -> str:
+    """Microsoft-Windows-Deployment RunSynchronous for the specialize pass.
+
+    Runs on first boot before OOBE, so the registry keys are in place before
+    Win11 would auto-enable Device Encryption or stop OOBE on the network
+    screen:
+      * BitLocker\\PreventDeviceEncryption = 1 — never auto-encrypt the OS
+        drive (we have no TPM, and encryption breaks offline provisioning /
+        memory + kernel analysis).
+      * OOBE\\BypassNRO = 1 — let OOBE proceed without a network / Microsoft
+        account (Win11 24H2+ otherwise blocks on "Let's connect you to a
+        network").
+    (Defender is handled separately, in the offline SYSTEM hive — Tamper
+    Protection ignores these specialize-pass reg writes.)
+    Emitted into {SPECIALIZE_DEPLOY_BLOCK}; empty for Server 2022.
+    """
+    cmds = [
+        r"reg add HKLM\SYSTEM\CurrentControlSet\Control\BitLocker "
+        r"/v PreventDeviceEncryption /t REG_DWORD /d 1 /f",
+        r"reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE "
+        r"/v BypassNRO /t REG_DWORD /d 1 /f",
+    ]
+    lines = [
+        "",
+        "",
+        '    <component name="Microsoft-Windows-Deployment"',
+        '               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"',
+        '               language="neutral" versionScope="nonSxS"',
+        '               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">',
+        "      <RunSynchronous>",
+    ]
+    for order, cmd in enumerate(cmds, start=1):
+        lines.append('        <RunSynchronousCommand wcm:action="add">')
+        lines.append(f"          <Order>{order}</Order>")
+        lines.append(f"          <Path>{cmd}</Path>")
+        lines.append("        </RunSynchronousCommand>")
+    lines.append("      </RunSynchronous>")
+    lines.append("    </component>")
+    return "\n".join(lines)
+
+
+def _labconfig_block() -> str:
+    """Render the <RunSynchronous> LabConfig-bypass block for the WinPE pass.
+
+    Returned string leads with a blank line so it substitutes inline right
+    after ``</DiskConfiguration>`` (the ``{LABCONFIG_BLOCK}`` placeholder);
+    an empty value leaves the Server 2022 XML byte-identical.
+    """
+    lines = [
+        "",
+        "",
+        "      <RunSynchronous>",
+    ]
+    for order, key in enumerate(_LABCONFIG_KEYS, start=1):
+        lines.append('        <RunSynchronousCommand wcm:action="add">')
+        lines.append(f"          <Order>{order}</Order>")
+        lines.append(
+            "          <Path>reg add HKLM\\System\\Setup\\LabConfig /v "
+            f"{key} /t REG_DWORD /d 1 /f</Path>"
+        )
+        lines.append("        </RunSynchronousCommand>")
+    lines.append("      </RunSynchronous>")
+    return "\n".join(lines)
+
+
+def _disk_partitions_block(cfg: Config) -> str:
+    """Render the <CreatePartitions>/<ModifyPartitions> XML for the profile's
+    UEFI/GPT disk layout.
+
+    Server 2022 uses a minimal ESP + Windows layout (2 partitions). Windows 11
+    Setup rejects that with "error selecting this partition for install" and
+    needs the standard ESP + MSR + Windows layout, so ``include_msr`` inserts
+    the Microsoft Reserved partition (unformatted) and pushes Windows to
+    partition 3. ``esp_size_mb`` sizes the EFI System Partition (Win11 wants a
+    larger ESP than the 100 MB that satisfies Server).
+    """
+    p = cfg.profile
+    create: list[str] = []
+    modify: list[str] = []
+    order = 1
+
+    # 1) EFI System Partition
+    create.append(
+        f'            <CreatePartition wcm:action="add">\n'
+        f"              <Order>{order}</Order>\n"
+        f"              <Size>{p.esp_size_mb}</Size>\n"
+        f"              <Type>EFI</Type>\n"
+        f"            </CreatePartition>"
+    )
+    modify.append(
+        f'            <ModifyPartition wcm:action="add">\n'
+        f"              <Order>{len(modify) + 1}</Order>\n"
+        f"              <PartitionID>{order}</PartitionID>\n"
+        f"              <Format>FAT32</Format>\n"
+        f"              <Label>System</Label>\n"
+        f"            </ModifyPartition>"
+    )
+    esp_id = order
+    order += 1
+
+    # 2) Microsoft Reserved partition (Win11) — created but never formatted.
+    if p.include_msr:
+        create.append(
+            f'            <CreatePartition wcm:action="add">\n'
+            f"              <Order>{order}</Order>\n"
+            f"              <Size>128</Size>\n"
+            f"              <Type>MSR</Type>\n"
+            f"            </CreatePartition>"
+        )
+        order += 1
+
+    # 3) Windows partition — rest of the disk.
+    create.append(
+        f'            <CreatePartition wcm:action="add">\n'
+        f"              <Order>{order}</Order>\n"
+        f"              <Extend>true</Extend>\n"
+        f"              <Type>Primary</Type>\n"
+        f"            </CreatePartition>"
+    )
+    modify.append(
+        f'            <ModifyPartition wcm:action="add">\n'
+        f"              <Order>{len(modify) + 1}</Order>\n"
+        f"              <PartitionID>{order}</PartitionID>\n"
+        f"              <Format>NTFS</Format>\n"
+        f"              <Label>Windows</Label>\n"
+        f"            </ModifyPartition>"
+    )
+    # Not an assert: under `python -O` this check would vanish, and a mismatch
+    # here means the unattend installs Windows to the wrong partition — a
+    # failure that only shows up 20 minutes into a build, inside WinPE.
+    if order != p.install_partition_id:
+        raise RuntimeError(
+            f"disk layout bug: Windows landed on partition {order} but "
+            f"{p.key}'s install_partition_id is {p.install_partition_id}"
+        )
+
+    return (
+        "          <CreatePartitions>\n"
+        + "\n".join(create)
+        + "\n          </CreatePartitions>\n"
+        + "          <ModifyPartitions>\n"
+        + "\n".join(modify)
+        + "\n          </ModifyPartitions>"
+    )
+
+
 def build_unattend_image(cfg: Config, *, desktop: bool = False) -> None:
-    """Build an ISO image containing autounattend.xml."""
+    """Build an ISO image containing autounattend.xml for the active OS profile."""
     mkisofs = _find_mkisofs()
     if mkisofs is None:
         raise RuntimeError(
             "Neither mkisofs nor genisoimage found. "
             "Install with: apt install genisoimage"
+        )
+
+    profile = cfg.profile
+    if desktop and not profile.supports_core:
+        raise RuntimeError(
+            f"--desktop is a Windows Server option (Core vs Desktop Experience); "
+            f"{profile.key} is always a full desktop. Drop --desktop."
         )
 
     # Remove stale image (may be owned by libvirt-qemu from previous run)
@@ -348,14 +563,29 @@ def build_unattend_image(cfg: Config, *, desktop: bool = False) -> None:
                     f"    Manual cleanup: sudo rm -f {cfg.unattend_img}"
                 )
 
-    edition = "Desktop Experience" if desktop else "Server Core"
+    image_name = profile.image_name
+    if profile.supports_core and desktop:
+        # Server: swap the Core image for the Desktop Experience one.
+        image_name = image_name.replace("SERVERSTANDARDCORE", "SERVERSTANDARD")
+
+    if profile.supports_core:
+        edition = "Desktop Experience" if desktop else "Server Core"
+    else:
+        edition = profile.key
     console.print(f"[blue][*][/] Building unattend image ({edition})...")
     with tempfile.TemporaryDirectory() as tmpdir:
-        src = _data.path("unattend.xml")
         dst = Path(tmpdir) / "autounattend.xml"
-        xml = Path(src).read_text()
-        if desktop:
-            xml = xml.replace("SERVERSTANDARDCORE", "SERVERSTANDARD")
+        xml = _data.render(
+            "unattend.xml",
+            IMAGE_NAME=image_name,
+            VIRTIO_SUBDIR=profile.virtio_subdir,
+            INSTALL_PARTITION_ID=str(profile.install_partition_id),
+            DISK_PARTITIONS=_disk_partitions_block(cfg),
+            LABCONFIG_BLOCK=_labconfig_block() if profile.labconfig_bypass else "",
+            SPECIALIZE_DEPLOY_BLOCK=(
+                _specialize_deploy_block() if profile.prevent_device_encryption else ""
+            ),
+        )
         dst.write_text(xml)
 
         subprocess.run(
@@ -367,10 +597,21 @@ def build_unattend_image(cfg: Config, *, desktop: bool = False) -> None:
 
 
 def create_disk(cfg: Config) -> None:
-    """Create the QCOW2 disk image."""
-    console.print(f"[blue][*][/] Creating VM disk ({cfg.vm_disk}GB)...")
+    """Create the QCOW2 disk image.
+
+    Honors the OS profile's minimum disk size: Win11 Setup rejects a system
+    drive under 64 GB, so we never create one smaller than ``min_disk_gb``
+    regardless of the (Server-oriented) ``vm_disk`` default.
+    """
+    disk_gb = max(cfg.vm_disk, cfg.profile.min_disk_gb)
+    if disk_gb != cfg.vm_disk:
+        console.print(
+            f"[yellow][!][/] {cfg.profile.key} needs ≥{cfg.profile.min_disk_gb}GB; "
+            f"using {disk_gb}GB instead of the configured {cfg.vm_disk}GB."
+        )
+    console.print(f"[blue][*][/] Creating VM disk ({disk_gb}GB)...")
     result = subprocess.run(
-        ["qemu-img", "create", "-f", "qcow2", str(cfg.disk_path), f"{cfg.vm_disk}G"],
+        ["qemu-img", "create", "-f", "qcow2", str(cfg.disk_path), f"{disk_gb}G"],
         capture_output=True,
         text=True,
         check=False,
@@ -409,7 +650,7 @@ def run_virt_install(cfg: Config, windows_iso: str) -> None:
             f"driver.queue=1024,source.dir={cfg.shared_dir},"
             f"target.dir=winbox_share"
         ),
-        "--os-variant", "win2k22",
+        "--os-variant", cfg.profile.os_variant,
         "--graphics", "vnc,listen=127.0.0.1",
         "--noautoconsole",
         "--boot", "uefi",
@@ -437,12 +678,24 @@ def provision_vm_disk(cfg: Config) -> None:
         # Build provision.zip: provision.ps1, .ssh_pubkey, OpenSSH, WinFsp, virtiofs.exe
         openssh_zip = cfg.iso_dir / OPENSSH_ZIP
         winfsp_msi = cfg.iso_dir / WINFSP_MSI
-        virtiofs_exe = cfg.iso_dir / VIRTIOFS_EXE
+        virtiofs_exe = _virtiofs_cache_path(cfg)
         python_exe = cfg.iso_dir / PYTHON_EXE
+        python_embed = cfg.iso_dir / PYTHON_EMBED_ZIP
         x64dbg_zip = cfg.iso_dir / X64DBG_ZIP
+        # provision.ps1 picks its Python payload by probing the guest's
+        # ProductType, so the build has to ship the one that probe will ask
+        # for. Shipping the wrong one isn't an error there — it just quietly
+        # leaves the VM with no Python, which only surfaces later as a broken
+        # MCP `python` tool.
+        if cfg.profile.client_sku:
+            required_python = (python_embed, "Python embeddable zip")
+        else:
+            required_python = (python_exe, "Python installer")
+
         missing_files = []
         for path, label in [
             (openssh_zip, "OpenSSH"), (winfsp_msi, "WinFsp"), (virtiofs_exe, "virtiofs"),
+            required_python,
         ]:
             if not path.exists():
                 missing_files.append(f"{label}: {path}")
@@ -475,6 +728,8 @@ def provision_vm_disk(cfg: Config) -> None:
                 zf.write(virtiofs_exe, VIRTIOFS_EXE)
             if python_exe.exists():
                 zf.write(python_exe, PYTHON_EXE)
+            if python_embed.exists():
+                zf.write(python_embed, PYTHON_EMBED_ZIP)
             if x64dbg_zip.exists():
                 zf.write(x64dbg_zip, X64DBG_ZIP)
 
@@ -485,14 +740,162 @@ def provision_vm_disk(cfg: Config) -> None:
 
         console.print("[blue][*][/] Injecting provision files into disk image...")
         env = {**os.environ, "LIBGUESTFS_BACKEND": "direct"}
-        run([
-            "virt-customize",
-            "-a", str(cfg.disk_path),
-            "--upload", f"{zip_path}:/provision.zip",
-            "--upload", f"{bootstrap_tmp}:/bootstrap.ps1",
-        ], env=env)
+        # virt-customize's automatic OS inspection (inspect_os) fails on the
+        # Win11 image — the installer leaves Windows.old / $Windows.~BT behind,
+        # which confuses libguestfs OS detection ("file exited with status 1").
+        # Mount the Windows partition explicitly (its index comes from the
+        # profile's disk layout) and upload; no inspection required.
+        win_part = f"/dev/sda{cfg.profile.install_partition_id}"
+        _guestfish(cfg.disk_path, env, [
+            f"mount {win_part} /",
+            f"upload {zip_path} /provision.zip",
+            f"upload {bootstrap_tmp} /bootstrap.ps1",
+        ])
+
+        if cfg.profile.disable_defender_offline:
+            _disable_defender_offline(cfg, tmpdir_path, env, win_part)
 
     console.print("[green][+][/] Provision files injected")
+
+
+# Windows-format registry file that disables Defender's services in the offline
+# SYSTEM hive (Start=4 = disabled), BEFORE the guest first boots. On Win11 every
+# in-VM disable is blocked by Tamper Protection, and editing the offline SOFTWARE
+# hive corrupts OOBE completion state. The SYSTEM hive holds no OOBE state, so it
+# boots clean — and a WinDefend that never starts never arms Tamper Protection,
+# so Defender is fully inert and can't quarantine winbox's tools. Targets
+# ControlSet001 (the current control set on a fresh install; see SYSTEM\Select).
+_DEFENDER_OFF_SYSTEM_REG = (
+    "Windows Registry Editor Version 5.00\r\n"
+    "\r\n"
+    "[HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\WinDefend]\r\n"
+    '"Start"=dword:00000004\r\n'
+    "\r\n"
+    "[HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\WdFilter]\r\n"
+    '"Start"=dword:00000004\r\n'
+    "\r\n"
+    "[HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\WdNisSvc]\r\n"
+    '"Start"=dword:00000004\r\n'
+    "\r\n"
+    "[HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\WdNisDrv]\r\n"
+    '"Start"=dword:00000004\r\n'
+)
+
+
+def _guestfish(disk_path: Path, env: dict[str, str], commands: list[str]) -> None:
+    """Run a read-write guestfish script against ``disk_path``.
+
+    ``run`` is prepended automatically; ``commands`` are the guestfish
+    statements that follow (e.g. ``mount``/``upload``/``download``). Raises
+    :class:`RuntimeError` on a non-zero exit. Used instead of virt-customize /
+    virt-win-reg because those auto-inspect the OS, and inspection fails on the
+    Win11 install image.
+    """
+    script = "run\n" + "\n".join(commands) + "\n"
+    result = subprocess.run(
+        ["guestfish", "--rw", "-a", str(disk_path)],
+        input=script, text=True, capture_output=True, env=env, check=False,
+    )
+    if result.returncode != 0:
+        msg = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise RuntimeError(f"guestfish failed: {msg}")
+
+
+# Path to the SYSTEM registry hive inside the mounted Windows partition.
+_SYSTEM_HIVE = "/Windows/System32/config/SYSTEM"
+
+
+def _disable_defender_offline(
+    cfg: Config, tmpdir_path: Path, env: dict[str, str], win_part: str
+) -> None:
+    """Disable the Defender services in the offline SYSTEM hive (Start=4).
+
+    Downloads the SYSTEM hive from ``win_part``, merges the service-disable keys
+    with ``hivexregedit`` (a standalone hive edit — no OS inspection, unlike
+    virt-win-reg), uploads it back, and clears the hive's transaction logs so
+    Windows rebuilds them rather than replaying stale entries over the edit.
+    Both tools ship with libguestfs-tools. This is the only Defender-disable
+    that survives Win11 Tamper Protection without corrupting OOBE; failure is a
+    warning, not a hard abort.
+    """
+    console.print("[blue][*][/] Disabling Defender in the offline SYSTEM hive...")
+    if shutil.which("hivexregedit") is None:
+        console.print(
+            "[yellow][!][/] hivexregedit not found — skipping offline Defender disable.\n"
+            "    Install libguestfs-tools. Defender may stay active on Win11."
+        )
+        return
+
+    hive = tmpdir_path / "SYSTEM"
+    reg_path = tmpdir_path / "defender-off.reg"
+    reg_path.write_text(_DEFENDER_OFF_SYSTEM_REG, encoding="utf-8")
+    try:
+        _guestfish(cfg.disk_path, env, [
+            f"mount {win_part} /",
+            f"download {_SYSTEM_HIVE} {hive}",
+        ])
+        merge = subprocess.run(
+            ["hivexregedit", "--merge", "--prefix", "HKEY_LOCAL_MACHINE\\SYSTEM",
+             str(hive), str(reg_path)],
+            capture_output=True, text=True, check=False,
+        )
+        if merge.returncode != 0:
+            console.print(
+                "[yellow][!][/] hivexregedit merge failed "
+                f"({merge.stderr.strip()}) — Defender may stay active on Win11."
+            )
+            return
+        _guestfish(cfg.disk_path, env, [
+            f"mount {win_part} /",
+            f"upload {hive} {_SYSTEM_HIVE}",
+            f"rm-f {_SYSTEM_HIVE}.LOG1",
+            f"rm-f {_SYSTEM_HIVE}.LOG2",
+        ])
+        console.print("[green][+][/] Defender services disabled in offline SYSTEM hive")
+    except RuntimeError as e:
+        console.print(
+            f"[yellow][!][/] Offline Defender disable failed: {e}\n"
+            "    Best-effort step — continuing; Defender may stay active on Win11."
+        )
+
+
+def _settle_firstlogon_boot(cfg: "Config", vm: VM, ga: GuestAgent) -> None:
+    """Boot once to let Win11's re-triggered OOBE FirstLogonCommands settle.
+
+    After the offline SYSTEM-hive Defender edit, Win11 re-runs its
+    FirstLogonCommands on the next boot (reinstalling the guest agent, ending in
+    ``shutdown /s``). We boot and wait for that shutdown; if instead the guest
+    agent comes up and stays (the edit didn't re-trigger OOBE that time), we
+    shut down cleanly. Either way the VM is left shut off, ready for a clean
+    provisioning boot.
+    """
+    console.print("[blue][*][/] Settling Win11 OOBE FirstLogon boot...")
+    vm.start()
+    deadline = time.monotonic() + 600
+    ga_stable = 0
+    while time.monotonic() < deadline:
+        if vm.state() == VMState.SHUTOFF:
+            console.print("[green][+][/] FirstLogon settled (VM shut down)")
+            return
+        try:
+            ga.wait(timeout=5)
+            ga_stable += 1
+        except GuestAgentError:
+            ga_stable = 0
+        # GA up and steady for ~30s => this boot didn't re-run OOBE; stop it.
+        if ga_stable >= 3:
+            console.print("[green][+][/] Boot came up clean; shutting down to provision")
+            try:
+                ga.shutdown()
+            except GuestAgentError:
+                pass
+            vm.wait_shutdown(timeout=120) or vm.force_stop()
+            return
+        time.sleep(10)
+    # Timed out waiting for a stable state — force it off and proceed.
+    console.print("[yellow][!][/] Settle boot didn't reach a stable state; forcing off")
+    vm.force_stop()
+    vm.wait_shutdown(timeout=60)
 
 
 def boot_for_provisioning(cfg: Config) -> None:
@@ -507,13 +910,26 @@ def boot_for_provisioning(cfg: Config) -> None:
     regardless of whether provision.ps1 parse-errored or crashed, so "VM shut
     down cleanly" is not by itself proof that anything actually got installed.
     """
-    console.print("[blue][*][/] Booting VM for provisioning...")
     vm = VM(cfg)
+    ga = GuestAgent(cfg)
+
+    # Win11: the offline Defender edit (SYSTEM hive) makes OOBE re-run its
+    # FirstLogonCommands on the very next boot — they reinstall the guest agent
+    # and end in `shutdown /s`. If we booted straight into provisioning we'd
+    # race that shutdown. Do one throwaway "settle" boot first and let it
+    # finish, so the real provisioning boot comes up clean.
+    if cfg.profile.disable_defender_offline:
+        _settle_firstlogon_boot(cfg, vm, ga)
+
+    console.print("[blue][*][/] Booting VM for provisioning...")
     vm.start()
 
+    # Win11's OOBE finalization ("Installing…", "Just a moment…") can spill
+    # into this boot and pushes the guest agent past the old 180s window;
+    # give it longer (returns as soon as the agent answers, so Server 2022
+    # isn't slowed).
     console.print("[blue][*][/] Waiting for guest agent...")
-    ga = GuestAgent(cfg)
-    ga.wait(timeout=180)
+    ga.wait(timeout=420)
     console.print("[green][+][/] Guest agent responding")
 
     console.print("[blue][*][/] Running bootstrap.ps1 via guest agent...")
@@ -556,7 +972,9 @@ def boot_for_provisioning(cfg: Config) -> None:
         )
 
     console.print("[blue][*][/] Waiting for VM to shut down...")
-    if not vm.wait_shutdown(timeout=600):
+    # Win11 provisioning (Python 3.13 + x64dbg + OpenSSH + WinFsp installs) runs
+    # slower than Server 2022, so allow more headroom before declaring a hang.
+    if not vm.wait_shutdown(timeout=900):
         console.print(
             f"[yellow][!][/] Provisioning timed out (VM did not shut down in 600s)"
         )
@@ -582,6 +1000,44 @@ def boot_for_provisioning(cfg: Config) -> None:
     console.print("[green][+][/] Provisioning complete")
 
 
+def _verify_python(ga: GuestAgent) -> None:
+    """Warn loudly if the guest has no working Python.
+
+    provision.ps1 treats a failed Python install as non-fatal and continues,
+    and the provisioning sentinel only proves the script *finished* — so a
+    build with no Python previously reported complete success. Python in the
+    guest is what the MCP ``python`` tool and parts of kdbg run on, so that
+    silence turned a broken VM into a puzzle discovered much later.
+    """
+    # On client SKUs Python comes from the embeddable zip extracted to
+    # C:\Python313 and put on the machine PATH — which a process started
+    # before the PATH write would not see. Check the explicit path too so a
+    # working install is never reported as missing.
+    candidates = ["python.exe", r"C:\Python313\python.exe"]
+    for candidate in candidates:
+        try:
+            # No quotes: the guest agent escapes them as \" and cmd.exe has no
+            # backslash-escape rule, so they arrive as literal characters.
+            # Neither candidate path contains a space.
+            result = ga.exec(f"{candidate} --version", timeout=30)
+        except GuestAgentError:
+            continue
+        if result.exitcode == 0 and "Python" in (result.stdout + result.stderr):
+            version = (result.stdout or result.stderr).strip()
+            console.print(f"[green][+][/] Guest Python verified ({version})")
+            return
+
+    console.print(
+        "[yellow][!][/] No working Python in the guest — the MCP [bold]python[/] "
+        "tool and parts of kdbg will not work.\n"
+        "    Provisioning otherwise completed, so the VM is usable for "
+        "everything else.\n"
+        "    Check the install log in the VM: "
+        "[bold]winbox exec 'type C:\\winbox-python-install.log'[/]\n"
+        "    Then re-run provisioning with: [bold]winbox provision[/]"
+    )
+
+
 def _verify_provisioning(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Boot the VM once more and assert provision.ps1 actually finished.
 
@@ -592,7 +1048,7 @@ def _verify_provisioning(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     console.print("[blue][*][/] Booting VM to verify provisioning...")
     vm.start()
     try:
-        ga.wait(timeout=180)
+        ga.wait(timeout=420)
     except GuestAgentError as e:
         raise RuntimeError(
             f"VM came back up but guest agent is unreachable: {e}"
@@ -605,6 +1061,7 @@ def _verify_provisioning(cfg: Config, vm: VM, ga: GuestAgent) -> None:
 
     if "OK" in sentinel_check.stdout:
         console.print("[green][+][/] Provisioning sentinel verified")
+        _verify_python(ga)
         _shutdown_and_wait(vm, ga)
         return
 

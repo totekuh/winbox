@@ -22,19 +22,17 @@ from pathlib import Path
 
 import click
 
-from winbox.cli import console, ensure_running, needs_vm
+from winbox.cli import console, needs_vm
 from winbox.config import Config
 from winbox.kdbg import (
     SymbolLoadError,
     SymbolStore,
     SymbolStoreError,
     WalkCache,
-    cached_pdb_path,
     copy_user_module,
     ensure_types_loaded,
     load_module,
     load_nt,
-    read_cpu_state,
     read_virt_cr3,
     resolve_nt_base,
 )
@@ -49,7 +47,12 @@ from winbox.kdbg.debugger import (
     install_user_breakpoint,
 )
 from winbox.kdbg.format import format_struct as _format_struct, format_sym as _format_sym
-from winbox.kdbg.hmp import HmpError, hmp as hmp_call, parse_registers, probe_port
+from winbox.kdbg.hmp import (
+    HmpError,
+    ensure_not_paused,
+    hmp as hmp_call,
+    probe_port,
+)
 from winbox.kdbg.walk import list_modules, list_processes, list_user_modules
 from winbox.vm import VM, GuestAgent, VMState
 
@@ -154,24 +157,31 @@ def kdbg_stop(ctx: click.Context) -> None:
 @click.option("--port", default=1234, show_default=True, help="Port to probe.")
 @click.pass_context
 def kdbg_status(ctx: click.Context, port: int) -> None:
-    """Show whether the gdb stub is listening.
+    """Show whether the gdb stub is listening, and whether kdbg holds it.
 
-    Probes 127.0.0.1:<port> with a TCP connect. QEMU's gdbstub only
-    accepts a single client at a time, so "listening but probe fails" is
-    the usual signal that a gdb session is already attached.
+    Read-only in the strict sense: the listening check reads /proc rather
+    than connecting, because QEMU's gdbstub halts the guest CPU as soon as a
+    client attaches — a status command must not do that.
     """
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
 
-    if vm.state() != VMState.RUNNING:
-        console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
+    state = vm.state()
+    if state != VMState.RUNNING:
+        console.print(f"[yellow][!][/] VM is not running (state: {state.value})")
+        if state == VMState.PAUSED:
+            console.print(
+                "    If a debug session left it paused: [bold]winbox kdbg resume[/]"
+            )
         return
 
-    listening = probe_port("127.0.0.1", port)
-    if listening:
-        console.print(f"gdb stub: [green]listening[/] on 127.0.0.1:{port}")
-    else:
+    if not probe_port("127.0.0.1", port):
         console.print(f"gdb stub: [red]not running[/] (nothing on 127.0.0.1:{port})")
+        return
+
+    console.print(f"gdb stub: [green]listening[/] on 127.0.0.1:{port}")
+    if DaemonClient(cfg).session_alive():
+        console.print("  a winbox kdbg session is attached — [bold]winbox kdbg session[/]")
 
 
 # ── Symbol / struct / walker subcommands ────────────────────────────────
@@ -1018,12 +1028,21 @@ def kdbg_detach(ctx: click.Context) -> None:
     # Daemon should exit shortly. Wait briefly for the lock to release.
     import time as _t
     deadline = _t.monotonic() + 5.0
+    detached = False
     while _t.monotonic() < deadline:
         if not client.session_alive():
             console.print("[green][+][/] detached")
-            return
+            detached = True
+            break
         _t.sleep(0.1)
-    console.print("[yellow][!][/] daemon didn't exit within 5s; lock may be stale")
+    if not detached:
+        console.print("[yellow][!][/] daemon didn't exit within 5s; lock may be stale")
+    # A daemon that didn't shut down cleanly never resumed the CPU, leaving
+    # the VM paused with only that warning to show for it — after which every
+    # winbox command sees a VM that looks down.
+    note = ensure_not_paused(cfg.vm_name)
+    if note:
+        console.print(f"[yellow][!][/] {note}")
 
 
 @kdbg.command("resume")
@@ -1044,6 +1063,15 @@ def kdbg_resume(ctx: click.Context, port: int) -> None:
 
     if state != VMState.RUNNING and state != VMState.PAUSED:
         console.print(f"[yellow][!][/] VM state is {state.value}; nothing to do")
+        return
+
+    if state == VMState.RUNNING:
+        # Already running: there is nothing to continue, and asking the
+        # gdbstub to anyway blocks waiting for a stop reply that never comes
+        # ("empty stop reply"). This is documented as a safe no-op, so it has
+        # to actually be one — a recovery valve that errors on a healthy VM
+        # is one people learn not to trust.
+        console.print("[green][+][/] VM is already running; nothing to resume")
         return
 
     if not probe_port("127.0.0.1", port):

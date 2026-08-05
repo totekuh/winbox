@@ -43,7 +43,7 @@ PS C:\Windows\system32>
 - **Autologin** — persistent Administrator auto-login that survives reboots on Server 2022
 - **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
-- **MCP server** — 51 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including a session-based named-pipe broker and a long-running hypervisor-level kernel debug session
+- **MCP server** — 54 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including Defender enable/disable/status, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
 - **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
 - **VNC display** via virt-manager (`winbox vnc`) — plain VGA, no clipboard/resize
 - **x64dbg in the guest** — bundled in setup, extracted to `C:\Tools\x64dbg`, both x32 and x64 on PATH
@@ -80,12 +80,43 @@ cd winbox
 pip install -e .
 ```
 
-Then build the VM (downloads Windows Server 2022 eval ISO + VirtIO drivers):
+Then build the VM (downloads the eval ISO + VirtIO drivers):
 
 ```bash
 winbox iso download          # ~4.7 GB, supports resume
 winbox setup -y              # builds and provisions the VM
 ```
+
+### Choosing the guest OS
+
+`winbox setup` builds **Windows Server 2022** by default. Pass `--os win11` to build
+**Windows 11 Enterprise (Evaluation)** instead:
+
+```bash
+winbox setup --os win11 -y   # build Windows 11 instead of Server 2022
+```
+
+The choice is build-time and there is one VM at a time — switching OS means
+`winbox destroy -y` then `winbox setup --os <other> -y`. Setup records the choice as
+`VM_OS=` in `~/.winbox/config`, so every later command (`status`, `av`, `exec`, the
+MCP server) resolves the same profile as the VM on disk; you can also set that key
+yourself to change the default for a bare `winbox setup`. The right ISO is downloaded
+automatically for the selected OS (or pass `--iso <path>` to use your own).
+
+Notes for Win11:
+- No TPM / Secure Boot required — setup injects the `LabConfig` bypass keys so the
+  install proceeds on plain UEFI. `--desktop` is Server-only and rejected for Win11.
+- Win11 needs a 64 GB system drive and the standard UEFI layout (larger ESP + MSR
+  partition); setup handles both automatically (the disk is grown to 64 GB and the
+  Windows partition lands on partition 3).
+- **Defender:** Win11 client ships with Tamper Protection on, which normally blocks
+  the registry-based disable. Setup clears it in the offline registry hive before
+  first boot so Defender can be turned off during provisioning. This is best-effort
+  (Defender's cloud component can re-arm it on a networked boot); `winbox av status`
+  reports the Tamper-Protection state, and `winbox av disable` refuses honestly rather
+  than falsely reporting success if TP is still on.
+- If Microsoft rotates the eval ISO's download link, the auto-download fails loudly;
+  grab the ISO manually and pass `--iso <path>`.
 
 ## Commands
 
@@ -447,6 +478,35 @@ VIRTIO_ISO_URL=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
     ├── .msi/                           # staging dir for winbox msi (cleaned up per-run)
     └── loot/                           # output directory
         └── .jobs/                      # background job log files
+```
+
+## Testing
+
+```bash
+pytest                                  # unit + coverage tests, no VM required
+pytest -m integration                   # live end-to-end suite, drives the real VM
+```
+
+A bare `pytest` deselects everything marked `integration`, so it never touches a
+VM you are using.
+
+The live suite (`tests/test_e2e_live.py`) exercises every CLI command and every
+MCP tool against whichever image `~/.winbox/config` points at, and is written to
+pass on **both** `server2022` and `win11` — where the two genuinely differ
+(Tamper Protection, Server Core's smaller service set, the Python payload) it
+asserts the profile-appropriate behavior instead of skipping.
+
+`tests/e2e_manifest.py` records how each command and tool is covered — live, or
+excluded with a stated reason — and `tests/test_e2e_coverage.py` checks that
+manifest against the real click tree and MCP registry. Adding a command or tool
+fails the build until you say how it gets exercised, which is what keeps "we
+test everything" a claim you can verify rather than one that quietly rots.
+
+To validate a change across both images:
+
+```bash
+winbox setup --os server2022 -y && pytest -m integration
+winbox setup --os win11 -y      && pytest -m integration
 ```
 
 ## License

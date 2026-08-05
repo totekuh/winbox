@@ -1,0 +1,250 @@
+"""Coverage manifest for the live end-to-end suite.
+
+Every CLI command and every MCP tool must appear here exactly once, with a
+status saying how it is covered. ``tests/test_e2e_coverage.py`` enforces that
+against the real click tree and the real MCP registry, so adding a command or
+tool fails the build until someone decides how it gets exercised.
+
+The point is that "we test everything" stays a checkable claim rather than an
+aspiration that quietly rots. Anything genuinely untestable in CI is
+``EXCLUDED`` with a reason you can read and argue with — not silently absent.
+
+Statuses
+--------
+``LIVE``      Exercised against a running VM by ``tests/test_e2e_live.py``.
+``GROUP``     A click group node, not an invocable command. Its ``--help`` is
+              still checked by the CLI walk test.
+``EXCLUDED``  Deliberately not run live. The note says why.
+"""
+
+from __future__ import annotations
+
+LIVE = "LIVE"
+GROUP = "GROUP"
+EXCLUDED = "EXCLUDED"
+
+
+# ─── CLI commands ───────────────────────────────────────────────────────────
+
+CLI_COVERAGE: dict[str, tuple[str, str]] = {
+    # Groups — no behavior of their own beyond dispatch.
+    "applocker": (GROUP, ""),
+    "autologin": (GROUP, ""),
+    "av": (GROUP, ""),
+    "binfmt": (GROUP, ""),
+    "dns": (GROUP, ""),
+    "domain": (GROUP, ""),
+    "hosts": (GROUP, ""),
+    "iso": (GROUP, ""),
+    "jobs": (GROUP, ""),
+    "kdbg": (GROUP, ""),
+    "net": (GROUP, ""),
+    "tools": (GROUP, ""),
+
+    # Lifecycle
+    "status": (LIVE, ""),
+    "up": (LIVE, ""),
+    "down": (LIVE, ""),
+    "suspend": (LIVE, ""),
+    "snapshot": (LIVE, "create + list"),
+    "restore": (LIVE, ""),
+    "provision": (LIVE, "re-runs provision.ps1 in the guest"),
+    "setup": (EXCLUDED, "rebuilds the VM from scratch; driven by the rebuild "
+                        "procedure, not the smoke suite"),
+    "destroy": (EXCLUDED, "deletes the VM and its storage; see setup"),
+    "vnc": (EXCLUDED, "launches virt-manager, a GUI application"),
+
+    # Execute
+    "exec": (LIVE, ""),
+    "shell": (EXCLUDED, "interactive ConPTY session; needs a TTY"),
+    "ssh": (EXCLUDED, "interactive SSH session; needs a TTY"),
+    "eventlogs": (LIVE, ""),
+    "eventlogs clear": (LIVE, ""),
+    "jobs list": (LIVE, ""),
+    "jobs output": (LIVE, ""),
+    "jobs kill": (LIVE, ""),
+    "msi": (LIVE, "argument validation only — installing a package mutates "
+                  "the guest in ways the suite cannot undo"),
+
+    # Files
+    "tools list": (LIVE, ""),
+    "tools add": (LIVE, ""),
+    "tools remove": (LIVE, ""),
+    "upload": (LIVE, ""),
+    "iso status": (LIVE, ""),
+    "iso download": (EXCLUDED, "multi-GB download from Microsoft's CDN"),
+
+    # Network
+    "net status": (LIVE, ""),
+    "net isolate": (LIVE, "including the re-isolate idempotency case"),
+    "net connect": (LIVE, ""),
+    "net unplug": (LIVE, ""),
+    "dns view": (LIVE, ""),
+    "dns set": (LIVE, ""),
+    "dns sync": (LIVE, ""),
+    "hosts view": (LIVE, ""),
+    "hosts add": (LIVE, ""),
+    "hosts set": (LIVE, ""),
+    "hosts delete": (LIVE, "including the nothing-to-remove case"),
+    "domain join": (EXCLUDED, "needs a reachable Active Directory domain "
+                              "controller and credentials"),
+    "domain leave": (EXCLUDED, "needs a domain-joined guest; see domain join"),
+
+    # Target
+    "applocker status": (LIVE, ""),
+    "applocker enable": (LIVE, ""),
+    "applocker disable": (LIVE, ""),
+    "autologin status": (LIVE, ""),
+    "autologin enable": (LIVE, ""),
+    "autologin disable": (LIVE, ""),
+    "av status": (LIVE, ""),
+    "av enable": (LIVE, ""),
+    "av disable": (LIVE, "reboots the guest"),
+
+    # Integrations
+    "binfmt status": (LIVE, ""),
+    "binfmt enable": (EXCLUDED, "writes to /proc/sys/fs/binfmt_misc as root; "
+                                "a host-level change the suite must not make"),
+    "binfmt disable": (EXCLUDED, "see binfmt enable"),
+    "mcp": (EXCLUDED, "starts a blocking stdio server; the tools it serves are "
+                      "covered directly in test_e2e_live.py"),
+    "office": (EXCLUDED, "needs a licensed Microsoft Office installer image"),
+
+    # kdbg
+    "kdbg start": (LIVE, ""),
+    "kdbg stop": (LIVE, ""),
+    "kdbg status": (LIVE, ""),
+    "kdbg symbols": (LIVE, "downloads and parses the nt PDB"),
+    "kdbg sym": (LIVE, ""),
+    "kdbg struct": (LIVE, ""),
+    "kdbg ps": (LIVE, ""),
+    "kdbg lm": (LIVE, ""),
+    "kdbg base": (LIVE, ""),
+    "kdbg session": (LIVE, ""),
+    "kdbg attach": (LIVE, ""),
+    "kdbg detach": (LIVE, "asserts the guest is not left paused"),
+    "kdbg resume": (LIVE, ""),
+    "kdbg user-lm": (LIVE, ""),
+    "kdbg user-symbols": (LIVE, ""),
+    "kdbg read-va": (LIVE, ""),
+    "kdbg regs": (LIVE, "requires an attached session"),
+    "kdbg mem": (LIVE, ""),
+    "kdbg stack": (LIVE, ""),
+    "kdbg bt": (LIVE, ""),
+    "kdbg bps": (LIVE, ""),
+    "kdbg bp": (LIVE, ""),
+    "kdbg rm": (LIVE, ""),
+    "kdbg user-bp": (LIVE, "argument validation only"),
+    "kdbg cont": (EXCLUDED, "blocks until a breakpoint fires or its budget "
+                            "expires; leaves the guest halted on timeout"),
+    "kdbg step": (EXCLUDED, "single-steps a halted guest; see kdbg cont"),
+    "kdbg interrupt": (EXCLUDED, "halts the guest CPU; see kdbg cont"),
+}
+
+
+# ─── MCP tools ──────────────────────────────────────────────────────────────
+
+MCP_COVERAGE: dict[str, tuple[str, str]] = {
+    "python": (LIVE, ""),
+    "ps": (LIVE, ""),
+    "ioctl": (LIVE, "error path — a real device IOCTL depends on a driver "
+                    "that is not part of a stock image"),
+    "reg_query": (LIVE, ""),
+    "reg_set": (LIVE, ""),
+    "reg_delete": (LIVE, ""),
+    "eventlogs": (LIVE, ""),
+    "eventlogs_clear": (LIVE, ""),
+    "upload": (LIVE, ""),
+    "file_copy": (LIVE, ""),
+    "mem_read": (LIVE, ""),
+    "service_start": (LIVE, ""),
+    "service_stop": (LIVE, ""),
+    "av_status": (LIVE, ""),
+    "av_enable": (LIVE, ""),
+    "av_disable": (EXCLUDED, "reboots the guest mid-suite; the CLI path "
+                             "`av disable` covers the same shared code"),
+    "net_isolate": (LIVE, ""),
+    "net_connect": (LIVE, ""),
+    "net_unplug": (LIVE, ""),
+
+    # Named-pipe broker
+    "pipe_list": (LIVE, ""),
+    "pipe_info": (LIVE, ""),
+    "pipe_connect": (LIVE, ""),
+    "pipe_open": (LIVE, ""),
+    "pipe_send": (LIVE, ""),
+    "pipe_recv": (LIVE, ""),
+    "pipe_close": (LIVE, "including the double-close case"),
+
+    # kdbg
+    "kdbg_start": (LIVE, ""),
+    "kdbg_stop": (LIVE, ""),
+    "kdbg_status": (LIVE, ""),
+    "kdbg_session": (LIVE, ""),
+    "kdbg_symbols_load": (LIVE, ""),
+    "kdbg_sym": (LIVE, ""),
+    "kdbg_struct": (LIVE, ""),
+    "kdbg_ps": (LIVE, ""),
+    "kdbg_lm": (LIVE, ""),
+    "kdbg_base_refresh": (LIVE, ""),
+    "kdbg_attach": (LIVE, ""),
+    "kdbg_detach": (LIVE, "asserts the guest is not left paused"),
+    "kdbg_resume": (LIVE, ""),
+    "kdbg_user_lm": (LIVE, ""),
+    "kdbg_user_symbols_load": (LIVE, ""),
+    "kdbg_read_va": (LIVE, ""),
+    "kdbg_regs": (LIVE, ""),
+    "kdbg_mem": (LIVE, ""),
+    "kdbg_stack": (LIVE, ""),
+    "kdbg_bt": (LIVE, ""),
+    "kdbg_bps": (LIVE, ""),
+    "kdbg_bp": (LIVE, ""),
+    "kdbg_rm": (LIVE, ""),
+    "kdbg_disasm": (LIVE, ""),
+    "kdbg_write_mem": (EXCLUDED, "writes into live kernel memory; a wrong "
+                                 "address or a misparsed read-back would "
+                                 "destabilize the guest mid-suite for no "
+                                 "coverage the RSP-level tests do not give"),
+    "kdbg_cont": (EXCLUDED, "blocks until a breakpoint fires or its budget "
+                            "expires; leaves the guest halted on timeout"),
+    "kdbg_step": (EXCLUDED, "single-steps a halted guest; see kdbg_cont"),
+    "kdbg_interrupt": (EXCLUDED, "halts the guest CPU; see kdbg_cont"),
+}
+
+
+def statuses(coverage: dict[str, tuple[str, str]], status: str) -> set[str]:
+    return {name for name, (st, _) in coverage.items() if st == status}
+
+
+# ─── Unit coverage backing each live exclusion ──────────────────────────────
+# Excluding something from the live suite is only acceptable if it is tested
+# some other way. Each EXCLUDED entry above names the unit test file that
+# covers it here, and test_e2e_coverage.py enforces that the mapping is
+# complete and that the files exist — so "excluded" can never quietly become
+# "untested".
+
+CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
+    "setup": "tests/test_installer.py",
+    "destroy": "tests/test_destroy.py",
+    "vnc": "tests/test_status.py",
+    "shell": "tests/test_shell.py",
+    "ssh": "tests/test_shell.py",
+    "iso download": "tests/test_iso.py",
+    "domain join": "tests/test_network.py",
+    "domain leave": "tests/test_network.py",
+    "binfmt enable": "tests/test_binfmt.py",
+    "binfmt disable": "tests/test_binfmt.py",
+    "mcp": "tests/test_mcp.py",
+    "office": "tests/test_office.py",
+    "kdbg cont": "tests/test_kdbg_daemon.py",
+    "kdbg step": "tests/test_kdbg_daemon.py",
+    "kdbg interrupt": "tests/test_kdbg_daemon.py",
+}
+
+MCP_EXCLUSION_UNIT_TESTS: dict[str, str] = {
+    "av_disable": "tests/test_mcp.py",
+    "kdbg_write_mem": "tests/test_kdbg_rsp.py",
+    "kdbg_cont": "tests/test_mcp.py",
+    "kdbg_step": "tests/test_mcp.py",
+    "kdbg_interrupt": "tests/test_mcp.py",
+}

@@ -7,6 +7,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from winbox.osprofile import DEFAULT_OS, OS_PROFILES, OSProfile
+
 logger = logging.getLogger(__name__)
 
 
@@ -15,6 +17,7 @@ class Config:
     """winbox configuration with defaults and user overrides."""
 
     vm_name: str = "winbox"
+    vm_os: str = DEFAULT_OS
     vm_user: str = "Administrator"
     vm_password: str = "WinboxP@ss123"
     vm_ram: int = 4096
@@ -31,6 +34,23 @@ class Config:
         "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/"
         "stable-virtio/virtio-win.iso"
     )
+
+    @property
+    def profile(self) -> OSProfile:
+        """The :class:`~winbox.osprofile.OSProfile` for ``vm_os``.
+
+        Falls back to the default profile (with a warning) if ``vm_os`` was
+        set to something unknown — ``_apply_overrides`` already rejects
+        unknown values from the config file, so this only trips if the field
+        is mutated in code.
+        """
+        try:
+            return OS_PROFILES[self.vm_os]
+        except KeyError:
+            logger.warning(
+                "unknown vm_os %r — falling back to %r", self.vm_os, DEFAULT_OS
+            )
+            return OS_PROFILES[DEFAULT_OS]
 
     @property
     def shared_dir(self) -> Path:
@@ -80,14 +100,46 @@ class Config:
     def unattend_img(self) -> Path:
         return self.iso_dir / "unattend.img"
 
+    @property
+    def config_file(self) -> Path:
+        return self.winbox_dir / "config"
+
     @classmethod
     def load(cls) -> Config:
         """Load config from defaults + ~/.winbox/config overrides."""
         cfg = cls()
-        config_file = cfg.winbox_dir / "config"
+        config_file = cfg.config_file
         if config_file.exists():
             cfg = cls._apply_overrides(cfg, config_file)
         return cfg
+
+    def persist(self, key: str, value: str) -> None:
+        """Write ``KEY=value`` into ``~/.winbox/config``, in place.
+
+        The build-time OS choice has to outlive the ``winbox setup`` process:
+        every later command (``status``, ``av``, ``exec``, the MCP server)
+        constructs its own :class:`Config` from the file, and a ``--os`` that
+        only lived in setup's memory would leave them all reading the default
+        profile against a VM built from the other one.
+
+        Rewrites an existing assignment in place (preserving comments, blank
+        lines, and unrelated keys) and appends otherwise, so a hand-edited
+        config survives.
+        """
+        self.winbox_dir.mkdir(parents=True, exist_ok=True)
+        path = self.config_file
+        line = f"{key}={value}"
+        lines = path.read_text().splitlines() if path.exists() else []
+        for i, existing in enumerate(lines):
+            stripped = existing.strip()
+            if stripped.startswith("#") or "=" not in stripped:
+                continue
+            if stripped.split("=", 1)[0].strip() == key:
+                lines[i] = line
+                break
+        else:
+            lines.append(line)
+        path.write_text("\n".join(lines) + "\n")
 
     @staticmethod
     def _apply_overrides(cfg: Config, path: Path) -> Config:
@@ -99,6 +151,7 @@ class Config:
         """
         mapping = {
             "VM_NAME": "vm_name",
+            "VM_OS": "vm_os",
             "VM_USER": "vm_user",
             "VM_PASSWORD": "vm_password",
             "VM_RAM": "vm_ram",
@@ -160,6 +213,14 @@ class Config:
                 setattr(cfg, attr, parsed)
             elif attr in path_fields:
                 setattr(cfg, attr, Path(value))
+            elif attr == "vm_os":
+                if value not in OS_PROFILES:
+                    logger.warning(
+                        "%s:%d: %s must be one of %s (got %r) — keeping default",
+                        path, lineno, key, ", ".join(sorted(OS_PROFILES)), value,
+                    )
+                    continue
+                setattr(cfg, attr, value)
             else:
                 setattr(cfg, attr, value)
 

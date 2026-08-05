@@ -407,17 +407,44 @@ class TestHostsSet:
 class TestHostsDelete:
     def test_delete_entry(self, runner, mock_env):
         mock_env.exec_powershell.return_value = ExecResult(
-            exitcode=0, stdout="", stderr=""
+            exitcode=0, stdout="REMOVED=1\n", stderr=""
         )
         result = runner.invoke(cli, ["hosts", "delete", "dc01.corp.local"])
         assert result.exit_code == 0
-        assert "Removed" in result.output
+        assert "Removed 1 entry" in result.output
         assert "dc01.corp.local" in result.output
 
         script = mock_env.exec_powershell.call_args[0][0]
         assert "notmatch" in script
         assert r"dc01\.corp\.local" in script
         assert "Set-Content" in script
+
+    def test_delete_reports_multiple_entries(self, runner, mock_env):
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="REMOVED=3\n", stderr=""
+        )
+        result = runner.invoke(cli, ["hosts", "delete", "dc01.corp.local"])
+        assert "Removed 3 entries" in result.output
+
+    def test_delete_nonexistent_entry_says_so(self, runner, mock_env):
+        """Reporting "Removed <host>" for an entry that was never there reads
+        as confirmation the hosts file no longer routes it — a different and
+        unverified claim."""
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="REMOVED=0\n", stderr=""
+        )
+        result = runner.invoke(cli, ["hosts", "delete", "ghost.local"])
+        assert result.exit_code == 0
+        assert "nothing to remove" in result.output
+        assert "Removed" not in result.output
+
+    def test_delete_skips_the_write_when_nothing_matched(self, runner, mock_env):
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="REMOVED=0\n", stderr=""
+        )
+        runner.invoke(cli, ["hosts", "delete", "ghost.local"])
+        script = mock_env.exec_powershell.call_args[0][0]
+        assert "if ($removed -gt 0)" in script
 
     def test_delete_failure(self, runner, mock_env):
         mock_env.exec_powershell.return_value = ExecResult(

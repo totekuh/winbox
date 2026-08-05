@@ -441,3 +441,132 @@ class TestHasFilter:
         with patch("winbox.nwfilter.virsh_run") as mock_virsh:
             mock_virsh.return_value = _proc(0, stdout="<not valid xml")
             assert nwfilter.has_filter("winbox") is False
+
+
+class TestDefineWhileFilterInUse:
+    """Re-isolating an already-isolated VM must be a no-op, not an error.
+
+    `winbox setup` leaves the VM isolated by default, so the filter is
+    attached to a running domain — and libvirt refuses to undefine a filter
+    that is in use. The undefine-and-retry path for the UUID conflict then
+    turned every `winbox net isolate` on a freshly built VM into an exit-1
+    failure, even though the VM was already in exactly the requested state.
+    """
+
+    UUID_ERR = (
+        "error: operation failed: filter 'winbox-isolate-ipv4' "
+        "already exists with uuid abc-123"
+    )
+    IN_USE_ERR = "error: Requested operation is not valid: nwfilter is in use"
+
+    # What libvirt reports back: a <uuid> the template lacks, a computed
+    # priority on the root element, and no comments.
+    LIVE_IPV4 = """\
+<filter name='winbox-isolate-ipv4' chain='ipv4' priority='-700'>
+  <uuid>0f8f38ba-eccc-4d5d-926a-0bc9a6879053</uuid>
+  <rule action='accept' direction='inout' priority='200'>
+    <ip srcipaddr='192.168.122.0' srcipmask='24' dstipaddr='192.168.122.0' dstipmask='24'/>
+  </rule>
+  <rule action='drop' direction='inout' priority='1000'/>
+</filter>
+"""
+
+    DIFFERENT_IPV4 = """\
+<filter name='winbox-isolate-ipv4' chain='ipv4' priority='-700'>
+  <uuid>0f8f38ba-eccc-4d5d-926a-0bc9a6879053</uuid>
+  <rule action='accept' direction='inout' priority='200'>
+    <ip srcipaddr='10.9.9.0' srcipmask='24' dstipaddr='10.9.9.0' dstipmask='24'/>
+  </rule>
+  <rule action='drop' direction='inout' priority='1000'/>
+</filter>
+"""
+
+    def _virsh(self, dumpxml_out):
+        def fake_virsh(*args, check=True):
+            if args[0] == "nwfilter-define":
+                return _proc(1, stderr=self.UUID_ERR)
+            if args[0] == "nwfilter-undefine":
+                return _proc(1, stderr=self.IN_USE_ERR)
+            if args[0] == "nwfilter-dumpxml":
+                return _proc(0, stdout=dumpxml_out)
+            return _proc(0)
+        return fake_virsh
+
+    def test_in_use_with_matching_ruleset_is_a_noop(self):
+        with patch("winbox.nwfilter.virsh_run", side_effect=self._virsh(self.LIVE_IPV4)):
+            nwfilter._define_one(
+                nwfilter.FILTER_IPV4_XML,
+                nwfilter.FILTER_IPV4_NAME,
+                render_kwargs={"subnet": "192.168.122.0", "mask": 24},
+            )  # must not raise
+
+    def test_in_use_with_different_ruleset_raises_with_guidance(self):
+        with patch(
+            "winbox.nwfilter.virsh_run", side_effect=self._virsh(self.DIFFERENT_IPV4)
+        ):
+            with pytest.raises(RuntimeError, match="net connect"):
+                nwfilter._define_one(
+                    nwfilter.FILTER_IPV4_XML,
+                    nwfilter.FILTER_IPV4_NAME,
+                    render_kwargs={"subnet": "192.168.122.0", "mask": 24},
+                )
+
+    def test_ensure_filter_defined_is_idempotent_while_in_use(self):
+        """The whole entry point, called repeatedly against a live filter."""
+        def fake_virsh(*args, check=True):
+            if args[0] == "nwfilter-define":
+                return _proc(1, stderr=self.UUID_ERR)
+            if args[0] == "nwfilter-undefine":
+                return _proc(1, stderr=self.IN_USE_ERR)
+            if args[0] == "nwfilter-dumpxml":
+                name = args[1]
+                if name == nwfilter.FILTER_IPV4_NAME:
+                    return _proc(0, stdout=self.LIVE_IPV4)
+                from winbox import data as _data
+                return _proc(0, stdout=_data.read(nwfilter.FILTER_XML))
+            return _proc(0)
+
+        with patch("winbox.nwfilter.virsh_run", side_effect=fake_virsh):
+            nwfilter.ensure_filter_defined()
+            nwfilter.ensure_filter_defined()  # must stay a no-op
+
+
+class TestFilterSignature:
+    """The comparison must ignore libvirt's bookkeeping and only notice rules."""
+
+    def _sig(self, xml):
+        import xml.etree.ElementTree as ET
+
+        return nwfilter._filter_signature(ET.fromstring(xml))
+
+    def test_uuid_and_priority_and_comments_are_ignored(self):
+        bare = "<filter name='f' chain='ipv4'><rule action='drop'/></filter>"
+        decorated = (
+            "<filter name='f' chain='ipv4' priority='-700'>"
+            "<uuid>abc</uuid><!-- explanation --><rule action='drop'/></filter>"
+        )
+        assert self._sig(bare) == self._sig(decorated)
+
+    def test_a_changed_rule_is_detected(self):
+        a = "<filter name='f' chain='ipv4'><rule action='drop'/></filter>"
+        b = "<filter name='f' chain='ipv4'><rule action='accept'/></filter>"
+        assert self._sig(a) != self._sig(b)
+
+    def test_a_changed_ip_range_is_detected(self):
+        a = ("<filter name='f' chain='ipv4'><rule action='accept'>"
+             "<ip srcipaddr='192.168.122.0' srcipmask='24'/></rule></filter>")
+        b = ("<filter name='f' chain='ipv4'><rule action='accept'>"
+             "<ip srcipaddr='10.0.0.0' srcipmask='8'/></rule></filter>")
+        assert self._sig(a) != self._sig(b)
+
+    def test_rule_order_matters(self):
+        a = ("<filter name='f' chain='ipv4'>"
+             "<rule action='accept'/><rule action='drop'/></filter>")
+        b = ("<filter name='f' chain='ipv4'>"
+             "<rule action='drop'/><rule action='accept'/></filter>")
+        assert self._sig(a) != self._sig(b)
+
+    def test_filterref_change_is_detected(self):
+        a = "<filter name='f' chain='root'><filterref filter='allow-dhcp'/></filter>"
+        b = "<filter name='f' chain='root'><filterref filter='clean-traffic'/></filter>"
+        assert self._sig(a) != self._sig(b)

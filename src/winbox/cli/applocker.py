@@ -101,7 +101,7 @@ def applocker_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     # Each step must be a separate GA call — running inside a single
     # exec_powershell doesn't give the converter the right context.
     console.print("[blue][*][/] Starting AppLocker stack...")
-    result = ga.exec("appidtel.exe start", timeout=15)
+    result = ga.exec("appidtel.exe start", timeout=60)
     if result.exitcode != 0:
         console.print("[red][-][/] Failed to start AppLocker stack (appidtel.exe):")
         console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
@@ -109,12 +109,15 @@ def applocker_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     time.sleep(5)
 
     console.print("[blue][*][/] Compiling rules...")
-    result = ga.exec(r"C:\Windows\System32\AppIdPolicyConverter.exe", timeout=15)
+    result = ga.exec(r"C:\Windows\System32\AppIdPolicyConverter.exe", timeout=60)
     if result.exitcode != 0:
         console.print("[yellow][!][/] Rule compilation warning (AppIdPolicyConverter):")
         console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
     time.sleep(5)
-    result = ga.exec("gpupdate /force", timeout=30)
+    # gpupdate /force can block for minutes when the guest has no domain
+    # controller to reach and the NIC is still settling — a tight budget
+    # here kills it mid-apply and leaves the policy half-applied.
+    result = ga.exec("gpupdate /force", timeout=180)
     if result.exitcode != 0:
         console.print("[yellow][!][/] gpupdate warning:")
         console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
@@ -153,7 +156,9 @@ def applocker_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
 @needs_vm()
 def applocker_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Show current AppLocker enforcement status."""
-    result = ga.exec_powershell(_STATUS_SCRIPT, timeout=15)
+    # Normally ~2s, but a read-only status query should ride out a
+    # transient guest stall rather than time out and get taskkill'd.
+    result = ga.exec_powershell(_STATUS_SCRIPT, timeout=90)
     if result.exitcode != 0:
         console.print(f"[red][-][/] Failed to query status: {result.stderr.strip()}")
         raise SystemExit(1)
