@@ -260,13 +260,20 @@ def enable(ga: "GuestAgent", *, progress: ProgressFn = _noop) -> EnableOutcome:
         raise DefenderError("Failed to start WinDefend", result)
 
     # Step 3: Exclusions must land before protections come up (see docstring).
+    # The first Add-MpPreference / Set-MpPreference after WinDefend starts loads
+    # the Defender PowerShell module ("Preparing modules for first use"), which
+    # on a freshly-started service — notably Server 2025's 24H2 Defender — can
+    # take well past 15s. These steps genuinely need to land (the exclusions
+    # keep Defender from flagging the guest agent's encoded PowerShell), so give
+    # the module load real headroom rather than letting a timeout fail an
+    # otherwise-successful enable with a traceback.
     progress("Adding exclusions for QEMU GA and VirtIO-FS...")
-    ga.exec_powershell(EXCLUSION_SCRIPT, timeout=15)
+    ga.exec_powershell(EXCLUSION_SCRIPT, timeout=120)
 
     # Step 4: Re-assert preferences (best-effort — defaults are already
     # "enabled" once the overrides are gone and the service is up).
     progress("Enabling protections...")
-    ga.exec_powershell(PREFS_ENABLE_SCRIPT, timeout=30)
+    ga.exec_powershell(PREFS_ENABLE_SCRIPT, timeout=120)
     return EnableOutcome(reboot_required=False)
 
 

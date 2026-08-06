@@ -937,7 +937,8 @@ class TestVirtiofsCacheIsProfileNamespaced:
         assert "w11" in win11.name
 
     @pytest.mark.parametrize(
-        "os_key,subdir", [("server2022", "2k22"), ("win11", "w11")]
+        "os_key,subdir",
+        [("server2022", "2k22"), ("server2025", "2k25"), ("win11", "w11")],
     )
     def test_iso_member_path_follows_the_profile(self, tmp_path, os_key, subdir):
         from winbox.setup.installer import _virtiofs_iso_member

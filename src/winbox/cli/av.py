@@ -66,11 +66,17 @@ def av_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
         #
         # That restart is also the one chance to clear Tamper Protection while
         # Defender still isn't running to defend it. Without this, enabling
-        # Defender on a client SKU is one-way: TP arms as soon as WinDefend
-        # starts and every later `av disable` needs its own power cycle. So on
-        # client SKUs the warm reboot becomes a power cycle that clears TP on
-        # the way through — same number of restarts, one less trap.
-        if cfg.profile.client_sku:
+        # Defender on an offline-disabled build is one-way: TP arms as soon as
+        # WinDefend starts and every later `av disable` needs its own power
+        # cycle. So the warm reboot becomes a power cycle that clears TP on the
+        # way through — same number of restarts, one less trap.
+        #
+        # Gate on disable_defender_offline, not client_sku: what makes the
+        # offline enable *necessary* is that the build disabled Defender in the
+        # offline hive (its Services\*\Start keys are ACL-protected in-guest).
+        # That is true for Win11 AND Server 2025 (both 24H2 Defender), but not
+        # Server 2022 — client-vs-server is the wrong axis here.
+        if cfg.profile.disable_defender_offline:
             _restart_clearing_tamper_protection(cfg, vm, ga)
         else:
             reboot_and_wait(
@@ -258,12 +264,15 @@ def av_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     report success. `winbox setup --os win11` clears TP offline during
     provisioning; if it's back on, disable it in the Windows Security UI.
     """
-    # Step 0: On a client SKU, Tamper Protection makes every in-guest disable
-    # a no-op. Rather than refuse — which left the VM in a state only a
-    # rebuild escaped — power the VM down and edit the hive offline, where
-    # nothing is enforcing TP. This is the same operation `winbox setup`
-    # applies before the guest's first boot.
-    if cfg.profile.client_sku and defender.tamper_protection_on(ga):
+    # Step 0: On an OS whose Defender enforces Tamper Protection (Win11 and
+    # Server 2025 — both built with the offline Defender disable), TP makes
+    # every in-guest disable a no-op. Rather than refuse — which left the VM in
+    # a state only a rebuild escaped — power the VM down and edit the hive
+    # offline, where nothing is enforcing TP. This is the same operation
+    # `winbox setup` applies before the guest's first boot. Gate on
+    # disable_defender_offline, not client_sku: Server 2025 is a Server SKU
+    # (client_sku False) that still needs this path.
+    if cfg.profile.disable_defender_offline and defender.tamper_protection_on(ga):
         console.print(
             "[blue][*][/] Tamper Protection is ON — disabling offline instead "
             "(the VM will be shut down and restarted)."

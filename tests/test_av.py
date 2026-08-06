@@ -570,6 +570,22 @@ class TestOfflineDisableOnClientSku:
 
         offline.assert_not_called()
 
+    def test_server2025_with_tp_on_goes_offline(self, runner, mock_env, cfg):
+        """Server 2025 is a Server SKU (client_sku False) but its 24H2 Defender
+        enforces TP, so it must take the offline path — the gate is
+        disable_defender_offline, not client_sku."""
+        cfg.vm_os = "server2025"
+        with (
+            patch("winbox.cli.av.defender.tamper_protection_on", return_value=True),
+            patch("winbox.cli.av._disable_via_offline_hive") as offline,
+            patch("winbox.cli.av.defender.set_disable_regkeys") as gp_keys,
+        ):
+            result = runner.invoke(cli, ["av", "disable"])
+
+        assert result.exit_code == 0
+        offline.assert_called_once()
+        gp_keys.assert_not_called()
+
     def test_offline_edit_refuses_while_the_disk_may_be_in_use(self, cfg):
         """guestfish opens the disk read-write; running it against a live VM
         risks corruption."""
@@ -637,6 +653,21 @@ class TestEnableClearsTamperProtection:
 
         warm.assert_called_once()
         restart.assert_not_called()
+
+    def test_server2025_restart_clears_tp(self, runner, mock_env, cfg):
+        """Server 2025 built with the offline Defender disable needs the offline
+        enable (restore ACL-protected start types), same as Win11."""
+        cfg.vm_os = "server2025"
+        with (
+            patch("winbox.cli.av.defender.enable", side_effect=[_OUT_REBOOT, _OUT_DONE]),
+            patch("winbox.cli.av._restart_clearing_tamper_protection") as restart,
+            patch("winbox.cli.av.reboot_and_wait") as warm,
+        ):
+            result = runner.invoke(cli, ["av", "enable"])
+
+        assert result.exit_code == 0
+        restart.assert_called_once()
+        warm.assert_not_called()
 
     def test_a_failed_tp_clear_does_not_fail_the_enable(self, cfg):
         """Defender still comes up; av disable just falls back to its own

@@ -7,8 +7,8 @@ import pytest
 from winbox.osprofile import DEFAULT_OS, OS_PROFILES, OSProfile, get_profile
 
 
-def test_registry_has_both_targets():
-    assert set(OS_PROFILES) == {"server2022", "win11"}
+def test_registry_has_all_targets():
+    assert set(OS_PROFILES) == {"server2022", "server2025", "win11"}
 
 
 def test_default_os_is_registered():
@@ -34,7 +34,7 @@ def test_get_profile():
 
 
 class TestProfileInvariants:
-    @pytest.mark.parametrize("key", ["server2022", "win11"])
+    @pytest.mark.parametrize("key", ["server2022", "server2025", "win11"])
     def test_shape(self, key):
         p = OS_PROFILES[key]
         assert isinstance(p, OSProfile)
@@ -59,6 +59,27 @@ class TestProfileInvariants:
         assert p.esp_size_mb == 100
         assert p.include_msr is False
         assert p.install_partition_id == 2
+
+    def test_server2025_flags(self):
+        p = OS_PROFILES["server2025"]
+        assert p.os_variant == "win2k25"
+        assert p.virtio_subdir == "2k25"
+        assert p.supports_core is True
+        assert p.client_sku is False
+        # Genuinely-client workarounds stay off (no TPM gate, no auto-BitLocker).
+        assert p.labconfig_bypass is False
+        assert p.prevent_device_encryption is False
+        # But its 24H2 Defender is aggressive like the client's, so the offline
+        # Defender disable is ON — same as Win11, unlike Server 2022.
+        assert p.disable_defender_offline is True
+        # The 24H2 Setup engine rejects the minimal 2022 layout, so 2025 uses
+        # the standard UEFI layout: 260 MB ESP + MSR, Windows on partition 3.
+        assert p.esp_size_mb == 260
+        assert p.include_msr is True
+        assert p.install_partition_id == 3
+        # Distinct local ISO name so it cannot clobber the 2022 SERVER_EVAL.
+        assert p.iso_filename == "SERVER2025_EVAL_x64FRE_en-us.iso"
+        assert "linkid=2293312" in p.iso_url
 
     def test_win11_flags(self):
         p = OS_PROFILES["win11"]
@@ -92,7 +113,7 @@ class TestClientSku:
     def test_win11_is_client(self):
         assert OS_PROFILES["win11"].client_sku is True
 
-    @pytest.mark.parametrize("key", ["server2022", "win11"])
+    @pytest.mark.parametrize("key", ["server2022", "server2025", "win11"])
     def test_client_sku_is_the_inverse_of_server_core_support(self, key):
         """Server Core is a Server-only concept; a client SKU never has it."""
         p = OS_PROFILES[key]
@@ -100,25 +121,29 @@ class TestClientSku:
 
 
 class TestWin11GatesAreServerNoOps:
-    """Every Win11 workaround must be inert for Server 2022.
+    """Every Win11 *client* workaround must be inert for the Server profiles.
 
-    Server 2022 has no TPM gate, no Tamper Protection, and no Device
-    Encryption, so each of these flags being True on Server would apply a
-    fix for a problem it doesn't have — to the profile that was proven.
+    Server has no TPM gate and no Device Encryption, so these flags being True
+    on Server would apply a fix for a problem it doesn't have.
+
+    Two flags are deliberately NOT in this list because they track the *Setup
+    engine* and *Defender generation*, not client-vs-server, and Server 2025
+    (24H2) legitimately sets both: ``include_msr`` (the 24H2 Setup needs the
+    standard UEFI layout) and ``disable_defender_offline`` (24H2 Defender is
+    aggressive enough to quarantine tools at first boot).
     """
 
+    @pytest.mark.parametrize("server", ["server2022", "server2025"])
     @pytest.mark.parametrize(
         "flag",
         [
             "labconfig_bypass",
-            "disable_defender_offline",
             "prevent_device_encryption",
-            "include_msr",
             "client_sku",
         ],
     )
-    def test_flag_is_off_for_server(self, flag):
-        assert getattr(OS_PROFILES["server2022"], flag) is False
+    def test_flag_is_off_for_server(self, server, flag):
+        assert getattr(OS_PROFILES[server], flag) is False
 
     def test_server_installs_to_partition_two(self):
         assert OS_PROFILES["server2022"].install_partition_id == 2

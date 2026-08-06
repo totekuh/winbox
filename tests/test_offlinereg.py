@@ -204,7 +204,12 @@ class TestMergeHiveHasNoStateCheck(TestMergeHive):
 
 class TestWindowsPartition:
     @pytest.mark.parametrize(
-        "os_key,expected", [("server2022", "/dev/sda2"), ("win11", "/dev/sda3")]
+        "os_key,expected",
+        [
+            ("server2022", "/dev/sda2"),
+            ("server2025", "/dev/sda3"),
+            ("win11", "/dev/sda3"),
+        ],
     )
     def test_follows_the_profile_layout(self, os_key, expected):
         from winbox.config import Config

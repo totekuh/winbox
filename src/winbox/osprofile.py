@@ -1,9 +1,9 @@
 """Guest-OS profiles: everything that varies between the Windows targets.
 
-winbox can build either Windows Server 2022 (the historical default) or
-Windows 11. The two differ in a handful of build-time details — the
+winbox can build Windows Server 2022 (the historical default), Windows Server
+2025, or Windows 11. They differ in a handful of build-time details — the
 evaluation ISO to fetch, the ``install.wim`` image name the unattend
-selects, the VirtIO driver subdirectory (``2k22`` vs ``w11``), the
+selects, the VirtIO driver subdirectory (``2k22`` / ``2k25`` / ``w11``), the
 libvirt ``--os-variant``, and whether the Server Core/Desktop toggle and
 the Win11 setup-gate bypass apply.
 
@@ -127,6 +127,55 @@ OS_PROFILES: dict[str, OSProfile] = {
         client_sku=False,
         labconfig_bypass=False,
         disable_defender_offline=False,
+        prevent_device_encryption=False,
+    ),
+    "server2025": OSProfile(
+        key="server2025",
+        os_variant="win2k25",
+        # NOTE: verify against the real install.wim with `wiminfo` before a
+        # build — a mismatch fails the WinPE image-select. Server 2025 Core
+        # Standard is expected to be "Windows Server 2025 SERVERSTANDARDCORE".
+        image_name="Windows Server 2025 SERVERSTANDARDCORE",
+        # virtio-win ships a dedicated 2k25 driver subdir (verified present on
+        # the pinned ISO). If a future virtio ISO drops it, 2k22 drivers work.
+        virtio_subdir="2k25",
+        # Microsoft evalcenter fwlink for the Windows Server 2025 Evaluation
+        # ISO (en-US, x64). HEAD-resolves to build 26100 SERVER_EVAL (~6.0 GB);
+        # if Microsoft rotates the link the HEAD resolve fails loudly and the
+        # user can pass `--iso <path>`.
+        iso_url=(
+            "https://go.microsoft.com/fwlink/"
+            "?linkid=2293312&clcid=0x409&culture=en-us&country=us"
+        ),
+        # Distinct local name: the CDN filename is the same SERVER_EVAL...iso
+        # as the 2022 media, which would clobber the cached 2022 ISO.
+        iso_filename="SERVER2025_EVAL_x64FRE_en-us.iso",
+        # Real size ~6.01 GB; keep a conservative truncation floor.
+        iso_min_size=5_800_000_000,
+        # Server Core installs happily on a modest disk.
+        min_disk_gb=32,
+        # Server 2025 runs the rewritten Windows 11 24H2 Setup (build 26100),
+        # which — like the Win11 client Setup — rejects the minimal 100 MB
+        # ESP + Windows layout that Server 2022's older Setup tolerated
+        # ("Windows can't be installed to this disk", with an aka.ms/SetupFaq
+        # link). It needs the standard UEFI layout: 260 MB ESP + MSR + Windows
+        # (partition 3). include_msr here is a Setup-engine requirement, not a
+        # Win11-client gate.
+        esp_size_mb=260,
+        include_msr=True,
+        supports_core=True,
+        client_sku=False,
+        labconfig_bypass=False,
+        # Server 2025's 24H2-lineage Defender is aggressive like the client's:
+        # left on, it quarantines winbox's tools (x64dbg trips
+        # "file contains a virus") during the very first provisioning boot,
+        # before provision.ps1 can disable it in-guest — the build fails with a
+        # missing sentinel. So, like Win11, disable the Defender services in the
+        # offline SYSTEM hive before first boot. This also makes the runtime av
+        # offline paths apply (they gate on this flag, not client_sku).
+        disable_defender_offline=True,
+        # Server does not auto-enable BitLocker Device Encryption, so the Win11
+        # OOBE-network / PreventDeviceEncryption workaround is not needed.
         prevent_device_encryption=False,
     ),
     "win11": OSProfile(
