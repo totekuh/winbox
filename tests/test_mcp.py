@@ -344,6 +344,252 @@ class TestMcpExecSurfaces:
         assert result["stdout"] == "alice"
 
 
+# ─── powershell tool ─────────────────────────────────────────────────────────
+
+
+class TestPowershellTool:
+    def test_returns_structured_json(self, mock_mcp):
+        import json
+        from winbox.mcp import powershell
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="42\r\n", stderr=""
+        )
+
+        result = powershell("Write-Output (6*7)")
+        parsed = json.loads(result)
+        assert parsed == {"stdout": "42\r\n", "stderr": "", "exitcode": 0}
+
+    def test_stderr_kept_separate_from_stdout(self, mock_mcp):
+        """stdout must stay cleanly json.loads-able — stderr does not bleed in."""
+        import json
+        from winbox.mcp import powershell
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout='{"answer": 42}',
+            stderr="WARNING: something\r\n",
+        )
+
+        result = powershell("...")
+        parsed = json.loads(result)
+        assert parsed["stdout"] == '{"answer": 42}'
+        assert parsed["stderr"] == "WARNING: something\r\n"
+        assert json.loads(parsed["stdout"]) == {"answer": 42}
+
+    def test_failure_carries_exitcode(self, mock_mcp):
+        import json
+        from winbox.mcp import powershell
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=3, stdout="", stderr="oops\r\n"
+        )
+
+        result = powershell("exit 3")
+        parsed = json.loads(result)
+        assert parsed["exitcode"] == 3
+        assert parsed["stderr"] == "oops\r\n"
+
+    def test_no_output(self, mock_mcp):
+        import json
+        from winbox.mcp import powershell
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+
+        result = powershell("$null = 1")
+        parsed = json.loads(result)
+        assert parsed == {"stdout": "", "stderr": "", "exitcode": 0}
+
+    def test_passes_timeout(self, mock_mcp):
+        from winbox.mcp import powershell
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+
+        powershell("Get-Date", timeout=60)
+        ga.exec_powershell.assert_called_once_with("Get-Date", timeout=60)
+
+    def test_uses_exec_powershell_not_python(self, mock_mcp):
+        """Route through the CLIXML/progress-stripping ga.exec_powershell path,
+        never the nested python-subprocess approach it exists to replace."""
+        from winbox.mcp import powershell
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+
+        powershell("Get-Process")
+
+        ga.exec_powershell.assert_called_once()
+        ga.exec.assert_not_called()
+        mcp_root = cfg.shared_dir / ".mcp"
+        if mcp_root.exists():
+            assert list(mcp_root.rglob("script.py")) == []
+
+
+# ─── background exec / python / powershell + job_result ──────────────────────
+
+
+class TestBackgroundExec:
+    def test_python_background_returns_job_handle(self, mock_mcp):
+        import json
+        from winbox.mcp import python
+        ga, vm, cfg = mock_mcp
+        ga.exec_background.return_value = 4321
+
+        out = json.loads(python("while True: pass", background=True))
+        assert out == {"background": True, "job_id": 1, "pid": 4321}
+        # Fired detached — never waited on via the synchronous path.
+        ga.exec.assert_not_called()
+        cmd = ga.exec_background.call_args[0][0]
+        assert cmd == "python.exe Z:\\.mcp\\jobs\\1\\script.py"
+        # Script materialized in a persistent per-job dir (not the auto-cleaned
+        # synchronous one).
+        script = cfg.shared_dir / ".mcp" / "jobs" / "1" / "script.py"
+        assert script.read_text() == "while True: pass"
+
+    def test_powershell_background_returns_job_handle(self, mock_mcp):
+        import json
+        from winbox.mcp import powershell
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell_background.return_value = 999
+
+        out = json.loads(powershell("Start-Sleep 999", background=True))
+        assert out == {"background": True, "job_id": 1, "pid": 999}
+        ga.exec_powershell_background.assert_called_once_with("Start-Sleep 999")
+        ga.exec_powershell.assert_not_called()
+        ga.exec.assert_not_called()
+
+    def test_exec_background_returns_job_handle(self, mock_mcp):
+        import json
+        from winbox.mcp import exec as exec_tool
+        ga, vm, cfg = mock_mcp
+        ga.exec_background.return_value = 555
+
+        out = json.loads(exec_tool("trigger.exe", background=True))
+        assert out == {"background": True, "job_id": 1, "pid": 555}
+        ga.exec_background.assert_called_once_with("trigger.exe")
+        ga.exec.assert_not_called()
+
+    def test_exec_sync_runs_and_returns_structured_json(self, mock_mcp):
+        import json
+        from winbox.mcp import exec as exec_tool
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="hi\r\n", stderr="")
+
+        out = json.loads(exec_tool("whoami"))
+        assert out == {"stdout": "hi\r\n", "stderr": "", "exitcode": 0}
+        ga.exec.assert_called_once_with("whoami", timeout=300)
+        ga.exec_background.assert_not_called()
+
+    def test_background_job_is_registered_in_jobstore(self, mock_mcp):
+        from winbox.mcp import python
+        from winbox.jobs import JobStore, JobStatus, JobMode
+        ga, vm, cfg = mock_mcp
+        ga.exec_background.return_value = 111
+
+        python("print(1)", background=True)
+        job = JobStore(cfg).get(1)
+        assert job is not None
+        assert job.pid == 111
+        assert job.status is JobStatus.RUNNING
+        assert job.mode is JobMode.BUFFERED
+
+
+class TestJobResult:
+    def _launch(self, mock_mcp, pid=7):
+        from winbox.mcp import python
+        ga = mock_mcp[0]
+        ga.exec_background.return_value = pid
+        python("print(1)", background=True)
+
+    def test_unknown_job(self, mock_mcp):
+        import json
+        from winbox.mcp import job_result
+        out = json.loads(job_result(999))
+        assert "not found" in out["error"]
+
+    def test_running_job(self, mock_mcp):
+        import json
+        from winbox.mcp import job_result
+        ga, vm, cfg = mock_mcp
+        self._launch(mock_mcp, pid=7)
+        ga.exec_status.return_value = {
+            "exited": False, "exitcode": -1, "stdout": "", "stderr": "",
+        }
+
+        out = json.loads(job_result(1))
+        assert out == {"job_id": 1, "pid": 7, "running": True}
+
+    def test_finished_job_returns_output_and_cleans_up(self, mock_mcp):
+        import json
+        from winbox.mcp import job_result
+        ga, vm, cfg = mock_mcp
+        self._launch(mock_mcp, pid=8)
+        ga.exec_status.return_value = {
+            "exited": True, "exitcode": 0, "stdout": "42\r\n", "stderr": "",
+        }
+
+        out = json.loads(job_result(1))
+        assert out["running"] is False
+        assert out["exitcode"] == 0
+        assert out["stdout"] == "42\r\n"
+        # The per-job script dir is removed once the process is done with it.
+        assert not (cfg.shared_dir / ".mcp" / "jobs" / "1").exists()
+
+    def test_powershell_error_is_clixml_decoded(self, mock_mcp):
+        """A background job's CLIXML error stderr is decoded on retrieval, the
+        same as the synchronous powershell path."""
+        import json
+        from winbox.mcp import powershell, job_result
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell_background.return_value = 9
+        powershell("asdf", background=True)
+        ga.exec_status.return_value = {
+            "exited": True, "exitcode": 1, "stdout": "",
+            "stderr": (
+                '#< CLIXML\r\n<Objs xmlns="http://schemas.microsoft.com/'
+                'powershell/2004/04"><S S="Error">'
+                "asdf : not recognized_x000D__x000A_</S></Objs>"
+            ),
+        }
+
+        out = json.loads(job_result(1))
+        assert out["exitcode"] == 1
+        assert "not recognized" in out["stderr"]
+        assert "CLIXML" not in out["stderr"]
+        assert "_x000D_" not in out["stderr"]
+
+    def test_cached_after_first_poll(self, mock_mcp):
+        """The guest agent frees its slot on the read that first saw the exit,
+        so a second job_result must serve the cached copy, not re-poll into a
+        potentially recycled PID."""
+        import json
+        from winbox.mcp import job_result
+        ga, vm, cfg = mock_mcp
+        self._launch(mock_mcp, pid=10)
+        ga.exec_status.return_value = {
+            "exited": True, "exitcode": 0, "stdout": "done\r\n", "stderr": "",
+        }
+        job_result(1)
+        ga.exec_status.reset_mock()
+
+        out = json.loads(job_result(1))
+        assert out["stdout"] == "done\r\n"
+        ga.exec_status.assert_not_called()
+
+    def test_poll_failure_reports_running_not_lost(self, mock_mcp):
+        """A transient GA hiccup must not be reported as a finished/empty job —
+        the caller should retry."""
+        import json
+        from winbox.mcp import job_result
+        from winbox.vm import GuestAgentError
+        ga, vm, cfg = mock_mcp
+        self._launch(mock_mcp, pid=11)
+        ga.exec_status.side_effect = GuestAgentError("virtio hiccup")
+
+        out = json.loads(job_result(1))
+        assert out["running"] is True
+        assert "hiccup" in out["note"]
+
+
 # ─── ioctl tool ─────────────────────────────────────────────────────────────
 
 

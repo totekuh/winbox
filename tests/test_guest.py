@@ -254,9 +254,10 @@ class TestExecPollTolerance:
 
 
 class TestPowershellStderrHygiene:
-    """With stderr redirected, PowerShell serializes its *progress* stream as
-    a CLIXML document onto stderr. Callers then saw hundreds of bytes of XML
-    on every Defender query and had to treat it as if it were an error."""
+    """With stderr redirected, PowerShell serializes its progress, error, and
+    warning streams as a CLIXML document onto stderr. Callers then saw hundreds
+    of bytes of XML on every Defender query and had to treat it as if it were an
+    error. ``_clixml_to_text`` decodes it: progress dropped, errors readable."""
 
     def test_progress_preference_is_disabled_in_the_script(self, monkeypatch):
         import base64
@@ -279,36 +280,79 @@ class TestPowershellStderrHygiene:
         assert "Get-MpComputerStatus" in seen["script"]
 
     def test_progress_only_clixml_is_dropped(self):
-        from winbox.vm.guest import _strip_clixml_progress
+        from winbox.vm.guest import _clixml_to_text
 
         noise = (
             '#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft'
             '.com/powershell/2004/04"><Obj S="progress" RefId="0"><MS><PR N="Record">'
             "<AV>Preparing modules for first use.</AV></PR></MS></Obj></Objs>"
         )
-        assert _strip_clixml_progress(noise) == ""
+        assert _clixml_to_text(noise) == ""
 
-    def test_real_errors_are_preserved(self):
-        """Losing a genuine PowerShell error to cosmetics would be worse."""
-        from winbox.vm.guest import _strip_clixml_progress
+    def test_progress_activity_strings_do_not_leak(self):
+        """Strings nested inside a progress <Obj> are not top-level records and
+        must not survive — only the drop-it-entirely outcome is correct here."""
+        from winbox.vm.guest import _clixml_to_text
+
+        noise = (
+            '#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft'
+            '.com/powershell/2004/04"><Obj S="progress" RefId="0"><MS>'
+            '<S N="Activity">Preparing modules for first use.</S>'
+            "</MS></Obj></Objs>"
+        )
+        assert _clixml_to_text(noise) == ""
+
+    def test_real_errors_are_decoded_to_plain_text(self):
+        """A genuine error must survive — and now as readable text, not XML."""
+        from winbox.vm.guest import _clixml_to_text
 
         err = (
-            '#< CLIXML\r\n<Objs Version="1.1.0.1"><S S="Error">'
-            "Set-MpPreference : Access denied</S></Objs>"
+            '#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft'
+            '.com/powershell/2004/04"><S S="Error">'
+            "asdf : The term 'asdf' is not recognized._x000D__x000A_</S>"
+            '<S S="Error">    + CategoryInfo : ObjectNotFound_x000D__x000A_</S>'
+            "</Objs>"
         )
-        assert _strip_clixml_progress(err) == err
+        out = _clixml_to_text(err)
+        assert "The term 'asdf' is not recognized." in out
+        assert "CategoryInfo : ObjectNotFound" in out
+        # No XML wrapper and no raw escape sequences leaking through.
+        assert "CLIXML" not in out
+        assert "<S" not in out
+        assert "_x000D_" not in out
+        # The _x000D__x000A_ pair decoded to a real CRLF between the two records.
+        assert "\r\n" in out
 
-    def test_warnings_are_preserved(self):
-        from winbox.vm.guest import _strip_clixml_progress
+    def test_warnings_are_decoded_to_plain_text(self):
+        from winbox.vm.guest import _clixml_to_text
 
-        warn = '#< CLIXML\r\n<Objs><S S="Warning">deprecated</S></Objs>'
-        assert _strip_clixml_progress(warn) == warn
+        warn = (
+            '#< CLIXML\r\n<Objs xmlns="http://schemas.microsoft.com/powershell/'
+            '2004/04"><S S="Warning">deprecated</S></Objs>'
+        )
+        assert _clixml_to_text(warn) == "deprecated"
+
+    def test_truncated_clixml_is_left_as_is(self):
+        """A document with no closing tag never matches, so it passes through
+        rather than vanishing — a real error must not be swallowed."""
+        from winbox.vm.guest import _clixml_to_text
+
+        broken = '#< CLIXML\r\n<Objs><S S="Error">truncated...'
+        assert _clixml_to_text(broken) == broken
+
+    def test_malformed_clixml_is_left_as_is(self):
+        """A closed but unparseable document (raw & is not valid XML) hits the
+        ParseError branch and is returned whole rather than dropped."""
+        from winbox.vm.guest import _clixml_to_text
+
+        bad = '#< CLIXML\r\n<Objs><S S="Error">a & b not escaped</S></Objs>'
+        assert _clixml_to_text(bad) == bad
 
     def test_plain_stderr_untouched(self):
-        from winbox.vm.guest import _strip_clixml_progress
+        from winbox.vm.guest import _clixml_to_text
 
-        assert _strip_clixml_progress("boom\r\n") == "boom\r\n"
-        assert _strip_clixml_progress("") == ""
+        assert _clixml_to_text("boom\r\n") == "boom\r\n"
+        assert _clixml_to_text("") == ""
 
     def test_exec_powershell_returns_cleaned_stderr(self, monkeypatch):
         from winbox.config import Config
@@ -328,6 +372,32 @@ class TestPowershellStderrHygiene:
 
         assert result.stdout == "Defender: ON\n"
         assert result.stderr == ""
+
+
+class TestPowershellBackground:
+    def test_launches_encoded_and_returns_pid(self, monkeypatch):
+        """Fire-and-forget: encodes like exec_powershell but goes through
+        exec_background (no wait) and hands back the guest PID."""
+        import base64
+
+        from winbox.config import Config
+        from winbox.vm.guest import GuestAgent
+
+        ga = GuestAgent(Config())
+        seen = {}
+
+        def fake_bg(cmd):
+            seen["cmd"] = cmd
+            return 4242
+
+        monkeypatch.setattr(ga, "exec_background", fake_bg)
+        pid = ga.exec_powershell_background("Get-Process")
+
+        assert pid == 4242
+        encoded = seen["cmd"].split("-EncodedCommand ")[1]
+        script = base64.b64decode(encoded).decode("utf-16-le")
+        assert script.startswith("$ProgressPreference = 'SilentlyContinue'")
+        assert "Get-Process" in script
 
 
 class TestExecPowershellFile:

@@ -6,9 +6,11 @@ import base64
 import binascii
 import json
 import logging
+import re
 import subprocess
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -744,11 +746,13 @@ class GuestAgent:
         """Execute a PowerShell command/script in the guest.
 
         Progress reporting is disabled first. With stderr redirected — which
-        it always is here — PowerShell serializes its progress stream as a
-        CLIXML document onto stderr, so cmdlets that report progress (notably
-        the Defender module's "Preparing modules for first use") buried every
-        result under hundreds of bytes of XML that callers then had to treat
-        as if it were an error.
+        it always is here — PowerShell serializes its progress, error, and
+        warning streams as a CLIXML document onto stderr, so cmdlets that
+        report progress (notably the Defender module's "Preparing modules for
+        first use") buried every result under hundreds of bytes of XML that
+        callers then had to treat as if it were an error. ``_clixml_to_text``
+        decodes that document back to the plain text a console would show:
+        progress is dropped, real errors and warnings come through readable.
         """
         # Use -EncodedCommand to avoid shell quoting issues
         script = f"$ProgressPreference = 'SilentlyContinue'\n{script}"
@@ -763,7 +767,7 @@ class GuestAgent:
         return ExecResult(
             exitcode=result.exitcode,
             stdout=result.stdout,
-            stderr=_strip_clixml_progress(result.stderr),
+            stderr=_clixml_to_text(result.stderr),
         )
 
     def exec_powershell_file(
@@ -793,6 +797,24 @@ class GuestAgent:
             **kwargs,
         )
 
+    def exec_powershell_background(self, script: str) -> int:
+        """Launch a PowerShell script fire-and-forget; return the guest PID.
+
+        The launch returns as soon as the process is spawned — before the
+        script does any work — so it survives a script that *later* halts the
+        guest (e.g. an RPC call parked on a kdbg breakpoint), which the
+        synchronous ``exec_powershell`` cannot: that one blocks polling for an
+        exit the frozen guest can never report. Output stays buffered in the
+        guest agent; retrieve it with ``exec_status`` once the process exits.
+        Encoding matches ``exec_powershell`` (same ``$ProgressPreference``
+        prefix), so only the wait differs.
+        """
+        script = f"$ProgressPreference = 'SilentlyContinue'\n{script}"
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        return self.exec_background(
+            f"powershell -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+        )
+
     def shutdown(self) -> None:
         """Initiate a graceful shutdown via the guest."""
         try:
@@ -801,20 +823,55 @@ class GuestAgent:
             pass  # Expected — VM shuts down before we get a response
 
 
-def _strip_clixml_progress(stderr: str) -> str:
-    """Drop a CLIXML payload from stderr when it carries only progress records.
+_CLIXML_ESCAPE = re.compile(r"_x([0-9A-Fa-f]{4})_")
+# The marker is part of the match so a document that does not decode (no closing
+# tag, or a parse failure) is left byte-for-byte untouched rather than having its
+# marker stripped by a separate pass.
+_CLIXML_DOC = re.compile(r"#< CLIXML\r?\n(<Objs\b.*?</Objs>)", re.DOTALL)
 
-    Belt-and-braces alongside ``$ProgressPreference``: some cmdlets emit
-    progress regardless. Anything containing a real error record is returned
-    untouched — losing an actual PowerShell error to cosmetics would be a far
-    worse trade than leaving some XML in place.
+
+def _decode_clixml_escapes(text: str) -> str:
+    """Undo PowerShell's ``_xHHHH_`` character escaping (e.g. ``_x000D_`` -> CR)."""
+    return _CLIXML_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
+
+
+def _clixml_to_text(stderr: str) -> str:
+    """Render PowerShell's CLIXML stderr as the plain text a console would show.
+
+    With stderr redirected, PowerShell serializes its error/warning/progress
+    streams as a CLIXML document rather than plain text. The old behavior here
+    dropped a progress-only document but passed an error document through
+    *verbatim* — so a caller (or an AI agent) reading a failed cmdlet got a wall
+    of ``<S S="Error">...</S>`` XML with ``_x000D__x000A_`` in place of newlines
+    instead of the one-line "term 'asdf' is not recognized" it meant to read.
+
+    This decodes rather than preserve-or-drop: every top-level string record
+    (``<S>`` — Error, Warning, Verbose, Debug) is unescaped and joined into
+    plain text, and the structured progress ``<Obj>`` objects are discarded.
+    Only *direct* children of ``<Objs>`` are read, so activity strings nested
+    inside a progress object do not leak back in — a document carrying only
+    progress therefore renders to "", exactly as before.
+
+    Text outside a CLIXML document (a native tool's plain stderr) is left
+    untouched, and a document that fails to parse is left as-is rather than
+    dropped: losing a real error to a decode bug is the worse failure.
     """
-    if not stderr or not stderr.lstrip().startswith("#< CLIXML"):
+    if not stderr or "#< CLIXML" not in stderr:
         return stderr
-    # Error records serialize as <S S="Error">; progress as <Obj S="progress">.
-    if 'S="Error"' in stderr or 'S="Warning"' in stderr:
-        return stderr
-    return ""
+
+    def _render(match: re.Match) -> str:
+        try:
+            root = ET.fromstring(match.group(1))
+        except ET.ParseError:
+            return match.group(0)  # leave the whole document (marker included) as-is
+        parts = [
+            _decode_clixml_escapes(child.text or "")
+            for child in root
+            if child.tag.rsplit("}", 1)[-1] == "S"
+        ]
+        return "".join(parts)
+
+    return _CLIXML_DOC.sub(_render, stderr).strip("\r\n")
 
 
 def _strip_nonce(stdout: str, nonce: str) -> str:

@@ -2,7 +2,7 @@
 
 Run Windows pentest tools from Kali. Transparently.
 
-winbox manages a headless Windows Server Core 2022 VM via QEMU/KVM. Type `winbox exec SharpHound.exe -c All -d corp.local` on your Kali box and it Just Works — the VM starts automatically, runs the command, and prints the output.
+winbox manages a headless Windows VM (Server Core 2022/2025 or Windows 11) via QEMU/KVM. Type `winbox exec SharpHound.exe -c All -d corp.local` on your Kali box and it Just Works — the VM starts automatically, runs the command, and prints the output.
 
 ## Quick Demo
 
@@ -44,7 +44,7 @@ PS C:\Windows\system32>
 - **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
 - **Malware detonation lab** — `winbox capture` (host-side pcap on the bridge — prefers `dumpcap`, which Kali's Wireshark package lets the `wireshark` group run without root, falling back to `tcpdump` otherwise), `winbox sinkhole` (zero-dependency DNS sinkhole that answers every C2 lookup with the bridge IP and logs the domain, plus optional INETSim fake services), and `winbox detonate check` (read-only preflight that refuses to go green unless the guest genuinely can't reach the internet). See [docs/malware-detonation.md](docs/malware-detonation.md)
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
-- **MCP server** — 56 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including credentialed exec/Python/PowerShell, Defender enable/disable/status, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
+- **MCP server** — 57 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including credentialed or background exec/Python/PowerShell, Defender enable/disable/status, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
 - **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`; `--mode auto` falls back to software 0xCC where the 4 DR slots run out, but note HVCI blocks software breakpoints on Windows 11), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
 - **VNC display** via virt-manager (`winbox vnc`) — plain VGA, no clipboard/resize
 - **x64dbg in the guest** — bundled in setup, extracted to `C:\Tools\x64dbg`, both x32 and x64 on PATH
@@ -90,11 +90,12 @@ winbox setup -y              # builds and provisions the VM
 
 ### Choosing the guest OS
 
-`winbox setup` builds **Windows Server 2022** by default. Pass `--os win11` to build
-**Windows 11 Enterprise (Evaluation)** instead:
+`winbox setup` builds **Windows Server 2022** by default. Pass `--os` to build a
+different target — **Windows Server 2025** or **Windows 11 Enterprise (Evaluation)**:
 
 ```bash
-winbox setup --os win11 -y   # build Windows 11 instead of Server 2022
+winbox setup --os server2025 -y   # Windows Server 2025 (Core, Evaluation)
+winbox setup --os win11 -y        # Windows 11 Enterprise (Evaluation)
 ```
 
 The choice is build-time and there is one VM at a time — switching OS means
@@ -103,6 +104,14 @@ The choice is build-time and there is one VM at a time — switching OS means
 MCP server) resolves the same profile as the VM on disk; you can also set that key
 yourself to change the default for a bare `winbox setup`. The right ISO is downloaded
 automatically for the selected OS (or pass `--iso <path>` to use your own).
+
+Notes for Server 2025:
+- Same server-minimal build as 2022 (Server Core, no TPM/Secure-Boot gate, 100 MB
+  ESP layout), but on the Windows 11 24H2 kernel (build 26100). `--desktop` selects
+  Desktop Experience, same as 2022.
+- Because it shares the 24H2 kernel, HVCI/VBS and Defender behavior can differ from
+  2022 — `winbox av status` reports the real Tamper-Protection state, and for `kdbg`
+  prefer `--mode hw`/`auto` if HVCI turns out to be on (it blocks software 0xCC bps).
 
 Notes for Win11:
 - No TPM / Secure Boot required — setup injects the `LabConfig` bypass keys so the
@@ -246,7 +255,8 @@ winbox domain leave
 ```bash
 winbox up                    # start or resume
 winbox up --reboot           # graceful shutdown + start in one command
-winbox down                  # graceful shutdown
+winbox down                  # graceful shutdown (needs a running, agent-responsive guest)
+winbox down --force          # hard power-off (virsh destroy) — works on a paused or wedged VM
 winbox suspend               # save state to disk (instant resume)
 winbox status                # state, IP, disk usage, tool/loot counts
 winbox destroy -y            # delete VM and all storage (clears jobs.json too)
@@ -315,7 +325,7 @@ winbox binfmt status
 
 ### MCP Server (AI-assisted vulnerability research)
 
-winbox exposes an MCP server so AI agents (Claude Code, etc.) can interact with the Windows VM directly — run Python code, send IOCTLs to drivers, query/set registry, list processes, talk to named pipes.
+winbox exposes an MCP server so AI agents (Claude Code, etc.) can interact with the Windows VM directly — run Python or PowerShell, send IOCTLs to drivers, query/set registry, list processes, talk to named pipes.
 
 **Install:**
 
@@ -329,15 +339,16 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (56):**
+**Available tools (57):**
 
 User-mode primitives:
 
 | Tool | Description |
 |------|-------------|
-| `exec(command, user?, password?)` | Execute a cmd.exe command, optionally as a local Windows user |
-| `python(code, user?, password?)` | Execute Python code in the VM, optionally as a local Windows user |
-| `powershell(script, user?, password?)` | Execute encoded PowerShell, optionally as a local Windows user |
+| `exec(command, user?, password?, background?)` | Execute a cmd.exe command, optionally as a local Windows user or in the background |
+| `python(code, user?, password?, background?)` | Execute Python code in the VM, optionally as a local Windows user or in the background |
+| `powershell(script, user?, password?, background?)` | Execute encoded PowerShell, optionally as a local Windows user or in the background |
+| `job_result(job_id)` | Retrieve output of a background `exec`/`python`/`powershell` job (non-blocking poll; also visible to `winbox jobs`) |
 | `ioctl(device, code, input_hex, output_size)` | Send DeviceIoControl to a driver — no ctypes boilerplate |
 | `reg_query(key, value?)` | Query registry key or value |
 | `reg_set(key, value, data, value_type)` | Set registry value (creates key if needed) |
@@ -526,6 +537,7 @@ To validate a change across both images:
 
 ```bash
 winbox setup --os server2022 -y && pytest -m integration
+winbox setup --os server2025 -y && pytest -m integration
 winbox setup --os win11 -y      && pytest -m integration
 ```
 

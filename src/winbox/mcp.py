@@ -20,13 +20,18 @@ from winbox.vm import (
     GuestAgentUnreachable,
     GuestExecAbandoned,
 )
+from winbox.jobs import Job, JobMode, JobStatus, JobStore
+# Private, but reused deliberately: it decodes PowerShell's CLIXML stderr to
+# plain text and is a no-op on anything else, so job_result can apply it to
+# both python and powershell job output without knowing which is which.
+from winbox.vm.guest import _clixml_to_text
 
 mcp = FastMCP(
     "winbox",
     instructions=(
         "Windows VM execution proxy for vulnerability research. "
         "Run Python code, send IOCTLs, query/set registry, list processes — "
-        "all executing inside a Windows (Server 2022 or 11) VM managed by QEMU/KVM."
+        "all executing inside a Windows (Server 2022/2025 or 11) VM managed by QEMU/KVM."
     ),
 )
 
@@ -236,6 +241,34 @@ def _format_exec_result(result: dict) -> str:
     return "".join(parts) or "(no output)"
 
 
+# ─── Background jobs ─────────────────────────────────────────────────────────
+
+
+def _bg_label(kind: str, code: str) -> str:
+    """A short, non-leaky command label for `winbox jobs list`."""
+    first = next((ln.strip() for ln in code.splitlines() if ln.strip()), "")
+    if len(first) > 50:
+        first = first[:47] + "..."
+    return f"{kind} (bg): {first}" if first else f"{kind} (bg)"
+
+
+def _launch_bg_job(cfg: Config, launch, label: str) -> str:
+    """Claim a job id, run ``launch(job_id) -> pid`` under the store lock,
+    persist a BUFFERED Job, and return a ``{background, job_id, pid}`` handle.
+
+    Shares the JobStore that backs ``winbox exec --bg``, so a job launched here
+    is visible to ``winbox jobs list`` and killable with ``winbox jobs kill``.
+    """
+    store = JobStore(cfg)
+
+    def _build(job_id: int) -> Job:
+        pid = launch(job_id)
+        return Job(id=job_id, pid=pid, command=label, mode=JobMode.BUFFERED)
+
+    job = store.claim(_build)
+    return _json.dumps({"background": True, "job_id": job.id, "pid": job.pid})
+
+
 # ─── Tool 1: python ────────────────────────────────────────────────────────
 
 def _execution_json(result) -> str:
@@ -251,9 +284,16 @@ def exec(
     timeout: int = 300,
     user: str | None = None,
     password: str | None = None,
+    background: bool = False,
 ) -> str:
-    """Execute a cmd.exe command in the VM, optionally as a local user."""
-    _, vm, ga = _ensure_vm_ready()
+    """Execute a cmd.exe command, optionally as a local user or in the background."""
+    cfg, vm, ga = _ensure_vm_ready()
+    if background:
+        if user is not None or password is not None:
+            raise ValueError("background execution does not support alternate credentials")
+        return _launch_bg_job(
+            cfg, lambda job_id: ga.exec_background(command), _bg_label("exec", command),
+        )
     with _guest_errors(vm):
         if user is None and password is None:
             result = ga.exec(command, timeout=timeout)
@@ -270,9 +310,18 @@ def powershell(
     timeout: int = 600,
     user: str | None = None,
     password: str | None = None,
+    background: bool = False,
 ) -> str:
-    """Execute an encoded PowerShell script, optionally as a local user."""
-    _, vm, ga = _ensure_vm_ready()
+    """Execute PowerShell, optionally as a local user or in the background."""
+    cfg, vm, ga = _ensure_vm_ready()
+    if background:
+        if user is not None or password is not None:
+            raise ValueError("background execution does not support alternate credentials")
+        return _launch_bg_job(
+            cfg,
+            lambda job_id: ga.exec_powershell_background(script),
+            _bg_label("powershell", script),
+        )
     with _guest_errors(vm):
         if user is None and password is None:
             result = ga.exec_powershell(script, timeout=timeout)
@@ -287,6 +336,7 @@ def powershell(
 def python(
     code: str, timeout: int = 300,
     user: str | None = None, password: str | None = None,
+    background: bool = False,
 ) -> str:
     """Execute Python code inside the Windows VM.
 
@@ -297,10 +347,32 @@ def python(
     Structured (not prose) so a script that prints valid JSON to stdout can be
     safely json.loads-ed by the caller without stderr/exitcode noise mixing in.
 
+    With ``background=True`` the call is fire-and-forget: it launches the script
+    and returns ``{"background": true, "job_id": N, "pid": P}`` immediately
+    without waiting for exit. Use this when the code may hang the guest (e.g. it
+    triggers something you have halted at a kdbg breakpoint) — a synchronous
+    call would block polling for a completion the frozen guest cannot report.
+    Retrieve the output later with ``job_result(job_id)``.
+
     Args:
         code: Python source code to execute.
-        timeout: Execution timeout in seconds (default 300).
+        timeout: Execution timeout in seconds (default 300). Ignored when
+            background=True (the job is never waited on here).
+        background: Launch detached and return a job handle instead of waiting.
     """
+    if background:
+        if user is not None or password is not None:
+            raise ValueError("background execution does not support alternate credentials")
+        cfg, vm, ga = _ensure_vm_ready()
+
+        def _launch(job_id: int) -> int:
+            job_dir = cfg.shared_dir / ".mcp" / "jobs" / str(job_id)
+            job_dir.mkdir(parents=True, exist_ok=True)
+            (job_dir / "script.py").write_text(code, encoding="utf-8")
+            return ga.exec_background(f"python.exe Z:\\.mcp\\jobs\\{job_id}\\script.py")
+
+        return _launch_bg_job(cfg, _launch, _bg_label("python", code))
+
     if user is None and password is None:
         result = _exec_python(code, timeout=timeout)
     else:
@@ -311,6 +383,160 @@ def python(
         "stdout": result["stdout"],
         "stderr": result["stderr"],
         "exitcode": result["exitcode"],
+    })
+
+
+# ─── powershell ─────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def powershell(code: str, timeout: int = 300, background: bool = False) -> str:
+    """Execute PowerShell (Windows PowerShell 5.1) inside the Windows VM.
+
+    Runs as Administrator. Use this instead of shelling out to powershell.exe
+    from the `python` tool — it removes the nested-quoting tax (backslash paths
+    and quotes pass through verbatim) and returns errors as readable plain text
+    (PowerShell's CLIXML stderr serialization is decoded for you; progress noise
+    is dropped).
+
+    Returns a JSON-encoded ``{"stdout": str, "stderr": str, "exitcode": int}``,
+    same shape as `python`, so a script that prints JSON to stdout can be
+    json.loads-ed cleanly.
+
+    With ``background=True`` the call is fire-and-forget: it launches the script
+    and returns ``{"background": true, "job_id": N, "pid": P}`` immediately
+    without waiting for exit. Use this when the code may hang the guest (e.g. it
+    triggers something you have halted at a kdbg breakpoint) — a synchronous
+    call would block polling for a completion the frozen guest cannot report.
+    Retrieve the output later with ``job_result(job_id)``.
+
+    The script is sent via -EncodedCommand, which caps it at roughly 12k
+    characters. For anything larger, use the `python` tool or upload a .ps1.
+    Note: exitcode reflects ``exit N`` and terminating errors; a non-terminating
+    PowerShell error lands on stderr with exitcode 0 (standard PS behavior).
+
+    Args:
+        code: PowerShell source to execute.
+        timeout: Execution timeout in seconds (default 300). Ignored when
+            background=True (the job is never waited on here).
+        background: Launch detached and return a job handle instead of waiting.
+    """
+    cfg, vm, ga = _ensure_vm_ready()
+    if background:
+        return _launch_bg_job(
+            cfg,
+            lambda job_id: ga.exec_powershell_background(code),
+            _bg_label("powershell", code),
+        )
+    result = ga.exec_powershell(code, timeout=timeout)
+    return _json.dumps({
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "exitcode": result.exitcode,
+    })
+
+
+# ─── exec ────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def exec(command: str, timeout: int = 300, background: bool = False) -> str:  # noqa: A001
+    """Run a command line in the Windows VM via cmd.exe.
+
+    The plain-command counterpart to `python`/`powershell`: run a native exe, a
+    built-in, a batch line — anything cmd.exe accepts — as Administrator, with
+    no Python-subprocess wrapper. Returns a JSON-encoded
+    ``{"stdout": str, "stderr": str, "exitcode": int}``.
+
+    With ``background=True`` the call is fire-and-forget: it launches the command
+    and returns ``{"background": true, "job_id": N, "pid": P}`` immediately
+    without waiting for exit — use it when the command may hang the guest (e.g.
+    it triggers something you have halted at a kdbg breakpoint), which a
+    synchronous call cannot survive. Retrieve the output with
+    ``job_result(job_id)``.
+
+    Args:
+        command: The command line to run (as passed to ``cmd.exe /c``).
+        timeout: Execution timeout in seconds (default 300). Ignored when
+            background=True (the job is never waited on here).
+        background: Launch detached and return a job handle instead of waiting.
+    """
+    cfg, vm, ga = _ensure_vm_ready()
+    if background:
+        return _launch_bg_job(
+            cfg,
+            lambda job_id: ga.exec_background(command),
+            _bg_label("exec", command),
+        )
+    result = ga.exec(command, timeout=timeout)
+    return _json.dumps({
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "exitcode": result.exitcode,
+    })
+
+
+# ─── job_result ──────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def job_result(job_id: int) -> str:
+    """Fetch the result of a background exec()/python()/powershell() job.
+
+    Background launches return a job_id immediately; this retrieves the output
+    once the process has exited. It is a single, non-blocking poll: if the
+    process is still running — including because the guest is halted at a kdbg
+    breakpoint — it returns ``{"running": true}``. Call again after the guest
+    resumes rather than blocking here (blocking would re-create the hang the
+    background launch exists to avoid).
+
+    Finished: ``{"job_id", "pid", "exitcode", "stdout", "stderr",
+    "running": false}`` — PowerShell errors are CLIXML-decoded to plain text.
+    Still running: ``{"job_id", "pid", "running": true}``.
+
+    Args:
+        job_id: The id returned by a background python()/powershell() call.
+    """
+    cfg, vm, ga = _ensure_vm_ready()
+    store = JobStore(cfg)
+    job = store.get(job_id)
+    if job is None:
+        return _json.dumps({"error": f"job {job_id} not found"})
+
+    # Terminal already: the guest agent frees its result slot on the read that
+    # first saw the exit, so the cached copy is the only one left — re-polling
+    # could only ever collide with a recycled PID.
+    if job.status in (JobStatus.DONE, JobStatus.FAILED):
+        return _json.dumps({
+            "job_id": job.id, "pid": job.pid, "exitcode": job.exitcode,
+            "stdout": job.stdout, "stderr": job.stderr, "running": False,
+        })
+    if job.status is JobStatus.LOST:
+        return _json.dumps({
+            "job_id": job.id, "pid": job.pid,
+            "error": "job lost — the VM was unavailable, output is unrecoverable",
+        })
+
+    try:
+        status = ga.exec_status(job.pid)
+    except GuestAgentError as e:
+        # A transient poll failure is not proof the job is gone — report it as
+        # still-running so the caller retries rather than losing the result.
+        return _json.dumps({
+            "job_id": job.id, "pid": job.pid, "running": True,
+            "note": f"could not poll guest: {e}",
+        })
+
+    if not status["exited"]:
+        return _json.dumps({"job_id": job.id, "pid": job.pid, "running": True})
+
+    job.exitcode = status["exitcode"]
+    job.stdout = status["stdout"]
+    job.stderr = _clixml_to_text(status["stderr"])
+    job.status = JobStatus.DONE if job.exitcode == 0 else JobStatus.FAILED
+    store.update(job)
+    # The process is done with its script; drop the per-job scratch dir.
+    shutil.rmtree(cfg.shared_dir / ".mcp" / "jobs" / str(job.id), ignore_errors=True)
+    return _json.dumps({
+        "job_id": job.id, "pid": job.pid, "exitcode": job.exitcode,
+        "stdout": job.stdout, "stderr": job.stderr, "running": False,
     })
 
 

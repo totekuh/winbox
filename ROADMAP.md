@@ -15,6 +15,8 @@ a roadmap whose top item nobody can start.
 Items 1-8 have all been worked — `git log` is the record. Item 8 is addressed
 at its source (below) but stays listed as *Watching* because it is
 intermittent by nature.
+at its source (below) but stays listed as *Watching* because it is intermittent
+by nature.
 
 One finding from the breakpoint work is worth keeping, because it shapes any
 future kdbg change: **neither breakpoint mechanism installs on both images.**
@@ -276,6 +278,52 @@ the risk of a human `gdb` already attached to the same port, but
 `kdbg_attach` doesn't check for or warn about it. Fix: probe the port or
 track attach state before forking the daemon, and fail with a clear message
 if something's already attached.
+### Debugger (kdbg) gaps — collected from a live MsMpEng RPC session
+
+Found while single-stepping a user-mode RPC call inside `MsMpEng.exe`. Ranked
+risk × tractability. The fire-and-forget gap that surfaced in the same session
+(synchronous `python`/`powershell` blocking and throwing "domain is not
+running" the moment a triggered call halts the guest) is **already closed** —
+`exec`/`python`/`powershell` now take `background=True` and return a job handle,
+retrieved with `job_result`. The rest below are open.
+
+**9. `kdbg_cont`'s `reason` and `kdbg_session`'s `halted` are not trustworthy.**
+Twice in one session both reported `timeout`/`false` while `kdbg_regs` read
+`rip` sitting exactly on the breakpoint address. This is a daemon state-tracking
+bug, not a UX nit: the tool disagrees with its own register read, which is
+ground truth. Highest priority — it makes every other kdbg result suspect. Fix
+involves reconciling the daemon's halt bookkeeping with the actual stop-reply /
+`rip` after a continue.
+
+**10. No structured stack / memory dump.** `kdbg_mem` returns raw hex only, so
+reading a stack means round-tripping the bytes through a separate script just to
+byte-swap and label offsets. Add a `decode='qwords'` mode (or a dedicated
+`kdbg_stack(count, base='rsp'|'rbp')`) that returns pre-endian-corrected 64-bit
+values with `rsp`/`rbp`-relative offset labels. Straightforward and removes an
+entire manual step.
+
+**11. `kdbg_bp mode='auto'` downgrades to software silently.** Against a
+PPL-protected target the `0xCC` software patch is materially riskier than the
+hardware path, yet the fallback is only visible as a buried `hw: false` field.
+Either refuse to silently downgrade against sensitive targets, or surface the
+fallback loudly.
+
+**12. `kdbg_attach` "empty stop reply" needs a manual stop+start cycle.** When
+it happens there is no error pointing at the fix; the operator has to know to
+`kdbg_stop` then `kdbg_start`. Add a bounded internal auto-retry and, failing
+that, an error message that names the recovery.
+
+**13. `kdbg_detach`'s unit test is not isolated (test hygiene).** Found this
+session: `test_detach_calls_daemon_and_waits_for_release` does not mock
+`ensure_not_paused`, so when the real VM happens to be paused (e.g. a live debug
+session) the test calls virsh against the actual box and the assertion flips.
+A unit test must never touch a running VM — patch `ensure_not_paused`.
+
+*Workflow note (not a tool defect):* prefer live `kdbg_disasm` against the
+running process over tracking a module's ASLR base and cross-referencing a
+static off-VM copy with `objdump`. The live path is faster and removes any
+"is this the right build" doubt. `kdbg_disasm` and `kdbg_user_symbols_load`
+already exist and went unused.
 
 ---
 

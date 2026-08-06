@@ -174,6 +174,7 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "exec": (LIVE, "including credentialed local-user execution"),
     "python": (LIVE, ""),
     "powershell": (LIVE, ""),
+    "job_result": (LIVE, "retrieves a background exec/python/powershell job"),
     "ps": (LIVE, ""),
     "ioctl": (LIVE, "error path — a real device IOCTL depends on a driver "
                     "that is not part of a stock image"),

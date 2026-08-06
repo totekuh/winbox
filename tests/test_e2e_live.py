@@ -5,9 +5,11 @@ Run explicitly (a bare ``pytest`` deselects these):
     pytest -m integration tests/test_e2e_live.py -v
 
 Runs against whichever image ``~/.winbox/config`` points at, and is written to
-pass on **both** ``server2022`` and ``win11``. Where the two genuinely differ —
-Tamper Protection, Server Core's missing services, the Python payload — the
-test asserts the profile-appropriate behavior rather than skipping.
+pass on any target profile (``server2022``, ``server2025``, ``win11``). Where
+they genuinely differ — Tamper Protection, Server Core's missing services, the
+Python payload — the test asserts the profile-appropriate behavior (keyed off
+``profile.client_sku`` / ``supports_core``, not a hardcoded OS list) rather than
+skipping.
 
 ``tests/e2e_manifest.py`` lists what must be covered here and
 ``tests/test_e2e_coverage.py`` enforces it, so a new command cannot quietly
@@ -468,6 +470,74 @@ class TestMcpCore:
         out = json.loads(tool("python")("import sys; print(sys.version)"))
         assert out["exitcode"] == 0, out
         assert "3." in out["stdout"]
+
+    def test_powershell_runs_in_the_guest(self, tool):
+        out = json.loads(tool("powershell")("Write-Output (6*7)"))
+        assert out["exitcode"] == 0, out
+        assert "42" in out["stdout"]
+
+    def test_powershell_propagates_a_nonzero_exit(self, tool):
+        out = json.loads(tool("powershell")("exit 3"))
+        assert out["exitcode"] == 3, out
+
+    def test_powershell_stderr_is_free_of_clixml_progress(self, tool):
+        """The encoded path silences $ProgressPreference and strips any CLIXML
+        progress document — a cmdlet that reports progress must not leave XML
+        masquerading as an error on stderr."""
+        out = json.loads(tool("powershell")("Get-Service WinDefend | Out-Null"))
+        assert out["exitcode"] == 0, out
+        assert "CLIXML" not in out["stderr"]
+
+    def test_powershell_handles_backslash_paths_without_escaping(self, tool):
+        """The whole point of the tool: Windows paths survive verbatim, with
+        none of the nested backslash-doubling the python-subprocess route needs."""
+        out = json.loads(tool("powershell")(r"Test-Path C:\Windows\System32\cmd.exe"))
+        assert out["exitcode"] == 0, out
+        assert "True" in out["stdout"]
+
+    def test_exec_runs_a_command_line(self, tool):
+        out = json.loads(tool("exec")("echo hello-exec"))
+        assert out["exitcode"] == 0, out
+        assert "hello-exec" in out["stdout"]
+
+    def _await_job(self, tool, job_id, tries=20):
+        out = None
+        for _ in range(tries):
+            out = json.loads(tool("job_result")(job_id))
+            if not out.get("running"):
+                return out
+            time.sleep(0.5)
+        return out
+
+    def test_exec_background_launch_and_result(self, tool):
+        launch = json.loads(tool("exec")("echo bg-exec", background=True))
+        assert launch["background"] is True
+        out = self._await_job(tool, launch["job_id"])
+        assert out and out["running"] is False, out
+        assert out["exitcode"] == 0
+        assert "bg-exec" in out["stdout"]
+
+    def test_powershell_background_launch_and_result(self, tool):
+        launch = json.loads(tool("powershell")(
+            "Start-Sleep -Milliseconds 300; Write-Output ps-bg-done", background=True
+        ))
+        assert launch["background"] is True
+        out = self._await_job(tool, launch["job_id"])
+        assert out and out["running"] is False, out
+        assert out["exitcode"] == 0
+        assert "ps-bg-done" in out["stdout"]
+
+    def test_python_background_launch_and_result(self, tool):
+        launch = json.loads(tool("python")(
+            "import time; time.sleep(0.3); print('py-bg-done')", background=True
+        ))
+        out = self._await_job(tool, launch["job_id"])
+        assert out and out["running"] is False, out
+        assert "py-bg-done" in out["stdout"]
+
+    def test_job_result_reports_unknown_job(self, tool):
+        out = json.loads(tool("job_result")(999999))
+        assert "not found" in out["error"]
 
     def test_ps_lists_processes(self, tool):
         procs = json.loads(tool("ps")("lsass"))
