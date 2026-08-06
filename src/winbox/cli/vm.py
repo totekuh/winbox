@@ -61,16 +61,41 @@ def up(ctx: click.Context, reboot: bool) -> None:
 
 
 @click.command()
+@click.option(
+    "--force", "-f", is_flag=True,
+    help="Hard power-off (virsh destroy) instead of a graceful shutdown. "
+         "Works when the VM is paused or wedged.",
+)
 @click.pass_context
-def down(ctx: click.Context) -> None:
-    """Shut down the VM."""
+def down(ctx: click.Context, force: bool) -> None:
+    """Shut down the VM.
+
+    Without --force this asks the guest to shut down cleanly, which needs a
+    running, agent-responsive guest. --force yanks the power (virsh destroy)
+    and also works on a paused or unresponsive VM.
+    """
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
     state = vm.state()
+
+    # Only RUNNING and PAUSED have a live QEMU process for `destroy` to kill;
+    # SHUTOFF/SAVED/NOT_FOUND have nothing to power off.
+    if force:
+        if state not in (VMState.RUNNING, VMState.PAUSED):
+            console.print(f"[yellow][!][/] VM is not running (state: {state.value})")
+            return
+        console.print("[blue][*][/] Forcing VM power-off...")
+        vm.force_stop()
+        console.print("[green][+][/] VM powered off")
+        return
+
     if state != VMState.RUNNING:
-        console.print(f"[yellow][!][/] VM is not running (state: {state.value})")
+        msg = f"[yellow][!][/] VM is not running (state: {state.value})"
+        if state == VMState.PAUSED:
+            msg += " — use [bold]winbox down --force[/] to power it off"
+        console.print(msg)
         return
 
     console.print("[blue][*][/] Shutting down VM...")
