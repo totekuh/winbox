@@ -12,8 +12,9 @@ a roadmap whose top item nobody can start.
 
 ## Open
 
-Nothing is currently queued above item 8. Items 1-7 are done — `git log` is
-the record.
+Nothing is currently queued. Items 1-8 have all been worked — `git log` is the
+record. Item 8 is addressed at its source (below) but stays listed as
+*Watching* because it is intermittent by nature.
 
 One finding from the breakpoint work is worth keeping, because it shapes any
 future kdbg change: **neither breakpoint mechanism installs on both images.**
@@ -28,32 +29,35 @@ messages now name the wall you actually hit instead of guessing at one.
 
 ## Watching
 
-### 8. The guest agent drops shortly after a reboot
+### 8. The guest agent drops shortly after a reboot — addressed, watched
 
-Sharpened from "the guest wedges sometimes". It has now been seen three
-times, always the same shape: a command runs fine, and the *next* one — a
-few seconds later, after a reboot earlier in the sequence — gets
-`Guest agent is not responding: QEMU guest agent is not connected`. Twice it
-was `autologin status` immediately following the AppLocker test's reboot.
+The shape: a command runs fine, and the *next* one — a few seconds later,
+after a reboot earlier in the sequence — gets
+`Guest agent is not responding: QEMU guest agent is not connected`. Seen
+several times, usually the command right after a reboot (e.g. `autologin
+status` after the AppLocker test's reboot). The channel comes up, answers
+once, and drops again before it settles.
 
-It is intermittent: the same test passes on most runs, and Server 2022 has
-gone 85/85 with it. The one hard wedge earlier in this work (black console,
-agent gone for good) was probably the same thing at its extreme, and its most
-likely contributor — the `kdbg status` probe pausing the guest for minutes —
-has since been fixed.
+**Fixed at the source.** Readiness now reads libvirt's channel-state
+attribute (`agent_channel_connected` in `vm/lifecycle.py`, consulted by
+`GuestAgent.ping()`), and `reboot_and_wait` waits for several consecutive
+channel-up reads rather than the first answered ping. libvirt is the
+authority on channel state — the exact thing that flaps — so the gate reads
+the drop directly instead of inferring it from a failed round-trip.
 
-Now easy to recognise: since guest-agent errors are typed, this arrives as
-`GuestAgentUnreachable` rather than a generic failure, so it is obvious at a
-glance that the transport dropped rather than a command failing.
+**Still Watching, not Closed**, because it is intermittent: a clean run does
+not prove absence. The channel-state gate closes the window it was measured
+in, but a sufficiently slow settle could still slip past a bounded wait.
 
-**Do not "fix" it with a blanket retry.** Retrying a command that may already
-have run in the guest is exactly what roadmap item 1 existed to prevent. If
-this is worth attacking, the safe version is a bounded retry on
-`GuestAgentUnreachable` for *read-only* operations only, where re-running
-costs nothing — and it needs to be a deliberate decision, not a reflex.
+**Do not "fix" the residue with a blanket retry.** Retrying a command that may
+already have run in the guest is exactly what item 1's typed exceptions exist
+to prevent. If more is needed, the only safe retry is a bounded one on
+`GuestAgentUnreachable` for *read-only* operations — a deliberate decision,
+not a reflex.
 
-**If it recurs:** note what ran immediately before, and whether a reboot
-happened within the previous minute.
+**If it recurs:** note what ran immediately before, whether a reboot happened
+within the previous minute, and whether `vm.agent_connected()` reads
+connected at that moment.
 
 ---
 

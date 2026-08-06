@@ -44,7 +44,7 @@ PS C:\Windows\system32>
 - **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
 - **MCP server** — 54 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including Defender enable/disable/status, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
-- **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
+- **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`; `--mode auto` falls back to software 0xCC where the 4 DR slots run out, but note HVCI blocks software breakpoints on Windows 11), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
 - **VNC display** via virt-manager (`winbox vnc`) — plain VGA, no clipboard/resize
 - **x64dbg in the guest** — bundled in setup, extracted to `C:\Tools\x64dbg`, both x32 and x64 on PATH
 - **Python in the guest** — Python 3.13 installed during setup (pip, PATH, py.exe launcher) for MCP-driven research
@@ -387,7 +387,7 @@ Hypervisor-level kernel debug (via QEMU gdbstub + HMP, EDR-invisible):
 | `kdbg_attach(pid, port?)` | Fork the session daemon and attach to a target process. VM keeps running; bps stay armed until detach |
 | `kdbg_detach()` | Tear down the session and leave the VM running |
 | `kdbg_session()` | Show current daemon state (target pid, attach time, bp count, halted vs running) |
-| `kdbg_bp(target, mode?, condition?)` | Install a bp. Default `mode="hw"` (Z1/DR — invisible to PatchGuard + `GetThreadContext`); `mode="soft"` for >4 simultaneous bps. Optional `condition` is a server-side predicate evaluated on each fire (regs, `[reg+off]` qword reads, `==/!=/</<=/>/>=`, `&&`/`||`) |
+| `kdbg_bp(target, mode?, condition?)` | Install a bp. `mode="hw"` (default; Z1/DR — invisible to PatchGuard + `GetThreadContext`, 4 slots/vCPU), `mode="soft"` (0xCC patch — unlimited but PG-visible), or `mode="auto"` (hw first, soft on slot exhaustion). **On Windows 11 use `hw`/`auto`: HVCI blocks the software 0xCC patch.** Optional `condition` is a server-side predicate evaluated on each fire (regs, `[reg+off]` qword reads, `==/!=/</<=/>/>=`, `&&`/`||`) |
 | `kdbg_bps()` | List installed bps with hit/skip/error counters |
 | `kdbg_rm(bp_id)` | Remove an installed bp |
 | `kdbg_cont(timeout?)` | Resume; block until next stop in target's CR3 set (KPTI-aware: kernel + user PML4) |
