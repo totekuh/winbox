@@ -45,7 +45,7 @@ PS C:\Windows\system32>
 - **Malware detonation lab** — `winbox capture` (host-side pcap on the bridge — prefers `dumpcap`, which Kali's Wireshark package lets the `wireshark` group run without root, falling back to `tcpdump` otherwise), `winbox sinkhole` (zero-dependency DNS sinkhole that answers every C2 lookup with the bridge IP and logs the domain, plus optional INETSim fake services), and `winbox detonate check` (read-only preflight that refuses to go green unless the guest genuinely can't reach the internet). See [docs/malware-detonation.md](docs/malware-detonation.md)
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
 - **MCP server** — 57 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including credentialed or background exec/Python/PowerShell, Defender enable/disable/status, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
-- **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`; `--mode auto` falls back to software 0xCC where the 4 DR slots run out, but note HVCI blocks software breakpoints on Windows 11), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
+- **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`; `--mode auto` falls back to software 0xCC where the 4 DR slots run out, but note HVCI blocks software breakpoints on the 24H2 kernel — Windows 11 and Server 2025), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
 - **VNC display** via virt-manager (`winbox vnc`) — plain VGA, no clipboard/resize
 - **x64dbg in the guest** — bundled in setup, extracted to `C:\Tools\x64dbg`, both x32 and x64 on PATH
 - **Python in the guest** — Python 3.13 installed during setup (pip, PATH, py.exe launcher) for MCP-driven research
@@ -411,7 +411,7 @@ Hypervisor-level kernel debug (via QEMU gdbstub + HMP, EDR-invisible):
 | `kdbg_attach(pid, port?)` | Fork the session daemon and attach to a target process. VM keeps running; bps stay armed until detach |
 | `kdbg_detach()` | Tear down the session and leave the VM running |
 | `kdbg_session()` | Show current daemon state (target pid, attach time, bp count, halted vs running) |
-| `kdbg_bp(target, mode?, condition?)` | Install a bp. `mode="hw"` (default; Z1/DR — invisible to PatchGuard + `GetThreadContext`, 4 slots/vCPU), `mode="soft"` (0xCC patch — unlimited but PG-visible), or `mode="auto"` (hw first, soft on slot exhaustion). **On Windows 11 use `hw`/`auto`: HVCI blocks the software 0xCC patch.** Optional `condition` is a server-side predicate evaluated on each fire (regs, `[reg+off]` qword reads, `==/!=/</<=/>/>=`, `&&`/`||`) |
+| `kdbg_bp(target, mode?, condition?)` | Install a bp. `mode="hw"` (default; Z1/DR — invisible to PatchGuard + `GetThreadContext`, 4 slots/vCPU), `mode="soft"` (0xCC patch — unlimited but PG-visible), or `mode="auto"` (hw first, soft on slot exhaustion). **On the 24H2 kernel (Windows 11, Server 2025) use `hw`/`auto`: HVCI blocks the software 0xCC patch.** Optional `condition` is a server-side predicate evaluated on each fire (regs, `[reg+off]` qword reads, `==/!=/</<=/>/>=`, `&&`/`||`) |
 | `kdbg_bps()` | List installed bps with hit/skip/error counters |
 | `kdbg_rm(bp_id)` | Remove an installed bp |
 | `kdbg_cont(timeout?)` | Resume; block until next stop in target's CR3 set (KPTI-aware: kernel + user PML4) |
@@ -439,7 +439,7 @@ Kali Linux
 │   ├── SSH ────────────────> OpenSSH Server (interactive PowerShell)
 │   └── TCP listener ───────< ConPTY reverse shell (SYSTEM, resizable PTY)
 │
-└── Windows Server Core 2022 (headless QEMU/KVM, plain VNC display)
+└── Windows guest — Server Core 2022/2025 or Win11 (headless QEMU/KVM, plain VNC display)
     ├── QEMU Guest Agent          ← primary exec channel
     ├── VirtioFsSvc (WinFsp)      ← auto-mounts Z:\ on boot
     ├── OpenSSH Server            ← interactive sessions
@@ -490,6 +490,8 @@ VIRTIO_ISO_URL=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
 ├── disk.qcow2                          # VM disk image
 ├── iso/
 │   ├── SERVER_EVAL_x64FRE_en-us.iso    # Windows Server 2022 eval ISO
+│   ├── SERVER2025_EVAL_x64FRE_en-us.iso # Windows Server 2025 eval ISO (--os server2025)
+│   ├── WIN11_ENT_EVAL_x64FRE_en-us.iso # Windows 11 Enterprise eval ISO (--os win11)
 │   ├── virtio-win.iso                  # VirtIO drivers
 │   ├── OpenSSH-Win64.zip               # bundled OpenSSH
 │   ├── winfsp.msi                      # WinFsp installer
@@ -523,9 +525,9 @@ VM you are using.
 
 The live suite (`tests/test_e2e_live.py`) exercises every CLI command and every
 MCP tool against whichever image `~/.winbox/config` points at, and is written to
-pass on **both** `server2022` and `win11` — where the two genuinely differ
-(Tamper Protection, Server Core's smaller service set, the Python payload) it
-asserts the profile-appropriate behavior instead of skipping.
+pass on **all three** profiles (`server2022`, `server2025`, `win11`) — where they
+genuinely differ (Tamper Protection, Server Core's smaller service set, the
+Python payload) it asserts the profile-appropriate behavior instead of skipping.
 
 `tests/e2e_manifest.py` records how each command and tool is covered — live, or
 excluded with a stated reason — and `tests/test_e2e_coverage.py` checks that
