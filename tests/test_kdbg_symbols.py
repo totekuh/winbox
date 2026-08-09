@@ -158,3 +158,131 @@ class _FakeCfg:
 
     def __init__(self, root: Path) -> None:
         self.symbols_dir = root
+
+
+class TestEnsureNtBaseCurrent:
+    """ASLR moves the kernel every boot; the symbol store does not.
+
+    Every kernel walk resolves symbols off the cached nt base, so a base left
+    over from a previous boot fails deep in the page-table walk as
+    "PDPTE not present" — an error that names the layer that noticed, not the
+    cause. Only the base moved: every RVA is still correct, so re-pointing it
+    is the whole repair.
+    """
+
+    class _Store:
+        def __init__(self, data, *, set_base_fails=False):
+            self._data = data
+            self.rebased = []
+            self._fails = set_base_fails
+
+        def load(self, module):
+            if module not in self._data:
+                raise KeyError(module)
+            return self._data[module]
+
+        def set_base(self, module, base):
+            if self._fails:
+                raise OSError("read-only")
+            self.rebased.append((module, base))
+            self._data[module]["base"] = base
+
+    def _cfg(self):
+        class C:
+            vm_name = "winbox"
+            symbols_dir = "/tmp/nope"
+        return C()
+
+    def _patch_live(self, monkeypatch, value):
+        import winbox.kdbg.symbols as sym
+
+        def resolver(cfg, syms):
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        monkeypatch.setattr(sym, "resolve_nt_base", resolver)
+
+    def test_repoints_a_moved_base(self, monkeypatch):
+        from winbox.kdbg.symbols import ensure_nt_base_current
+
+        store = self._Store({"nt": {"base": 0xfffff80000000000, "symbols": {"K": 1}}})
+        self._patch_live(monkeypatch, 0xfffff80099999000)
+
+        assert ensure_nt_base_current(self._cfg(), store) is True
+        assert store.rebased == [("nt", 0xfffff80099999000)]
+
+    def test_leaves_a_current_base_alone(self, monkeypatch):
+        from winbox.kdbg.symbols import ensure_nt_base_current
+
+        store = self._Store({"nt": {"base": 0xfffff80000000000, "symbols": {"K": 1}}})
+        self._patch_live(monkeypatch, 0xfffff80000000000)
+
+        assert ensure_nt_base_current(self._cfg(), store) is False
+        assert store.rebased == []
+
+    def test_no_symbols_means_nothing_to_compare(self, monkeypatch):
+        """resolve_nt_base works backwards from the IDT using a symbol RVA."""
+        from winbox.kdbg.symbols import ensure_nt_base_current
+
+        store = self._Store({"nt": {"base": 0xfffff80000000000, "symbols": {}}})
+        called = []
+        monkeypatch.setattr(
+            "winbox.kdbg.symbols.resolve_nt_base",
+            lambda *a, **k: called.append(1),
+        )
+
+        assert ensure_nt_base_current(self._cfg(), store) is False
+        assert called == []
+
+    def test_unloaded_nt_is_not_an_error(self):
+        from winbox.kdbg.symbols import ensure_nt_base_current
+
+        assert ensure_nt_base_current(self._cfg(), self._Store({})) is False
+
+    def test_a_failed_probe_leaves_the_store_alone(self, monkeypatch):
+        """Never raise: the walk should fail the way it always did, not turn
+        into a different error from the repair attempt."""
+        from winbox.kdbg.symbols import ensure_nt_base_current
+
+        store = self._Store({"nt": {"base": 0xfffff80000000000, "symbols": {"K": 1}}})
+        self._patch_live(monkeypatch, RuntimeError("hmp down"))
+
+        assert ensure_nt_base_current(self._cfg(), store) is False
+        assert store.rebased == []
+
+    def test_an_unwritable_store_propagates(self, monkeypatch):
+        """Distinct from a failed probe: here we know the base is wrong and
+        could not fix it, which the caller should see."""
+        from winbox.kdbg.symbols import ensure_nt_base_current
+
+        store = self._Store(
+            {"nt": {"base": 0xfffff80000000000, "symbols": {"K": 1}}},
+            set_base_fails=True,
+        )
+        self._patch_live(monkeypatch, 0xfffff80099999000)
+
+        with pytest.raises(OSError):
+            ensure_nt_base_current(self._cfg(), store)
+
+
+class TestWalkerEntryPointsHealFirst:
+    """The repair has to happen before anything resolves a kernel symbol."""
+
+    def test_daemon_heals_before_listing_processes(self):
+        import inspect
+
+        from winbox.kdbg.debugger import daemon
+
+        src = inspect.getsource(daemon.fork_daemon)
+        assert "ensure_nt_base_current" in src
+        assert src.index("ensure_nt_base_current") < src.index("list_processes(")
+
+    def test_mcp_and_cli_store_accessors_heal(self):
+        import inspect
+
+        import winbox.mcp as mcp_mod
+        from winbox.cli import kdbg as cli_kdbg
+
+        assert "ensure_nt_base_current" in inspect.getsource(mcp_mod._kdbg_get_store)
+        assert "ensure_nt_base_current" in inspect.getsource(cli_kdbg._get_store)

@@ -78,6 +78,12 @@ def needs_vm(*, auto_start: bool = True):
             cfg: Config = ctx.obj["cfg"]
             vm = VM(cfg)
             ga = GuestAgent(cfg)
+            # A group callback that is only dispatching must not touch the VM:
+            # click runs it before the subcommand, so `winbox eventlogs clear
+            # --help` would boot and wait on the guest just to print help. The
+            # subcommand carries its own @needs_vm and will do this itself.
+            if ctx.invoked_subcommand is not None:
+                return fn(cfg, vm, ga, *args, **kwargs)
             if auto_start:
                 ensure_running(vm, ga, cfg)
             else:
@@ -170,10 +176,36 @@ def reboot_and_wait(
     try:
         ga.wait(timeout=wait_timeout)
         _ensure_z_drive(ga)
+        _wait_for_stable_agent(ga)
     except GuestAgentError:
         console.print("[yellow][!][/] Guest agent not responding after reboot")
         console.print(f"    Check with: virsh console {cfg.vm_name}")
         raise SystemExit(1)
+
+
+def _wait_for_stable_agent(ga: GuestAgent, *, checks: int = 3, gap: float = 1.0) -> None:
+    """Wait until the agent answers *consistently*, not just once.
+
+    The first ping after a reboot is not proof the guest has settled: the
+    agent has repeatedly come up, answered, and dropped again seconds later,
+    so the command issued right after a reboot died with "QEMU guest agent is
+    not connected". Requiring several consecutive answers closes most of that
+    window.
+
+    Best-effort — a guest that never stabilises is left to the caller's own
+    error handling rather than being failed here, because by this point the
+    reboot itself has already succeeded.
+    """
+    consecutive = 0
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if ga.ping():
+            consecutive += 1
+            if consecutive >= checks:
+                return
+        else:
+            consecutive = 0
+        time.sleep(gap)
 
 
 def _ensure_z_drive(ga: GuestAgent) -> None:

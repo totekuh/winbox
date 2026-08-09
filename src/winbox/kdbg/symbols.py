@@ -39,6 +39,9 @@ if TYPE_CHECKING:
     from winbox.vm import GuestAgent
 
 
+
+logger = logging.getLogger(__name__)
+
 class SymbolLoadError(RuntimeError):
     pass
 
@@ -345,3 +348,49 @@ def ensure_types_loaded(
         base=data.get("base"),
         size_of_image=data.get("size_of_image"),
     )
+
+
+def ensure_nt_base_current(cfg: Config, store: SymbolStore) -> bool:
+    """Re-point the store's nt base at the running kernel if ASLR moved it.
+
+    The symbol store outlives the boot that produced it, but ASLR
+    re-randomizes the kernel base on every restart. Every RVA in the store is
+    still correct — only the number they are added to changed — so this is
+    the entire repair, and it is cheap enough to do before a walk rather than
+    making the user run ``kdbg base`` by hand after every reboot.
+
+    Must run *before* anything resolves a kernel symbol: a walk against a
+    stale base fails deep inside the page-table walk as
+    ``PageWalkError: PDPTE not present``, which says nothing about the actual
+    cause.
+
+    Returns True if the base was changed. Never raises — a probe that cannot
+    run leaves the store alone, and the walk fails as it did before.
+    """
+    try:
+        data = store.load("nt")
+    except Exception:
+        return False  # nt not loaded yet; nothing to correct
+
+    cached = data.get("base")
+    syms = data.get("symbols") or {}
+    if not cached or not syms:
+        # resolve_nt_base works backwards from the IDT using
+        # KiDivideErrorFault's RVA, so with no symbols there is nothing to
+        # compare against.
+        return False
+
+    try:
+        live = resolve_nt_base(cfg, syms)
+    except Exception:
+        return False
+
+    if not live or live == cached:
+        return False
+
+    store.set_base("nt", live)
+    logger.info(
+        "nt base moved 0x%x -> 0x%x (ASLR, typically a VM reboot); refreshed",
+        cached, live,
+    )
+    return True

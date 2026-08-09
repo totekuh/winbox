@@ -2,6 +2,8 @@
 
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from winbox.cli import cli
 from winbox.vm import VMState
 
@@ -30,7 +32,8 @@ class TestStatusRunning:
 
     def test_shows_snapshot_count(self, runner, mock_env):
         result = runner.invoke(cli, ["status"])
-        assert "1" in result.output
+        # A bare "1" matched the IP, the disk size, almost anything on screen.
+        assert "Snaps:   1" in result.output
 
     def test_shows_tool_count(self, runner, mock_env, cfg):
         # Create some tool files (all non-hidden files counted)
@@ -123,7 +126,7 @@ class TestStatusOtherStates:
     def test_multiple_snapshots(self, runner, mock_env):
         mock_env._vm.snapshot_list.return_value = ["clean", "pre-attack", "post-pivot"]
         result = runner.invoke(cli, ["status"])
-        assert "3" in result.output
+        assert "Snaps:   3" in result.output
 
     def test_no_ip(self, runner, mock_env):
         mock_env._vm.ip.return_value = None
@@ -155,3 +158,22 @@ class TestVnc:
         assert result.exit_code != 0
         assert "virt-manager not found" in result.output
         assert "apt install virt-manager" in result.output
+
+
+class TestStatusShowsTheGuestOs:
+    """With two possible images, which one is on disk should not require
+    reading ~/.winbox/config — it decides the install layout, the VirtIO
+    drivers, and how Defender behaves."""
+
+    @pytest.mark.parametrize("os_key", ["server2022", "win11"])
+    def test_os_line_reflects_the_configured_profile(
+        self, runner, cfg, mock_env, os_key
+    ):
+        cfg.vm_os = os_key
+        result = runner.invoke(cli, ["status"])
+        assert result.exit_code == 0
+        assert f"OS:      {os_key}" in result.output
+
+    def test_os_line_appears_before_state(self, runner, cfg, mock_env):
+        out = runner.invoke(cli, ["status"]).output
+        assert out.index("OS:") < out.index("State:")

@@ -13,6 +13,38 @@ from winbox.jobs import Job, JobMode, JobStatus, JobStore
 from winbox.vm import GuestAgent, GuestAgentError, VM
 
 
+def _poll_job_status(ga: GuestAgent, pid: int, *, attempts: int = 3) -> dict:
+    """Query a job's status, retrying briefly before treating it as gone.
+
+    Marking a job LOST is now permanent, so a single virtio-serial hiccup
+    must not be enough to do it. Retries a couple of times and only lets
+    the error escape if the agent consistently has no answer for this PID.
+    """
+    for attempt in range(attempts):
+        try:
+            return ga.exec_status(pid)
+        except GuestAgentError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.5)
+    raise AssertionError("unreachable")
+
+
+def _exited_status(ga: GuestAgent, pid: int) -> dict | None:
+    """Return the agent's finished-result dict for ``pid``, else None.
+
+    None means "not finished, or the agent has no record" — the two cases
+    a caller must not treat as a completed job. Errors are swallowed on
+    purpose: this runs on failure paths where a probe blowing up should
+    not replace the failure the caller is already reporting.
+    """
+    try:
+        status = ga.exec_status(pid)
+    except GuestAgentError:
+        return None
+    return status if status.get("exited") else None
+
+
 @click.group()
 @click.pass_context
 def jobs(ctx: click.Context) -> None:
@@ -48,12 +80,19 @@ def jobs_list(ctx: click.Context) -> None:
     # stale snapshot in between locks.
     mutated: list[Job] = []
     for job in all_jobs:
-        if job.status not in (JobStatus.RUNNING, JobStatus.LOST):
+        # LOST is terminal. We only get there with the agent otherwise
+        # responsive and still refusing to answer for this PID after
+        # retries, which means the agent has no record of it — and a
+        # discarded result never comes back. Re-polling could therefore
+        # never recover anything, but it could very much return a *new*
+        # process's output once Windows recycled the number onto it, and
+        # report that as this job's result.
+        if job.status is not JobStatus.RUNNING:
             continue
         if ga is None:
             continue  # VM offline — skip, don't permanently mark LOST
         try:
-            status = ga.exec_status(job.pid)
+            status = _poll_job_status(ga, job.pid)
             if status["exited"]:
                 job.exitcode = status["exitcode"]
                 job.stdout = status["stdout"]
@@ -202,10 +241,55 @@ def jobs_kill(ctx: click.Context, job_id: int) -> None:
     ensure_running(vm, ga, cfg)
 
     try:
-        ga.exec(f"taskkill /PID {job.pid} /F", timeout=15)
+        # /T kills the whole tree. Without it only the outer cmd.exe died;
+        # its children kept the inherited stdout pipe open, so the guest
+        # agent went on buffering their output into a result slot nobody
+        # would ever read — the orphan that later collided with a recycled
+        # PID and surfaced as another command's output.
+        kill = ga.exec(f"taskkill /PID {job.pid} /T /F", timeout=15)
     except GuestAgentError as e:
         console.print(f"[red][-][/] Kill failed: {e}")
         raise SystemExit(1)
+
+    if kill.exitcode != 0:
+        # taskkill exits 128 when the PID is gone and 1 on access-denied.
+        # Treating either as success used to print "killed" and then reap
+        # the job's buffered result away, destroying the output of a run
+        # that had in fact completed. Ask the agent what actually happened
+        # before deciding.
+        exited = _exited_status(ga, job.pid)
+        if exited is not None:
+            # The job finished on its own; the status read we just did is
+            # also what frees the agent's slot, so record the real result
+            # rather than fabricating FAILED/-1.
+            job.exitcode = exited["exitcode"]
+            job.stdout = exited["stdout"]
+            job.stderr = exited["stderr"]
+            job.status = JobStatus.DONE if job.exitcode == 0 else JobStatus.FAILED
+            store.update(job)
+            console.print(
+                f"[yellow][!][/] Job {job_id} had already exited "
+                f"(code {job.exitcode}) — nothing to kill; output preserved"
+            )
+            return
+        # Still running (or unknowable) and taskkill refused: leave the
+        # ledger alone — the job is not dead and its slot is not ours to
+        # free. Reaping here would strand a live process's output.
+        console.print(
+            f"[red][-][/] Kill failed: taskkill exited {kill.exitcode}"
+        )
+        # taskkill writes its diagnostics to stderr, but the guest agent has
+        # been seen surfacing them on stdout too — print whatever we got.
+        detail = " ".join(
+            part for part in (kill.stderr.strip(), kill.stdout.strip()) if part
+        )
+        if detail:
+            console.print(f"    {detail}", markup=False, highlight=False)
+        raise SystemExit(1)
+
+    # Consume this job's buffered result so its slot is freed now, rather
+    # than left for a future command that lands on the same PID.
+    ga.reap(job.pid)
 
     job.status = JobStatus.FAILED
     job.exitcode = -1

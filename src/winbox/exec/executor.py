@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from winbox.vm.guest import ExecResult, GuestAgent, GuestAgentError
+from winbox.vm.guest import (
+    ExecResult,
+    GuestAgent,
+    GuestAgentError,
+    GuestExecAbandoned,
+    GuestExecTimeout,
+)
 from winbox.jobs import Job, JobMode, JobStatus, JobStore
 from winbox.utils import human_size
 
@@ -17,6 +23,23 @@ if TYPE_CHECKING:
     from winbox.config import Config
 
 console = Console()
+
+
+def _command_already_ran(err: GuestAgentError) -> bool:
+    """True when this error means the guest already launched the command.
+
+    The retry loop below exists for the GA pipe race, which fails *before* the
+    process starts — retrying is free. Anything that already ran is the
+    opposite: a retry re-runs a half-completed, non-idempotent operation
+    (installers, registry writers, exploit PoCs).
+
+    The axis is launch-phase vs poll-phase, not transport vs timeout. A
+    transport failure during the *poll* means the command started and was then
+    killed, which is why guest.py raises GuestExecAbandoned there rather than
+    letting the transport error through — classifying that as retryable would
+    be a licence to run it twice.
+    """
+    return isinstance(err, (GuestExecTimeout, GuestExecAbandoned))
 
 
 def resolve_exe(exe: str, tools_dir: Path) -> str:
@@ -86,7 +109,9 @@ def run_command(
     for attempt in range(max_retries):
         try:
             attempt_result = ga.exec(full_cmd, timeout=timeout)
-        except GuestAgentError:
+        except GuestAgentError as e:
+            if _command_already_ran(e):
+                raise
             if attempt < max_retries - 1:
                 console.print(f"[yellow][!][/] GA error, retrying ({attempt + 1}/{max_retries})...")
                 time.sleep(0.5)

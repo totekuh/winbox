@@ -10,7 +10,7 @@ from click.testing import CliRunner
 from winbox.cli import cli
 from winbox.config import Config
 from winbox.jobs import Job, JobMode, JobStatus, JobStore
-from winbox.vm.guest import ExecResult
+from winbox.vm.guest import ExecResult, GuestAgentError
 
 
 # ─── JobStore ─────────────────────────────────────────────────────────────────
@@ -338,6 +338,71 @@ class TestJobsKill:
         assert result.exit_code == 1
         assert "not found" in result.output
 
+    def test_kill_of_already_finished_job_keeps_its_result(self, runner, cfg, mock_env):
+        """Regression: taskkill exits 128 when the PID is gone. That used to
+        be reported as a successful kill, the job overwritten with
+        FAILED/-1, and `ga.reap` called — throwing away the completed run's
+        buffered output."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=4812, command="sharphound.exe", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING))
+        mock_env.exec.return_value = ExecResult(
+            exitcode=128, stdout='ERROR: The process "4812" not found.', stderr=""
+        )
+        mock_env.exec_status.return_value = {
+            "exited": True, "exitcode": 0,
+            "stdout": "50 hosts collected\n", "stderr": "",
+        }
+
+        result = runner.invoke(cli, ["jobs", "kill", "1"])
+
+        assert result.exit_code == 0
+        assert "already exited" in result.output
+        assert "killed" not in result.output.lower()
+        reloaded = JobStore(cfg).get(1)
+        assert reloaded.status == JobStatus.DONE
+        assert reloaded.exitcode == 0
+        assert reloaded.stdout == "50 hosts collected\n"
+        mock_env.reap.assert_not_called()
+
+    def test_kill_of_finished_failed_job_records_real_exitcode(self, runner, cfg, mock_env):
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=4812, command="x.exe", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING))
+        mock_env.exec.return_value = ExecResult(exitcode=128, stdout="not found", stderr="")
+        mock_env.exec_status.return_value = {
+            "exited": True, "exitcode": 3, "stdout": "", "stderr": "boom\n",
+        }
+
+        result = runner.invoke(cli, ["jobs", "kill", "1"])
+
+        assert result.exit_code == 0
+        reloaded = JobStore(cfg).get(1)
+        assert reloaded.status == JobStatus.FAILED
+        assert reloaded.exitcode == 3
+        assert reloaded.stderr == "boom\n"
+
+    def test_kill_denied_is_an_error_and_leaves_job_running(self, runner, cfg, mock_env):
+        """taskkill exit 1 = access denied. The process is still alive, so
+        the job must not be marked dead and its slot must not be reaped."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING))
+        mock_env.exec.return_value = ExecResult(
+            exitcode=1, stdout="ERROR: Access is denied.", stderr=""
+        )
+        mock_env.exec_status.return_value = {
+            "exited": False, "exitcode": -1, "stdout": "", "stderr": "",
+        }
+
+        result = runner.invoke(cli, ["jobs", "kill", "1"])
+
+        assert result.exit_code == 1
+        assert "Kill failed" in result.output
+        assert "Access is denied" in result.output
+        assert JobStore(cfg).get(1).status == JobStatus.RUNNING
+        mock_env.reap.assert_not_called()
+
     def test_kill_ga_error(self, runner, cfg, mock_env):
         """Kill fails when taskkill GA exec raises GuestAgentError."""
         from winbox.vm.guest import GuestAgentError
@@ -394,19 +459,64 @@ class TestJobsListEdge:
         reloaded = JobStore(cfg)
         assert reloaded.get(1).status == JobStatus.LOST
 
-    def test_lost_job_repolled_when_vm_back(self, runner, cfg, mock_env):
-        """LOST jobs are re-polled when VM comes back online."""
+    def test_lost_job_is_terminal_and_never_repolled(self, runner, cfg, mock_env):
+        """A LOST job must not adopt a recycled PID's output.
+
+        LOST means the agent was responsive and still had no record of this
+        PID after retries — a discarded result never comes back, so polling
+        again can only ever attribute some *other* process's output to this
+        job once Windows reuses the number.
+        """
         store = JobStore(cfg)
         store.add(Job(id=1, pid=100, command="recovered.exe", mode=JobMode.BUFFERED,
                        status=JobStatus.LOST, started=time.time()))
         mock_env.exec_status.return_value = {
-            "exited": True, "exitcode": 0, "stdout": "done", "stderr": "",
+            "exited": True, "exitcode": 0, "stdout": "someone-elses-output",
+            "stderr": "",
         }
+
         result = runner.invoke(cli, ["jobs", "list"])
+
         assert result.exit_code == 0
-        assert "done" in result.output
+        assert "someone-elses-output" not in result.output
+        mock_env.exec_status.assert_not_called()
+        reloaded = JobStore(cfg)
+        assert reloaded.get(1).status == JobStatus.LOST
+
+    def test_transient_status_error_does_not_lose_a_running_job(
+        self, runner, cfg, mock_env
+    ):
+        """One virtio hiccup must not permanently strand a running job."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="slow.exe", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING, started=time.time()))
+        mock_env.exec_status.side_effect = [
+            GuestAgentError("transient"),
+            {"exited": True, "exitcode": 0, "stdout": "done", "stderr": ""},
+        ]
+
+        with patch("time.sleep"):
+            result = runner.invoke(cli, ["jobs", "list"])
+
+        assert result.exit_code == 0
         reloaded = JobStore(cfg)
         assert reloaded.get(1).status == JobStatus.DONE
+
+    def test_running_job_lost_only_after_retries_exhausted(
+        self, runner, cfg, mock_env
+    ):
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="gone.exe", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING, started=time.time()))
+        mock_env.exec_status.side_effect = GuestAgentError("no such PID")
+
+        with patch("time.sleep"):
+            result = runner.invoke(cli, ["jobs", "list"])
+
+        assert result.exit_code == 0
+        assert mock_env.exec_status.call_count == 3
+        reloaded = JobStore(cfg)
+        assert reloaded.get(1).status == JobStatus.LOST
 
     def test_age_minutes(self, runner, cfg, mock_env):
         """Jobs between 1-59 minutes display as Xm."""

@@ -38,6 +38,43 @@ def _filter_path(filename: str) -> Path:
     return _data.path(filename)
 
 
+def _filter_signature(root: ET.Element) -> tuple:
+    """Canonical, comparable form of an nwfilter's actual ruleset.
+
+    A raw XML comparison is useless here: libvirt stores a ``<uuid>`` our
+    templates don't carry, fills in a computed ``priority`` on the root
+    element, and discards comments. So compare only what changes behavior —
+    the chain, the referenced sub-filters, and the ordered rules.
+    """
+    def attrs(el: ET.Element) -> tuple:
+        return tuple(sorted(el.attrib.items()))
+
+    rules = []
+    for rule in root.findall("rule"):
+        children = tuple(
+            (child.tag, attrs(child))
+            for child in rule
+            if isinstance(child.tag, str)  # skip comments
+        )
+        rules.append((attrs(rule), children))
+
+    refs = tuple(sorted(r.get("filter", "") for r in root.findall("filterref")))
+    return (root.get("name"), root.get("chain"), refs, tuple(rules))
+
+
+def _defined_filter_matches(name: str, desired_xml: str) -> bool:
+    """True if libvirt's current definition of ``name`` equals ``desired_xml``."""
+    result = virsh_run("nwfilter-dumpxml", name, check=False)
+    if result.returncode != 0:
+        return False
+    try:
+        current = _filter_signature(ET.fromstring(result.stdout))
+        desired = _filter_signature(ET.fromstring(desired_xml))
+    except ET.ParseError:
+        return False
+    return current == desired
+
+
 def _define_one(filename: str, name: str, render_kwargs: dict | None = None) -> None:
     """Run ``virsh nwfilter-define`` against a bundled XML.
 
@@ -65,15 +102,25 @@ def _define_one(filename: str, name: str, render_kwargs: dict | None = None) -> 
     else:
         cleanup_paths = []
         define_arg = str(_data.path(filename))
+        body = _data.read(filename)
 
     try:
         result = virsh_run("nwfilter-define", define_arg, check=False)
         if result.returncode != 0 and "already exists with uuid" in (result.stderr or ""):
             undef = virsh_run("nwfilter-undefine", name, check=False)
             if undef.returncode != 0:
+                # A filter attached to a running domain cannot be undefined.
+                # That is the normal state whenever the VM is already
+                # isolated — and re-isolating an isolated VM should be a
+                # no-op, not an error. Only complain if the live ruleset
+                # actually differs from what we want to install.
+                if _defined_filter_matches(name, body):
+                    return
                 msg = undef.stderr.strip() or f"virsh exit {undef.returncode}"
                 raise RuntimeError(
-                    f"Failed to undefine stale nwfilter '{name}' before redefine: {msg}"
+                    f"nwfilter '{name}' is defined with a different ruleset and "
+                    f"cannot be replaced while in use: {msg}\n"
+                    f"    Run `winbox net connect` to detach it, then retry."
                 )
             result = virsh_run("nwfilter-define", define_arg, check=False)
 

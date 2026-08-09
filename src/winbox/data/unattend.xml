@@ -30,12 +30,12 @@
           <InstallFrom>
             <MetaData wcm:action="add">
               <Key>/IMAGE/NAME</Key>
-              <Value>Windows Server 2022 SERVERSTANDARDCORE</Value>
+              <Value>{IMAGE_NAME}</Value>
             </MetaData>
           </InstallFrom>
           <InstallTo>
             <DiskID>0</DiskID>
-            <PartitionID>2</PartitionID>
+            <PartitionID>{INSTALL_PARTITION_ID}</PartitionID>
           </InstallTo>
         </OSImage>
       </ImageInstall>
@@ -44,36 +44,9 @@
         <Disk wcm:action="add">
           <DiskID>0</DiskID>
           <WillWipeDisk>true</WillWipeDisk>
-          <CreatePartitions>
-            <!-- EFI System Partition -->
-            <CreatePartition wcm:action="add">
-              <Order>1</Order>
-              <Size>100</Size>
-              <Type>EFI</Type>
-            </CreatePartition>
-            <!-- Windows partition (rest of disk) -->
-            <CreatePartition wcm:action="add">
-              <Order>2</Order>
-              <Extend>true</Extend>
-              <Type>Primary</Type>
-            </CreatePartition>
-          </CreatePartitions>
-          <ModifyPartitions>
-            <ModifyPartition wcm:action="add">
-              <Order>1</Order>
-              <PartitionID>1</PartitionID>
-              <Format>FAT32</Format>
-              <Label>EFI</Label>
-            </ModifyPartition>
-            <ModifyPartition wcm:action="add">
-              <Order>2</Order>
-              <PartitionID>2</PartitionID>
-              <Format>NTFS</Format>
-              <Label>Windows</Label>
-            </ModifyPartition>
-          </ModifyPartitions>
+{DISK_PARTITIONS}
         </Disk>
-      </DiskConfiguration>
+      </DiskConfiguration>{LABCONFIG_BLOCK}
 
     </component>
   </settings>
@@ -85,11 +58,24 @@
                language="neutral" versionScope="nonSxS">
       <ComputerName>WINBOX</ComputerName>
       <TimeZone>UTC</TimeZone>
-    </component>
+    </component>{SPECIALIZE_DEPLOY_BLOCK}
   </settings>
 
   <!-- OOBE: admin account, auto-logon, first-run commands -->
   <settings pass="oobeSystem">
+    <!-- Locale/region/keyboard so Win11 OOBE doesn't stop on the interactive
+         "Is this the right country or region?" / keyboard-layout screens
+         (Server 2022 skips them; Win11 25H2 does not without this). -->
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
     <component name="Microsoft-Windows-Shell-Setup"
                processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
                language="neutral" versionScope="nonSxS"
@@ -136,14 +122,14 @@
         <!-- 1. Install VirtIO serial driver (required for guest agent channel) -->
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\vioserial\2k22\amd64\vioser.inf pnputil /add-driver %d:\vioserial\2k22\amd64\vioser.inf /install</CommandLine>
+          <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\vioserial\{VIRTIO_SUBDIR}\amd64\vioser.inf pnputil /add-driver %d:\vioserial\{VIRTIO_SUBDIR}\amd64\vioser.inf /install</CommandLine>
           <Description>Install VirtIO serial driver</Description>
         </SynchronousCommand>
 
         <!-- 2. Install VirtIO-FS driver (required for host filesystem sharing) -->
         <SynchronousCommand wcm:action="add">
           <Order>2</Order>
-          <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\viofs\2k22\amd64\viofs.inf pnputil /add-driver %d:\viofs\2k22\amd64\viofs.inf /install</CommandLine>
+          <CommandLine>cmd /c for %d in (D E F G H I J K) do if exist %d:\viofs\{VIRTIO_SUBDIR}\amd64\viofs.inf pnputil /add-driver %d:\viofs\{VIRTIO_SUBDIR}\amd64\viofs.inf /install</CommandLine>
           <Description>Install VirtIO-FS driver</Description>
         </SynchronousCommand>
 

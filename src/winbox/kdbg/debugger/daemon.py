@@ -21,10 +21,19 @@ LOCK_EX is automatically released by the kernel on process death, so
 stale-lock recovery is free. The .session.json file is for
 introspection only (CLI clients can read it before connecting).
 
-Single-threaded serve loop: one op at a time. While a long-running op
-(``cont``) is in flight, other connections get an immediate
-``BUSY`` reply — except SIGUSR1 (sent by ``winbox kdbg interrupt``)
-which interrupts the in-flight gdb wait and lets ``cont`` return.
+Single-threaded serve loop: one op at a time. A long-running op
+(``cont``) pumps the listen socket itself while it waits (see
+``_wait_for_stop_serving``), so clients are still answered: heavy ops
+get an immediate ``BUSY`` reply and the lightweight ops (``status``,
+``interrupt``) are executed for real. That pump is what lets
+``winbox kdbg interrupt`` break an in-flight ``cont`` — the accept()
+in ``serve`` is unreachable for the whole duration of the op, so
+without it a second client just sits in the listen backlog until its
+own socket timeout fires.
+
+SIGUSR1 sets the same interrupt-pending flag and is kept as a
+last-resort path for an operator holding only the daemon pid; nothing
+in winbox sends it.
 """
 
 from __future__ import annotations
@@ -401,37 +410,40 @@ class DaemonSession:
         installed_hw = False
         elapsed_ms = 0.0
 
+        hw_error: Exception | None = None
         if mode in ("hw", "auto"):
-            # Try hw first.
+            # Try hw first: DR-register breakpoints are PatchGuard-safe and
+            # invisible to in-guest anti-debug, so they are always preferred.
             t0 = time.monotonic()
             try:
                 self.rsp.insert_breakpoint(va, kind=1, hardware=True)
                 installed_hw = True
                 elapsed_ms = (time.monotonic() - t0) * 1000.0
             except RspError as e:
+                hw_error = e
                 if mode == "hw":
-                    raise RuntimeError(
-                        f"hw bp install failed: {e}. The 4-slot DR0..3 budget "
-                        f"may be exhausted; set mode='soft' to use a software "
-                        f"breakpoint instead (unlimited but PG-visible / hash-"
-                        f"detectable)."
-                    ) from e
+                    raise RuntimeError(_hw_bp_failure(e)) from e
                 # mode == "auto" — fall through to soft path
 
         if not installed_hw:
             # Software path. Kernel VAs get plain Z0 (kernel pages are
             # in every CR3); user VAs need the CR3-masquerade dance.
             t0 = time.monotonic()
-            if is_user:
-                report = install_user_breakpoint(
-                    self.rsp, self.cfg.vm_name, self.store,
-                    target_dtb=self.target.dtb,
-                    user_va=va,
-                )
-                elapsed_ms = report.elapsed * 1000.0
-            else:
-                self.rsp.insert_breakpoint(va, kind=1)
-                elapsed_ms = (time.monotonic() - t0) * 1000.0
+            try:
+                if is_user:
+                    report = install_user_breakpoint(
+                        self.rsp, self.cfg.vm_name, self.store,
+                        target_dtb=self.target.dtb,
+                        user_va=va,
+                    )
+                    elapsed_ms = report.elapsed * 1000.0
+                else:
+                    self.rsp.insert_breakpoint(va, kind=1)
+                    elapsed_ms = (time.monotonic() - t0) * 1000.0
+            except (RspError, InstallError) as e:
+                raise RuntimeError(
+                    _soft_bp_failure(e, is_user=is_user, hw_error=hw_error)
+                ) from e
 
         bp_id = self._next_bp_id
         self._next_bp_id += 1
@@ -521,6 +533,11 @@ class DaemonSession:
         """
         accepted_cr3s = self.target.cr3_set
         deadline = time.monotonic() + max(0.5, float(timeout))
+        # Drop a flag left over from an interrupt issued while nothing was
+        # running — honouring it would make this cont return immediately
+        # without ever resuming the guest. An interrupt that arrives *during*
+        # this cont is delivered by the pump in _wait_for_stop_serving and
+        # consumed below, so it is no longer at risk of being swallowed here.
         self._interrupt_pending = False
         while True:
             if self._interrupt_pending:
@@ -535,7 +552,7 @@ class DaemonSession:
 
             self.rsp.cont()
             try:
-                sr = self.rsp.wait_for_stop(timeout=remaining)
+                sr = self._wait_for_stop_serving(remaining)
             except RspError as e:
                 if "timed out" in str(e).lower():
                     # Wall-clock budget exhausted in wait_for_stop —
@@ -548,6 +565,15 @@ class DaemonSession:
                         pass
                     return {"reason": "timeout"}
                 raise RuntimeError(f"cont/wait failed: {e}") from e
+
+            if self._interrupt_pending:
+                # An interrupt was served mid-wait and its \x03 is what
+                # halted us (QEMU reports SIGINT, not SIGTRAP). Consume the
+                # flag here so it can't leak into the next cont, and label
+                # the stop for what the operator asked for.
+                self._interrupt_pending = False
+                self._capture_stop(sr)
+                return {"reason": "interrupt", **self._stop_summary()}
 
             if sr.signal != 5:
                 # Not a bp — surface anyway, caller decides.
@@ -656,7 +682,10 @@ class DaemonSession:
 
         ``op_interrupt`` is a lightweight op (bypasses ``_busy``), so it
         runs on a separate connection while ``op_cont`` is blocked in
-        ``wait_for_stop`` on a different connection. The flag alone is
+        ``wait_for_stop`` on a different connection — that connection is
+        accepted by ``_pump_client`` from inside the cont wait, since the
+        serve loop's own accept() is unreachable until the op finishes.
+        The flag alone is
         only checked at the top of each cont-loop iteration — a stuck
         cont that isn't firing bps wouldn't notice for the full 30s
         default timeout. Sending ``\\x03`` directly punts a stop reply
@@ -997,6 +1026,92 @@ class DaemonSession:
 
     # ── serve loop ──────────────────────────────────────────────────────
 
+    def _rsp_fd(self) -> int | None:
+        """fileno of the gdbstub socket, or None if unavailable.
+
+        Returns None for RspClient stand-ins that hold no socket (unit
+        tests), which is the signal to fall back to a plain blocking wait.
+        """
+        sock = getattr(self.rsp, "_sock", None)
+        if sock is None:
+            return None
+        try:
+            fd = sock.fileno()
+        except (OSError, AttributeError):
+            return None
+        return fd if fd >= 0 else None
+
+    def _wait_for_stop_serving(self, timeout: float):
+        """``rsp.wait_for_stop`` that keeps answering daemon clients.
+
+        WHY this exists: ``serve`` accepts one connection, runs the op to
+        completion, and only then loops back to ``select``/``accept``. So
+        for the whole of a ``cont`` — up to the caller's full timeout —
+        nothing accepts. A concurrently-launched ``winbox kdbg interrupt``
+        never gets read off the backlog, hits its own 60s socket timeout
+        and tells the operator the daemon "went away" on a session that is
+        perfectly healthy. The ``is_lightweight`` bypass in ``_serve_one``
+        was written for a concurrency that did not exist at the transport
+        layer; this is what supplies it.
+
+        We deliberately do NOT slice the RSP read into short timeouts:
+        ``_read_packet`` consumes the frame byte by byte and drops what it
+        has collected when a read times out, so a stop reply straddling a
+        slice boundary would desync the stream. Instead we select on both
+        fds and only enter ``wait_for_stop`` once the gdbstub actually has
+        bytes for us; the rest of the budget is spent serving clients.
+        """
+        fd = self._rsp_fd()
+        listen = self._listen_sock
+        if fd is None or listen is None:
+            return self.rsp.wait_for_stop(timeout=timeout)
+
+        deadline = time.monotonic() + timeout
+        # Bytes already buffered by a previous read mean select would never
+        # fire for them — check before ever blocking.
+        while not getattr(self.rsp, "_inbuf", None):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                # Same error shape a bounded rsp read raises, so op_cont's
+                # existing "timed out" handling applies unchanged.
+                raise RspError("read timed out")
+            try:
+                ready, _, _ = select.select([fd, listen], [], [], min(left, 0.5))
+            except (OSError, InterruptedError):
+                # A signal landed mid-select (e.g. SIGUSR1) — re-check.
+                continue
+            if fd in ready:
+                break
+            if listen in ready:
+                self._pump_client()
+        return self.rsp.wait_for_stop(
+            timeout=max(0.5, deadline - time.monotonic())
+        )
+
+    def _pump_client(self) -> None:
+        """Accept and service one client from inside a long-running op."""
+        listen = self._listen_sock
+        if listen is None:
+            return
+        try:
+            conn, _ = listen.accept()
+        except OSError:
+            return
+        # Force the busy flag: op_cont may have been entered directly (not
+        # through _serve_one), and a heavy op running reentrantly on this
+        # stack would interleave RSP packets with the cont we're inside of.
+        was_busy = self._busy
+        self._busy = True
+        try:
+            # Short read budget — this is on the debugger's hot path, so a
+            # client that connects and then says nothing must not stall the
+            # cont for the serve loop's full 60s.
+            self._serve_one(conn, read_timeout=5.0)
+        finally:
+            self._busy = was_busy
+            with suppress(OSError):
+                conn.close()
+
     def serve(self, listen_sock: socket.socket) -> None:
         """Single-threaded select loop. Returns when detach is requested
         or a signal asks for shutdown."""
@@ -1023,11 +1138,14 @@ class DaemonSession:
                 with suppress(OSError):
                     conn.close()
 
-    def _serve_one(self, conn: socket.socket) -> None:
-        conn.settimeout(60.0)
+    def _serve_one(self, conn: socket.socket, *, read_timeout: float = 60.0) -> None:
+        conn.settimeout(read_timeout)
         try:
             line = read_line(conn)
-        except ProtocolError as e:
+        except (ProtocolError, OSError) as e:
+            # OSError covers the socket timeout: a client that connects and
+            # sends nothing used to let socket.timeout escape all the way
+            # out of serve() and kill the daemon.
             with suppress(OSError):
                 conn.sendall(encode(reply_err(f"protocol: {e}")))
             return
@@ -1317,6 +1435,56 @@ def _normalize_module_name(name: str) -> str:
     return n
 
 
+def _looks_like_timeout(err: Exception) -> bool:
+    """A stalled gdbstub read, as opposed to the stub refusing outright."""
+    text = str(err).lower()
+    return "timed out" in text or "timeout" in text
+
+
+def _hw_bp_failure(err: Exception) -> str:
+    """Explain a failed hardware breakpoint without inventing a cause.
+
+    The old message asserted the DR0..3 budget was exhausted whatever
+    happened. A stalled read is the commoner failure and says nothing about
+    slots, so pointing at the budget sent people looking in the wrong place.
+    """
+    if _looks_like_timeout(err):
+        return (
+            f"hw bp install timed out: {err}. The stub stopped answering "
+            f"rather than refusing — the guest may be busy, or all four "
+            f"DR0..3 slots (per-vCPU) may already be taken. Check `kdbg bps`, "
+            f"and try mode='auto' to fall back to a software breakpoint."
+        )
+    return (
+        f"hw bp install failed: {err}. The 4-slot DR0..3 budget is the usual "
+        f"cause; check `kdbg bps`. mode='soft' uses a software breakpoint "
+        f"instead — unlimited, but PatchGuard-visible and hash-detectable."
+    )
+
+
+def _soft_bp_failure(
+    err: Exception, *, is_user: bool, hw_error: Exception | None
+) -> str:
+    """Explain a failed software breakpoint.
+
+    A software breakpoint writes 0xCC into the code page. Windows 11 enables
+    HVCI by default, which is precisely a guard against writing to kernel
+    code — so on a client SKU this path fails for a structural reason, and
+    reporting only "read timed out" left no way to know that.
+    """
+    parts = [f"soft bp install failed: {err}."]
+    if not is_user and _looks_like_timeout(err):
+        parts.append(
+            "A software breakpoint patches 0xCC into the kernel code page, "
+            "which HVCI exists to prevent — and HVCI is on by default on "
+            "Windows 11. If this guest is a client SKU, hardware breakpoints "
+            "(mode='hw') are the only ones that will install."
+        )
+    if hw_error is not None:
+        parts.append(f"The hardware path was tried first and also failed: {hw_error}")
+    return " ".join(parts)
+
+
 def _validate_module_bases(
     cfg: Config,
     rsp: "RspClient",
@@ -1385,12 +1553,19 @@ def _validate_module_bases(
                 )
             else:
                 if live_nt_base != cached_nt_base:
-                    raise DaemonError(
-                        f"stale nt base: cached 0x{cached_nt_base:x}, "
-                        f"actual 0x{live_nt_base:x}. ASLR moved the kernel "
-                        f"since symbols were loaded (typically a VM reboot). "
-                        f"Run `winbox kdbg base` to refresh nt base, then "
-                        f"`winbox kdbg symbols load -m nt` to repull."
+                    # ASLR moves the kernel every boot, and the symbol store
+                    # outlives the boot that produced it — so this fires after
+                    # any restart. Only the *base* moved; every RVA in the
+                    # store is still correct, so re-pointing it is the whole
+                    # repair. Telling the user to run two commands that do
+                    # exactly this was busywork standing between them and a
+                    # working debugger.
+                    store.set_base("nt", live_nt_base)
+                    print(
+                        f"note: nt base moved 0x{cached_nt_base:x} -> "
+                        f"0x{live_nt_base:x} (ASLR, typically a VM reboot); "
+                        f"refreshed automatically",
+                        file=sys.stderr,
                     )
 
     # ── Step 2: collect user-mode candidates with cached bases ──
@@ -1454,15 +1629,33 @@ def _validate_module_bases(
             stale.append((mod_name, cached_base, actual_base))
 
     if stale:
-        details = ", ".join(
-            f"{name} (cached 0x{cached:x}, actual 0x{actual:x})"
-            for name, cached, actual in stale
-        )
-        raise DaemonError(
-            f"stale module bases for {target.name}: {details}. "
-            f"ASLR moved them since symbols were loaded. "
-            f"Re-run kdbg_user_symbols_load for each stale module before retrying."
-        )
+        # Same story as the kernel above: ASLR relocated the images, but the
+        # symbols themselves are still valid — only the base each RVA is added
+        # to has changed, and the live value is right here in `target_loaded`.
+        # The documented remedy (kdbg_user_symbols_load per module) re-copied
+        # the PE and re-parsed its PDB purely to arrive at this same number.
+        repaired: list[str] = []
+        failed: list[str] = []
+        for name, cached, actual in stale:
+            try:
+                store.set_base(name, actual)
+            except Exception as e:  # store unwritable, malformed, ...
+                failed.append(f"{name} ({type(e).__name__}: {e})")
+            else:
+                repaired.append(f"{name} 0x{cached:x} -> 0x{actual:x}")
+
+        if repaired:
+            print(
+                f"note: refreshed {len(repaired)} stale module base(s) for "
+                f"{target.name} after ASLR: {', '.join(repaired)}",
+                file=sys.stderr,
+            )
+        if failed:
+            raise DaemonError(
+                f"stale module bases for {target.name} could not be "
+                f"refreshed: {', '.join(failed)}. Re-run "
+                f"kdbg_user_symbols_load for each before retrying."
+            )
 
 
 def fork_daemon(
@@ -1516,6 +1709,12 @@ def fork_daemon(
         # Resolve target now that we're inside the daemon (parent doesn't
         # need to talk to gdb).
         store = SymbolStore(cfg.symbols_dir)
+        # Before anything resolves a kernel symbol. list_processes below
+        # reads PsActiveProcessHead off the cached nt base, so a base left
+        # over from a previous boot fails here as "PDPTE not present" —
+        # long before the staleness check further down could say so.
+        from winbox.kdbg.symbols import ensure_nt_base_current
+        ensure_nt_base_current(cfg, store)
         procs = list_processes(cfg.vm_name, store)
         target = next((p for p in procs if p.pid == target_pid), None)
         if target is None:

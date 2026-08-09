@@ -104,3 +104,64 @@ def test_session_alive_true_when_someone_holds_lock(tmp_path, monkeypatch):
         assert client.session_alive() is True
     finally:
         os.close(fd)
+
+
+class TestClientSurvivesDaemonDeath:
+    """Tearing down a session is exactly when the daemon dies mid-request.
+
+    The connect() failure was already translated into an actionable
+    ClientError, but a daemon that died *after* the connect surfaced as a
+    raw ConnectionResetError traceback from sendall()/read_line().
+    """
+
+    def _client(self, tmp_path, monkeypatch):
+        from winbox.config import Config
+        from winbox.kdbg.debugger.client import DaemonClient
+
+        cfg = Config(winbox_dir=tmp_path)
+        cfg.winbox_dir.mkdir(parents=True, exist_ok=True)
+        client = DaemonClient(cfg)
+        monkeypatch.setattr(client, "session_alive", lambda: True)
+        return client
+
+    def test_reset_on_send_becomes_client_error(self, tmp_path, monkeypatch):
+        import socket
+
+        from winbox.kdbg.debugger.client import ClientError
+
+        client = self._client(tmp_path, monkeypatch)
+
+        class DeadSock:
+            def settimeout(self, _): pass
+            def connect(self, _): pass
+            def sendall(self, _): raise ConnectionResetError(104, "reset by peer")
+            def close(self): pass
+
+        monkeypatch.setattr(socket, "socket", lambda *a, **kw: DeadSock())
+
+        with pytest.raises(ClientError, match="went away mid-request"):
+            client.call("status")
+
+    def test_reset_on_read_becomes_client_error(self, tmp_path, monkeypatch):
+        import socket
+
+        from winbox.kdbg.debugger import client as client_mod
+        from winbox.kdbg.debugger.client import ClientError
+
+        client = self._client(tmp_path, monkeypatch)
+
+        class HalfDeadSock:
+            def settimeout(self, _): pass
+            def connect(self, _): pass
+            def sendall(self, _): pass
+            def close(self): pass
+
+        monkeypatch.setattr(socket, "socket", lambda *a, **kw: HalfDeadSock())
+
+        def boom(_sock):
+            raise ConnectionResetError(104, "reset by peer")
+
+        monkeypatch.setattr(client_mod, "read_line", boom)
+
+        with pytest.raises(ClientError, match="went away mid-request"):
+            client.call("status")

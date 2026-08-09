@@ -818,6 +818,186 @@ class TestServiceTools:
             assert list(mcp_root.rglob("script.py")) == []
 
 
+# ─── av_enable / av_disable / av_status tools ────────────────────────────────
+
+
+class TestAvTools:
+    def test_status_returns_summary(self, mock_mcp):
+        from winbox.mcp import av_status
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout="Defender: ON\n  RealTimeProtection: True\n",
+            stderr="",
+        )
+
+        result = av_status()
+        assert "Defender: ON" in result
+        assert "RealTimeProtection: True" in result
+
+    def test_enable_drives_all_steps(self, mock_mcp):
+        from winbox.mcp import av_enable
+        ga, vm, cfg = mock_mcp
+        # Serves the three enable scripts *and* the closing status query.
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="Defender: ON\n  RealTimeProtection: True\n", stderr=""
+        )
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+
+        result = av_enable()
+        assert "Defender enabled" in result
+
+        # 3 PowerShell steps (registry cleanup, exclusions, prefs) + sc.exe
+        # start + the status query that backs the claim we just made.
+        assert ga.exec_powershell.call_count == 4
+        assert "sc.exe start WinDefend" in ga.exec.call_args[0][0]
+
+    def test_enable_does_not_claim_protections_it_has_not_verified(self, mock_mcp):
+        """WdFilter is a boot-start driver: when it was disabled at boot,
+        real-time protection cannot arm this boot no matter what we ran. An
+        agent told "enabled" runs its sample believing it is being scanned."""
+        from winbox.mcp import av_enable
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout="Defender: partial\n  RealTimeProtection: False\n",
+            stderr="",
+        )
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+
+        result = av_enable()
+
+        assert "Defender enabled (real-time, AMSI, behavior monitoring)" not in result
+        assert "not every protection is active" in result
+        assert "RealTimeProtection: False" in result
+        assert "reboot" in result.lower()
+
+    def test_enable_survives_a_guest_that_wont_answer_the_status_query(self, mock_mcp):
+        """A status probe that fails must downgrade the claim, not crash."""
+        from winbox.mcp import av_enable
+        from winbox.vm import GuestAgentError
+        ga, vm, cfg = mock_mcp
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec_powershell.side_effect = [
+            ExecResult(exitcode=0, stdout="", stderr=""),
+            ExecResult(exitcode=0, stdout="", stderr=""),
+            ExecResult(exitcode=0, stdout="", stderr=""),
+            GuestAgentError("guest agent gone"),
+        ]
+
+        result = av_enable()
+        assert "not every protection is active" in result
+
+    def test_enable_docstring_does_not_promise_no_reboot(self, mock_mcp):
+        import winbox.mcp as m
+        fn = m.av_enable.fn if hasattr(m.av_enable, "fn") else m.av_enable
+        assert "No reboot needed" not in (fn.__doc__ or "")
+
+    def test_enable_start_failure_surfaces_error(self, mock_mcp):
+        from winbox.mcp import av_enable
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec.return_value = ExecResult(
+            exitcode=5, stdout="Access is denied", stderr=""
+        )
+
+        result = av_enable()
+        assert result.startswith("error:")
+        assert "Failed to start WinDefend" in result
+        assert "Access is denied" in result
+
+    def test_disable_requires_confirm(self, mock_mcp):
+        from winbox.mcp import av_disable
+        ga, vm, cfg = mock_mcp
+
+        result = av_disable()
+        assert "confirm=True" in result
+        # No reboot, no registry writes without confirmation.
+        ga.exec_argv.assert_not_called()
+        ga.exec.assert_not_called()
+
+    def test_disable_sets_regkeys_then_reboots(self, mock_mcp):
+        from winbox.mcp import av_disable
+        from winbox.defender import DISABLE_REG_ARGS
+        ga, vm, cfg = mock_mcp
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        # exec_powershell serves both the pre-flight Tamper-Protection probe
+        # (needs no TAMPER_ON) and the post-reboot verification (needs an OFF
+        # status), so one benign payload satisfies both.
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout="TAMPER_OFF\nDefender: OFF (all protections disabled)\n",
+            stderr="",
+        )
+
+        with patch("time.sleep"):
+            result = av_disable(confirm=True)
+
+        assert "Defender disabled" in result
+        assert ga.exec_argv.call_count == len(DISABLE_REG_ARGS)
+        reboot_calls = [c for c in ga.exec.call_args_list if "shutdown" in c[0][0]]
+        assert len(reboot_calls) == 1
+        ga.wait.assert_called_once()
+
+    def test_disable_refuses_when_tamper_protection_on(self, mock_mcp):
+        from winbox.mcp import av_disable
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="TAMPER_ON\n", stderr=""
+        )
+
+        result = av_disable(confirm=True)
+
+        assert result.startswith("error:")
+        assert "Tamper Protection" in result
+        # Gate must trip before any registry write or reboot.
+        ga.exec_argv.assert_not_called()
+        ga.exec.assert_not_called()
+
+    def test_disable_reports_when_defender_survives_reboot(self, mock_mcp):
+        from winbox.mcp import av_disable
+        ga, vm, cfg = mock_mcp
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        # TP probe passes, but the post-reboot status still shows Defender up.
+        ga.exec_powershell.return_value = ExecResult(
+            exitcode=0,
+            stdout="TAMPER_OFF\nDefender: ON (real-time protection enabled)\n",
+            stderr="",
+        )
+
+        with patch("time.sleep"):
+            result = av_disable(confirm=True)
+
+        assert "still reports active" in result
+        assert "Defender disabled" not in result
+
+    def test_disable_reg_failure_aborts_before_reboot(self, mock_mcp):
+        from winbox.mcp import av_disable
+        ga, vm, cfg = mock_mcp
+        ga.exec_argv.return_value = ExecResult(
+            exitcode=1, stdout="", stderr="Access denied"
+        )
+
+        result = av_disable(confirm=True)
+        assert result.startswith("error:")
+        # Should not have rebooted.
+        ga.exec.assert_not_called()
+
+    def test_disable_reboot_wait_failure(self, mock_mcp):
+        from winbox.mcp import av_disable
+        from winbox.vm import GuestAgentError
+        ga, vm, cfg = mock_mcp
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        ga.wait.side_effect = GuestAgentError("timeout")
+
+        with patch("time.sleep"):
+            result = av_disable(confirm=True)
+        assert "did not" in result and "come back" in result
+
+
 # ─── net_isolate / net_unplug / net_connect tools ───────────────────────────
 
 
@@ -1163,22 +1343,41 @@ def _make_session(cfg, session_id: str) -> object:
     return session_dir
 
 
-def _broker_thread(session_dir, response: dict, *, delay: float = 0.05):
-    """Simulate the broker: wait for cmd.json, write result.json."""
+def _pending_cmds(session_dir):
+    """(seq, path) for every command file the broker hasn't consumed, in order."""
+    out = []
+    for p in session_dir.glob("cmd.*.json"):
+        try:
+            out.append((int(p.name[4:-5]), p))
+        except ValueError:
+            continue
+    return sorted(out)
+
+
+def _broker_thread(session_dir, response: dict, *, delay: float = 0.05, count: int = 1):
+    """Simulate the broker: consume the next cmd.<seq>.json, answer into
+    result.<seq>.json. `response` may be a dict or a list of dicts (one per
+    command served)."""
     import json
     import threading
     import time as _t
 
+    responses = response if isinstance(response, list) else [response] * count
+
     def _run():
-        cmd_file    = session_dir / "cmd.json"
-        result_file = session_dir / "result.json"
         deadline = _t.time() + 3
-        while _t.time() < deadline:
-            if cmd_file.exists():
-                cmd_file.unlink()
+        served = 0
+        while _t.time() < deadline and served < len(responses):
+            pending = _pending_cmds(session_dir)
+            if pending:
+                seq, path = pending[0]
+                path.unlink()
                 _t.sleep(delay)
-                result_file.write_text(json.dumps(response))
-                return
+                (session_dir / f"result.{seq}.json").write_text(
+                    json.dumps({**responses[served], "seq": seq})
+                )
+                served += 1
+                continue
             _t.sleep(0.01)
 
     t = threading.Thread(target=_run, daemon=True)
@@ -1445,7 +1644,7 @@ class TestPipeSession:
 
         sid = "aabbcc001129"
         session_dir = _make_session(cfg, sid)
-        # No broker thread — result.json never appears; close should still clean up
+        # No broker thread — no result ever appears; close should still clean up
 
         result = pipe_close(sid)
         assert "closed session" in result
@@ -1459,13 +1658,194 @@ class TestPipeSession:
         assert "WriteFile" in _BROKER_SCRIPT
         assert "ReadFile" in _BROKER_SCRIPT
         assert "status.json" in _BROKER_SCRIPT
-        assert "cmd.json" in _BROKER_SCRIPT
-        assert "result.json" in _BROKER_SCRIPT
+        # Assert the sequence-numbered protocol specifically. Matching on a
+        # bare "cmd." prefix passes against almost any text, which would let a
+        # regression back to the fixed cmd.json/result.json pair — the desync
+        # this protocol exists to prevent — sail straight through.
+        assert "result.%d.json" in _BROKER_SCRIPT, "results must be seq-numbered"
+        assert "startswith('cmd.')" in _BROKER_SCRIPT
+        assert "endswith('.json')" in _BROKER_SCRIPT
+        # The fixed single-slot filenames must not come back.
+        assert "cmd.json" not in _BROKER_SCRIPT
+        assert "result.json" not in _BROKER_SCRIPT
 
     def test_broker_script_is_valid_python(self, mock_mcp):
         import ast
         from winbox.mcp import _BROKER_SCRIPT
         ast.parse(_BROKER_SCRIPT)  # raises SyntaxError if invalid
+
+
+class TestPipeSessionDoesNotDesync:
+    """One timed-out pipe call used to poison the session forever: commands
+    and results were unkeyed, so a late answer was consumed by whatever call
+    polled next."""
+
+    def test_a_late_result_is_never_handed_to_the_next_call(self, mock_mcp):
+        """The exact reported sequence: a recv times out, then the broker
+        answers a *write*. The next recv must not receive that write's result
+        (which has no data_hex and used to raise KeyError out of the tool)."""
+        import json
+        from winbox.mcp import pipe_recv, pipe_send
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000001"
+        session_dir = _make_session(cfg, sid)
+
+        # 1. recv times out with nothing answering.
+        assert "timeout" in pipe_recv(sid, 1024, timeout=0)
+        # 2. send times out too.
+        assert "timeout" in pipe_send(sid, "deadbeef", timeout=0)
+        # 3. the broker now wakes up and answers both abandoned commands.
+        for seq, path in _pending_cmds(session_dir):
+            cmd = json.loads(path.read_text())
+            path.unlink()
+            answer = (
+                {"ok": True, "data_hex": "cafe"} if cmd["cmd"] == "read"
+                else {"ok": True, "written": 4}
+            )
+            (session_dir / f"result.{seq}.json").write_text(
+                json.dumps({**answer, "seq": seq})
+            )
+
+        # 4. a fresh recv, answered properly, must get its own answer.
+        _broker_thread(session_dir, {"ok": True, "data_hex": "beef"})
+        assert pipe_recv(sid, 16) == "beef"
+
+    def test_a_stale_answer_alone_does_not_satisfy_a_new_call(self, mock_mcp):
+        """Belt and braces: an orphan result from an earlier seq must not be
+        mistaken for the current call's."""
+        import json
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000002"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "result.1.json").write_text(
+            json.dumps({"ok": True, "written": 4, "seq": 1})
+        )
+
+        result = pipe_recv(sid, 16, timeout=0)
+        assert "timeout" in result
+
+    def test_a_command_is_not_overwritten_while_another_is_in_flight(self, mock_mcp):
+        """Both commands went to the same fixed cmd.json, so a call issued
+        while the broker was busy silently destroyed the previous one."""
+        import json
+        from winbox.mcp import pipe_recv, pipe_send
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000003"
+        session_dir = _make_session(cfg, sid)
+
+        pipe_recv(sid, 1024, timeout=0)
+        pipe_send(sid, "deadbeef", timeout=0)
+
+        pending = [json.loads(p.read_text()) for _, p in _pending_cmds(session_dir)]
+        assert [c["cmd"] for c in pending] == ["read", "write"]
+        assert [c["seq"] for c in pending] == sorted(c["seq"] for c in pending)
+
+    def test_recv_reports_an_unexpected_result_shape_as_an_error(self, mock_mcp):
+        """Never a KeyError out of an MCP tool call."""
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000004"
+        session_dir = _make_session(cfg, sid)
+        _broker_thread(session_dir, {"ok": True, "written": 4})
+
+        result = pipe_recv(sid, 16)
+        assert "error" in result
+
+    def test_recv_asks_the_broker_to_time_out_first(self, mock_mcp):
+        """ReadFile on the synchronous handle blocks forever with no data and
+        nothing host-side can cancel it, so the broker needs its own deadline —
+        shorter than ours, or the answer arrives after we've given up."""
+        import json
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000005"
+        session_dir = _make_session(cfg, sid)
+        pipe_recv(sid, 16, timeout=0)
+
+        cmd = json.loads(_pending_cmds(session_dir)[0][1].read_text())
+        assert "wait_ms" in cmd
+
+    def test_broker_side_timeout_is_reported_as_no_data(self, mock_mcp):
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "de5ync000006"
+        session_dir = _make_session(cfg, sid)
+        _broker_thread(
+            session_dir,
+            {"ok": False, "timed_out": True, "error": "no data available within 9.0s"},
+        )
+
+        result = pipe_recv(sid, 16)
+        assert "no data" in result
+
+    def test_broker_peeks_before_reading_and_exits_when_its_dir_is_gone(self, mock_mcp):
+        """Both halves of "a wedged broker is unreachable": it must be able to
+        time out a read, and it must give up when pipe_close removes the
+        session dir it takes orders from."""
+        from winbox.mcp import _BROKER_SCRIPT
+        assert "PeekNamedPipe" in _BROKER_SCRIPT
+        assert "config_file" in _BROKER_SCRIPT
+
+
+class TestPipeCloseDoesNotLeakTheBroker:
+    """pipe_close deleted broker.pid along with the session dir, so a broker
+    still blocked in ReadFile kept the pipe handle (and one of the pipe's
+    instances) forever with nothing left able to kill it."""
+
+    def test_unacknowledged_close_taskkills_the_broker(self, mock_mcp):
+        from winbox.mcp import pipe_close
+        ga, _, cfg = mock_mcp
+
+        sid = "1eak00000001"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "broker.pid").write_text("4242")
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        # No broker thread — the close is never acknowledged.
+
+        result = pipe_close(sid)
+
+        kills = [
+            c for c in ga.exec_argv.call_args_list
+            if c[0][0] == "taskkill.exe" and "4242" in c[0][1]
+        ]
+        assert len(kills) == 1, f"expected the orphan broker to be killed, got {kills}"
+        assert "force-killed" in result
+        assert not session_dir.exists()
+
+    def test_acknowledged_close_does_not_kill_anything(self, mock_mcp):
+        from winbox.mcp import pipe_close
+        ga, _, cfg = mock_mcp
+
+        sid = "1eak00000002"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "broker.pid").write_text("4242")
+        _broker_thread(session_dir, {"ok": True})
+
+        result = pipe_close(sid)
+
+        assert result == f"closed session {sid}"
+        assert [c for c in ga.exec_argv.call_args_list if c[0][0] == "taskkill.exe"] == []
+
+    def test_unkillable_broker_is_reported_not_papered_over(self, mock_mcp):
+        from winbox.mcp import pipe_close
+        ga, _, cfg = mock_mcp
+
+        sid = "1eak00000003"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "broker.pid").write_text("4242")
+        ga.exec_argv.return_value = ExecResult(exitcode=128, stdout="", stderr="no such PID")
+
+        result = pipe_close(sid)
+
+        assert "4242" in result
+        assert "may still hold the pipe handle" in result
 
 
 # ─── kdbg_start / kdbg_stop / kdbg_status tools ─────────────────────────────
@@ -2172,3 +2552,191 @@ class TestKdbgDaemonTools:
              patch("winbox.kdbg.hmp.probe_port", return_value=False):
             result = kdbg_resume()
         assert "gdbstub not listening" in result
+
+
+class TestReadmeToolCount:
+    """The README advertises how many MCP tools ship; it has drifted before.
+
+    Comparing against the README's own number (rather than a literal here)
+    means adding a tool fails this test until the docs are updated, without
+    needing two magic numbers kept in sync.
+    """
+
+    def _readme(self):
+        import pathlib
+
+        path = pathlib.Path(__file__).resolve().parents[1] / "README.md"
+        if not path.exists():
+            import pytest
+
+            pytest.skip("README.md not present (installed package)")
+        return path.read_text(encoding="utf-8")
+
+    def test_readme_count_matches_registered_tools(self):
+        import asyncio
+        import re
+
+        from winbox.mcp import mcp
+
+        tools = asyncio.run(mcp.list_tools())
+        m = re.search(r"\*\*MCP server\*\* — (\d+) tools", self._readme())
+        assert m, "README no longer states an MCP tool count in the expected form"
+        assert int(m.group(1)) == len(tools), (
+            f"README says {m.group(1)} MCP tools but {len(tools)} are registered"
+        )
+
+    def test_tool_names_are_unique(self):
+        import asyncio
+
+        from winbox.mcp import mcp
+
+        names = [t.name for t in asyncio.run(mcp.list_tools())]
+        assert len(names) == len(set(names))
+
+    def test_every_tool_has_a_description(self):
+        """Tool docstrings are the only thing an agent sees when choosing."""
+        import asyncio
+
+        from winbox.mcp import mcp
+
+        undocumented = [
+            t.name for t in asyncio.run(mcp.list_tools()) if not (t.description or "").strip()
+        ]
+        assert undocumented == []
+
+
+class TestFormatExecResultDiagnostics:
+    """A non-zero exit with nothing on either stream used to render as the
+    bare string "\\n[exit code: 1]" — indistinguishable from a tool that
+    simply had nothing to say, and the exact shape an externally killed
+    in-guest process leaves behind (Python block-buffers stdout to a pipe,
+    so a kill before interpreter shutdown discards it)."""
+
+    def test_silent_failure_explains_itself(self):
+        from winbox.mcp import _format_exec_result
+
+        out = _format_exec_result({"stdout": "", "stderr": "", "exitcode": 1})
+
+        assert "[exit code: 1]" in out
+        assert "no output on either stream" in out
+        assert "flush" in out
+
+    def test_failure_with_stderr_is_left_alone(self):
+        from winbox.mcp import _format_exec_result
+
+        out = _format_exec_result(
+            {"stdout": "", "stderr": "Traceback...", "exitcode": 1}
+        )
+
+        assert "Traceback..." in out
+        assert "no output on either stream" not in out
+
+    def test_failure_with_stdout_is_left_alone(self):
+        from winbox.mcp import _format_exec_result
+
+        out = _format_exec_result({"stdout": "partial", "stderr": "", "exitcode": 1})
+
+        assert "partial" in out
+        assert "no output on either stream" not in out
+
+    def test_success_with_no_output_is_unchanged(self):
+        from winbox.mcp import _format_exec_result
+
+        assert _format_exec_result(
+            {"stdout": "", "stderr": "", "exitcode": 0}
+        ) == "(no output)"
+
+
+class TestRegSetTypeLeniency:
+    """A registry write should not fail over the spelling of its type."""
+
+    def _script_for(self, value_type):
+        import winbox.mcp as m
+
+        captured = {}
+
+        def fake_exec_python(script, timeout=30):
+            captured["script"] = script
+            return {"stdout": "", "stderr": "", "exitcode": 0}
+
+        fn = m.reg_set.fn if hasattr(m.reg_set, "fn") else m.reg_set
+        with patch.object(m, "_exec_python", fake_exec_python):
+            fn(r"HKLM\SOFTWARE\X", "V", "1", value_type)
+        return captured["script"]
+
+    def test_shorthand_is_normalized(self):
+        script = self._script_for("dword")
+        assert 'reg_type_name.strip().upper()' in script
+        assert 'reg_type_name = "REG_" + reg_type_name' in script
+
+    def test_unknown_type_lists_the_valid_ones(self):
+        script = self._script_for("frobnicate")
+        assert "Expected one of" in script
+
+
+class TestBrokerScriptExecutes:
+    """The in-guest broker was checked with ast.parse and substring greps.
+
+    That proves it is syntactically Python and mentions the right words — not
+    that it does the right thing. Its sequencing logic is the whole basis of
+    the desync fix (a recv that timed out must never be answered by the next
+    command's result), and it is pure Python over os.listdir, so it can be
+    run here rather than only on a Windows guest.
+    """
+
+    def _next_command(self, script_dir):
+        """Extract and bind the broker's `next_command` against a real dir."""
+        import os
+
+        from winbox.mcp import _BROKER_SCRIPT
+
+        lines = _BROKER_SCRIPT.splitlines()
+        start = next(i for i, l in enumerate(lines) if l.startswith("def next_command()"))
+        end = next(
+            (i for i in range(start + 1, len(lines))
+             if lines[i].startswith("def ") or lines[i].startswith("while ")),
+            len(lines),
+        )
+        ns = {"os": os, "script_dir": str(script_dir)}
+        exec("\n".join(lines[start:end]), ns)
+        return ns["next_command"]
+
+    def test_takes_the_lowest_pending_sequence(self, tmp_path):
+        """Out-of-order execution is the desync this protocol prevents."""
+        for seq in (7, 2, 5):
+            (tmp_path / f"cmd.{seq}.json").write_text("{}")
+
+        assert self._next_command(tmp_path)() == (2, "cmd.2.json")
+
+    def test_returns_none_when_nothing_is_pending(self, tmp_path):
+        assert self._next_command(tmp_path)() is None
+
+    def test_ignores_files_that_are_not_commands(self, tmp_path):
+        (tmp_path / "result.3.json").write_text("{}")
+        (tmp_path / "config.json").write_text("{}")
+        (tmp_path / "broker.pid").write_text("123")
+        (tmp_path / "cmd.9.json").write_text("{}")
+
+        assert self._next_command(tmp_path)() == (9, "cmd.9.json")
+
+    def test_skips_a_malformed_sequence_rather_than_crashing(self, tmp_path):
+        """A half-written or stray name must not take the broker down — it
+        would strand the session with no way to close it."""
+        (tmp_path / "cmd.notanumber.json").write_text("{}")
+        (tmp_path / "cmd..json").write_text("{}")
+        (tmp_path / "cmd.4.json").write_text("{}")
+
+        assert self._next_command(tmp_path)() == (4, "cmd.4.json")
+
+    def test_sequences_are_ordered_numerically_not_lexically(self, tmp_path):
+        """String ordering would run 10 before 9 and desync the session."""
+        for seq in (9, 10, 11):
+            (tmp_path / f"cmd.{seq}.json").write_text("{}")
+
+        assert self._next_command(tmp_path)() == (9, "cmd.9.json")
+
+    def test_a_vanished_directory_is_not_fatal(self, tmp_path):
+        """pipe_close rmtree's the session dir; the broker may still be in
+        its loop and must exit rather than raise."""
+        gone = tmp_path / "never-existed"
+        assert self._next_command(gone)() is None

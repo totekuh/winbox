@@ -4,11 +4,48 @@ from __future__ import annotations
 
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from winbox.config import Config
+
+# The virtio-serial channel qemu-ga speaks over. libvirt stamps a live
+# ``state`` attribute on this target and keeps it current as the agent
+# connects and drops — see ``agent_channel_connected``.
+_GUEST_AGENT_CHANNEL = "org.qemu.guest_agent.0"
+
+
+def agent_channel_connected(vm_name: str) -> bool:
+    """Whether libvirt currently sees the guest-agent channel as connected.
+
+    This is the authoritative readiness signal, and the cause of the
+    post-reboot flake it guards against: the agent comes up, answers once, and
+    the channel drops again for a few seconds before it settles. A
+    ``guest-ping`` only sees that indirectly; libvirt tracks the channel state
+    directly and exposes it in ``virsh dumpxml`` as::
+
+        <target type='virtio' name='org.qemu.guest_agent.0' state='connected'/>
+
+    Reads that attribute and nothing else. Returns ``False`` — never raises —
+    when the domain is off, absent, unqueryable, or the channel/attribute is
+    missing, matching how :meth:`VM.state` degrades an unusable domain: a
+    "not connected" answer has to be a value callers can gate on, not an
+    exception.
+    """
+    result = virsh_run("dumpxml", vm_name, check=False)
+    if result.returncode != 0:
+        return False
+    try:
+        domain = ET.fromstring(result.stdout)
+    except ET.ParseError:
+        return False
+    target = domain.find(
+        f"devices/channel/target[@name='{_GUEST_AGENT_CHANNEL}']"
+    )
+    # `state` is only present on a live domain; absent on a shut-off one.
+    return target is not None and target.get("state") == "connected"
 
 
 class VMState(Enum):
@@ -55,11 +92,24 @@ class VM:
         self.cfg = cfg
         self.name = cfg.vm_name
 
-    def state(self) -> VMState:
+    def _domstate_raw(self) -> str | None:
+        """Raw, lowercased ``virsh domstate`` text — or None if unqueryable.
+
+        Kept separate from :meth:`state` because two callers want two
+        different questions answered from the same output: "roughly, what is
+        this domain doing" (``state``, which folds transient states onto the
+        nearest stable one) and "has QEMU actually let go of the disk"
+        (``is_off``, which must not fold anything).
+        """
         result = virsh_run("domstate", self.name, check=False)
         if result.returncode != 0:
+            return None
+        return result.stdout.strip().lower()
+
+    def state(self) -> VMState:
+        raw = self._domstate_raw()
+        if raw is None:
             return VMState.NOT_FOUND
-        raw = result.stdout.strip().lower()
         # virsh emits 8 well-known states; map the transient ones to the
         # nearest stable one rather than collapsing them all to UNKNOWN
         # (which callers like _ensure_vm_ready treat as fatal). "saved"
@@ -82,14 +132,73 @@ class VM:
             return VMState.SAVED
         return VMState.UNKNOWN
 
+    def is_off(self) -> bool:
+        """True only when libvirt reports the domain as genuinely "shut off".
+
+        Deliberately *not* ``state() == VMState.SHUTOFF``. ``state()`` folds
+        "in shutdown", "dying", "crashed" and "idle" onto SHUTOFF so callers
+        like ``ensure_running`` don't treat them as a fatal UNKNOWN — but in
+        every one of those states the domain is still active and the QEMU
+        process still holds the qcow2 open read-write. "crashed" is the worst
+        of them: it is not transient, it persists until someone destroys the
+        domain.
+
+        This is the predicate for "QEMU has released the disk, so guestfish
+        may open it read-write" (offline provisioning, the offline Defender
+        hive edits). A false "yes" costs a corrupted disk image; a false "no"
+        costs a caller some waiting. So anything we cannot positively confirm
+        as off — including a domain we failed to query at all, since a dead
+        libvirtd is not evidence that QEMU exited — answers False.
+
+        "shut off (saved)" is excluded on purpose too: the disk is free, but
+        the next ``start`` restores RAM captured before whatever edit we are
+        about to make, and a hive edited underneath a saved memory image is
+        its own kind of corruption.
+        """
+        return self._domstate_raw() == "shut off"
+
     def exists(self) -> bool:
         return self.state() != VMState.NOT_FOUND
 
     def is_running(self) -> bool:
         return self.state() == VMState.RUNNING
 
+    def agent_connected(self) -> bool:
+        """Whether libvirt sees the guest-agent channel as connected.
+
+        The authoritative readiness signal — see
+        :func:`agent_channel_connected`. A method here so callers read it the
+        conventional ``vm.*`` way and tests can mock it like ``state``.
+        """
+        return agent_channel_connected(self.name)
+
     def start(self) -> None:
-        virsh_run("start", self.name)
+        """Start the domain, tolerating one that is still winding down.
+
+        ``state()`` folds "in shutdown" into SHUTOFF — right for callers
+        asking "is it usable", wrong for callers asking "can I start it".
+        A `winbox down` immediately followed by `winbox up` therefore hit
+        ``virsh start`` while the domain was still active, and libvirt
+        refused with "Domain is already active".
+
+        Rather than leak that distinction into every caller, settle it here:
+        wait for the shutdown to finish and start once more. If it never
+        settles, the domain is genuinely running and the goal is already met.
+        """
+        result = virsh_run("start", self.name, check=False)
+        if result.returncode == 0:
+            return
+
+        stderr = (result.stderr or "").lower()
+        if "already active" not in stderr:
+            msg = result.stderr.strip() or f"virsh exit {result.returncode}"
+            raise RuntimeError(f"virsh start {self.name} failed: {msg}")
+
+        if self.wait_shutdown(timeout=120, poll=2):
+            virsh_run("start", self.name)
+            return
+        # Still up after two minutes: it was not shutting down at all, it was
+        # simply running. Nothing to do.
 
     def shutdown(self) -> None:
         virsh_run("shutdown", self.name, check=False)
@@ -232,9 +341,17 @@ class VM:
         return [s.strip() for s in result.stdout.splitlines() if s.strip()]
 
     def wait_shutdown(self, timeout: int = 600, poll: int = 5) -> bool:
-        """Wait for the VM to reach SHUTOFF state. Returns True if shut down within timeout."""
+        """Wait for the VM to be genuinely shut off. False on timeout.
+
+        Gated on :meth:`is_off`, not on ``state()``: every caller of this
+        method uses a True return as permission to open the qcow2 read-write
+        from the host (``winbox setup`` phase 2, ``winbox av enable/disable``).
+        Under ``state()``'s lenient mapping a domain that had crashed — QEMU
+        still running, image still open — reported SHUTOFF on the very first
+        poll, and provisioning went on to write to a live disk.
+        """
         deadline = time.monotonic() + timeout
-        while self.state() != VMState.SHUTOFF:
+        while not self.is_off():
             if time.monotonic() >= deadline:
                 return False
             time.sleep(poll)

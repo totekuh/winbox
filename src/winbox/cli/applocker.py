@@ -101,7 +101,7 @@ def applocker_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     # Each step must be a separate GA call — running inside a single
     # exec_powershell doesn't give the converter the right context.
     console.print("[blue][*][/] Starting AppLocker stack...")
-    result = ga.exec("appidtel.exe start", timeout=15)
+    result = ga.exec("appidtel.exe start", timeout=60)
     if result.exitcode != 0:
         console.print("[red][-][/] Failed to start AppLocker stack (appidtel.exe):")
         console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
@@ -109,12 +109,15 @@ def applocker_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     time.sleep(5)
 
     console.print("[blue][*][/] Compiling rules...")
-    result = ga.exec(r"C:\Windows\System32\AppIdPolicyConverter.exe", timeout=15)
+    result = ga.exec(r"C:\Windows\System32\AppIdPolicyConverter.exe", timeout=60)
     if result.exitcode != 0:
         console.print("[yellow][!][/] Rule compilation warning (AppIdPolicyConverter):")
         console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
     time.sleep(5)
-    result = ga.exec("gpupdate /force", timeout=30)
+    # gpupdate /force can block for minutes when the guest has no domain
+    # controller to reach and the NIC is still settling — a tight budget
+    # here kills it mid-apply and leaves the policy half-applied.
+    result = ga.exec("gpupdate /force", timeout=180)
     if result.exitcode != 0:
         console.print("[yellow][!][/] gpupdate warning:")
         console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
@@ -137,23 +140,53 @@ def applocker_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     console.print("[blue][*][/] Clearing AppLocker policies...")
     policy_file.write_text(_clear_policy_xml(), encoding="utf-8")
     try:
-        ga.exec_powershell(_DISABLE_APPLY_SCRIPT, timeout=30)
+        result = ga.exec_powershell(_DISABLE_APPLY_SCRIPT, timeout=30)
     finally:
         policy_file.unlink(missing_ok=True)
+
+    # The reboot only flushes appid.sys's cached rules — it does NOT clear a
+    # policy that is still in the registry. So if Set-AppLockerPolicy failed
+    # (commonly: Z: not mounted yet, so the script's Test-Path bails with
+    # exit 1 having cleared nothing) rebooting and claiming success leaves
+    # the guest still enforcing while the user is told it is off. Match
+    # applocker_enable and refuse to continue.
+    if result.exitcode != 0:
+        console.print("[red][-][/] Failed to clear AppLocker policy:")
+        detail = result.stderr.strip() or result.stdout.strip()
+        if detail:
+            console.print(f"    {detail}", markup=False, highlight=False)
+        raise SystemExit(1)
 
     reboot_and_wait(
         cfg, ga,
         msg="Rebooting VM (kernel caches enforcement)...",
     )
 
-    console.print("[green][+][/] AppLocker disabled")
+    # Trust the guest, not the exit code: appid.sys can survive the clear
+    # (compiled rule cache, service restart racing the reboot). Re-query
+    # rather than assert an outcome we never checked.
+    status = ga.exec_powershell(_STATUS_SCRIPT, timeout=90)
+    reported = status.stdout.strip()
+    if status.exitcode != 0:
+        console.print("[yellow][!][/] Policy cleared, but could not verify state:")
+        console.print(f"    {status.stderr.strip()}", markup=False, highlight=False)
+        return
+    if "AppLocker: off" in reported or "not available" in reported:
+        console.print("[green][+][/] AppLocker disabled")
+        return
+
+    console.print("[red][-][/] AppLocker still active after disable:")
+    console.print(reported, markup=False, highlight=False)
+    raise SystemExit(1)
 
 
 @applocker.command("status")
 @needs_vm()
 def applocker_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Show current AppLocker enforcement status."""
-    result = ga.exec_powershell(_STATUS_SCRIPT, timeout=15)
+    # Normally ~2s, but a read-only status query should ride out a
+    # transient guest stall rather than time out and get taskkill'd.
+    result = ga.exec_powershell(_STATUS_SCRIPT, timeout=90)
     if result.exitcode != 0:
         console.print(f"[red][-][/] Failed to query status: {result.stderr.strip()}")
         raise SystemExit(1)

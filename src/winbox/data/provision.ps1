@@ -195,35 +195,68 @@ try {
 # (more than 2 quotes + `&`/`>` -> first and last `"` get stripped,
 # mangling the exe path) and PS 5.1's buggy ArgumentList quoting.
 Write-Host "[*] Installing Python..."
-$pythonExe = "$provDir\python-3.13.13-amd64.exe"
-$pythonLog = "C:\winbox-python-install.log"
-$pythonBat = "C:\winbox-python-install.bat"
+$pythonExe   = "$provDir\python-3.13.13-amd64.exe"
+$pythonEmbed = "$provDir\python-3.13.13-embed-amd64.zip"
+$pythonLog   = "C:\winbox-python-install.log"
+$pyEmbedDir  = "C:\Python313"
+# ProductType 1 = client (Windows 11), 2/3 = server.
+$isClient = ((Get-CimInstance Win32_OperatingSystem).ProductType -eq 1)
 try {
-    if (Test-Path $pythonExe) {
-        $batLines = @(
-            "@echo off",
-            "`"$pythonExe`" /quiet InstallAllUsers=1 PrependPath=1 Include_pip=1 Include_tcltk=0 Include_doc=0 Include_test=0 CompileAll=0 > `"$pythonLog`" 2>&1"
-        )
-        Set-Content -Path $pythonBat -Value $batLines -Encoding ASCII
-        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $pythonBat `
-            -Wait -PassThru -WindowStyle Hidden
-        Write-Host "[+] Python installed (exit code: $($proc.ExitCode))"
-        if ($proc.ExitCode -ne 0) {
-            if (Test-Path $pythonLog) {
-                Write-Host "--- python-install.log ---"
-                Get-Content $pythonLog | ForEach-Object { Write-Host $_ }
-                Write-Host "--- end python-install.log ---"
-            }
-            $script:ProvisionFailed = $true
-            Write-Host "[!] Python installer failed - marking provisioning as failed"
+    if ($isClient -and (Test-Path $pythonEmbed)) {
+        # Windows 11 can't run the Python WiX *bundle* installer under the
+        # SYSTEM/session-0 context the guest agent provides (it deadlocks /
+        # returns 1601 — single MSIs like WinFsp are fine, only the Burn
+        # bootstrapper breaks). Use the embeddable zip instead: no installer,
+        # just python.exe + stdlib (ctypes/winreg/…), which is what the winbox
+        # MCP tools run on.
+        Write-Host "[*] Client SKU detected - using Python embeddable..."
+        if (Test-Path $pyEmbedDir) { Remove-Item $pyEmbedDir -Recurse -Force }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($pythonEmbed, $pyEmbedDir)
+        # Enable `import site` + a site-packages dir so pip-installed modules import.
+        $pth = Get-ChildItem "$pyEmbedDir\python*._pth" | Select-Object -First 1
+        if ($pth) {
+            $lines = (Get-Content $pth.FullName) -replace '^\s*#\s*import site', 'import site'
+            if ($lines -notcontains 'Lib\site-packages') { $lines += 'Lib\site-packages' }
+            Set-Content $pth.FullName $lines
+        }
+        New-Item -ItemType Directory -Force -Path "$pyEmbedDir\Lib\site-packages" | Out-Null
+        # Put python.exe on the machine PATH (picked up after the provisioning
+        # reboot, which is when the guest agent — hence the MCP tools — restart).
+        $mp = [Environment]::GetEnvironmentVariable("Path", "Machine")
+        if ($mp -notlike "*$pyEmbedDir*") {
+            [Environment]::SetEnvironmentVariable("Path", "$mp;$pyEmbedDir", "Machine")
+        }
+        # Bootstrap pip best-effort (the VM still has network during provisioning).
+        try {
+            $gp = "$env:TEMP\get-pip.py"
+            Invoke-WebRequest -UseBasicParsing "https://bootstrap.pypa.io/get-pip.py" -OutFile $gp -TimeoutSec 60
+            & "$pyEmbedDir\python.exe" $gp --no-warn-script-location 2>&1 | Out-Null
+            Write-Host "[+] Python embeddable installed (with pip)"
+        } catch {
+            Write-Host "[+] Python embeddable installed (pip bootstrap skipped: $_)"
+        }
+    } elseif (Test-Path $pythonExe) {
+        # Server 2022: the full WiX installer works. Run it directly with its own
+        # /log (piping through cmd makes Start-Process -Wait hang) and a timeout.
+        $proc = Start-Process -FilePath $pythonExe -PassThru -WindowStyle Hidden `
+            -ArgumentList "/quiet", "/log", $pythonLog, "InstallAllUsers=1", "PrependPath=1", `
+                          "Include_pip=1", "Include_tcltk=0", "Include_doc=0", `
+                          "Include_test=0", "CompileAll=0"
+        if ($proc.WaitForExit(300000)) {
+            if ($proc.ExitCode -eq 0) { Write-Host "[+] Python installed" }
+            else { Write-Host "[!] Python installer exited $($proc.ExitCode) - continuing without Python" }
+        } else {
+            Write-Host "[!] Python install timed out - continuing without Python"
+            try { $proc | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
+            Get-Process -Name "python-3.13.13-amd64", "msiexec" -ErrorAction SilentlyContinue |
+                Stop-Process -Force -ErrorAction SilentlyContinue
         }
     } else {
-        Write-Host "[!] Python installer not found at $pythonExe - skipping"
+        Write-Host "[!] No Python installer found in payload - skipping"
     }
 } catch {
-    Write-Host "[!] Python install failed: $_"
-} finally {
-    Remove-Item $pythonBat -Force -ErrorAction SilentlyContinue
+    Write-Host "[!] Python install failed: $_ - continuing without Python"
 }
 
 # --- x64dbg (debugger - extract to C:\Tools\x64dbg) ---

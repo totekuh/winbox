@@ -11,6 +11,7 @@ class TestConfigDefaults:
     def test_default_values(self):
         cfg = Config()
         assert cfg.vm_name == "winbox"
+        assert cfg.vm_os == "server2022"
         assert cfg.vm_ram == 4096
         assert cfg.vm_cpus == 4
         assert cfg.vm_disk == 30
@@ -24,6 +25,21 @@ class TestConfigDefaults:
         cfg = Config()
         assert "virtio-win" in cfg.virtio_iso_url
         assert cfg.virtio_iso_url.startswith("https://")
+
+
+class TestConfigProfile:
+    def test_default_profile_is_server(self):
+        assert Config().profile.key == "server2022"
+
+    def test_profile_follows_vm_os(self):
+        cfg = Config()
+        cfg.vm_os = "win11"
+        assert cfg.profile.key == "win11"
+
+    def test_profile_unknown_falls_back(self):
+        cfg = Config()
+        cfg.vm_os = "nonsense"
+        assert cfg.profile.key == "server2022"
 
 
 class TestConfigProperties:
@@ -79,6 +95,19 @@ class TestConfigOverrides:
         config_file.write_text("VM_NAME=myvm\n")
         cfg = Config._apply_overrides(Config(), config_file)
         assert cfg.vm_name == "myvm"
+
+    def test_override_vm_os(self, tmp_path):
+        config_file = tmp_path / "config"
+        config_file.write_text("VM_OS=win11\n")
+        cfg = Config._apply_overrides(Config(), config_file)
+        assert cfg.vm_os == "win11"
+        assert cfg.profile.os_variant == "win11"
+
+    def test_override_vm_os_invalid_keeps_default(self, tmp_path):
+        config_file = tmp_path / "config"
+        config_file.write_text("VM_OS=windows95\n")
+        cfg = Config._apply_overrides(Config(), config_file)
+        assert cfg.vm_os == "server2022"
 
     def test_override_int_fields(self, tmp_path):
         config_file = tmp_path / "config"
@@ -209,3 +238,66 @@ class TestConfigOverrides:
         )[-1])
         cfg = Config.load()
         assert cfg.vm_name == "winbox"
+
+
+class TestConfigPersist:
+    """`winbox setup --os X` has to outlive its own process.
+
+    Without a write-back, setup built (say) a Win11 disk while every later
+    command re-loaded Config from a file with no VM_OS and resolved the
+    default server2022 profile — wrong virtio subdir, wrong install
+    partition, wrong Defender handling, against a VM that was never
+    Server 2022.
+    """
+
+    def test_persist_creates_file_and_round_trips(self, tmp_path):
+        cfg = Config(winbox_dir=tmp_path / ".winbox")
+        cfg.vm_os = "win11"
+        cfg.persist("VM_OS", cfg.vm_os)
+
+        reloaded = Config._apply_overrides(
+            Config(winbox_dir=cfg.winbox_dir), cfg.config_file
+        )
+        assert reloaded.vm_os == "win11"
+        assert reloaded.profile.virtio_subdir == "w11"
+        assert reloaded.profile.install_partition_id == 3
+
+    def test_persist_rewrites_existing_key_in_place(self, tmp_path):
+        cfg = Config(winbox_dir=tmp_path / ".winbox")
+        cfg.winbox_dir.mkdir(parents=True)
+        cfg.config_file.write_text("VM_OS=win11\nVM_RAM=8192\n")
+
+        cfg.persist("VM_OS", "server2022")
+
+        assert cfg.config_file.read_text() == "VM_OS=server2022\nVM_RAM=8192\n"
+
+    def test_persist_preserves_comments_and_unrelated_keys(self, tmp_path):
+        cfg = Config(winbox_dir=tmp_path / ".winbox")
+        cfg.winbox_dir.mkdir(parents=True)
+        cfg.config_file.write_text("# hand-edited\nVM_RAM=8192\n\nVM_NAME=lab\n")
+
+        cfg.persist("VM_OS", "win11")
+
+        body = cfg.config_file.read_text()
+        assert "# hand-edited" in body
+        assert "VM_RAM=8192" in body
+        assert "VM_NAME=lab" in body
+        assert "VM_OS=win11" in body
+
+    def test_persist_ignores_commented_out_assignment(self, tmp_path):
+        cfg = Config(winbox_dir=tmp_path / ".winbox")
+        cfg.winbox_dir.mkdir(parents=True)
+        cfg.config_file.write_text("#VM_OS=server2022\n")
+
+        cfg.persist("VM_OS", "win11")
+
+        lines = cfg.config_file.read_text().splitlines()
+        assert lines == ["#VM_OS=server2022", "VM_OS=win11"]
+
+    def test_persisted_value_survives_full_load(self, tmp_path, monkeypatch):
+        winbox_dir = tmp_path / ".winbox"
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        cfg = Config(winbox_dir=winbox_dir)
+        cfg.persist("VM_OS", "win11")
+
+        assert Config.load().vm_os == "win11"

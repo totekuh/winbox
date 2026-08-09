@@ -7,7 +7,7 @@ import click
 from winbox import tools as tools_mod
 from winbox.cli import console
 from winbox.config import Config
-from winbox.setup.iso import ISO_FILENAME, download_iso
+from winbox.setup.iso import download_iso
 from winbox.utils import human_size
 
 
@@ -59,7 +59,7 @@ def iso() -> None:
 @click.option("--force", "-f", is_flag=True, help="Re-download even if ISO exists.")
 @click.pass_context
 def iso_download(ctx: click.Context, force: bool) -> None:
-    """Download the Windows Server 2022 Evaluation ISO (~5GB)."""
+    """Download the active OS profile's Windows Evaluation ISO (~5GB)."""
     cfg: Config = ctx.obj["cfg"]
     download_iso(cfg, force=force)
 
@@ -69,7 +69,7 @@ def iso_download(ctx: click.Context, force: bool) -> None:
 def iso_status(ctx: click.Context) -> None:
     """Check if the Windows ISO is downloaded."""
     cfg: Config = ctx.obj["cfg"]
-    path = cfg.iso_dir / ISO_FILENAME
+    path = cfg.iso_dir / cfg.profile.iso_filename
     if path.exists():
         size = path.stat().st_size
         console.print(f"[green][+][/] ISO found: {path} ({human_size(size)})")

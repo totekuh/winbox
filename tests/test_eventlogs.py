@@ -847,3 +847,53 @@ class TestMcpEventlogsClear:
         out = eventlogs_clear(log="Security", confirm=True)
         assert out.startswith("error (exit 1):")
         assert "boom" in out
+
+
+class TestGroupDispatchDoesNotTouchTheVm:
+    """`--help` must never start a VM.
+
+    ``eventlogs`` is a group with ``invoke_without_command=True`` carrying
+    ``@needs_vm()``, and click runs a group's callback before dispatching to
+    its subcommand. So `winbox eventlogs clear --help` used to boot the guest,
+    wait ~30s for the agent, and then fail with "Guest agent not responding"
+    instead of printing help. The subcommand carries its own ``@needs_vm``, so
+    the group's is redundant whenever a subcommand is being dispatched.
+    """
+
+    def test_subcommand_help_does_not_start_the_vm(self):
+        from click.testing import CliRunner
+
+        from winbox.cli import cli
+
+        with patch("winbox.cli.ensure_running") as ensure:
+            result = CliRunner().invoke(cli, ["eventlogs", "clear", "--help"])
+
+        assert result.exit_code == 0
+        assert "Usage:" in result.output
+        ensure.assert_not_called()
+
+    def test_group_help_does_not_start_the_vm(self):
+        from click.testing import CliRunner
+
+        from winbox.cli import cli
+
+        with patch("winbox.cli.ensure_running") as ensure:
+            result = CliRunner().invoke(cli, ["eventlogs", "--help"])
+
+        assert result.exit_code == 0
+        ensure.assert_not_called()
+
+    def test_bare_group_invocation_still_requires_the_vm(self):
+        """The query path genuinely needs a running guest — the fix must not
+        turn that into a silent no-op."""
+        from click.testing import CliRunner
+
+        from winbox.cli import cli
+
+        with (
+            patch("winbox.cli.ensure_running") as ensure,
+            patch("winbox.cli.eventlogs._do_query"),
+        ):
+            CliRunner().invoke(cli, ["eventlogs"])
+
+        ensure.assert_called_once()
