@@ -171,12 +171,18 @@ def jobs_output(ctx: click.Context, job_id: int) -> None:
             console.print("[yellow][!][/] No output files yet")
         return
 
-    # Buffered mode — check cached output first
-    if job.stdout or job.stderr:
+    # Buffered mode — check cached output first. Status must be checked
+    # too: a DONE/FAILED job with no output on either stream (e.g. `mkdir`)
+    # would otherwise fall through to re-polling the GA by PID, and that
+    # PID's guest-exec slot may already have been recycled onto an
+    # unrelated process by the time this runs.
+    if job.status in (JobStatus.DONE, JobStatus.FAILED) or job.stdout or job.stderr:
         if job.stdout:
             console.print(job.stdout, end="", markup=False, highlight=False)
         if job.stderr:
             console.print(job.stderr, end="", markup=False, style="red", highlight=False)
+        if not job.stdout and not job.stderr:
+            console.print("[yellow][!][/] Job finished with no output")
         return
 
     if job.status == JobStatus.LOST:

@@ -18,8 +18,10 @@ and inspection fails on the Win11 image — the installer leaves ``Windows.old``
 / ``$Windows.~BT`` behind, which confuses libguestfs.
 
 **The disk must not be in use.** guestfish opens it read-write; running it
-against a live VM risks corruption. Callers are responsible for shutting the
-VM down first — :func:`merge_hive` refuses if it can tell the domain is up.
+against a live VM risks corruption. :func:`merge_hive` performs no
+VM-state check of its own — it only has a disk path, not a domain to
+query — so callers are responsible for shutting the VM down first and
+confirming it's off before calling in.
 """
 
 from __future__ import annotations

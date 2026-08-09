@@ -128,6 +128,22 @@ class TestMergeHive:
         run.assert_not_called()
 
 
+class TestMergeHiveHasNoStateCheck(TestMergeHive):
+    def test_runs_even_though_nothing_indicates_the_vm_is_off(self, monkeypatch):
+        """merge_hive only ever receives a disk path, never a domain to
+        query, so it cannot refuse on VM state — it always runs guestfish.
+        Enforcement lives with the caller (see cli/av.py's
+        _power_off_or_refuse), not here."""
+        calls = self._run_merge(monkeypatch)
+        assert any(c[0] == "guestfish" for c in calls)
+
+    def test_module_docstring_does_not_promise_a_refusal(self):
+        """The module previously documented a guarantee merge_hive() never
+        implemented; guard against that claim coming back without the code
+        to back it."""
+        assert "refuses if it can tell the domain is up" not in offlinereg.__doc__
+
+
 class TestWindowsPartition:
     @pytest.mark.parametrize(
         "os_key,expected", [("server2022", "/dev/sda2"), ("win11", "/dev/sda3")]
