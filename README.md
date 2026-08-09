@@ -42,7 +42,7 @@ PS C:\Windows\system32>
 - **AppLocker** — enable AppLocker with default rules for bypass testing
 - **Autologin** — persistent Administrator auto-login that survives reboots on Server 2022
 - **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
-- **Malware detonation lab** — `winbox capture` (host-side tcpdump on the bridge → pcap), `winbox sinkhole` (zero-dependency DNS sinkhole that answers every C2 lookup with the bridge IP and logs the domain, plus optional INETSim fake services), and `winbox detonate check` (read-only preflight that refuses to go green unless the guest genuinely can't reach the internet). See [docs/malware-detonation.md](docs/malware-detonation.md)
+- **Malware detonation lab** — `winbox capture` (host-side pcap on the bridge — prefers `dumpcap`, which Kali's Wireshark package lets the `wireshark` group run without root, falling back to `tcpdump` otherwise), `winbox sinkhole` (zero-dependency DNS sinkhole that answers every C2 lookup with the bridge IP and logs the domain, plus optional INETSim fake services), and `winbox detonate check` (read-only preflight that refuses to go green unless the guest genuinely can't reach the internet). See [docs/malware-detonation.md](docs/malware-detonation.md)
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
 - **MCP server** — 54 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including Defender enable/disable/status, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
 - **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`; `--mode auto` falls back to software 0xCC where the 4 DR slots run out, but note HVCI blocks software breakpoints on Windows 11), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
@@ -121,16 +121,16 @@ Notes for Win11:
 
 ## Commands
 
-`winbox --help` groups commands into six sections:
+`winbox --help` groups commands into seven sections:
 
 ```
-VM Lifecycle   setup  up  down  suspend  destroy  status  snapshot  restore  provision
-Execute        exec  shell  ssh  vnc  jobs  msi  eventlogs  kdbg
-Files          tools  upload  iso
-Network        net  dns  hosts  domain
-Target         av  applocker  autologin     (bidirectional — flip on to test bypass tools)
-Malware        capture  sinkhole  detonate    (detonation lab — capture C2, sinkhole DNS, preflight)
-Integrations   binfmt  mcp  office
+VM Lifecycle       setup  provision  up  down  suspend  destroy  status  snapshot  restore  vnc
+Execute            eventlogs  exec  shell  ssh  jobs  msi
+Files              tools  upload  iso
+Network            net  dns  hosts  domain
+Target             applocker  autologin  av      (bidirectional — flip on to test bypass tools)
+Malware Analysis   capture  detonate  sinkhole   (detonation lab — capture C2, sinkhole DNS, preflight)
+Integrations       binfmt  kdbg  mcp  office
 ```
 
 Each command supports `--help` for its own flags and subcommands.
@@ -328,7 +328,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (51):**
+**Available tools (54):**
 
 User-mode primitives:
 
@@ -350,6 +350,14 @@ User-mode primitives:
 | `net_unplug()` | Full air-gap (link down via virsh) |
 | `eventlogs(log?, since?, ids?, provider?, level?, max_events?)` | Query Windows event logs via Get-WinEvent (returns JSON array; CLI defaults to CSV) |
 | `eventlogs_clear(log?, all_logs?, confirm)` | Clear event channels via wevtutil cl. `confirm=True` required (destructive). |
+
+Defender:
+
+| Tool | Description |
+|------|-------------|
+| `av_status(timeout?)` | Report Defender/AMSI protection state (Get-MpComputerStatus + Get-MpPreference) |
+| `av_enable()` | Re-enable Defender real-time protection, AMSI, and behavior monitoring |
+| `av_disable(confirm)` | Disable Defender completely — sets GP registry keys then reboots the VM. `confirm=True` required. |
 
 Named pipes:
 
@@ -475,6 +483,13 @@ VIRTIO_ISO_URL=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
 │   ├── python-3.13.13-amd64.exe        # Python 3.13 installer for the guest
 │   ├── x64dbg.zip                      # x64dbg snapshot (extracted to C:\Tools\x64dbg)
 │   └── unattend.img                    # built during setup
+├── captures/                           # winbox capture — host-side pcaps
+│   ├── capture-<ts>.pcap
+│   └── capture.pid                     # pidfile for the running capture
+├── sinkhole/                           # winbox sinkhole — DNS sinkhole state
+│   ├── queries.log                     # captured C2 domains (tab-sep)
+│   ├── sinkhole.pid
+│   └── inetsim.conf                    # written by `sinkhole inetsim`
 └── shared/                             # VirtIO-FS share <=> Z:\ in VM
     ├── tools/                          # your pentest tools
     ├── .msi/                           # staging dir for winbox msi (cleaned up per-run)

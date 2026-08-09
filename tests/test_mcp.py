@@ -2622,6 +2622,32 @@ class TestReadmeToolCount:
         ]
         assert undocumented == []
 
+    def test_detailed_tool_table_matches_registered_tools(self):
+        """The Features-bullet count above only checks one number; the
+        detailed "Available tools (N):" table has its own count and its own
+        row list, and neither is derived from the other. This table drifted
+        silently to 51/54 with the whole av_status/av_enable/av_disable
+        group missing before this test existed."""
+        import asyncio
+        import re
+
+        from winbox.mcp import mcp
+
+        tools = {t.name for t in asyncio.run(mcp.list_tools())}
+        readme = self._readme()
+
+        m = re.search(r"\*\*Available tools \((\d+)\):\*\*", readme)
+        assert m, "README no longer states the detailed-table tool count in the expected form"
+        assert int(m.group(1)) == len(tools), (
+            f"README's detailed table header says {m.group(1)} tools but {len(tools)} are registered"
+        )
+
+        section = readme.split(f"**Available tools ({m.group(1)}):**", 1)[1]
+        section = section.split("## Architecture", 1)[0]
+        listed = set(re.findall(r"`([a-z_]+)\(", section))
+        missing = tools - listed
+        assert not missing, f"registered tools missing from the detailed table: {sorted(missing)}"
+
 
 class TestFormatExecResultDiagnostics:
     """A non-zero exit with nothing on either stream used to render as the

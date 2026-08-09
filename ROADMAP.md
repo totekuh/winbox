@@ -65,6 +65,12 @@ connected at that moment.
 
 * `/tmp` is a 16 GB tmpfs. Tests that write ISO-sized files fill it —
   `tests/test_iso.py` shrinks the profile floor to 4 KB for this reason.
-* Use the pipx venv interpreter for tests; the system python has an old `mcp`
-  and fabricates 164 errors:
-  `/home/witchtape/.local/share/pipx/venvs/winbox/bin/python -m pytest`
+* **Fixed at the source.** `pyproject.toml`'s `mcp` extra was unbounded
+  (`mcp>=1.0`), so a plain reinstall could silently resolve to `mcp` 2.0.0,
+  which dropped `mcp.server.fastmcp` — the import `winbox.mcp` relies on —
+  and broke every `mcp`-dependent test with no warning until import time.
+  Now pinned `mcp>=1.0,<2`. If a test run still fabricates `mcp`-import
+  errors, the environment's Python has a stale/wrong `mcp` install outside
+  this constraint (e.g. a system-wide `pip install mcp` from before this fix)
+  — reinstall it (`pip install 'mcp>=1.0,<2'`) rather than chasing the
+  symptom per-test.
