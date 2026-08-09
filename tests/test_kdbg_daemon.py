@@ -701,6 +701,32 @@ def test_op_cont_silent_continues_unrelated_cr3():
     assert result["reason"] == "timeout"
 
 
+def test_op_cont_silent_continue_does_not_inflate_bp_hits():
+    """A bp on shared code (e.g. ntdll!NtCreateFile) fires from every
+    process on the box, not just the target. Fires that get
+    silent-continued because their CR3 isn't the target's must not
+    bump ``hits`` — that field is documented as counting only
+    in-target fires."""
+    import time as _t
+
+    target = TargetInfo(
+        pid=8000, dtb=0x1225ad000, name="cyserver.exe",
+        user_dtb=0x1225ac000,
+    )
+    va = 0xfffff80700001234
+    # Some unrelated process's CR3 hits the same shared VA.
+    rsp = FakeRsp(regs_blob=_blob(rip=va, cr3=0xdeadbeef000))
+    session = _make_session(rsp=rsp, target=target)
+    session.bps[0] = Breakpoint(
+        bp_id=0, va=va, target="nt!Shared",
+        user_mode=False, hw=False, installed_at=_t.monotonic(),
+    )
+
+    session.handle_op("cont", {"timeout": 0.5})
+
+    assert session.bps[0].hits == 0
+
+
 # ── regs decode roundtrip ──────────────────────────────────────────────
 
 

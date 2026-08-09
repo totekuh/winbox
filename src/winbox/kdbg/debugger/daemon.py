@@ -959,6 +959,8 @@ class DaemonSession:
         }
 
     def _bump_bp_hits(self, va: int, *, in_target: bool) -> None:
+        if not in_target:
+            return
         for b in self.bps.values():
             if b.va == va:
                 b.hits += 1

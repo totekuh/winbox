@@ -3017,7 +3017,13 @@ def kdbg_resume(port: int = 1234) -> str:
     Args:
         port: gdbstub port to talk through.
     """
-    cfg = _kdbg_cfg_only()
+    cfg, vm, _ = _get_state()
+    if vm.state() == VMState.RUNNING:
+        # Already running: there is nothing to continue, and connecting to
+        # the gdbstub anyway halts a healthy VM (QEMU stops the guest CPU
+        # the moment a client attaches) — a "no-op" that isn't one.
+        return "VM is already running; nothing to resume"
+
     client = _kdbg_client(cfg)
     if client.session_alive():
         return "error: a kdbg session is active; call kdbg_detach instead"

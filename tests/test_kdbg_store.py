@@ -182,6 +182,23 @@ def test_load_missing_module(tmp_path):
         store.load("nt")
 
 
+def test_save_rejects_path_traversal_module_name(tmp_path):
+    """module comes from an untrusted source for user-mode loads (a live
+    process's PEB.Ldr BaseDllName) — a hostile sample spoofing it to a
+    traversal payload must not be able to write outside the store root."""
+    store = SymbolStore(tmp_path)
+    with pytest.raises(SymbolStoreError, match="invalid module name"):
+        store.save(
+            module="../../../../tmp/pwned",
+            build="X",
+            image="evil.pdb",
+            symbols={},
+            types={},
+        )
+    # Nothing should have been written anywhere, on-disk or in the index.
+    assert list(tmp_path.rglob("*.json")) == []
+
+
 def test_list_modules(tmp_path):
     store = SymbolStore(tmp_path)
     _save_nt(store)

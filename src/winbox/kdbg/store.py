@@ -133,6 +133,12 @@ class SymbolStore:
         if not module:
             raise SymbolStoreError("module name is empty")
         fname = filename or f"{module}_{build}.json"
+        # module (and, for user-mode loads, filename) can originate from a
+        # PEB BaseDllName read out of a live process on the analyzed VM —
+        # a hostile sample can spoof that to a traversal payload, so we
+        # must not let it walk the write outside self.root.
+        if not (self.root / fname).resolve().is_relative_to(self.root.resolve()):
+            raise SymbolStoreError(f"invalid module name: {module!r}")
         data: dict[str, Any] = {
             "module": module,
             "build": build,

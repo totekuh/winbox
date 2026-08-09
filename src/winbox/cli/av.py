@@ -237,7 +237,11 @@ def _restart_clearing_tamper_protection(cfg: Config, vm: VM, ga: GuestAgent) -> 
 
     console.print("[blue][*][/] Booting VM...")
     vm.start()
-    ga.wait(timeout=420)
+    try:
+        ga.wait(timeout=420)
+    except GuestAgentError as e:
+        console.print(f"[yellow][!][/] VM booted but the guest agent is quiet: {e}")
+        raise SystemExit(1)
 
 
 @av.command("disable")

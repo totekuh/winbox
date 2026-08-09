@@ -679,6 +679,24 @@ class TestEnableClearsTamperProtection:
 
         vm.start.assert_not_called()
 
+    def test_a_quiet_guest_agent_after_boot_exits_cleanly(self, cfg):
+        """Mirrors _disable_via_offline_hive's handling of the same wait — a
+        slow/unhealthy guest boot must not crash `av enable` with a raw
+        GuestAgentError traceback."""
+        from winbox.cli.av import _restart_clearing_tamper_protection
+        from winbox.vm import GuestAgentError
+
+        vm, ga = MagicMock(), MagicMock()
+        vm.wait_shutdown.return_value = True
+        ga.wait.side_effect = GuestAgentError("timeout")
+
+        with (
+            patch("winbox.cli.av.defender.enable_offline"),
+            patch("winbox.cli.av.defender.clear_tamper_protection_offline"),
+            pytest.raises(SystemExit),
+        ):
+            _restart_clearing_tamper_protection(cfg, vm, ga)
+
     def test_service_restore_happens_before_the_tp_clear(self, cfg):
         from winbox.cli.av import _restart_clearing_tamper_protection
 

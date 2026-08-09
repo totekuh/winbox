@@ -150,6 +150,33 @@ def test_ensure_types_loaded_empty_pdb_response_is_silent(tmp_path, monkeypatch)
     assert data["types"] == {}
 
 
+# ── copy_user_module path traversal (module name is attacker-controlled) ──
+
+
+def test_copy_via_share_rejects_path_traversal_in_cached_name(tmp_path):
+    """cached_name is derived from a live process's PEB.Ldr BaseDllName —
+    a hostile sample can spoof that field to a traversal payload. The
+    copy must refuse rather than write outside symbols_dir/shared_dir."""
+
+    class _FakeCfgWithShare:
+        def __init__(self, root: Path) -> None:
+            self.symbols_dir = root / "symbols"
+            self.shared_dir = root / "share"
+
+    class _ExplodingGA:
+        def exec_powershell(self, *args, **kwargs):
+            raise AssertionError("must not reach the VM for a malicious filename")
+
+    cfg = _FakeCfgWithShare(tmp_path)
+    with pytest.raises(SymbolLoadError, match="invalid module filename"):
+        symbols._copy_via_share(
+            cfg, _ExplodingGA(),
+            r"C:\Windows\System32\evil.dll",
+            "../../../../etc/cron.d/evil",
+        )
+    assert not (tmp_path / "etc").exists()
+
+
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 

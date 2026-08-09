@@ -2540,6 +2540,8 @@ class TestKdbgDaemonTools:
 
     def test_resume_refuses_when_session_active(self, mock_mcp):
         from winbox.mcp import kdbg_resume
+        import winbox.mcp as mcp_mod
+        mcp_mod._vm.state.return_value = VMState.PAUSED
         client = self._client_with(alive=True)
         with patch("winbox.mcp._kdbg_client", return_value=client):
             result = kdbg_resume()
@@ -2547,11 +2549,27 @@ class TestKdbgDaemonTools:
 
     def test_resume_errors_when_no_gdbstub(self, mock_mcp):
         from winbox.mcp import kdbg_resume
+        import winbox.mcp as mcp_mod
+        mcp_mod._vm.state.return_value = VMState.PAUSED
         client = self._client_with(alive=False)
         with patch("winbox.mcp._kdbg_client", return_value=client), \
              patch("winbox.kdbg.hmp.probe_port", return_value=False):
             result = kdbg_resume()
         assert "gdbstub not listening" in result
+
+    def test_resume_is_a_clean_no_op_on_a_running_vm(self, mock_mcp):
+        """Docstring promises 'No-op if VM is already running' — it must
+        not connect to the gdbstub, which would halt a healthy VM."""
+        from winbox.mcp import kdbg_resume
+        import winbox.mcp as mcp_mod
+        mcp_mod._vm.state.return_value = VMState.RUNNING
+        client = self._client_with(alive=False)
+        with patch("winbox.mcp._kdbg_client", return_value=client) as kc, \
+             patch("winbox.mcp._RspClient") as rsp:
+            result = kdbg_resume()
+        assert "already running" in result
+        kc.assert_not_called()
+        rsp.connect.assert_not_called()
 
 
 class TestReadmeToolCount:

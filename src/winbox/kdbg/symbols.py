@@ -75,6 +75,12 @@ def _copy_via_share(
     """
     cfg.symbols_dir.mkdir(parents=True, exist_ok=True)
     cached = cfg.symbols_dir / cached_name
+    # cached_name can originate from a PEB BaseDllName read out of a live
+    # process on the analyzed VM — a hostile sample can spoof that to a
+    # traversal payload, so we must not let it walk either copy outside
+    # its intended directory.
+    if not cached.resolve().is_relative_to(cfg.symbols_dir.resolve()):
+        raise SymbolLoadError(f"invalid module filename: {cached_name!r}")
 
     cfg.shared_dir.mkdir(parents=True, exist_ok=True)
     # Use a unique staging name — concurrent module loads (e.g. parallel
