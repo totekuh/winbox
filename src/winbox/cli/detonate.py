@@ -132,16 +132,24 @@ def detonate_check(cfg: Config, vm: VM, ga: GuestAgent) -> None:
 
     # ── Guest DNS → sink (advisory; only meaningful with a sinkhole) ─────
     servers = _guest_dns_servers(ga)
+    sink_port = sk.read_port(cfg) if sink_pid is not None else None
     if servers is None:
         _warn("Guest DNS unknown", "could not query the guest resolver")
-    elif cfg.host_ip in servers:
-        _ok("Guest DNS → sink", f"{cfg.host_ip}")
-    else:
+    elif cfg.host_ip not in servers:
         _warn(
             "Guest DNS not pointed at sink",
             f"configured: {', '.join(servers) or 'none'} — run "
             f"`winbox dns set {cfg.host_ip}`",
         )
+    elif sink_port is not None and sink_port != sk.DNS_PORT:
+        _warn(
+            "Guest DNS → sink, but sinkhole is on a non-standard port",
+            f"sinkhole bound to :{sink_port}, guest queries go to :{sk.DNS_PORT} "
+            "— lookups will get no response unless you've redirected "
+            f":{sk.DNS_PORT}->{sink_port} on the bridge",
+        )
+    else:
+        _ok("Guest DNS → sink", f"{cfg.host_ip}")
 
     # ── Defender disabled (advisory) ─────────────────────────────────────
     rtp = _defender_realtime_on(ga)

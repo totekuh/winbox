@@ -704,6 +704,43 @@ class TestDefender:
                 CliRunner().invoke(cli, ["av", "disable"])
 
 
+class TestMalwareAnalysis:
+    """capture/sinkhole/detonate. `capture start` needs root for tcpdump, so
+    it is not exercised here — see tests/test_capture.py."""
+
+    def test_capture_status_and_stop_without_a_running_capture(self, run):
+        status = run("capture", "status").output
+        assert "Capture:" in status
+        stopped = run("capture", "stop", expect_ok=False)
+        assert stopped.exit_code != 0
+        assert "No capture running" in stopped.output
+
+    def test_sinkhole_start_status_log_stop_on_an_unprivileged_port(self, run):
+        """The default :53 bind needs root (like capture start), so this
+        exercises the same documented low-privilege path instead."""
+        run("sinkhole", "start", "--port", "5353")
+        try:
+            assert "running" in run("sinkhole", "status").output.lower()
+            run("sinkhole", "log")
+        finally:
+            run("sinkhole", "stop")
+        assert "stopped" in run("sinkhole", "status").output.lower()
+
+    def test_sinkhole_inetsim(self, run):
+        """Accept either outcome — INETSim may or may not be installed on
+        whatever host runs this suite; only a wrong claim is a bug."""
+        out = run("sinkhole", "inetsim", expect_ok=False).output
+        assert "Config written" in out or "not installed" in out
+
+    def test_detonate_check_reports_safe_when_isolated(self, run):
+        run("net", "isolate")
+        try:
+            result = run("detonate", "check")
+            assert "Safe to detonate" in result.output
+        finally:
+            run("net", "connect")
+
+
 class TestEventLogsCli:
     """The CLI query/clear paths, distinct from the MCP tools above."""
 

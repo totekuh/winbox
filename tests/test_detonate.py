@@ -77,6 +77,27 @@ class TestDetonateCheck:
         assert "No snapshot" in result.output
         assert "Safe to detonate" in result.output
 
+    def test_warns_when_sinkhole_on_nonstandard_port(self, runner, mock_env):
+        """Sinkhole alive + guest DNS -> host IP look fine individually, but if
+        the sinkhole bound a non-53 port (e.g. the documented unprivileged
+        `--port 5353` path), the guest's queries land nowhere. Must WARN, not
+        PASS -- this is the case detonate check previously missed."""
+        mock_env._vm.net_link_state.return_value = "up"
+        mock_env.exec_powershell.side_effect = [
+            _dns_result("192.168.122.1"),  # guest DNS points at the sink IP
+            _defender_result("False"),
+        ]
+        with patch("winbox.cli.detonate.nwfilter.has_filter", return_value=True), \
+             patch("winbox.cli.detonate._cap_read_pidfile", return_value=None), \
+             patch("winbox.cli.detonate.sk.is_running", return_value=999), \
+             patch("winbox.cli.detonate.sk.read_port", return_value=5353), \
+             patch("winbox.cli.detonate.sk.query_log_path", return_value=Path("/t/q.log")):
+            result = runner.invoke(cli, ["detonate", "check"])
+        assert result.exit_code == 0
+        assert "non-standard port" in result.output
+        assert ":5353" in result.output
+        assert "PASS  Guest DNS → sink" not in result.output
+
     def test_dns_query_failure_warns_unknown(self, runner, mock_env):
         """If the guest DNS query fails, report unknown rather than crashing."""
         mock_env._vm.net_link_state.return_value = "up"

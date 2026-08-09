@@ -32,6 +32,8 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "autologin": (GROUP, ""),
     "av": (GROUP, ""),
     "binfmt": (GROUP, ""),
+    "capture": (GROUP, ""),
+    "detonate": (GROUP, ""),
     "dns": (GROUP, ""),
     "domain": (GROUP, ""),
     "hosts": (GROUP, ""),
@@ -39,6 +41,7 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "jobs": (GROUP, ""),
     "kdbg": (GROUP, ""),
     "net": (GROUP, ""),
+    "sinkhole": (GROUP, ""),
     "tools": (GROUP, ""),
 
     # Lifecycle
@@ -100,6 +103,26 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "av status": (LIVE, ""),
     "av enable": (LIVE, ""),
     "av disable": (LIVE, "reboots the guest"),
+
+    # Malware Analysis
+    "capture start": (EXCLUDED, "needs root to run tcpdump on the bridge; a "
+                                "host-level privilege the live suite doesn't "
+                                "have"),
+    "capture stop": (LIVE, "the no-capture-running case"),
+    "capture status": (LIVE, ""),
+    "sinkhole start": (LIVE, "on an unprivileged high port; the default :53 "
+                             "bind needs root, same as capture start"),
+    "sinkhole stop": (LIVE, ""),
+    "sinkhole status": (LIVE, ""),
+    "sinkhole log": (LIVE, ""),
+    "sinkhole inetsim": (LIVE, ""),
+    "sinkhole _serve": (EXCLUDED, "internal foreground entrypoint `start` "
+                                  "re-execs into as a detached process; it "
+                                  "blocks serving DNS until SIGTERM, so "
+                                  "invoking it directly would hang the "
+                                  "suite"),
+    "detonate check": (LIVE, "read-only preflight; run under an explicit "
+                             "net isolate so the hard gate passes"),
 
     # Integrations
     "binfmt status": (LIVE, ""),
@@ -224,6 +247,8 @@ def statuses(coverage: dict[str, tuple[str, str]], status: str) -> set[str]:
 # "untested".
 
 CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
+    "capture start": "tests/test_capture.py",
+    "sinkhole _serve": "tests/test_sinkhole.py",
     "setup": "tests/test_installer.py",
     "destroy": "tests/test_destroy.py",
     "vnc": "tests/test_status.py",
