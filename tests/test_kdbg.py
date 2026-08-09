@@ -183,6 +183,84 @@ class TestKdbgStatus:
         kdbg_env["probe"].assert_not_called()
 
 
+class TestKdbgResume:
+    """`kdbg resume` had zero unit coverage before this — only the live e2e
+    suite touched it, which is why a dead conditional (state == RUNNING
+    checked after the two guards above it already made that impossible)
+    went unnoticed through more than one prior audit pass."""
+
+    def test_running_vm_is_a_clean_noop(self, runner, kdbg_env):
+        from winbox.cli import cli
+        result = runner.invoke(cli, ["kdbg", "resume"])
+        assert result.exit_code == 0
+        assert "already running" in result.output.lower()
+
+    def test_shutoff_vm_has_nothing_to_do(self, runner, kdbg_env):
+        from winbox.cli import cli
+        kdbg_env["vm"].state.return_value = VMState.SHUTOFF
+        result = runner.invoke(cli, ["kdbg", "resume"])
+        assert result.exit_code == 0
+        assert "nothing to do" in result.output.lower()
+
+    def test_no_gdbstub_listening_errors(self, runner, kdbg_env):
+        from winbox.cli import cli
+        kdbg_env["vm"].state.return_value = VMState.PAUSED
+        kdbg_env["probe"].return_value = False
+        result = runner.invoke(cli, ["kdbg", "resume"])
+        assert result.exit_code == 1
+        assert "not listening" in result.output.lower()
+
+    def test_active_daemon_session_defers_to_detach(self, runner, kdbg_env):
+        from winbox.cli import cli
+        kdbg_env["vm"].state.return_value = VMState.PAUSED
+        kdbg_env["probe"].return_value = True
+        daemon = MagicMock()
+        daemon.session_alive.return_value = True
+        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon):
+            result = runner.invoke(cli, ["kdbg", "resume"])
+        assert result.exit_code == 1
+        assert "kdbg detach" in result.output
+
+    def test_successful_resume_reports_success_and_never_prints_the_dead_message(
+        self, runner, kdbg_env
+    ):
+        """The removed conditional's message ("gdb halted it on attach")
+        could never fire even before removal -- state is always PAUSED by
+        this point, never RUNNING -- so it must not reappear."""
+        from winbox.cli import cli
+        kdbg_env["vm"].state.side_effect = [VMState.PAUSED, VMState.RUNNING]
+        kdbg_env["probe"].return_value = True
+        daemon = MagicMock()
+        daemon.session_alive.return_value = False
+        rsp_client = MagicMock()
+        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
+             patch("winbox.cli.kdbg.RspClient") as rsp_cls, \
+             patch("time.sleep"):
+            rsp_cls.connect.return_value = rsp_client
+            result = runner.invoke(cli, ["kdbg", "resume"])
+        assert result.exit_code == 0
+        assert "VM resumed" in result.output
+        assert "halted it on attach" not in result.output
+        rsp_client.cont.assert_called_once()
+        rsp_client.close.assert_called_once()
+
+    def test_reports_the_real_state_when_release_leaves_it_paused(self, runner, kdbg_env):
+        from winbox.cli import cli
+        kdbg_env["vm"].state.side_effect = [VMState.PAUSED, VMState.PAUSED]
+        kdbg_env["probe"].return_value = True
+        daemon = MagicMock()
+        daemon.session_alive.return_value = False
+        rsp_client = MagicMock()
+        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
+             patch("winbox.cli.kdbg.RspClient") as rsp_cls, \
+             patch("time.sleep"):
+            rsp_cls.connect.return_value = rsp_client
+            result = runner.invoke(cli, ["kdbg", "resume"])
+        assert result.exit_code == 0
+        assert "VM resumed" not in result.output
+        assert "paused" in result.output.lower()
+
+
 class TestProbePortHelper:
     """Direct unit test for _probe_port since everything else mocks it out."""
 

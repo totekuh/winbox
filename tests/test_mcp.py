@@ -1793,6 +1793,56 @@ class TestPipeSessionDoesNotDesync:
         assert "PeekNamedPipe" in _BROKER_SCRIPT
         assert "config_file" in _BROKER_SCRIPT
 
+    def test_broker_cmd_does_not_delete_another_in_flight_calls_result(self, mock_mcp):
+        """A readwrite session has pipe_send/pipe_recv racing concurrently by
+        design (pipe_open's own docstring). A stray result belonging to some
+        other call that hasn't been polled for yet must survive issuing a
+        new command -- deleting it would be real data already dequeued off
+        the guest's pipe, gone for good, not just a status string."""
+        import json
+        from winbox.mcp import pipe_send
+        _, _, cfg = mock_mcp
+
+        sid = "nosweep00001"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "result.999.json").write_text(
+            json.dumps({"ok": True, "data_hex": "cafe", "seq": 999})
+        )
+
+        pipe_send(sid, "deadbeef", timeout=0)
+
+        assert (session_dir / "result.999.json").exists()
+
+    def test_next_seq_is_race_free_under_concurrent_callers(self, mock_mcp):
+        """Without a lock around the read-modify-write of the seq file, two
+        callers racing _broker_cmd (exactly what readwrite pipe_send/recv
+        does) can read the same current value and allocate the same seq --
+        one command's cmd.<seq>.json silently overwriting the other's
+        before the broker ever reads it."""
+        import threading
+        from winbox.mcp import _next_seq
+        _, _, cfg = mock_mcp
+
+        sid = "raceseq00001"
+        session_dir = _make_session(cfg, sid)
+
+        results = []
+        results_lock = threading.Lock()
+
+        def worker():
+            seq = _next_seq(session_dir)
+            with results_lock:
+                results.append(seq)
+
+        threads = [threading.Thread(target=worker) for _ in range(50)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(results) == len(set(results)), f"seq collision: {sorted(results)}"
+        assert sorted(results) == list(range(1, 51))
+
 
 class TestPipeCloseDoesNotLeakTheBroker:
     """pipe_close deleted broker.pid along with the session dir, so a broker
@@ -2570,6 +2620,42 @@ class TestKdbgDaemonTools:
         assert "already running" in result
         kc.assert_not_called()
         rsp.connect.assert_not_called()
+
+    def test_resume_reports_success_only_when_vm_actually_ends_up_running(self, mock_mcp):
+        """close() does interrupt+detach, which its own docstring says can
+        race QEMU and leave the VM paused instead of running. kdbg_resume
+        must not claim success it did not verify."""
+        from winbox.mcp import kdbg_resume
+        import winbox.mcp as mcp_mod
+        # Not running yet (proceeds past the no-op check); running by the
+        # time the post-release check happens.
+        mcp_mod._vm.state.side_effect = [VMState.PAUSED, VMState.RUNNING]
+        daemon_client = self._client_with(alive=False)
+        rsp_client = MagicMock()
+        with patch("winbox.mcp._kdbg_client", return_value=daemon_client), \
+             patch("winbox.kdbg.hmp.probe_port", return_value=True), \
+             patch("winbox.mcp._RspClient") as rsp_cls, \
+             patch("time.sleep"):
+            rsp_cls.connect.return_value = rsp_client
+            result = kdbg_resume()
+        rsp_client.cont.assert_called_once()
+        rsp_client.close.assert_called_once()
+        assert result == "VM resumed"
+
+    def test_resume_reports_the_real_state_when_release_leaves_it_paused(self, mock_mcp):
+        from winbox.mcp import kdbg_resume
+        import winbox.mcp as mcp_mod
+        mcp_mod._vm.state.side_effect = [VMState.PAUSED, VMState.PAUSED]
+        daemon_client = self._client_with(alive=False)
+        rsp_client = MagicMock()
+        with patch("winbox.mcp._kdbg_client", return_value=daemon_client), \
+             patch("winbox.kdbg.hmp.probe_port", return_value=True), \
+             patch("winbox.mcp._RspClient") as rsp_cls, \
+             patch("time.sleep"):
+            rsp_cls.connect.return_value = rsp_client
+            result = kdbg_resume()
+        assert result != "VM resumed"
+        assert "paused" in result.lower()
 
 
 class TestReadmeToolCount:

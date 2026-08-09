@@ -1104,9 +1104,7 @@ def kdbg_resume(ctx: click.Context, port: int) -> None:
         raise SystemExit(1)
     try:
         c.handshake()
-        sr = c.query_halt_reason()
-        if sr.signal != 0 and state == VMState.RUNNING:
-            console.print(f"[dim]VM was running; gdb halted it on attach (signal={sr.signal})[/]")
+        c.query_halt_reason()
         c.cont()
     finally:
         # close() does interrupt+detach which leaves VM running.

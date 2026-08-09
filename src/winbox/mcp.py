@@ -1788,15 +1788,26 @@ def _next_seq(session_dir: Path) -> int:
     Persisted in the session dir rather than in memory: the MCP server can be
     restarted (or a session inspected by another process) between calls, and a
     reused seq would let a stale result be read as a fresh one.
+
+    Locked across the read-modify-write (same idiom as JobStore._exclusive()
+    in jobs.py): a readwrite pipe session is meant to have concurrent
+    pipe_send/pipe_recv calls in flight, and two of them racing this
+    unlocked would allocate the same seq -- one command's cmd.<seq>.json
+    silently overwriting the other's before the broker ever reads it.
     """
+    import fcntl
+
     seq_file = session_dir / "seq"
-    try:
-        current = int(seq_file.read_text().strip())
-    except (OSError, ValueError):
-        current = 0
-    current += 1
-    seq_file.write_text(str(current))
-    return current
+    lock_file = session_dir / "seq.lock"
+    with open(lock_file, "w") as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        try:
+            current = int(seq_file.read_text().strip())
+        except (OSError, ValueError):
+            current = 0
+        current += 1
+        seq_file.write_text(str(current))
+        return current
 
 
 def _broker_cmd(session_dir: Path, cmd: dict, timeout: int) -> dict | None:
@@ -1810,12 +1821,14 @@ def _broker_cmd(session_dir: Path, cmd: dict, timeout: int) -> dict | None:
     payload = dict(cmd)
     payload["seq"] = seq
 
-    # Sweep answers to calls we already abandoned. Harmless to keep — nothing
-    # reads them now that results are per-seq — but the session dir lives on
-    # the VirtIO-FS share and would grow for the life of the session.
-    for stale in session_dir.glob("result.*.json"):
-        stale.unlink(missing_ok=True)
-
+    # No sweep of other result.*.json files here on purpose: a readwrite
+    # session has pipe_send/pipe_recv in flight concurrently by design (see
+    # pipe_open's docstring), and a blanket sweep would delete a *live*
+    # result some other in-flight call hasn't polled for yet -- data
+    # already dequeued off the real pipe on the guest side, gone for good.
+    # A call's own result is cleaned up by _poll_result on a successful
+    # read; a genuinely abandoned (timed-out) one is a harmless leftover
+    # JSON file until pipe_close rmtrees the whole session dir.
     (session_dir / f"cmd.{seq}.json").write_text(_json.dumps(payload))
     return _poll_result(session_dir / f"result.{seq}.json", timeout)
 
@@ -3041,8 +3054,17 @@ def kdbg_resume(port: int = 1234) -> str:
         c.query_halt_reason()
         c.cont()
     finally:
+        # close() does interrupt+detach which leaves VM running -- but its
+        # own docstring warns the sequence can race QEMU and leave the VM
+        # paused instead. Don't report success without checking.
         c.close()
-    return "VM resumed"
+
+    import time as _time
+    _time.sleep(0.3)
+    final = vm.state()
+    if final == VMState.RUNNING:
+        return "VM resumed"
+    return f"VM state after release: {final.value}"
 
 
 # ─── Entry point ────────────────────────────────────────────────────────────
