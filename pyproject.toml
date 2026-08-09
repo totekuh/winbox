@@ -35,7 +35,7 @@ winbox = "winbox.cli:cli"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov>=4.0"]
-mcp = ["mcp>=1.0"]
+mcp = ["mcp>=1.0,<2"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/winbox"]
