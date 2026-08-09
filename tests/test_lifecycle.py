@@ -82,8 +82,26 @@ class TestStateMapping:
     def test_saved_wins_over_everything(self, vm):
         """managedsave shows up alongside another word; SAVED is the one that
         determines whether `up` resumes or cold-boots."""
-        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc("shut off (saved)")):
+        with patch(
+            "winbox.vm.lifecycle.virsh_run", return_value=_proc("shut off (saved)")
+        ) as run:
             assert vm.state() is VMState.SAVED
+        # The "(saved)" annotation only exists because domstate was asked
+        # for it — without --reason a managed-saved domain reads as a bare
+        # "shut off" indistinguishable from any other shutoff cause.
+        assert "--reason" in run.call_args[0]
+
+    def test_canonical_match_ignores_reason_suffix(self, vm):
+        """--reason appends " (<reason>)" to every state string; the exact-
+        match path against bare canonical values must still work with that
+        suffix present."""
+        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc("running (booted)")):
+            assert vm.state() is VMState.RUNNING
+        with patch(
+            "winbox.vm.lifecycle.virsh_run", return_value=_proc("shut off (destroyed)")
+        ):
+            assert vm.state() is VMState.SHUTOFF
+            assert vm.is_off() is True
 
     def test_nonzero_exit_means_not_found(self, vm):
         with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(returncode=1)):
@@ -297,8 +315,13 @@ class TestDiskIsFreePredicate:
         """The disk is free, but the next start restores RAM captured before
         whatever edit we are about to make — a hive edited underneath a saved
         memory image is its own corruption."""
-        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc("shut off (saved)")):
+        with patch(
+            "winbox.vm.lifecycle.virsh_run", return_value=_proc("shut off (saved)")
+        ) as run:
             assert vm.is_off() is False
+        # Same regression as test_saved_wins_over_everything: this predicate
+        # depends entirely on --reason being requested.
+        assert "--reason" in run.call_args[0]
 
 
 class TestDiskUsage:

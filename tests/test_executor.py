@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from winbox.exec.executor import resolve_exe, run_command
+from winbox.exec.executor import resolve_exe, run_command, run_command_bg
 from winbox.vm.guest import (
     ExecResult,
     GuestAgentError,
@@ -106,6 +106,44 @@ class TestResolveExe:
         result = resolve_exe("./foo.exe", tools_dir)
         assert result == "Z:\\tools\\foo.exe"
         assert (tools_dir / "foo.exe").read_bytes() == b"data"
+
+
+class TestRunCommandQuoting:
+    """cmd.exe re-splits any unquoted whitespace into extra arguments, so a
+    spacey exe path or argument must be wrapped in double quotes before it
+    reaches ga.exec — otherwise `winbox exec tool.exe --path "C:\\Program
+    Files\\Target"` arrives in the guest as four arguments instead of two."""
+
+    def _ga(self):
+        ga = MagicMock()
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        return ga
+
+    def test_spacey_argument_is_quoted(self, cfg):
+        ga = self._ga()
+        run_command(cfg, ga, "whoami.exe", ("C:\\Program Files\\Target",), timeout=60)
+        full_cmd = ga.exec.call_args[0][0]
+        assert '"C:\\Program Files\\Target"' in full_cmd
+
+    def test_spacey_resolved_exe_path_is_quoted(self, cfg):
+        (cfg.tools_dir / "PsExec (v2).exe").touch()
+        ga = self._ga()
+        run_command(cfg, ga, "PsExec (v2).exe", (), timeout=60)
+        full_cmd = ga.exec.call_args[0][0]
+        assert '"Z:\\tools\\PsExec (v2).exe"' in full_cmd
+
+    def test_argument_without_whitespace_is_not_quoted(self, cfg):
+        ga = self._ga()
+        run_command(cfg, ga, "whoami.exe", ("/priv",), timeout=60)
+        full_cmd = ga.exec.call_args[0][0]
+        assert full_cmd.endswith("whoami.exe /priv")
+
+    def test_bg_spacey_argument_is_quoted(self, cfg):
+        ga = MagicMock()
+        ga.exec_background.return_value = 1234
+        run_command_bg(cfg, ga, "whoami.exe", ("C:\\Program Files\\Target",))
+        full_cmd = ga.exec_background.call_args[0][0]
+        assert '"C:\\Program Files\\Target"' in full_cmd
 
 
 class TestRunCommandRetryPolicy:

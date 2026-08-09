@@ -93,7 +93,13 @@ class VM:
         self.name = cfg.vm_name
 
     def _domstate_raw(self) -> str | None:
-        """Raw, lowercased ``virsh domstate`` text — or None if unqueryable.
+        """Raw, lowercased ``virsh domstate --reason`` text — or None if
+        unqueryable.
+
+        ``--reason`` is what makes a managed-saved domain read as
+        ``"shut off (saved)"`` instead of a bare ``"shut off"`` indistinguishable
+        from any other shutoff cause; without it ``state()`` can never see
+        SAVED and ``is_off()`` can never exclude it.
 
         Kept separate from :meth:`state` because two callers want two
         different questions answered from the same output: "roughly, what is
@@ -101,7 +107,7 @@ class VM:
         nearest stable one) and "has QEMU actually let go of the disk"
         (``is_off``, which must not fold anything).
         """
-        result = virsh_run("domstate", self.name, check=False)
+        result = virsh_run("domstate", self.name, "--reason", check=False)
         if result.returncode != 0:
             return None
         return result.stdout.strip().lower()
@@ -116,9 +122,12 @@ class VM:
         # comes from managedsave indicator on running VMs.
         if "saved" in raw:
             return VMState.SAVED
+        # --reason appends " (<reason>)" to the state; strip it before
+        # matching against the bare canonical values below.
+        canonical = raw.partition(" (")[0]
         # Direct match against canonical values first.
         for s in VMState:
-            if s.value == raw:
+            if s.value == canonical:
                 return s
         # Transient / nearby states virsh can emit:
         #   "in shutdown" — heading to SHUTOFF, not interesting to most callers
@@ -126,9 +135,9 @@ class VM:
         #   "crashed"     — VM died; treat as off so callers offer winbox up
         #   "pmsuspended" — ACPI-suspended, equivalent to a saved state
         #   "idle"        — defined-but-not-running on some libvirt builds
-        if raw in ("in shutdown", "dying", "crashed", "idle"):
+        if canonical in ("in shutdown", "dying", "crashed", "idle"):
             return VMState.SHUTOFF
-        if raw == "pmsuspended":
+        if canonical == "pmsuspended":
             return VMState.SAVED
         return VMState.UNKNOWN
 
@@ -155,7 +164,11 @@ class VM:
         about to make, and a hive edited underneath a saved memory image is
         its own kind of corruption.
         """
-        return self._domstate_raw() == "shut off"
+        raw = self._domstate_raw()
+        if raw is None:
+            return False
+        canonical, _, reason = raw.partition(" (")
+        return canonical == "shut off" and "saved" not in reason
 
     def exists(self) -> bool:
         return self.state() != VMState.NOT_FOUND

@@ -72,6 +72,12 @@ def resolve_exe(exe: str, tools_dir: Path) -> str:
     return exe
 
 
+def _quote_cmd_arg(s: str) -> str:
+    """Wrap a token in double quotes if it has whitespace, so cmd.exe's own
+    parser doesn't re-split it into multiple arguments."""
+    return f'"{s}"' if any(c.isspace() for c in s) else s
+
+
 def run_command(
     cfg: Config,
     ga: GuestAgent,
@@ -89,9 +95,10 @@ def run_command(
 
     # Build the full command: cd to tools dir, then run
     args_str = " ".join(args)
-    full_cmd = f"cd /d Z:\\tools && {resolved}"
-    if args_str:
-        full_cmd += f" {args_str}"
+    quoted_args = " ".join(_quote_cmd_arg(a) for a in args)
+    full_cmd = f"cd /d Z:\\tools && {_quote_cmd_arg(resolved)}"
+    if quoted_args:
+        full_cmd += f" {quoted_args}"
 
     console.print(f"[blue][*][/] Executing: {resolved} {args_str}")
 
@@ -159,9 +166,10 @@ def run_command_bg(
     """
     resolved = resolve_exe(exe, cfg.tools_dir)
     args_str = " ".join(args)
-    full_cmd = f"cd /d Z:\\tools && {resolved}"
-    if args_str:
-        full_cmd += f" {args_str}"
+    quoted_args = " ".join(_quote_cmd_arg(a) for a in args)
+    full_cmd = f"cd /d Z:\\tools && {_quote_cmd_arg(resolved)}"
+    if quoted_args:
+        full_cmd += f" {quoted_args}"
 
     store = JobStore(cfg)
 
