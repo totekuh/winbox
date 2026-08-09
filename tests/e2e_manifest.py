@@ -105,13 +105,16 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "av disable": (LIVE, "reboots the guest"),
 
     # Malware Analysis
-    "capture start": (EXCLUDED, "needs root to run tcpdump on the bridge; a "
-                                "host-level privilege the live suite doesn't "
-                                "have"),
-    "capture stop": (LIVE, "the no-capture-running case"),
+    "capture start": (LIVE, "via dumpcap, which Kali's Wireshark package "
+                            "grants cap_net_raw to for the wireshark group "
+                            "— no root needed. Falls back to tcpdump "
+                            "(needs root) when dumpcap isn't installed"),
+    "capture stop": (LIVE, ""),
     "capture status": (LIVE, ""),
     "sinkhole start": (LIVE, "on an unprivileged high port; the default :53 "
-                             "bind needs root, same as capture start"),
+                             "bind needs root or a lowered "
+                             "ip_unprivileged_port_start, same idea as "
+                             "capture start needing dumpcap's capability"),
     "sinkhole stop": (LIVE, ""),
     "sinkhole status": (LIVE, ""),
     "sinkhole log": (LIVE, ""),
@@ -247,7 +250,6 @@ def statuses(coverage: dict[str, tuple[str, str]], status: str) -> set[str]:
 # "untested".
 
 CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
-    "capture start": "tests/test_capture.py",
     "sinkhole _serve": "tests/test_sinkhole.py",
     "setup": "tests/test_installer.py",
     "destroy": "tests/test_destroy.py",

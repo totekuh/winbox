@@ -27,6 +27,7 @@ import pytest
 from click.testing import CliRunner
 
 from winbox.cli import cli
+from winbox.cli import capture as capture_mod
 from winbox.config import Config
 from winbox.vm import VM, GuestAgent, VMState
 
@@ -714,6 +715,27 @@ class TestMalwareAnalysis:
         stopped = run("capture", "stop", expect_ok=False)
         assert stopped.exit_code != 0
         assert "No capture running" in stopped.output
+
+    def test_capture_start_captures_real_traffic(self, run, ga, cfg):
+        """dumpcap needs no root when Kali's Wireshark package granted it
+        cap_net_raw for the wireshark group (see capture.py's docstring).
+        Skip rather than fail on a host where that isn't true and there's
+        no root either -- that gap is exactly what the command itself
+        reports, not something this test should paper over."""
+        result = run("capture", "start", expect_ok=False)
+        if result.exit_code != 0:
+            pytest.skip(f"capture start unavailable on this host:\n{result.output}")
+        try:
+            ga.exec("ping -n 2 192.168.122.1", timeout=30)
+        finally:
+            # Read the pidfile before `stop` deletes it, so the pcap path
+            # comes from the module's own bookkeeping, not a text-parsed
+            # (and possibly line-wrapped) CLI message.
+            state = capture_mod.read_pidfile(cfg)
+            run("capture", "stop")
+        assert state is not None
+        _, pcap = state
+        assert pcap.exists() and pcap.stat().st_size > 0
 
     def test_sinkhole_start_status_log_stop_on_an_unprivileged_port(self, run):
         """The default :53 bind needs root (like capture start), so this

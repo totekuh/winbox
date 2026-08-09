@@ -118,7 +118,7 @@ def detonate_check(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     if cap and _cap_pid_alive(cap[0]):
         _ok("Capture running", f"pcap: {cap[1]}")
     else:
-        _warn("Capture not running", "no pcap — start with `winbox capture start` (as root)")
+        _warn("Capture not running", "no pcap — start with `winbox capture start`")
 
     # ── Sinkhole (advisory) ──────────────────────────────────────────────
     sink_pid = sk.is_running(cfg)
