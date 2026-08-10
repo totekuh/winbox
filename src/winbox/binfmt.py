@@ -94,10 +94,23 @@ def unregister(remove_handler: bool = True) -> None:
         _sudo_write(BINFMT_ENTRY, "-1")
 
     if remove_handler and BINFMT_PERSIST.exists():
-        subprocess.run(
-            ["sudo", "rm", "-f", str(BINFMT_PERSIST)],
-            check=True,
-        )
+        if shutil.which("sudo") is None:
+            # Same guard as _sudo_write: without it subprocess.run raises a
+            # raw FileNotFoundError that the CLI (which only catches
+            # PermissionError) lets escape as a traceback.
+            raise PermissionError(
+                f"Failed to remove {BINFMT_PERSIST}: 'sudo' is not installed. "
+                "Removing the persistent binfmt config requires sudo (or root)."
+            )
+        try:
+            subprocess.run(
+                ["sudo", "rm", "-f", str(BINFMT_PERSIST)],
+                check=True,
+                stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError as e:
+            detail = e.stderr.decode().strip() if e.stderr else "sudo denied?"
+            raise PermissionError(f"Failed to remove {BINFMT_PERSIST}: {detail}") from e
 
 
 def is_registered() -> bool:

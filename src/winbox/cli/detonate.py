@@ -21,6 +21,7 @@ will be less useful, not that it's dangerous.
 from __future__ import annotations
 
 import click
+from rich.markup import escape
 
 from winbox import nwfilter
 from winbox import sinkhole as sk
@@ -116,14 +117,14 @@ def detonate_check(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     # ── Capture (advisory) ───────────────────────────────────────────────
     cap = _cap_read_pidfile(cfg)
     if cap and _cap_pid_alive(cap[0]):
-        _ok("Capture running", f"pcap: {cap[1]}")
+        _ok("Capture running", f"pcap: {escape(str(cap[1]))}")
     else:
         _warn("Capture not running", "no pcap — start with `winbox capture start`")
 
     # ── Sinkhole (advisory) ──────────────────────────────────────────────
     sink_pid = sk.is_running(cfg)
     if sink_pid is not None:
-        _ok("Sinkhole running", f"pid {sink_pid}, log: {sk.query_log_path(cfg)}")
+        _ok("Sinkhole running", f"pid {sink_pid}, log: {escape(str(sk.query_log_path(cfg)))}")
     else:
         _warn(
             "Sinkhole not running",

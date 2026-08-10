@@ -324,3 +324,15 @@ class TestStatus:
             result = self._invoke(runner, cfg)
         assert result.exit_code == 0
         assert "stale" in result.output.lower()
+
+    def test_pcap_path_with_markup_chars_does_not_crash(self, runner, cfg):
+        # A user-chosen -o path can contain rich markup metacharacters; the
+        # path is echoed back verbatim and must not be parsed as markup.
+        # `[/]` is a stray closing tag that raises MarkupError unescaped,
+        # which would crash status after the capture child is already up.
+        cap.captures_dir(cfg).mkdir(parents=True, exist_ok=True)
+        cap.pidfile_path(cfg).write_text("8888\n/tmp/weird[/].pcap\n")
+        with patch.object(cap, "pid_alive", return_value=True):
+            result = self._invoke(runner, cfg)
+        assert result.exit_code == 0, result.output
+        assert "/tmp/weird[/].pcap" in result.output

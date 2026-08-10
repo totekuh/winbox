@@ -407,8 +407,8 @@ _REG_TYPE_MAP = '''\
 type_map = {
     'REG_SZ':        (winreg.REG_SZ,        lambda d: d),
     'REG_EXPAND_SZ': (winreg.REG_EXPAND_SZ, lambda d: d),
-    'REG_DWORD':     (winreg.REG_DWORD,     lambda d: int(d)),
-    'REG_QWORD':     (winreg.REG_QWORD,     lambda d: int(d)),
+    'REG_DWORD':     (winreg.REG_DWORD,     lambda d: int(d, 0)),
+    'REG_QWORD':     (winreg.REG_QWORD,     lambda d: int(d, 0)),
     'REG_BINARY':    (winreg.REG_BINARY,    lambda d: bytes.fromhex(d)),
     'REG_MULTI_SZ':  (winreg.REG_MULTI_SZ,  lambda d: d.split('\\n')),
 }
@@ -539,10 +539,26 @@ def reg_set(
                 sys.exit(1)
 
             reg_type, converter = type_map[reg_type_name]
-            converted = converter(raw_data)
+            try:
+                converted = converter(raw_data)
+            except (ValueError, OverflowError) as e:
+                print(f"Bad data for {reg_type_name}: {raw_data!r} ({e})",
+                      file=sys.stderr)
+                sys.exit(1)
 
-            with winreg.CreateKey(hive, subkey) as k:
-                winreg.SetValueEx(k, value_name, 0, reg_type, converted)
+            try:
+                with winreg.CreateKey(hive, subkey) as k:
+                    winreg.SetValueEx(k, value_name, 0, reg_type, converted)
+            except (ValueError, OverflowError) as e:
+                print(f"Bad data for {reg_type_name}: {raw_data!r} ({e})",
+                      file=sys.stderr)
+                sys.exit(1)
+            except FileNotFoundError:
+                print(f"Not found: {key_path}", file=sys.stderr)
+                sys.exit(1)
+            except PermissionError:
+                print(f"Access denied: {key_path}", file=sys.stderr)
+                sys.exit(1)
             print(f"Set {key_path}\\\\{value_name} = {raw_data} ({reg_type_name})")
         ''')
     )
@@ -1221,19 +1237,23 @@ def av_disable(confirm: bool = False) -> str:
 
     cfg, vm, ga = _ensure_vm_ready()
 
-    # Step 0: On Win11 client, Tamper Protection silently neuters the GP-key
-    # disable. Refuse rather than reboot into a still-protected VM.
-    if defender.tamper_protection_on(ga):
-        return (
-            "error: Tamper Protection is ON — Defender cannot be disabled from the "
-            "running OS. It should have been cleared offline by `winbox setup --os "
-            "win11`; otherwise turn it off in Windows Security (Virus & threat "
-            "protection > Manage settings > Tamper Protection) and retry."
-        )
-
-    # Step 1: Set the GP registry keys (shared with the CLI).
+    # Steps 0-1 talk to the guest agent (reg.exe / status): a dropped or
+    # timed-out GA must surface as the clean guest-error string the rest of
+    # the module returns, not an uncaught GuestAgentError.
     try:
-        defender.set_disable_regkeys(ga)
+        with _guest_errors(vm):
+            # Step 0: On Win11 client, Tamper Protection silently neuters the
+            # GP-key disable. Refuse rather than reboot into a still-protected VM.
+            if defender.tamper_protection_on(ga):
+                return (
+                    "error: Tamper Protection is ON — Defender cannot be disabled from the "
+                    "running OS. It should have been cleared offline by `winbox setup --os "
+                    "win11`; otherwise turn it off in Windows Security (Virus & threat "
+                    "protection > Manage settings > Tamper Protection) and retry."
+                )
+
+            # Step 1: Set the GP registry keys (shared with the CLI).
+            defender.set_disable_regkeys(ga)
     except defender.DefenderError as e:
         detail = _format_exec_result(e.result) if e.result is not None else ""
         return f"error: {e}\n{detail}".rstrip()

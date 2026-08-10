@@ -68,13 +68,22 @@ def parse_since(s: str, *, now: datetime | None = None) -> datetime:
         n = int(m.group(1))
         unit = _DURATION_UNITS[m.group(2)]
         base = now if now is not None else datetime.now()
-        return base - timedelta(**{unit: n})
+        try:
+            return base - timedelta(**{unit: n})
+        except OverflowError as e:
+            raise ValueError(f"invalid --since: {s!r} (out of range)") from e
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
     except ValueError as e:
         raise ValueError(
             f"invalid --since: {s!r} (use Nh/Nm/Nd/Nw or ISO 8601)"
         ) from e
+    if dt.tzinfo is not None:
+        raise ValueError(
+            f"invalid --since: {s!r} (timezone offsets not supported; "
+            "pass guest-local naive time)"
+        )
+    return dt
 
 
 # PowerShell escaping helpers live in winbox.ps; re-exported here for the
@@ -138,7 +147,7 @@ def _normalize_ps_date(value: Any) -> Any:
     try:
         ts = int(m.group(1)) / 1000.0
         return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
-    except (ValueError, OSError):
+    except (ValueError, OSError, OverflowError):
         return value
 
 
@@ -243,8 +252,11 @@ def _short_time(s: str | None) -> str:
     if s.startswith("/Date("):
         m = re.match(r"^/Date\((\d+)", s)
         if m:
-            ts = int(m.group(1)) / 1000.0
-            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                ts = int(m.group(1)) / 1000.0
+                return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            except (ValueError, OSError, OverflowError):
+                return s[:19]
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime(
             "%Y-%m-%d %H:%M:%S"

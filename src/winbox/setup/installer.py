@@ -271,12 +271,18 @@ def download_winfsp(cfg: Config) -> Path:
         return dest
 
     console.print("[blue][*][/] Downloading WinFsp...")
+    # Download to a temp path and only os.replace into place once the size
+    # check passes, so an interrupted/truncated wget never lands a partial at
+    # dest that a later run would return as 'cached' (MSI has no zip check).
+    part = dest.with_name(dest.name + ".part")
     subprocess.run(
-        ["wget", "-q", "--show-progress", "-O", str(dest), WINFSP_URL],
+        ["wget", "-q", "--show-progress", "-O", str(part), WINFSP_URL],
         check=True,
     )
-    if not dest.exists() or dest.stat().st_size < 1_000_000:
+    if not part.exists() or part.stat().st_size < 1_000_000:
+        part.unlink(missing_ok=True)
         raise RuntimeError(f"WinFsp download appears truncated: {dest}")
+    os.replace(part, dest)
     console.print("[green][+][/] WinFsp MSI downloaded")
     return dest
 
@@ -289,12 +295,18 @@ def download_python(cfg: Config) -> Path:
         return dest
 
     console.print("[blue][*][/] Downloading Python installer...")
+    # Download to a temp path and only os.replace into place once the size
+    # check passes, so an interrupted/truncated wget never lands a partial at
+    # dest that a later run would return as 'cached' (the EXE has no zip check).
+    part = dest.with_name(dest.name + ".part")
     subprocess.run(
-        ["wget", "-q", "--show-progress", "-O", str(dest), PYTHON_URL],
+        ["wget", "-q", "--show-progress", "-O", str(part), PYTHON_URL],
         check=True,
     )
-    if not dest.exists() or dest.stat().st_size < 20_000_000:
+    if not part.exists() or part.stat().st_size < 20_000_000:
+        part.unlink(missing_ok=True)
         raise RuntimeError(f"Python installer download appears truncated: {dest}")
+    os.replace(part, dest)
     console.print("[green][+][/] Python installer downloaded")
     return dest
 

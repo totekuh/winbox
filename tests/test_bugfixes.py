@@ -204,6 +204,45 @@ class TestBinfmtRemoveHandler:
         ):
             unregister()  # default = True
 
+    def test_rm_failure_raises_permissionerror(self, tmp_path):
+        """A failing `sudo rm` must surface as PermissionError, not a raw
+        CalledProcessError traceback (the CLI only catches PermissionError)."""
+        import subprocess
+
+        from winbox.binfmt import unregister
+
+        persist = tmp_path / "winbox.conf"
+        persist.write_text(":winbox:E::exe::/handler:")
+        entry = tmp_path / "winbox"  # not exists → is_registered() False
+
+        with (
+            patch("winbox.binfmt.BINFMT_ENTRY", entry),
+            patch("winbox.binfmt.BINFMT_PERSIST", persist),
+            patch("winbox.binfmt.shutil.which", return_value="/usr/bin/sudo"),
+            patch(
+                "subprocess.run",
+                side_effect=subprocess.CalledProcessError(1, "rm", stderr=b"denied"),
+            ),
+            pytest.raises(PermissionError),
+        ):
+            unregister(remove_handler=True)
+
+    def test_missing_sudo_raises_permissionerror(self, tmp_path):
+        """No sudo binary must surface as PermissionError, not FileNotFoundError."""
+        from winbox.binfmt import unregister
+
+        persist = tmp_path / "winbox.conf"
+        persist.write_text(":winbox:E::exe::/handler:")
+        entry = tmp_path / "winbox"  # not exists
+
+        with (
+            patch("winbox.binfmt.BINFMT_ENTRY", entry),
+            patch("winbox.binfmt.BINFMT_PERSIST", persist),
+            patch("winbox.binfmt.shutil.which", return_value=None),
+            pytest.raises(PermissionError),
+        ):
+            unregister(remove_handler=True)
+
 
 # ─── Bug #6: PowerShell input validation ────────────────────────────────────
 

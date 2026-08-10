@@ -60,6 +60,22 @@ class TestParseSince:
         with pytest.raises(ValueError):
             parse_since("")
 
+    def test_duration_out_of_range(self):
+        with pytest.raises(ValueError, match="invalid --since"):
+            parse_since("999999999d")
+
+    def test_duration_out_of_range_weeks(self):
+        with pytest.raises(ValueError, match="invalid --since"):
+            parse_since("99999999999999999999w")
+
+    def test_iso8601_aware_rejected(self):
+        with pytest.raises(ValueError, match="invalid --since"):
+            parse_since("2026-08-10T12:00:00+05:00")
+
+    def test_iso8601_utc_z_rejected(self):
+        with pytest.raises(ValueError, match="invalid --since"):
+            parse_since("2026-08-10T12:00:00Z")
+
 
 # ─── build_powershell ───────────────────────────────────────────────────────
 
@@ -189,6 +205,12 @@ class TestParseEvents:
         out = parse_events(json.dumps([ev]))
         assert out[0] == {"Id": 1}
 
+    def test_out_of_range_ps_date_passes_through(self):
+        """An out-of-range /Date(ms)/ must not raise; leave the raw string."""
+        ev = {"TimeCreated": "/Date(99999999999999999999999)/", "Id": 1}
+        out = parse_events(json.dumps([ev]))
+        assert out[0]["TimeCreated"] == "/Date(99999999999999999999999)/"
+
 
 # ─── format_csv ─────────────────────────────────────────────────────────────
 
@@ -215,6 +237,17 @@ class TestFormatCsv:
             "Microsoft-Windows-Security-Auditing,"
             "An account was successfully logged on."
         )
+
+    def test_out_of_range_ps_date_does_not_crash(self):
+        """A raw out-of-range /Date(ms)/ in CSV output must not raise."""
+        events = [{
+            "TimeCreated": "/Date(99999999999999999)/", "LogName": "Security",
+            "Level": 4, "LevelDisplayName": "Information", "Id": 1,
+            "ProviderName": "p", "Message": "m",
+        }]
+        out = format_csv(events).splitlines()
+        assert len(out) == 2
+        assert out[1].endswith(",Security,Information,1,p,m")
 
     def test_message_with_comma_quoted(self):
         events = [{

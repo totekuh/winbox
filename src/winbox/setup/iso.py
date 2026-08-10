@@ -124,7 +124,9 @@ def download_iso(
     console.print(f"[blue][*][/] Downloading from Microsoft CDN...")
 
     total_size = get_remote_size(url)
-    existing_size = dest.stat().st_size if dest.exists() else 0
+    # force means "start clean": never resume onto an existing (possibly
+    # corrupt) partial, so treat the local file as absent and overwrite it.
+    existing_size = dest.stat().st_size if dest.exists() and not force else 0
 
     # Build request with Range header for resume
     req = urllib.request.Request(url)

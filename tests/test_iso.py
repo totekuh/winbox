@@ -171,6 +171,29 @@ class TestDownloadIsoCacheDecisions:
         with pytest.raises(RuntimeError, match="truncated"):
             h.mod.download_iso(h.cfg, force=True)
 
+    def test_force_restarts_instead_of_resuming_a_known_size_partial(
+        self, monkeypatch, tmp_path
+    ):
+        """With a known remote size, force must overwrite the partial rather
+        than sending a Range header and appending onto a corrupt prefix."""
+        h = _IsoHarness(monkeypatch, tmp_path)
+        floor = h.cfg.profile.iso_min_size
+        h.write_local(100)
+        h.set_remote_size(floor)
+
+        seen = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["range"] = req.get_header("Range")
+            return _FakeResp([b"x" * floor], status=200, content_length=floor)
+
+        monkeypatch.setattr(h.mod.urllib.request, "urlopen", fake_urlopen)
+
+        h.mod.download_iso(h.cfg, force=True)
+
+        assert seen["range"] is None
+        assert h.dest.stat().st_size == floor
+
 
 class TestDownloadIsoIsProfileDriven:
     @pytest.mark.parametrize("os_key", ["server2022", "win11"])

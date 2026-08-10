@@ -229,11 +229,14 @@ class TestDownloads:
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_winfsp(self, mock_run, cfg):
         dest = cfg.iso_dir / "winfsp.msi"
+        part = cfg.iso_dir / "winfsp.msi.part"
         def fake_wget(*a, **kw):
-            dest.write_bytes(b"\x00" * 1_000_001)
+            part.write_bytes(b"\x00" * 1_000_001)
         mock_run.side_effect = fake_wget
         result = download_winfsp(cfg)
         assert result == dest
+        assert dest.stat().st_size == 1_000_001
+        assert not part.exists()
         mock_run.assert_called_once()
 
     @patch("winbox.setup.installer.subprocess.run")
@@ -247,11 +250,14 @@ class TestDownloads:
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_python(self, mock_run, cfg):
         dest = cfg.iso_dir / PYTHON_EXE
+        part = cfg.iso_dir / (PYTHON_EXE + ".part")
         def fake_wget(*a, **kw):
-            dest.write_bytes(b"\x00" * 25_000_000)
+            part.write_bytes(b"\x00" * 25_000_000)
         mock_run.side_effect = fake_wget
         result = download_python(cfg)
         assert result == dest
+        assert dest.stat().st_size == 25_000_000
+        assert not part.exists()
         mock_run.assert_called_once()
 
     @patch("winbox.setup.installer.subprocess.run")
@@ -265,11 +271,16 @@ class TestDownloads:
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_python_truncated(self, mock_run, cfg):
         dest = cfg.iso_dir / PYTHON_EXE
+        part = cfg.iso_dir / (PYTHON_EXE + ".part")
         def fake_wget(*a, **kw):
-            dest.write_bytes(b"\x00" * 500)
+            part.write_bytes(b"\x00" * 500)
         mock_run.side_effect = fake_wget
         with pytest.raises(RuntimeError, match="truncated"):
             download_python(cfg)
+        # A truncated partial must never land at dest to be reused as cache,
+        # and the .part must be cleaned up.
+        assert not dest.exists()
+        assert not part.exists()
 
     def test_python_url_is_regular_installer(self):
         """URL must point at the regular Python installer, not the embeddable zip."""

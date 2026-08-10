@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 import click
+from rich.markup import escape
 
 from winbox.cli import console
 from winbox.config import Config
@@ -195,7 +196,7 @@ def capture_start(ctx: click.Context, bpf: str | None, output: str | None) -> No
     existing = read_pidfile(cfg)
     if existing and pid_alive(existing[0]):
         console.print(f"[yellow][!][/] Capture already running (pid {existing[0]})")
-        console.print(f"    pcap: {existing[1]}")
+        console.print(f"    pcap: {escape(str(existing[1]))}")
         console.print("    Stop it first: [bold]winbox capture stop[/]")
         raise SystemExit(1)
 
@@ -227,16 +228,16 @@ def capture_start(ctx: click.Context, bpf: str | None, output: str | None) -> No
         detail = log_path.read_text(errors="replace").strip() if log_path.exists() else ""
         console.print(f"[red][-][/] {backend} exited immediately (code {proc.returncode})")
         if detail:
-            console.print(f"    {detail}")
+            console.print(f"    {escape(detail)}")
         log_path.unlink(missing_ok=True)
         raise SystemExit(1)
 
     pidfile_path(cfg).write_text(f"{proc.pid}\n{pcap}\n")
 
     console.print(f"[green][+][/] Capturing on [bold]{bridge}[/] via {backend} (pid {proc.pid})")
-    console.print(f"    pcap: {pcap}")
+    console.print(f"    pcap: {escape(str(pcap))}")
     if bpf:
-        console.print(f"    filter: {bpf}")
+        console.print(f"    filter: {escape(bpf)}")
     console.print("    Stop with: [bold]winbox capture stop[/]")
 
 
@@ -265,9 +266,9 @@ def capture_stop(ctx: click.Context) -> None:
 
     if pcap.exists():
         size = _human_size(pcap.stat().st_size)
-        console.print(f"    pcap saved: {pcap} ({size})")
+        console.print(f"    pcap saved: {escape(str(pcap))} ({size})")
     else:
-        console.print(f"    pcap path: {pcap} [yellow](not found)[/]")
+        console.print(f"    pcap path: {escape(str(pcap))} [yellow](not found)[/]")
 
 
 @capture.command("status")
@@ -292,9 +293,9 @@ def capture_status(ctx: click.Context) -> None:
 
     if pcap.exists():
         size = _human_size(pcap.stat().st_size)
-        console.print(f"pcap:    {pcap} ({size})")
+        console.print(f"pcap:    {escape(str(pcap))} ({size})")
     else:
-        console.print(f"pcap:    {pcap} [yellow](not found)[/]")
+        console.print(f"pcap:    {escape(str(pcap))} [yellow](not found)[/]")
 
 
 REGISTER = ("Malware Analysis", [capture])

@@ -43,6 +43,28 @@ class TestDetonateCheck:
         assert "nwfilter attached" in result.output
         assert "Safe to detonate" in result.output
 
+    def test_markup_chars_in_pcap_path_do_not_crash(self, runner, mock_env):
+        """A pcap path from the capture pidfile can contain rich markup
+        metacharacters (e.g. `[/]`); the preflight must escape it, not crash
+        with MarkupError."""
+        mock_env._vm.net_link_state.return_value = "up"
+        mock_env.exec_powershell.side_effect = [
+            _dns_result("192.168.122.1"),
+            _defender_result("False"),
+        ]
+        with patch("winbox.cli.detonate.nwfilter.has_filter", return_value=True), \
+             patch("winbox.cli.detonate._cap_read_pidfile",
+                   return_value=(123, Path("/tmp/weird[/].pcap"))), \
+             patch("winbox.cli.detonate._cap_pid_alive", return_value=True), \
+             patch("winbox.cli.detonate.sk.is_running", return_value=999), \
+             patch("winbox.cli.detonate.sk.query_log_path",
+                   return_value=Path("/tmp/q[/].log")):
+            result = runner.invoke(cli, ["detonate", "check"])
+        assert result.exception is None, result.exception
+        assert result.exit_code == 0
+        assert "Capture running" in result.output
+        assert "weird" in result.output
+
     def test_passes_gate_when_nic_unplugged(self, runner, mock_env):
         """Link down (air-gap) also satisfies the gate."""
         mock_env._vm.net_link_state.return_value = "down"
