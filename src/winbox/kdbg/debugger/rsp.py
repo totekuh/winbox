@@ -122,6 +122,20 @@ class RspClient:
     # ``wait_for_stop`` overrides this with its own (or None for forever).
     _DEFAULT_TIMEOUT = 10.0
 
+    # Hard cap on a single packet body. We advertise PacketSize=0x10000 (64 KiB
+    # of data), which hex-encodes to ~128 KiB plus framing; 1 MiB is generous
+    # headroom. A stub that never sends the closing '#' would otherwise grow the
+    # body bytearray without bound until the daemon OOMs — bound it to a clean
+    # RspError instead.
+    _MAX_PACKET = 1 << 20
+
+    # A valid x86-64 QEMU g-packet carries the GPRs, rip, eflags, segment regs,
+    # and control registers through at least CR3 (offset 204, +8 = 212 bytes).
+    # Anything shorter is a truncated/foreign reply, not a register block — the
+    # daemon unpacks CR3/rip at fixed offsets, so reject it here rather than let
+    # a struct.error escape unwrapped.
+    _MIN_G_PACKET = 212
+
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
         self._inbuf = bytearray()
@@ -237,8 +251,17 @@ class RspClient:
             if strict:
                 raise RspError("server NAK'd packet — checksum mismatch?")
             return
-        # No ack (NoAckMode) — push the byte back; it's the start of a
-        # genuine packet (likely '$').
+        if b == 0x24:  # '$'
+            # Some stubs skip the ack and send the response frame directly.
+            # Push the '$' back so _read_packet reads the response — this is
+            # the one non-ack byte that is legitimate here.
+            self._inbuf.insert(0, b)
+            return
+        if strict:
+            # Ack mode expected a '+'/'-'/'$' — any other byte is a protocol
+            # desync (the old code pushed it back and returned "acked", masking
+            # the missing ack and pairing a later reply with the wrong request).
+            raise RspError(f"expected ack, got unexpected byte {b:#04x}")
         self._inbuf.insert(0, b)
 
     def _read_packet(self, *, timeout: float | None = _DEFAULT_TIMEOUT) -> bytes:
@@ -260,6 +283,11 @@ class RspClient:
             if b == 0x23:  # '#'
                 break
             body.append(b)
+            if len(body) > self._MAX_PACKET:
+                raise RspError(
+                    f"packet body exceeded {self._MAX_PACKET} bytes with no "
+                    "'#' terminator — malformed/oversized stub reply"
+                )
 
         cs_hex = bytes([self._read_byte(timeout=timeout), self._read_byte(timeout=timeout)])
         try:
@@ -352,7 +380,12 @@ class RspClient:
         """
         ids: list[str] = []
         first = self._exchange(b"qfThreadInfo")
-        while first and first != b"l":
+        # A guest has a bounded vCPU count; cap the continuation rounds so a
+        # stub that keeps answering 'm...' without the terminating 'l' can't spin
+        # the daemon thread forever.
+        for _ in range(256):
+            if not first or first == b"l":
+                break
             if not first.startswith(b"m"):
                 # Unexpected reply shape — bail rather than spin.
                 break
@@ -394,26 +427,39 @@ class RspClient:
         128   rip (8B)
         136   eflags (4B)
         140   cs, ss, ds, es, fs, gs (each 4B; 24B total)
-        164   fs_base, gs_base (each 8B)... layout varies
+        164   segment bases (fs_base, gs_base, k_gs_base, ...) — width and
+              count vary by QEMU build; do NOT unpack these by fixed offset
         188   cr0 (8B)
         196   cr2 (8B)
-        204   cr3 (8B)             ← used by ``read_cr3`` shortcut
+        204   cr3 (8B)             ← used by ``read_cr3`` shortcut (empirically
+                                     pinned + plausibility-checked there)
         212   cr4 (8B)
         220   cr8 (8B)
         228   efer (8B)
         236+  FPU + SSE state
         ===== =====================================================
 
-        Treat as raw bytes; use ``struct.unpack_from`` on the offsets
-        you care about. CR3 has a dedicated shortcut.
+        The only offset this codebase relies on is CR3 (204); the segment-base
+        block above it is build-dependent, so treat everything else as opaque.
+        Treat as raw bytes; use ``struct.unpack_from`` on the offsets you care
+        about. CR3 has a dedicated, guarded shortcut (``read_cr3``).
         """
         resp = self._exchange(b"g")
         if resp.startswith(b"E"):
             raise RspError(f"g failed: {resp!r}")
         try:
-            return bytes.fromhex(resp.decode("ascii"))
+            regs = bytes.fromhex(resp.decode("ascii"))
         except ValueError as e:
             raise RspError(f"non-hex g response: {resp!r}") from e
+        if len(regs) < self._MIN_G_PACKET:
+            # Callers (the daemon's silent-cont loop) unpack CR3/rip at fixed
+            # offsets; a truncated block would make struct.unpack_from raise a
+            # bare struct.error past every RspError handler. Reject it here.
+            raise RspError(
+                f"g-packet too short: {len(regs)} bytes "
+                f"(need >= {self._MIN_G_PACKET} for the register block)"
+            )
+        return regs
 
     # Cache the CR3 offset to avoid repeating the struct.unpack overhead
     # on the hot path; verified against QEMU 8.x/9.x x86-64 stub.
@@ -435,11 +481,32 @@ class RspClient:
         # 608-byte payload on every call.
         hex_off = self._CR3_OFFSET * 2
         hex_window = resp[hex_off:hex_off + 16]
+        if len(hex_window) < 16:
+            # Truncated / 32-bit-mode / foreign g-reply: the CR3 window isn't
+            # even present. Fail cleanly instead of decoding <8 bytes and
+            # letting struct.unpack raise a bare struct.error past RspError.
+            raise RspError(
+                f"g-reply too short for CR3 at offset {self._CR3_OFFSET} "
+                f"({len(resp)} hex chars) — wrong register layout for this stub?"
+            )
         try:
             cr3_bytes = bytes.fromhex(hex_window.decode("ascii"))
-        except ValueError as e:
-            raise RspError(f"non-hex CR3 window: {hex_window!r}") from e
-        return struct.unpack("<Q", cr3_bytes)[0]
+            cr3 = struct.unpack("<Q", cr3_bytes)[0]
+        except (ValueError, struct.error) as e:
+            raise RspError(f"bad CR3 window {hex_window!r}: {e}") from e
+        # Plausibility guard: if _CR3_OFFSET is wrong for this QEMU build the
+        # decoded quadword is garbage, and the bp-install path would then walk
+        # page tables through it and patch the wrong (or no) address space
+        # silently. A real CR3 is non-zero, has a non-zero physical frame, and
+        # fits the 52-bit physical cap. (Low 12 bits may carry a PCID, so they
+        # are not required to be zero.)
+        if cr3 == 0 or (cr3 >> 12) == 0 or cr3 >= (1 << 52):
+            raise RspError(
+                f"implausible CR3 0x{cr3:x} from g-packet offset "
+                f"{self._CR3_OFFSET} — register layout may be wrong for this "
+                "QEMU build"
+            )
+        return cr3
 
     # Chunk size for memory I/O — kept comfortably under the smallest
     # PacketSize any historical QEMU build advertises (typically 0x1000
@@ -469,6 +536,14 @@ class RspClient:
         cur = addr
         while remaining > 0:
             n = min(remaining, self._MEM_CHUNK)
+            # Never let one 'm' request cross a page boundary. QEMU fails the
+            # WHOLE request if any byte in it faults, so a chunk straddling a
+            # mapped/unmapped boundary would discard the readable head bytes and
+            # report a shorter partial than was actually available. Clamping to
+            # the current page means only the unmapped page's own request fails,
+            # and `out` carries every mapped byte up to it.
+            to_page_end = 0x1000 - (cur & 0xFFF)
+            n = min(n, to_page_end)
             try:
                 resp = self._exchange(f"m{cur:x},{n:x}".encode("ascii"))
             except RspError as e:
@@ -591,9 +666,17 @@ class RspClient:
 
         ``timeout=None`` blocks forever (used while waiting for a bp
         hit on an idle target). Pass a numeric timeout to bound the wait.
+
+        Skips any ``O`` (target console output) packets QEMU may interleave
+        before the real stop reply, so a stray output notification doesn't
+        surface as an "unexpected stop reply prefix O" error and lose the
+        breakpoint-hit event.
         """
-        resp = self._read_packet(timeout=timeout)
-        return self._parse_stop_reply(resp)
+        while True:
+            resp = self._read_packet(timeout=timeout)
+            if resp[:1] == b"O" and resp != b"OK":
+                continue  # console-output notification — not a stop reply
+            return self._parse_stop_reply(resp)
 
     @staticmethod
     def _parse_stop_reply(body: bytes) -> StopReply:
@@ -601,16 +684,26 @@ class RspClient:
         if not text:
             raise RspError("empty stop reply")
         kind = text[0]
+
+        def _signal(s: str) -> int:
+            # The signal byte is 2 hex digits; a degenerate reply (bare 'S'/'T',
+            # or non-hex bytes) would make int() raise a bare ValueError that
+            # callers catching RspError never see. Wrap it.
+            try:
+                return int(s[1:3], 16)
+            except ValueError as e:
+                raise RspError(f"malformed stop reply {s!r}: {e}") from e
+
         if kind == "S":
-            sig = int(text[1:3], 16)
-            return StopReply(signal=sig, thread=None, stop_kind=None, raw=text)
+            return StopReply(signal=_signal(text), thread=None, stop_kind=None, raw=text)
         if kind != "T":
             # 'W' (process exit), 'X' (signalled), 'O' (output) — we don't
             # expect them from QEMU's gdbstub against a Windows guest, so
-            # surface them rather than silently treat as no-op.
+            # surface them rather than silently treat as no-op. ('O' is skipped
+            # earlier by wait_for_stop; reaching here means it wasn't.)
             raise RspError(f"unexpected stop reply prefix {kind!r}: {text!r}")
 
-        sig = int(text[1:3], 16)
+        sig = _signal(text)
         thread: str | None = None
         stop_kind: str | None = None
         # Body is 'T<ss><k1>:<v1>;<k2>:<v2>;...'

@@ -272,9 +272,22 @@ def test_list_threads_consumes_qf_then_qs_until_l():
 
 
 def test_read_registers_returns_raw_bytes():
-    chunks = [b"+", _frame(b"01020304")]
+    # A valid x86-64 g-packet is >= _MIN_G_PACKET bytes (through the control
+    # registers); use a realistic-length blob.
+    blob = bytes((i * 7) & 0xFF for i in range(240))
+    chunks = [b"+", _frame(blob.hex().encode("ascii"))]
     cli, _ = _client(chunks)
-    assert cli.read_registers() == b"\x01\x02\x03\x04"
+    assert cli.read_registers() == blob
+
+
+def test_read_registers_rejects_a_truncated_g_packet():
+    """A short g-packet must raise RspError, not return a stub the daemon then
+    struct.unpack_from's past its end (bare struct.error escaping RspError)."""
+    from winbox.kdbg.debugger.rsp import RspError
+    chunks = [b"+", _frame(b"01020304")]  # 4 bytes, far below _MIN_G_PACKET
+    cli, _ = _client(chunks)
+    with pytest.raises(RspError, match="too short"):
+        cli.read_registers()
 
 
 # ── stop replies ────────────────────────────────────────────────────────
@@ -297,11 +310,54 @@ def test_parse_stop_reply_rejects_unexpected_prefix():
         RspClient._parse_stop_reply(b"W00")
 
 
+@pytest.mark.parametrize("body", [b"T", b"S", b"Tzz", b"S", b"Tg5"])
+def test_parse_stop_reply_wraps_malformed_signal_as_rsperror(body):
+    """A degenerate/non-hex signal must raise RspError, not a bare ValueError
+    that callers catching RspError never see."""
+    with pytest.raises(RspError, match="malformed stop reply"):
+        RspClient._parse_stop_reply(body)
+
+
 def test_wait_for_stop_returns_parsed_reply():
     cli, _ = _client([_frame(b"T05swbreak:;thread:1;")])
     sr = cli.wait_for_stop(timeout=0.1)
     assert sr.thread == "1"
     assert sr.stop_kind == "swbreak"
+
+
+def test_wait_for_stop_skips_output_packets():
+    """An 'O...' console-output packet before the stop reply must be skipped,
+    not surfaced as an 'unexpected prefix O' error that loses the stop event."""
+    cli, _ = _client([_frame(b"O48656c6c6f"), _frame(b"T05swbreak:;thread:2;")])
+    sr = cli.wait_for_stop(timeout=0.1)
+    assert sr.thread == "2"
+    assert sr.stop_kind == "swbreak"
+
+
+def _g_reply_with_cr3(cr3: int) -> bytes:
+    import struct
+    regs = bytearray(212)
+    regs[204:212] = struct.pack("<Q", cr3)
+    return regs.hex().encode("ascii")
+
+
+def test_read_cr3_decodes_the_offset_204_quadword():
+    cli, _ = _client([_frame(_g_reply_with_cr3(0x1AA000))])
+    assert cli.read_cr3() == 0x1AA000
+
+
+def test_read_cr3_rejects_an_implausible_value():
+    """If the g-packet CR3 offset is wrong the decoded quadword is garbage; a
+    zero / out-of-range value must raise rather than be walked as a CR3."""
+    cli, _ = _client([_frame(_g_reply_with_cr3(0))])
+    with pytest.raises(RspError, match="implausible CR3"):
+        cli.read_cr3()
+
+
+def test_read_cr3_rejects_a_short_g_reply():
+    cli, _ = _client([_frame(b"01020304")])  # far shorter than offset 204
+    with pytest.raises(RspError, match="too short for CR3"):
+        cli.read_cr3()
 
 
 # ── continue / interrupt / step (no response expected) ──────────────────
@@ -348,24 +404,35 @@ def test_handshake_advertises_64kib_packet_size():
 # ── Memory chunking ─────────────────────────────────────────────────────
 
 
-def test_read_memory_chunks_above_chunk_threshold():
-    """Reads larger than _MEM_CHUNK get split across multiple ``m``
-    requests and the bytes are concatenated in order."""
+def test_read_memory_never_crosses_a_page_boundary_in_one_request():
+    """No single 'm' request straddles a page boundary — QEMU fails the whole
+    request if any byte faults, so a straddling chunk would discard the readable
+    bytes of the mapped page before the fault."""
+    addr = 0x2000 - 0x100  # 0x1f00, 0x100 bytes before the page boundary
+    total = 0x120          # 0x100 in the first page + 0x20 in the next
+    first = (b"\xAA" * 0x100).hex().encode("ascii")
+    second = (b"\xBB" * 0x20).hex().encode("ascii")
+    cli, sock = _client([_frame(first), _frame(second)])
+    data = cli.read_memory(addr, total)
+    assert data == b"\xAA" * 0x100 + b"\xBB" * 0x20
+    sent = bytes(sock.sent)
+    assert b"$m1f00,100#" in sent  # first request stops AT the page boundary
+    assert b"$m2000,20#" in sent   # second starts at the boundary
+
+
+def test_read_memory_chunks_a_large_page_aligned_read():
+    """A read larger than _MEM_CHUNK from a page-aligned address is split; the
+    first request is the full _MEM_CHUNK and the bytes concatenate in order."""
     chunk_size = RspClient._MEM_CHUNK  # 0xFF0
-    total = chunk_size + 0x100  # forces exactly two requests
-    # First reply: chunk_size bytes (all 0xAA), second: 0x100 bytes (0xBB).
+    total = chunk_size + 0x8  # first chunk fills to 0x1ff0, tail to 0x1ff8
     first = (b"\xAA" * chunk_size).hex().encode("ascii")
-    second = (b"\xBB" * 0x100).hex().encode("ascii")
+    second = (b"\xBB" * 0x8).hex().encode("ascii")
     cli, sock = _client([_frame(first), _frame(second)])
     data = cli.read_memory(0x1000, total)
-    assert len(data) == total
-    assert data[:chunk_size] == b"\xAA" * chunk_size
-    assert data[chunk_size:] == b"\xBB" * 0x100
+    assert data == b"\xAA" * chunk_size + b"\xBB" * 0x8
     sent = bytes(sock.sent)
-    # First request asks for the full chunk; second asks for the remainder.
     assert f"$m1000,{chunk_size:x}#".encode("ascii") in sent
-    second_addr = 0x1000 + chunk_size
-    assert f"$m{second_addr:x},100#".encode("ascii") in sent
+    assert f"$m1ff0,8#".encode("ascii") in sent
 
 
 def test_read_memory_under_threshold_uses_single_request():

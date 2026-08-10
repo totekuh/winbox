@@ -679,18 +679,22 @@ def kdbg_user_bp(
             cli.cont()
             try:
                 sr = cli.wait_for_stop(timeout=timeout)
+                # select_thread/read_cr3/read_registers are inside the guard too:
+                # a transient RspError on any of them must break the drain so the
+                # bp-removal cleanup after the loop still runs, not abort the whole
+                # command and leave the software breakpoint patched in the guest.
+                cli.select_thread(sr.thread or "01")
+                cr3 = cli.read_cr3()
+                if cr3 != target_dtb:
+                    skipped += 1
+                    continue
+                import struct as _struct
+                regs = cli.read_registers()
+                rip = _struct.unpack_from("<Q", regs, 16 * 8)[0]
             except RspError as e:
-                console.print(f"[yellow][!][/] wait_for_stop: {e}")
+                console.print(f"[yellow][!][/] drain step: {e}")
                 break
-            cli.select_thread(sr.thread or "01")
-            cr3 = cli.read_cr3()
-            if cr3 != target_dtb:
-                skipped += 1
-                continue
             target_hits += 1
-            import struct as _struct
-            regs = cli.read_registers()
-            rip = _struct.unpack_from("<Q", regs, 16 * 8)[0]
             console.print(
                 f"  hit #{target_hits}: vCPU={sr.thread} RIP=0x{rip:x} "
                 f"CR3=0x{cr3:x}  [bold green]<-- IN NOTEPAD[/]"
