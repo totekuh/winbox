@@ -50,7 +50,8 @@ def upload(
 
     console.print(f"[blue][*][/] Staging {basename} on VirtIO-FS...")
     cfg.shared_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src_path, staged)
+    if src_path != staged.resolve():
+        shutil.copy2(src_path, staged)
     size = staged.stat().st_size
 
     if dst is None:

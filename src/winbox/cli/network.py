@@ -123,11 +123,16 @@ def net_connect(ctx: click.Context) -> None:
             raise SystemExit(1)
         # Windows doesn't re-notice the cable by itself; bounce the adapter
         # so the driver re-queries DHCP.
-        ga.exec_powershell(
-            "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
-            "-Confirm:$false",
-            timeout=30,
-        )
+        try:
+            ga.exec_powershell(
+                "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
+                "-Confirm:$false",
+                timeout=30,
+            )
+        except GuestAgentError as e:
+            # Transient virtio-serial hiccup during the adapter bounce — don't
+            # abandon the cycle; the DHCP poll below still reports pending.
+            console.print(f"[yellow][!][/] Could not restart adapter: {e}")
 
     # Full DHCP cycle. Plain /renew on a still-valid lease does a DHCPREQUEST
     # that skips re-adding the default route, so a `net isolate` wouldn't get
@@ -137,7 +142,12 @@ def net_connect(ctx: click.Context) -> None:
         ga.exec("ipconfig /release", timeout=15)
     except GuestAgentError:
         pass  # ok if there's nothing to release
-    ga.exec("ipconfig /renew", timeout=30)
+    try:
+        ga.exec("ipconfig /renew", timeout=30)
+    except GuestAgentError as e:
+        # Transient virtio-serial hiccup during renew — don't escape as a raw
+        # traceback; the DHCP poll below still reports the outcome.
+        console.print(f"[yellow][!][/] DHCP renew did not complete cleanly: {e}")
 
     ip = None
     for _ in range(15):

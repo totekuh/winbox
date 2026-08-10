@@ -48,6 +48,9 @@ def mock_mcp(cfg):
     mcp_mod._cfg = cfg
     mcp_mod._vm = vm
     mcp_mod._ga = ga
+    # State is injected directly, so mark init complete: _get_state now keys
+    # its fast path on _initialized rather than on _cfg being non-None.
+    mcp_mod._initialized = True
 
     original_exec_python = mcp_mod._exec_python
 
@@ -64,6 +67,7 @@ def mock_mcp(cfg):
     mcp_mod._cfg = None
     mcp_mod._vm = None
     mcp_mod._ga = None
+    mcp_mod._initialized = False
 
 
 @pytest.fixture
@@ -1173,6 +1177,7 @@ class TestGetState:
         mcp_mod._cfg = None
         mcp_mod._vm = None
         mcp_mod._ga = None
+        mcp_mod._initialized = False
 
         with patch("winbox.mcp.Config.load") as mock_load, \
              patch("winbox.mcp.VM") as mock_vm_cls, \
@@ -1193,6 +1198,7 @@ class TestGetState:
         mcp_mod._cfg = None
         mcp_mod._vm = None
         mcp_mod._ga = None
+        mcp_mod._initialized = False
 
 
 # ─── pipe_list / pipe_info / pipe_connect tools ─────────────────────────────

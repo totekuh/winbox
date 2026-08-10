@@ -171,15 +171,25 @@ def _show_new_files(loot_dir: Path, since: float) -> None:
         return
 
     jobs_dir = loot_dir / ".jobs"
-    new_files = [
-        f for f in loot_dir.rglob("*")
-        if f.is_file() and f.stat().st_mtime > since
-        and not str(f).startswith(str(jobs_dir))
-    ]
+    new_files = []
+    for f in loot_dir.rglob("*"):
+        if str(f).startswith(str(jobs_dir)):
+            continue
+        try:
+            # The guest may unlink a file (VirtIO-FS loot churn during a
+            # detonation) between rglob yielding it and this stat — skip
+            # vanished files instead of crashing the output display.
+            if f.is_file() and f.stat().st_mtime > since:
+                new_files.append(f)
+        except OSError:
+            continue
 
     if new_files:
         console.print()
         console.print("[green][+][/] Output files:")
         for f in new_files:
-            size = human_size(f.stat().st_size)
+            try:
+                size = human_size(f.stat().st_size)
+            except OSError:
+                continue
             console.print(f"    {f} ({size})")

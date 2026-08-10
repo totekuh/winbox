@@ -42,6 +42,10 @@ def office(cfg: Config, vm: VM, ga: GuestAgent) -> None:
                     ["wget", "-q", "-O", str(odt_path), ODT_URL],
                     check=True,
                 )
+            except FileNotFoundError:
+                raise click.ClickException(
+                    "wget is required to download ODT setup.exe. Install wget and retry."
+                )
             except subprocess.CalledProcessError:
                 raise click.ClickException("Failed to download ODT setup.exe")
         console.print("[green][+][/] ODT ready")

@@ -37,6 +37,11 @@ import threading as _threading
 _cfg: Config | None = None
 _vm: VM | None = None
 _ga: GuestAgent | None = None
+# Set last, inside the lock, once all three globals are published. The
+# fast-path guard keys on this flag rather than on _cfg so a thread that is
+# preempted mid-init can never expose a half-built state (_cfg set but _vm/_ga
+# still None) to a racing reader.
+_initialized = False
 # Guards the lazy init so two concurrent first-calls don't both build
 # a Config / VM / GuestAgent. FastMCP can dispatch concurrent tool calls;
 # while construction is idempotent today, the pattern is fragile.
@@ -44,14 +49,18 @@ _state_lock = _threading.Lock()
 
 
 def _get_state() -> tuple[Config, VM, GuestAgent]:
-    global _cfg, _vm, _ga
-    if _cfg is None:
+    global _cfg, _vm, _ga, _initialized
+    if not _initialized:
         with _state_lock:
             # Re-check inside the lock; another thread may have raced us here.
-            if _cfg is None:
-                _cfg = Config.load()
-                _vm = VM(_cfg)
-                _ga = GuestAgent(_cfg)
+            if not _initialized:
+                cfg = Config.load()
+                vm = VM(cfg)
+                ga = GuestAgent(cfg)
+                _cfg, _vm, _ga = cfg, vm, ga
+                # Publish the flag last: a racing reader on the fast path only
+                # skips the lock once all three globals are in place.
+                _initialized = True
     return _cfg, _vm, _ga
 
 
@@ -1784,7 +1793,9 @@ def do_read(cmd):
             }
         time.sleep(0.02)
 
-    want = min(size, avail.value)
+    # Clamp defensively: a negative size would make create_string_buffer raise
+    # ValueError and (before the dispatch guard below) kill the broker.
+    want = max(0, min(size, avail.value))
     buf = ctypes.create_string_buffer(want)
     nread = wintypes.DWORD(0)
     ok = kernel32.ReadFile(handle, buf, want, ctypes.byref(nread), None)
@@ -1821,34 +1832,41 @@ while True:
     action = cmd.get('cmd')
     closing = False
 
-    if action == 'write':
-        # Guard the decode: the host validates hex before sending, but a bad
-        # payload from any future path must not crash the broker (which would
-        # silently wedge the session for every later command).
-        try:
-            data = bytes.fromhex(cmd['data_hex'])
-        except (ValueError, KeyError, TypeError) as e:
-            result = {'ok': False, 'error': 'bad write payload: %s' % e}
-        else:
-            buf  = ctypes.create_string_buffer(data)
-            written = wintypes.DWORD(0)
-            ok = kernel32.WriteFile(handle, buf, len(data), ctypes.byref(written), None)
-            if ok:
-                result = {'ok': True, 'written': written.value}
+    # Any exception raised while dispatching a command must become an error
+    # result, never escape the loop -- an uncaught exception kills the broker
+    # process and silently wedges the session for every later command (no
+    # result file is ever written, so the host just times out).
+    try:
+        if action == 'write':
+            # Guard the decode: the host validates hex before sending, but a bad
+            # payload from any future path must not crash the broker (which would
+            # silently wedge the session for every later command).
+            try:
+                data = bytes.fromhex(cmd['data_hex'])
+            except (ValueError, KeyError, TypeError) as e:
+                result = {'ok': False, 'error': 'bad write payload: %s' % e}
             else:
-                err = ctypes.get_last_error()
-                result = {'ok': False, 'error': 'WriteFile failed: error %d' % err}
+                buf  = ctypes.create_string_buffer(data)
+                written = wintypes.DWORD(0)
+                ok = kernel32.WriteFile(handle, buf, len(data), ctypes.byref(written), None)
+                if ok:
+                    result = {'ok': True, 'written': written.value}
+                else:
+                    err = ctypes.get_last_error()
+                    result = {'ok': False, 'error': 'WriteFile failed: error %d' % err}
 
-    elif action == 'read':
-        result = do_read(cmd)
+        elif action == 'read':
+            result = do_read(cmd)
 
-    elif action == 'close':
-        kernel32.CloseHandle(handle)
-        result = {'ok': True}
-        closing = True
+        elif action == 'close':
+            kernel32.CloseHandle(handle)
+            result = {'ok': True}
+            closing = True
 
-    else:
-        result = {'ok': False, 'error': 'unknown command: %s' % action}
+        else:
+            result = {'ok': False, 'error': 'unknown command: %s' % action}
+    except Exception as e:
+        result = {'ok': False, 'error': 'broker dispatch failed: %s' % e}
 
     # Echo the seq into a per-seq result file: a result the host already gave
     # up waiting for can then never be mistaken for the answer to a later call.
@@ -2098,6 +2116,11 @@ def pipe_recv(session_id: str, size: int, timeout: int = 10) -> str:
     session_dir = _session_dir(session_id)
     if not session_dir.exists():
         return f"session not found: {session_id}"
+
+    if size < 0:
+        # A negative size would make the in-guest broker call
+        # create_string_buffer(-1), which raises and kills the broker.
+        return f"error: size must be >= 0, got {size}"
 
     # Give the broker a slightly shorter budget than our own, so a quiet pipe
     # comes back as a clean "no data" answer rather than as a host-side
@@ -3170,9 +3193,12 @@ def kdbg_resume(port: int = 1234) -> str:
     except (OSError, _RspError) as e:
         return f"error: gdbstub connect failed: {e}"
     try:
-        c.handshake()
-        c.query_halt_reason()
-        c.cont()
+        try:
+            c.handshake()
+            c.query_halt_reason()
+            c.cont()
+        except (_RspError, OSError) as e:
+            return f"error: gdbstub resume failed: {e}"
     finally:
         # close() does interrupt+detach which leaves VM running -- but its
         # own docstring warns the sequence can race QEMU and leave the VM
