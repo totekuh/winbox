@@ -232,8 +232,22 @@ def format_log_line(qname: str, qtype: int, client_ip: str,
     Columns: ISO-8601 timestamp, qname, qtype, client IP.
     """
     ts = (when or datetime.now()).strftime("%Y-%m-%dT%H:%M:%S")
-    name = qname if qname else "."
+    name = _sanitize_qname(qname) if qname else "."
     return f"{ts}\t{name}\t{qtype_name(qtype)}\t{client_ip}"
+
+
+def _sanitize_qname(name: str) -> str:
+    """Escape control characters in a guest-controlled DNS name before it goes
+    into the tab-separated log.
+
+    DNS labels may carry arbitrary octets, and ``_decode_name`` passes tab/
+    newline through literally. Unescaped, a malicious A query could embed a
+    newline and forge whole log lines (or a tab and shift columns). Replace
+    anything non-printable — or a literal tab — with a ``\\xNN`` escape."""
+    return "".join(
+        c if (c.isprintable() and c != "\t") else f"\\x{ord(c):02x}"
+        for c in name
+    )
 
 
 def append_log(path: Path, line: str) -> None:
@@ -279,6 +293,17 @@ class SinkholeServer(socketserver.UDPServer):
 
     def __init__(self, bind_ip: str, port: int, sink_ip: str,
                  log_file: Path, *, ttl: int = DEFAULT_TTL) -> None:
+        # Validate up front. build_response() does IPv4Address(sink_ip) per A
+        # query outside the handler's try/except, so a non-IPv4 sink_ip (an
+        # IPv6 literal or hostname in cfg.host_ip) would raise on every query
+        # and the sinkhole would silently answer nothing while reporting itself
+        # as serving. Fail at construction instead — start() surfaces it.
+        try:
+            ipaddress.IPv4Address(sink_ip)
+        except ipaddress.AddressValueError as e:
+            raise ValueError(
+                f"sinkhole sink_ip {sink_ip!r} is not a valid IPv4 address: {e}"
+            ) from e
         self.sink_ip = sink_ip
         self.log_file = log_file
         self.ttl = ttl
@@ -372,14 +397,36 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def _is_sinkhole_proc(pid: int) -> bool:
+    """True if ``pid`` looks like our detached ``winbox sinkhole _serve``.
+
+    The pidfile records a bare PID, which Linux recycles freely — a crashed
+    sinkhole's PID can be reassigned to an unrelated process, and signalling it
+    on ``stop`` would kill a bystander. Confirm identity via the process's own
+    command line before we ever signal it. If ``/proc`` can't be read we return
+    False (fail safe: refuse to signal an unverifiable PID rather than risk
+    hitting the wrong process)."""
+    if pid <= 0:
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+    except OSError:
+        return False
+    return "sinkhole" in cmd and "_serve" in cmd
+
+
 def is_running(cfg: Config) -> int | None:
     """Return the live sinkhole PID, or None. Cleans up a stale pidfile."""
     pid = read_pidfile(cfg)
     if pid is None:
         return None
-    if pid_alive(pid):
+    # Alive AND actually our sinkhole — a recycled PID owned by an unrelated
+    # process must read as "not running" (and clean up the stale pidfile), not
+    # as a live sinkhole.
+    if pid_alive(pid) and _is_sinkhole_proc(pid):
         return pid
-    # Stale pidfile from a crashed process — clean it up.
+    # Stale pidfile from a crashed process (or a recycled PID) — clean it up.
     try:
         pidfile_path(cfg).unlink()
     except OSError:
@@ -421,7 +468,9 @@ def stop(cfg: Config, *, timeout: float = 5.0) -> bool:
     pf = pidfile_path(cfg)
     if pid is None:
         return False
-    if not pid_alive(pid):
+    # Only signal a PID we can confirm is actually our sinkhole — a recycled PID
+    # (crashed sinkhole, OS reassigned the number) must not get SIGTERM/SIGKILL.
+    if not pid_alive(pid) or not _is_sinkhole_proc(pid):
         try:
             pf.unlink()
         except OSError:
@@ -467,15 +516,21 @@ def try_bind(bind_ip: str, port: int = DNS_PORT) -> str:
                          CAP_NET_BIND_SERVICE / lowered port floor)
       * ``"error:<detail>"`` -- any other bind failure, verbatim
 
-    The probe socket is closed immediately; the real server rebinds with
-    ``SO_REUSEADDR``, so the momentary gap is harmless. This lets ``start``
-    give an accurate, actionable error instead of pre-judging on euid --
-    if the OS permits an unprivileged :53 bind, the sinkhole just works.
+    The probe socket is closed immediately; the momentary gap is harmless.
+    This lets ``start`` give an accurate, actionable error instead of
+    pre-judging on euid — if the OS permits an unprivileged :53 bind, the
+    sinkhole just works.
+
+    The probe deliberately does **not** set ``SO_REUSEADDR``: libvirt's own
+    dnsmasq holds the bridge :53 with it, and a probe that also sets it would
+    co-bind and return "ok" — so ``start`` would launch the sinkhole over
+    dnsmasq, the kernel would keep delivering guest DNS to dnsmasq, and the
+    capture would silently record nothing. Without it the probe hits
+    EADDRINUSE and correctly reports "in_use".
     """
     import errno
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind((bind_ip, port))
     except PermissionError:

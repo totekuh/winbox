@@ -97,6 +97,35 @@ DOMXML_FALLBACK_IFACE = """\
 # ─── ensure_filter_defined ────────────────────────────────────────────────────
 
 
+class TestAllowSubnetValidation:
+    """The F9 fix: the intra-LAN allow rule is the isolation control's whole
+    job, so a subnet/mask that would open the air-gap must be refused before the
+    filter is ever defined — not silently rendered into a permissive filter."""
+
+    def _cfg(self, subnet, mask):
+        from winbox.config import Config
+        cfg = Config()
+        cfg.vm_subnet = subnet
+        cfg.vm_subnet_mask = mask
+        return cfg
+
+    @pytest.mark.parametrize("subnet,mask", [
+        ("0.0.0.0", 0),        # the whole internet
+        ("10.0.0.0", 4),       # absurdly wide
+        ("8.8.8.0", 24),       # public range, not private
+        ("not-an-ip", 24),     # malformed
+    ])
+    def test_rejects_wide_or_public_or_malformed(self, subnet, mask):
+        with patch("winbox.nwfilter.virsh_run") as run:
+            with pytest.raises(RuntimeError, match="refusing to define nwfilter"):
+                nwfilter.ensure_filter_defined(self._cfg(subnet, mask))
+        run.assert_not_called()  # refused before touching libvirt
+
+    def test_accepts_the_default_private_network(self):
+        with patch("winbox.nwfilter.virsh_run", return_value=_proc(0)):
+            nwfilter.ensure_filter_defined(self._cfg("192.168.122.0", 24))
+
+
 class TestEnsureFilterDefined:
     def test_defines_both_filters_ipv4_first(self):
         """The root filter references the ipv4 sub-filter, so sub-filter must
@@ -412,9 +441,20 @@ class TestDetachFilter:
 
 class TestHasFilter:
     def test_true_when_attached(self):
-        with patch("winbox.nwfilter.virsh_run") as mock_virsh:
+        # has_filter now also confirms the referenced filters are actually
+        # defined+enforcing (the detonation gate); mock that check here.
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh, \
+             patch("winbox.nwfilter.filters_enforcing", return_value=True):
             mock_virsh.return_value = _proc(0, stdout=DOMXML_WITH_FILTER)
             assert nwfilter.has_filter("winbox") is True
+
+    def test_false_when_referenced_but_filter_not_enforcing(self):
+        """The F0 fix: a dangling filterref (filter undefined or permissively
+        redefined) must read as NOT isolated, so detonate refuses to run."""
+        with patch("winbox.nwfilter.virsh_run") as mock_virsh, \
+             patch("winbox.nwfilter.filters_enforcing", return_value=False):
+            mock_virsh.return_value = _proc(0, stdout=DOMXML_WITH_FILTER)
+            assert nwfilter.has_filter("winbox") is False
 
     def test_false_when_absent(self):
         with patch("winbox.nwfilter.virsh_run") as mock_virsh:

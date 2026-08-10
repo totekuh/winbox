@@ -107,6 +107,24 @@ class TestDNSCodec:
 # ─── query logging ────────────────────────────────────────────────────────────
 
 
+class TestServerValidation:
+    def test_invalid_sink_ip_raises_at_construction(self, tmp_path):
+        """The F6 fix: a non-IPv4 sink_ip must fail when the server is built,
+        not silently drop every A query (build_response runs outside the
+        handler's try/except)."""
+        with pytest.raises(ValueError, match="not a valid IPv4"):
+            sk.SinkholeServer(
+                "127.0.0.1", 0, "not-an-ip", tmp_path / "q.log",
+            )
+
+    def test_valid_sink_ip_constructs(self, tmp_path):
+        server = sk.SinkholeServer("127.0.0.1", 0, "10.0.0.1", tmp_path / "q.log")
+        try:
+            assert server.sink_ip == "10.0.0.1"
+        finally:
+            server.server_close()
+
+
 class TestQueryLog:
     def test_log_line_is_greppable(self):
         from datetime import datetime
@@ -127,6 +145,15 @@ class TestQueryLog:
     def test_aaaa_qtype_renders_in_log(self):
         line = sk.format_log_line("x.test", sk.QTYPE_AAAA, "1.2.3.4")
         assert "\tAAAA\t" in line
+
+    def test_control_chars_in_qname_cannot_forge_log_lines(self):
+        """The F7 fix: a guest-controlled qname with an embedded newline/tab
+        must be escaped so it stays a single, correctly-columned log line."""
+        evil = "evil\n2026-01-01T00:00:00\tforged.example\tA\t10.0.0.1"
+        line = sk.format_log_line(evil, sk.QTYPE_A, "192.168.122.5")
+        assert "\n" not in line          # no injected newline
+        assert line.count("\t") == 3     # exactly the 4 real columns
+        assert "\\x0a" in line and "\\x09" in line  # escaped, not literal
 
 
 # ─── process / pidfile management ──────────────────────────────────────────────
@@ -173,14 +200,35 @@ class TestProcessMgmt:
 
     def test_is_running_reports_live_pid(self, cfg):
         sk.write_pidfile(cfg, os.getpid())
-        assert sk.is_running(cfg) == os.getpid()
+        # is_running now also confirms the PID is actually the sinkhole process.
+        with patch.object(sk, "_is_sinkhole_proc", return_value=True):
+            assert sk.is_running(cfg) == os.getpid()
+
+    def test_is_running_ignores_recycled_non_sinkhole_pid(self, cfg):
+        """The F8 fix: a live PID that isn't our sinkhole (recycled) must read
+        as not-running and clean up the stale pidfile — never be signalled."""
+        sk.write_pidfile(cfg, os.getpid())
+        with patch.object(sk, "_is_sinkhole_proc", return_value=False):
+            assert sk.is_running(cfg) is None
+        assert not sk.pidfile_path(cfg).exists()
 
     def test_stop_signals_and_clears_pidfile(self, cfg):
         sk.write_pidfile(cfg, 5555)
         with patch.object(sk, "pid_alive", side_effect=[True, False]), \
+             patch.object(sk, "_is_sinkhole_proc", return_value=True), \
              patch.object(sk.os, "kill") as mock_kill:
             assert sk.stop(cfg) is True
             mock_kill.assert_called_once()
+        assert not sk.pidfile_path(cfg).exists()
+
+    def test_stop_refuses_to_signal_a_recycled_pid(self, cfg):
+        """A recycled PID (not our sinkhole) must not get SIGTERM/SIGKILL."""
+        sk.write_pidfile(cfg, 5555)
+        with patch.object(sk, "pid_alive", return_value=True), \
+             patch.object(sk, "_is_sinkhole_proc", return_value=False), \
+             patch.object(sk.os, "kill") as mock_kill:
+            assert sk.stop(cfg) is False
+            mock_kill.assert_not_called()
         assert not sk.pidfile_path(cfg).exists()
 
     def test_stop_when_not_running(self, cfg):
@@ -202,6 +250,20 @@ class TestPortInUse:
             s.close()
         # Once freed it should report available.
         assert sk.port_in_use("127.0.0.1", port) is False
+
+    def test_detects_a_reuseaddr_listener_like_dnsmasq(self):
+        """The F1 fix: libvirt's dnsmasq holds :53 with SO_REUSEADDR. The probe
+        must still report in_use — a probe that also set SO_REUSEADDR would
+        co-bind and wrongly report 'ok', launching the sinkhole over dnsmasq."""
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        try:
+            assert sk.try_bind("127.0.0.1", port) == "in_use"
+        finally:
+            s.close()
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────

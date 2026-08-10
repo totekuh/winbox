@@ -151,11 +151,48 @@ def ensure_filter_defined(cfg=None) -> None:
         from winbox.config import Config
         cfg = Config()
 
+    _validate_allow_subnet(cfg.vm_subnet, cfg.vm_subnet_mask)
     _define_one(
         FILTER_IPV4_XML, FILTER_IPV4_NAME,
         render_kwargs={"subnet": cfg.vm_subnet, "mask": cfg.vm_subnet_mask},
     )
     _define_one(FILTER_XML, FILTER_NAME)
+
+
+def _validate_allow_subnet(subnet: str, mask) -> None:
+    """Reject a subnet/mask that would make the 'allow intra-LAN' rule permit
+    the whole internet.
+
+    The IPv4 sub-filter's only accept rule is scoped to ``subnet/mask``; a
+    misconfigured wide value (``0.0.0.0/0``, a public range, a tiny prefix)
+    renders a *syntactically valid* filter that nwfilter-define accepts, so
+    net_isolate would report "enforced" while actually allowing egress. This is
+    the isolation control's whole job, so validate it rather than trust config.
+    """
+    import ipaddress
+
+    try:
+        prefix = int(mask)
+        net = ipaddress.IPv4Network(f"{subnet}/{prefix}", strict=False)
+    except (ValueError, TypeError) as e:
+        raise RuntimeError(
+            f"refusing to define nwfilter: invalid isolation subnet "
+            f"{subnet!r}/{mask!r}: {e}"
+        )
+    # A /8 (16M hosts) is already generous for a libvirt NAT network; anything
+    # wider, or a non-private range, is almost certainly a misconfiguration that
+    # would punch the air-gap wide open.
+    if prefix < 8:
+        raise RuntimeError(
+            f"refusing to define nwfilter: isolation subnet {net} is too wide "
+            f"(/{prefix}) — the intra-LAN allow rule would permit ~the whole "
+            "internet. Set VM_SUBNET/VM_SUBNET_MASK to the libvirt network."
+        )
+    if not net.is_private:
+        raise RuntimeError(
+            f"refusing to define nwfilter: isolation subnet {net} is not a "
+            "private range — the allow rule would permit public egress."
+        )
 
 
 def _dumpxml(vm_name: str) -> ET.Element:
@@ -283,15 +320,46 @@ def detach_filter(
     return True
 
 
-def has_filter(vm_name: str) -> bool:
-    """Return True iff the VM's interface has 'winbox-isolate' attached.
+def filters_enforcing(cfg=None) -> bool:
+    """True iff BOTH winbox nwfilters are defined in libvirt with exactly the
+    rulesets we ship.
 
-    Swallows any XML-parse or virsh error as False so callers (status/UI)
-    don't fault on a missing/unparseable domain.
+    A ``<filterref>`` in the domain XML is only a *name*: libvirt drops egress
+    only if the named filter is actually defined and carries the right rules. A
+    partial ``ensure_filter_defined``, a manual ``nwfilter-undefine``, or a
+    permissive redefinition all leave the reference dangling while the guest is
+    wide open — so the detonation gate must confirm the definitions, not just
+    the reference.
+    """
+    if cfg is None:
+        from winbox.config import Config
+        cfg = Config()
+    ipv4_body = _data.render(
+        FILTER_IPV4_XML, subnet=cfg.vm_subnet, mask=cfg.vm_subnet_mask
+    )
+    root_body = _data.read(FILTER_XML)
+    return (
+        _defined_filter_matches(FILTER_IPV4_NAME, ipv4_body)
+        and _defined_filter_matches(FILTER_NAME, root_body)
+    )
+
+
+def has_filter(vm_name: str, cfg=None) -> bool:
+    """Return True iff the VM is *actually* internet-isolated: the interface
+    references 'winbox-isolate' AND both nwfilters are defined and enforcing the
+    shipped rulesets.
+
+    This is the safety gate ``winbox detonate`` relies on, so it is deliberately
+    strict — a dangling reference to an undefined/permissive filter reads as
+    NOT isolated (a false "yes" here runs malware on a live network; a false
+    "no" only refuses to detonate). Swallows any XML-parse or virsh error as
+    False so callers (status/UI) don't fault on a missing/unparseable domain.
     """
     try:
         domain = _dumpxml(vm_name)
         iface = _find_iface(domain)
     except (RuntimeError, ET.ParseError):
         return False
-    return bool(_matching_filterrefs(iface))
+    if not _matching_filterrefs(iface):
+        return False
+    return filters_enforcing(cfg)

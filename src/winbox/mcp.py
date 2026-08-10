@@ -1284,15 +1284,31 @@ def net_isolate() -> str:
     try:
         nwfilter.ensure_filter_defined(cfg)
         changed = nwfilter.attach_filter(vm.name)
-    except RuntimeError as e:
+    except Exception as e:
+        # Not just RuntimeError: attach_filter -> _dumpxml -> ET.fromstring can
+        # raise ET.ParseError on malformed virsh output, which would otherwise
+        # escape as an unhandled traceback instead of a clean tool error.
         return f"Failed to attach nwfilter: {e}"
 
+    # If the NIC link is down (e.g. after net_unplug's full air-gap), the filter
+    # alone does nothing until traffic can flow. Bring it up so filtered access
+    # works — but that WEAKENS a full air-gap to filter-only, so say so instead
+    # of silently downgrading, and honor net_set_link's result.
+    downgrade_note = ""
     if vm.net_link_state() == "down":
-        vm.net_set_link("up")
+        if not vm.net_set_link("up"):
+            return (
+                "nwfilter attached, but failed to bring the NIC link up "
+                "(no interface found?) — internet-isolation is not yet active."
+            )
+        downgrade_note = (
+            " (note: the NIC was unplugged/air-gapped; brought the link up for "
+            "filtered access — Kali<->VM is reachable again, internet stays blocked)"
+        )
 
     if changed:
-        return "Internet isolated — nwfilter enforced at host bridge"
-    return "Already isolated — nwfilter already attached"
+        return "Internet isolated — nwfilter enforced at host bridge" + downgrade_note
+    return "Already isolated — nwfilter already attached" + downgrade_note
 
 
 @mcp.tool()
@@ -1326,38 +1342,49 @@ def net_connect() -> str:
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
 
-    # Detach is best-effort -- a libvirt error here is rare but if it
-    # happens silently the user thinks they're un-isolated when they're
-    # not. Capture the error and surface it in the return string so the
-    # agent sees it.
-    detach_warning: str | None = None
+    # A failed detach means the winbox-isolate filter is STILL attached and the
+    # bridge is STILL dropping egress — the VM is not un-isolated. Reporting
+    # "Network connected" (with a live intra-LAN IP) would read as success, so
+    # fail loudly and stop rather than bury it in a suffix.
     try:
         nwfilter.detach_filter(vm.name)
     except Exception as e:
-        detach_warning = f"detach_filter failed: {e}"
+        return (
+            f"error: nwfilter detach FAILED — the VM is STILL internet-isolated: "
+            f"{e}. Retry, or inspect the domain XML / `virsh nwfilter-list`."
+        )
 
     if vm.net_link_state() == "down":
         if not vm.net_set_link("up"):
             return "Failed to set link up (no interface found?)"
-        ga.exec_powershell(
-            "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
-            "-Confirm:$false",
-            timeout=30,
-        )
+        # Best-effort: the DHCP poll below is the real readiness signal.
+        try:
+            ga.exec_powershell(
+                "Restart-NetAdapter -Name (Get-NetAdapter | Select -First 1).Name "
+                "-Confirm:$false",
+                timeout=30,
+            )
+        except GuestAgentError:
+            pass
 
+    # Both DHCP steps are best-effort — the filter is already detached and the
+    # link is up, so a guest-agent hiccup here must not error the whole tool
+    # (the vm.ip() poll below reflects the true outcome).
     try:
         ga.exec("ipconfig /release", timeout=15)
     except GuestAgentError:
         pass
-    ga.exec("ipconfig /renew", timeout=30)
+    try:
+        ga.exec("ipconfig /renew", timeout=30)
+    except GuestAgentError:
+        pass
 
-    suffix = f" (warning: {detach_warning})" if detach_warning else ""
     for _ in range(15):
         ip = vm.ip()
         if ip:
-            return f"Network connected — IP: {ip}{suffix}"
+            return f"Network connected — IP: {ip}"
         time.sleep(1)
-    return f"Network connected (DHCP pending){suffix}"
+    return "Network connected (DHCP pending)"
 
 
 # ─── Tool 10: pipe_list / pipe_info / pipe_connect ──────────────────────────
