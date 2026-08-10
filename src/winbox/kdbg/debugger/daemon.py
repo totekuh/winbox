@@ -334,14 +334,17 @@ class DaemonSession:
         original_cr3 = struct.unpack_from("<Q", regs, _CR3_OFFSET_IN_G)[0]
         target_dtb = cr3
 
-        # Swap in target_dtb.
-        mod = bytearray(regs)
-        struct.pack_into("<Q", mod, _CR3_OFFSET_IN_G, target_dtb)
-        resp = self.rsp._exchange(b"G" + bytes(mod).hex().encode("ascii"))
-        if resp != b"OK":
-            raise RuntimeError(f"G-packet (CR3 swap) rejected: {resp!r}")
-
+        # Swap in target_dtb INSIDE the try so the finally always attempts
+        # a restore. If the swap _exchange writes the G-packet (CR3 applied
+        # in QEMU) but then the reply read fails, we must still put the
+        # original CR3 back — otherwise the vCPU resumes kernel code under
+        # target's page tables and BSODs. Mirrors _read_target_bytes.
         try:
+            mod = bytearray(regs)
+            struct.pack_into("<Q", mod, _CR3_OFFSET_IN_G, target_dtb)
+            resp = self.rsp._exchange(b"G" + bytes(mod).hex().encode("ascii"))
+            if resp != b"OK":
+                raise RuntimeError(f"G-packet (CR3 swap) rejected: {resp!r}")
             yield
         finally:
             restore = bytearray(regs)
@@ -501,6 +504,11 @@ class DaemonSession:
                         user_va=va,
                     )
                     elapsed_ms = report.elapsed * 1000.0
+                    # install_user_breakpoint issues its own Hg (threads[0])
+                    # via code we don't own — invalidate the cache so the
+                    # next op_cont re-selects rather than trusting a stale
+                    # _last_selected_vcpu.
+                    self._last_selected_vcpu = None
                 else:
                     self.rsp.insert_breakpoint(va, kind=1)
                     elapsed_ms = (time.monotonic() - t0) * 1000.0
@@ -554,14 +562,50 @@ class DaemonSession:
             ]
         }
 
+    def _remove_bp_via_stub(self, bp: Breakpoint) -> None:
+        """Send the z-packet that clears ``bp`` from the gdbstub.
+
+        Route by how the bp was installed:
+
+        * User-mode *software* bp — was patched into target's physical
+          page under a CR3 masquerade (``install_user_breakpoint``). QEMU's
+          z0 removal re-translates ``bp.va`` through the *currently
+          selected* vCPU's CR3, which after a kernel-side stop is NOT
+          target's. Without re-masquerading, QEMU restores the saved byte
+          in the wrong address space and leaves target's 0xCC in place — an
+          INT3 with no debugger attached once the guest resumes. Remove
+          under the same masquerade dance (and candidate retry) used to
+          install.
+        * Kernel-mode software bp — kernel pages are present in every CR3,
+          so a plain z0 translates correctly regardless of current CR3.
+        * Hardware bp — z1 clears a DR match; no VA translation happens,
+          so no masquerade is needed.
+
+        Raises ``RspError`` (removal rejected under every candidate CR3)
+        or ``CR3RestoreError`` (restore failed, session poisoned) — same
+        contract as the memory-op masquerade path.
+        """
+        if bp.user_mode and not bp.hw:
+            vcpu = self._pick_vcpu()
+            self._select_thread(vcpu)
+            regs = self.rsp.read_registers()
+            self._cr3_masqueraded_call(
+                vcpu, regs,
+                lambda: self.rsp.remove_breakpoint(bp.va, kind=1, hardware=False),
+            )
+        else:
+            self.rsp.remove_breakpoint(bp.va, kind=1, hardware=bp.hw)
+
     def op_bp_remove(self, id: int) -> dict[str, Any]:  # noqa: A002 — wire name
         bp = self.bps.get(id)
         if bp is None:
             raise ValueError(f"no bp with id {id}")
         try:
-            # Route to the right packet (z0 vs z1) based on how it
-            # was installed. Mismatching is a no-op or error in QEMU.
-            self.rsp.remove_breakpoint(bp.va, kind=1, hardware=bp.hw)
+            # Route to the right packet (z0 vs z1) based on how it was
+            # installed; user-mode soft bps re-enter the CR3 masquerade so
+            # QEMU clears the byte in target's address space, not the
+            # current vCPU's. Mismatching is a no-op or error in QEMU.
+            self._remove_bp_via_stub(bp)
         except RspError as e:
             # Don't drop from registry on failure. If the z-packet
             # didn't actually clear the bp in QEMU, untracking it
@@ -658,8 +702,7 @@ class DaemonSession:
             # an entire round-trip per fire.
             firing_vcpu = sr.thread or "01"
             if self._last_selected_vcpu != firing_vcpu:
-                self.rsp.select_thread(firing_vcpu)
-                self._last_selected_vcpu = firing_vcpu
+                self._select_thread(firing_vcpu)
             regs = self.rsp.read_registers()
             cr3 = struct.unpack_from("<Q", regs, _CR3_OFFSET_IN_G)[0]
             rip = struct.unpack_from("<Q", regs, 128)[0]
@@ -736,7 +779,7 @@ class DaemonSession:
                 "step did not complete within 5s and recovery halt failed; "
                 "stub state is indeterminate, daemon may need restart"
             ) from e
-        self.rsp.select_thread(sr.thread or vcpu)
+        self._select_thread(sr.thread or vcpu)
         self._capture_stop(sr)
         return {"reason": "step", **self._stop_summary()}
 
@@ -793,6 +836,21 @@ class DaemonSession:
             raise RuntimeError("no vCPUs returned by gdbstub")
         return threads[0]
 
+    def _select_thread(self, vcpu: str) -> None:
+        """Select ``vcpu`` for Hg and keep ``_last_selected_vcpu`` in sync.
+
+        The cont hot path (``op_cont``) skips a redundant ``select_thread``
+        when the firing vCPU already matches this cache. That is only safe
+        if the cache is the single source of truth for the stub's current
+        Hg selection — so EVERY select must route through here (op_step,
+        op_mem, op_write_mem, _capture_stop*, bp_remove), or op_cont would
+        read the wrong vCPU's g-packet on an SMP guest. Selection made by
+        code we don't own (install_user_breakpoint) invalidates the cache
+        to None at its call site instead.
+        """
+        self.rsp.select_thread(vcpu)
+        self._last_selected_vcpu = vcpu
+
     def op_mem(self, va: int | str, length: int = 64) -> dict[str, Any]:
         """Read `length` bytes at `va` in target's CR3. Uses the same
         CR3-masquerade trick as bp install: temporarily writes target
@@ -807,7 +865,7 @@ class DaemonSession:
         # Pick the firing vCPU (or fall back to threads[0] pre-stop)
         # and snapshot its CR3 via the masquerade context.
         vcpu = self._pick_vcpu()
-        self.rsp.select_thread(vcpu)
+        self._select_thread(vcpu)
         regs = self.rsp.read_registers()
 
         data = self._cr3_masqueraded_call(
@@ -841,7 +899,7 @@ class DaemonSession:
             raise RuntimeError(f"write capped at 64 KiB; got {len(payload)} bytes")
 
         vcpu = self._pick_vcpu()
-        self.rsp.select_thread(vcpu)
+        self._select_thread(vcpu)
         regs = self.rsp.read_registers()
 
         # gdb ``M addr,len:hex`` writes payload bytes at addr.
@@ -925,7 +983,7 @@ class DaemonSession:
 
     def _capture_stop(self, sr) -> None:
         vcpu = sr.thread or "01"
-        self.rsp.select_thread(vcpu)
+        self._select_thread(vcpu)
         regs = self.rsp.read_registers()
         self._capture_stop_with_regs(sr, regs, vcpu=vcpu)
 
@@ -937,7 +995,7 @@ class DaemonSession:
         """
         if vcpu is None:
             vcpu = sr.thread or "01"
-            self.rsp.select_thread(vcpu)
+            self._select_thread(vcpu)
         self.stop = StopState(
             vcpu=vcpu,
             rip=struct.unpack_from("<Q", regs, 16 * 8)[0],
@@ -1291,8 +1349,13 @@ class DaemonSession:
         # and leaks DR0..3 across the detach.
         if not self._cr3_corrupted:
             for bp in list(self.bps.values()):
+                # User-mode soft bps must be cleared under the CR3
+                # masquerade (see _remove_bp_via_stub) or their 0xCC is
+                # left in target's page. suppress() still swallows a plain
+                # removal failure, but a masquerade restore failure sets
+                # _cr3_corrupted, which correctly gates off the cont below.
                 with suppress(Exception):
-                    self.rsp.remove_breakpoint(bp.va, kind=1, hardware=bp.hw)
+                    self._remove_bp_via_stub(bp)
         self.bps.clear()
 
         # Send cont to resume the VM, give QEMU time to process it,

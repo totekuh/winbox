@@ -49,6 +49,16 @@ def test_decode_rejects_invalid_utf8():
         decode(b"\xff\xfe garbage")
 
 
+def test_decode_rejects_deeply_nested_json():
+    # Deeply-nested (but sub-MAX_LINE_BYTES) JSON overflows the parser's
+    # recursion limit; RecursionError must be contained as ProtocolError,
+    # not escape and crash the daemon serve loop.
+    depth = 200_000
+    line = (b"[" * depth) + (b"]" * depth)
+    with pytest.raises(ProtocolError, match="bad JSON"):
+        decode(line)
+
+
 # ── request builder validates op ────────────────────────────────────────
 
 

@@ -48,30 +48,46 @@ def read_pdb_ref(pe_path: Path) -> PdbRef:
     """Parse the PE debug directory and return the CodeView reference.
 
     Raises ``PeError`` if the PE has no RSDS debug entry — modern Microsoft
-    kernel binaries always do, third-party drivers may not.
+    kernel binaries always do, third-party drivers may not — or if the file
+    is not a parseable PE at all. The input may be a binary copied out of a
+    possibly-hostile guest, so a malformed/truncated file must surface as the
+    documented ``PeError``, not a bare ``pefile.PEFormatError`` that escapes
+    every caller's ``except PeError``.
     """
-    pe = pefile.PE(str(pe_path), fast_load=True)
-    pe.parse_data_directories(
-        directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DEBUG"]]
-    )
+    try:
+        pe = pefile.PE(str(pe_path), fast_load=True)
+    except pefile.PEFormatError as e:
+        raise PeError(f"{pe_path.name} is not a valid PE: {e}") from e
 
-    debug_entries = getattr(pe, "DIRECTORY_ENTRY_DEBUG", None) or []
-    for entry in debug_entries:
-        if entry.struct.Type != IMAGE_DEBUG_TYPE_CODEVIEW:
-            continue
-        cv = entry.entry
-        if cv is None:
-            continue
-        if getattr(cv, "CvSignature", None) != b"RSDS":
-            continue
-        build_key = getattr(cv, "Signature_String", None)
-        if not build_key:
-            continue
-        return PdbRef(
-            pdb_name=_decode_pdb_name(cv.PdbFileName),
-            build_key=build_key,
-            size_of_image=int(pe.OPTIONAL_HEADER.SizeOfImage),
+    try:
+        pe.parse_data_directories(
+            directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DEBUG"]]
         )
+
+        debug_entries = getattr(pe, "DIRECTORY_ENTRY_DEBUG", None) or []
+        for entry in debug_entries:
+            if entry.struct.Type != IMAGE_DEBUG_TYPE_CODEVIEW:
+                continue
+            cv = entry.entry
+            if cv is None:
+                continue
+            if getattr(cv, "CvSignature", None) != b"RSDS":
+                continue
+            build_key = getattr(cv, "Signature_String", None)
+            if not build_key:
+                continue
+            return PdbRef(
+                pdb_name=_decode_pdb_name(cv.PdbFileName),
+                build_key=build_key,
+                size_of_image=int(pe.OPTIONAL_HEADER.SizeOfImage),
+            )
+    except (pefile.PEFormatError, AttributeError, IndexError) as e:
+        # AttributeError/IndexError: a truncated PE that pefile accepts but
+        # whose OPTIONAL_HEADER / debug structures are missing or short.
+        raise PeError(f"{pe_path.name} has malformed PE debug data: {e}") from e
+    finally:
+        with suppress(Exception):
+            pe.close()
 
     raise PeError(
         f"{pe_path.name} has no CodeView (RSDS) debug entry — "

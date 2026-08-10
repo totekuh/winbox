@@ -106,6 +106,19 @@ def test_session_alive_true_when_someone_holds_lock(tmp_path, monkeypatch):
         os.close(fd)
 
 
+def test_call_negative_sock_timeout_raises_client_error(tmp_path, monkeypatch):
+    """A negative sock_timeout (reachable from callers that derive it from a
+    user-supplied op timeout) must surface as a ClientError, not a bare
+    ValueError from socket.settimeout() that escapes the ClientError contract."""
+    cfg = _Cfg(tmp_path)
+    _patch_paths(monkeypatch, cfg)
+    client = DaemonClient(cfg)
+    monkeypatch.setattr(client, "session_alive", lambda: True)
+    with pytest.raises(ClientError) as ei:
+        client.call("status", sock_timeout=-10.0)
+    assert "non-negative" in str(ei.value)
+
+
 class TestClientSurvivesDaemonDeath:
     """Tearing down a session is exactly when the daemon dies mid-request.
 

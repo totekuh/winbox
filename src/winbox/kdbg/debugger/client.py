@@ -98,9 +98,16 @@ class DaemonClient:
                 "no kdbg session is attached (run `winbox kdbg attach <pid>`)"
             )
 
+        # A negative socket timeout is reachable from callers that derive
+        # sock_timeout from a user-supplied op timeout (e.g. cont --timeout).
+        # socket.settimeout() would raise a bare ValueError that escapes the
+        # ClientError contract, so reject it here as a clean ClientError.
+        if sock_timeout < 0:
+            raise ClientError(f"socket timeout must be non-negative, got {sock_timeout}")
+
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(sock_timeout)
         try:
+            s.settimeout(sock_timeout)
             try:
                 s.connect(str(self._sock_path))
             except OSError as e:

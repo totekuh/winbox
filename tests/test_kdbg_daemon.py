@@ -435,6 +435,88 @@ def test_bp_remove_routes_to_correct_packet():
     assert rm_calls == [True, False]
 
 
+def _track_masquerade(rsp):
+    """Wire ``rsp`` to record every G-packet CR3 write and the CR3 in
+    effect at each remove_breakpoint call. Returns (cr3_writes,
+    remove_cr3) lists that fill in as ops run."""
+    cr3_writes: list[int] = []
+    remove_cr3: list[int] = []
+    orig_exchange = rsp._exchange
+
+    def tracking_exchange(body, *, timeout=None):
+        if body.startswith(b"G"):
+            blob = bytes.fromhex(body[1:].decode("ascii"))
+            cr3_writes.append(struct.unpack_from("<Q", blob, _CR3_OFFSET)[0])
+        return orig_exchange(body, timeout=timeout)
+
+    rsp._exchange = tracking_exchange
+
+    orig_remove = rsp.remove_breakpoint
+
+    def tracking_remove(addr, *, kind=1, hardware=False):
+        remove_cr3.append(struct.unpack_from("<Q", rsp.regs_blob, _CR3_OFFSET)[0])
+        orig_remove(addr, kind=kind, hardware=hardware)
+
+    rsp.remove_breakpoint = tracking_remove
+    return cr3_writes, remove_cr3
+
+
+def test_bp_remove_user_soft_masquerades_cr3():
+    """A user-mode software bp was patched into target's physical page
+    under a CR3 masquerade; its z0 removal must re-enter the same
+    masquerade so QEMU clears the byte in target's address space, not
+    the current (kernel-side) vCPU's — otherwise target's 0xCC stays."""
+    import time as _t
+    user_va = 0x7ff6e289a760
+    rsp = FakeRsp()  # regs_blob default cr3 = 0x1ae000 (a non-target CR3)
+    target = TargetInfo(pid=4584, dtb=0x4d6bb000, name="notepad.exe")
+    cr3_writes, remove_cr3 = _track_masquerade(rsp)
+
+    session = _make_session(rsp=rsp, target=target)
+    # Simulate a kernel-side stop: the current vCPU CR3 is not target's.
+    session.stop = StopState(
+        vcpu="01", rip=0xfffff80600001000, cr3=0x1ae000, signal=5,
+        raw_regs=_blob(cr3=0x1ae000),
+    )
+    session.bps[0] = Breakpoint(
+        bp_id=0, va=user_va, target="notepad!NPWndProc",
+        user_mode=True, hw=False, installed_at=_t.monotonic(),
+    )
+    session._bp_by_va[user_va] = 0
+
+    reply = session.handle_op("bp_remove", {"id": 0})
+    assert reply["ok"], reply
+    assert session.bps == {}
+    # Swap to target.dtb, then restore original 0x1ae000.
+    assert cr3_writes == [0x4d6bb000, 0x1ae000]
+    # The z0 removal happened while masqueraded as target.dtb.
+    assert remove_cr3 == [0x4d6bb000]
+    assert rsp.bps_removed == [user_va]
+
+
+def test_shutdown_user_soft_bp_removed_under_masquerade():
+    """shutdown's bp sweep must masquerade for user-mode soft bps too,
+    for the same reason op_bp_remove does."""
+    import time as _t
+    user_va = 0x7ff6e289a760
+    rsp = FakeRsp()
+    rsp._sock = MagicMock()
+    target = TargetInfo(pid=4584, dtb=0x4d6bb000, name="notepad.exe")
+    cr3_writes, remove_cr3 = _track_masquerade(rsp)
+
+    session = _make_session(rsp=rsp, target=target)
+    session.bps[0] = Breakpoint(
+        bp_id=0, va=user_va, target="notepad!NPWndProc",
+        user_mode=True, hw=False, installed_at=_t.monotonic(),
+    )
+
+    session.shutdown()
+
+    assert remove_cr3 == [0x4d6bb000]  # removed under target's CR3
+    # swap-in target.dtb then restore initial CR3 present in the writes.
+    assert cr3_writes[0] == 0x4d6bb000
+
+
 def test_bp_list_includes_hw_field():
     rsp = FakeRsp()
     store = FakeStore({"nt!Foo": 0xfffff80608000000, "nt!Bar": 0xfffff80608000100})

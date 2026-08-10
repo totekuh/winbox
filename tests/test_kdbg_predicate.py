@@ -434,6 +434,23 @@ def test_parse_long_decimal_literal_does_not_leak_value_error():
         if not isinstance(e, PredicateSyntaxError):
             pytest.fail(f"raw ValueError leaked: {e!r}")
 
+def test_parse_flat_operator_chain_rejected():
+    """A flat operator chain slips past the paren-depth cap but builds a
+    deep left-leaning AST whose tree-walking eval RecursionErrors at fire
+    time (uncaught by the daemon). Must fail cleanly as a
+    PredicateSyntaxError at parse/install instead."""
+    src = "1" + ("&1" * 3000)
+    with pytest.raises(PredicateSyntaxError):
+        parse(src)
+
+
+def test_parse_flat_chain_under_cap_still_evaluates():
+    """Sanity: a flat chain under the token cap still parses AND evaluates
+    without recursing off the interpreter limit."""
+    ast = parse("1" + ("&1" * 100))
+    assert ast.eval(b"\x00" * 200, lambda a: 0) == 1
+
+
 def test_parse_unicode_digit_rejected_cleanly():
     """Regression: str.isdigit() accepts Unicode digits like ²
     (superscript-2) but int('²', 10) raises bare ValueError, which

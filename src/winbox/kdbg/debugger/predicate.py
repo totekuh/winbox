@@ -265,6 +265,16 @@ def _tokenize(src: str) -> list[tuple]:
 
 _MAX_PAREN_DEPTH = 64
 
+# A flat operator chain (e.g. ``1 & 1 & 1 & ...``) is parsed iteratively
+# by ``_or``/``_and``/``_bitand`` and so slips past ``_MAX_PAREN_DEPTH``,
+# but it still builds a left-leaning AST whose tree-walking ``eval``
+# recurses one frame per operand — enough of them RecursionError at fire
+# time (which the daemon does not catch). Cap the total token count well
+# under the interpreter recursion limit so adversarial-length input fails
+# cleanly at parse/install rather than at eval. The deepest committed
+# valid predicate is ~131 tokens, so this leaves ample headroom.
+_MAX_TOKENS = 500
+
 
 class _Parser:
     def __init__(self, toks: list[tuple]) -> None:
@@ -407,4 +417,8 @@ def parse(src: str):
     if not src.strip():
         raise PredicateSyntaxError("empty predicate")
     toks = _tokenize(src)
+    if len(toks) > _MAX_TOKENS:
+        raise PredicateSyntaxError(
+            f"predicate too long: {len(toks)} tokens (max {_MAX_TOKENS})"
+        )
     return _Parser(toks).parse()

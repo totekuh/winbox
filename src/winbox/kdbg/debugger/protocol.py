@@ -69,7 +69,7 @@ def decode(line: bytes) -> dict[str, Any]:
     """Parse a single line. Strict on shape — top-level must be a dict."""
     try:
         obj = json.loads(line.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as e:
         raise ProtocolError(f"bad JSON: {e}") from e
     if not isinstance(obj, dict):
         raise ProtocolError(f"top-level not an object: {type(obj).__name__}")

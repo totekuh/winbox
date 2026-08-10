@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from winbox.kdbg.pe import PdbRef, PeError, fetch_pdb
+from winbox.kdbg.pe import PdbRef, PeError, fetch_pdb, read_pdb_ref
 
 
 _REF = PdbRef(pdb_name="ntkrnlmp.pdb", build_key="DEADBEEF1", size_of_image=0)
@@ -42,6 +42,21 @@ def _patch_urlopen(monkeypatch, factory):
     """Replace urllib.request.urlopen with one that calls ``factory(req)``."""
     import urllib.request as ur
     monkeypatch.setattr(ur, "urlopen", lambda req, timeout=None: factory(req))
+
+
+def test_read_pdb_ref_malformed_pe_raises_peerror(tmp_path):
+    """A non-PE / truncated file copied from a possibly-hostile guest must
+    surface as PeError (the documented contract), not a bare
+    pefile.PEFormatError that escapes every caller's `except PeError`."""
+    junk = tmp_path / "not_a.pe"
+    junk.write_bytes(b"MZ" + b"\x00" * 8)  # MZ magic but no valid PE body
+    with pytest.raises(PeError):
+        read_pdb_ref(junk)
+
+    empty = tmp_path / "empty.pe"
+    empty.write_bytes(b"")
+    with pytest.raises(PeError):
+        read_pdb_ref(empty)
 
 
 def test_fetch_pdb_streams_into_part_then_renames(tmp_path, monkeypatch):
