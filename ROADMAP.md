@@ -91,6 +91,55 @@ bigger change than the foreground path took. Not yet reproduced;
 audit-derived from the same PID-recycle mechanism `git log` already fixed for
 the foreground path.
 
+The same raw-PID weakness has a second consequence on the *write* side:
+`winbox jobs kill <id>` runs `taskkill /PID <job.pid> /T /F`, so a job that
+finished and had its PID recycled onto an unrelated guest process gets that
+innocent process's whole tree force-killed. Both consequences (wrong output
+read, wrong process killed) are the same missing-identity-token root and want
+the same fix.
+
+### 23. The named-pipe broker is killed by raw PID with no ownership check — recycle → collateral kill
+
+`pipe_open`'s `_abort` and `pipe_close` run `taskkill /F /PID <broker_pid>`
+against the stored broker PID with no verification that the PID still belongs
+to the broker. A broker that crashes right after spawn and has its Windows PID
+recycled onto an unrelated process gets that process force-killed instead. This
+is the pipe-subsystem twin of item 22's kill side (same PID-recycle root). The
+broker now self-writes its `broker.pid` at startup (2026-08-10), which fixed
+the *unkillable-leak* half — the host can always find the PID — but not this
+*wrong-PID-kill* half, which needs an identity token (e.g. verify the target is
+the `python.exe` we launched, or tag the broker and check the tag before
+killing). PLAUSIBLE, audit-derived, not reproduced.
+
+### 24. `pipe_recv` can silently lose bytes when the host times out after the broker already read them
+
+The broker's `do_read` peeks then `ReadFile`s N bytes off the real pipe and
+writes `result.<seq>.json`. If the host-side `_poll_result` deadline passes in
+the window before that file is read (VirtIO-FS write latency under load),
+`pipe_recv` returns "timeout waiting for read result" — but the bytes are
+already gone from the pipe, the result file is orphaned (the no-sweep policy
+leaves it, by design, so a concurrent in-flight call's live result isn't
+deleted), and the next `pipe_recv` uses a fresh seq. The dequeued bytes are
+lost for good and any length-prefixed stream parse desyncs. The broker gets a
+budget `timeout - 1s` shorter than the host to make this rare, but it is not
+eliminated. A real fix needs a two-phase read (peek-and-hold until the host
+ACKs) or a bounded sweep that reclaims a still-unread result for the *same*
+logical read before issuing the next — a broker-protocol change. CONFIRMED,
+audit-derived.
+
+### 25. `JobStore.claim` spawns the guest process before it persists the Job
+
+`claim()` runs `build(job_id)` — which launches the VM-side process via
+`exec_background`/`exec_detached` — and only then calls `_save()`. If `_save()`
+raises (disk full, tmpfile/rename error), the process is already running but
+has no ledger entry, so `winbox jobs list`/`kill` never see it and it holds its
+exec slot / log handles until the VM reboots. Low-probability (needs a disk-
+level `_save` failure). The clean fix is persist-placeholder → spawn → update,
+which also removes the deliberately-accepted flock-held-across-spawn window
+(documented in `claim`'s docstring — a `jobs list` blocks for the spawn
+duration), but it restructures the `claim(build)` API and the `run_command_bg`
+caller, so it is logged rather than rushed. CONFIRMED, audit-derived.
+
 ### 10. Conditional breakpoints fail closed and indistinguishably from a real null
 
 `_mem_qword_reader` (`daemon.py:883-941`) returns `0` both when a VA is

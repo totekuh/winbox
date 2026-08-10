@@ -1508,6 +1508,38 @@ class TestPipeSession:
             f"got {len(taskkill_calls)}: {ga.exec_argv.call_args_list}"
         )
 
+    def test_open_timeout_kills_broker_via_pid_file_when_stdout_pid_missing(self, mock_mcp):
+        """If the spawner's 'pid:' stdout line is lost, _abort must still kill
+        the broker using the broker.pid file the broker writes itself —
+        otherwise a wedged broker leaks a python.exe + pipe instance."""
+        import winbox.mcp as mcp_mod
+        from unittest.mock import patch
+        from winbox.mcp import pipe_open
+        ga, vm, cfg = mock_mcp
+
+        def _fake_exec(code, timeout=300, args=None):
+            # Broker self-writes its pid but never writes status.json → timeout.
+            # stdout carries NO 'pid:' line, so the host parse yields nothing.
+            pipes_dir = cfg.shared_dir / ".mcp" / "pipes"
+            if pipes_dir.exists():
+                for d in pipes_dir.iterdir():
+                    (d / "broker.pid").write_text("9191")
+            return {"exitcode": 0, "stdout": "", "stderr": ""}
+
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
+            result = pipe_open(name="srvsvc", timeout=0)
+
+        assert "timeout" in result
+        taskkill_calls = [
+            c for c in ga.exec_argv.call_args_list
+            if c[0][0] == "taskkill.exe" and "/PID" in c[0][1] and "9191" in c[0][1]
+        ]
+        assert len(taskkill_calls) == 1, (
+            f"expected taskkill of the broker-written PID 9191, got "
+            f"{ga.exec_argv.call_args_list}"
+        )
+
     def test_open_success_does_not_kill_broker(self, mock_mcp):
         """Happy path must not taskkill the broker we just launched."""
         import winbox.mcp as mcp_mod
@@ -1576,6 +1608,24 @@ class TestPipeSession:
 
         result = pipe_send(sid, "ff", timeout=0)
         assert "timeout" in result
+
+    def test_send_invalid_hex_rejected_before_broker(self, mock_mcp):
+        """A malformed payload must fail fast host-side and never reach the
+        broker — an unguarded bytes.fromhex there would crash it and wedge the
+        whole session."""
+        from winbox.mcp import pipe_send
+        _, _, cfg = mock_mcp
+
+        sid = "aabbcc001125"
+        session_dir = _make_session(cfg, sid)
+
+        # Note: bytes.fromhex tolerates inter-byte spaces, so "de ad" is valid;
+        # these are genuinely malformed (odd length / non-hex characters).
+        for bad in ("abc", "xy", "zz"):
+            result = pipe_send(sid, bad)
+            assert "not valid hex" in result
+        # No command file was ever written for the broker to choke on.
+        assert _pending_cmds(session_dir) == []
 
     # ── pipe_recv ──────────────────────────────────────────────────────────────
 

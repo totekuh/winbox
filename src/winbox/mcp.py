@@ -1633,6 +1633,18 @@ import os
 import time
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Record our own PID up front — before the config load and the (possibly
+# blocking) CreateFileW below — so the host can always taskkill this broker on
+# a failure path. Relying on the spawner's stdout 'pid:' line alone leaked a
+# python.exe (and one pipe instance) whenever that line was lost or the broker
+# wedged on CreateFileW before ever writing status 'ready'.
+try:
+    with open(os.path.join(script_dir, 'broker.pid'), 'w') as _pf:
+        _pf.write(str(os.getpid()))
+except OSError:
+    pass
+
 config = json.load(open(os.path.join(script_dir, 'config.json')))
 name = config['name']
 access_str = config.get('access', 'readwrite').lower()
@@ -1783,15 +1795,22 @@ while True:
     closing = False
 
     if action == 'write':
-        data = bytes.fromhex(cmd['data_hex'])
-        buf  = ctypes.create_string_buffer(data)
-        written = wintypes.DWORD(0)
-        ok = kernel32.WriteFile(handle, buf, len(data), ctypes.byref(written), None)
-        if ok:
-            result = {'ok': True, 'written': written.value}
+        # Guard the decode: the host validates hex before sending, but a bad
+        # payload from any future path must not crash the broker (which would
+        # silently wedge the session for every later command).
+        try:
+            data = bytes.fromhex(cmd['data_hex'])
+        except (ValueError, KeyError, TypeError) as e:
+            result = {'ok': False, 'error': 'bad write payload: %s' % e}
         else:
-            err = ctypes.get_last_error()
-            result = {'ok': False, 'error': 'WriteFile failed: error %d' % err}
+            buf  = ctypes.create_string_buffer(data)
+            written = wintypes.DWORD(0)
+            ok = kernel32.WriteFile(handle, buf, len(data), ctypes.byref(written), None)
+            if ok:
+                result = {'ok': True, 'written': written.value}
+            else:
+                err = ctypes.get_last_error()
+                result = {'ok': False, 'error': 'WriteFile failed: error %d' % err}
 
     elif action == 'read':
         result = do_read(cmd)
@@ -1951,7 +1970,9 @@ def pipe_open(name: str, access: str = "readwrite", timeout: int = 10) -> str:
 
     # The broker is already running detached in the VM at this point. Parse
     # its PID so we can kill it on any failure path — otherwise a broken
-    # pipe_open leaves zombie python.exe processes accumulating forever.
+    # pipe_open leaves zombie python.exe processes accumulating forever. The
+    # broker also writes its own broker.pid file at startup (see _BROKER_SCRIPT),
+    # so _abort can recover the PID even when this stdout line is lost.
     broker_pid: int | None = None
     for line in result["stdout"].splitlines():
         line = line.strip()
@@ -1967,10 +1988,18 @@ def pipe_open(name: str, access: str = "readwrite", timeout: int = 10) -> str:
     def _abort(reason: str) -> str:
         """Kill the orphaned broker (if any) and clean up the session dir."""
         import shutil
-        if broker_pid is not None:
+        # Prefer the parsed PID, but fall back to the file the broker wrote
+        # itself — otherwise a lost 'pid:' line left a wedged broker unkillable.
+        pid = broker_pid
+        if pid is None:
+            try:
+                pid = int((session_dir / "broker.pid").read_text().strip())
+            except (OSError, ValueError):
+                pid = None
+        if pid is not None:
             try:
                 _, _, ga = _ensure_vm_ready()
-                ga.exec_argv("taskkill.exe", ["/F", "/PID", str(broker_pid)], timeout=5)
+                ga.exec_argv("taskkill.exe", ["/F", "/PID", str(pid)], timeout=5)
             except Exception:
                 pass  # best-effort — broker may already have exited
         shutil.rmtree(session_dir, ignore_errors=True)
@@ -2008,6 +2037,14 @@ def pipe_send(session_id: str, data_hex: str, timeout: int = 10) -> str:
     session_dir = _session_dir(session_id)
     if not session_dir.exists():
         return f"session not found: {session_id}"
+
+    # Validate hex host-side so a malformed payload fails fast with a clear
+    # message and never reaches the broker — an unguarded bytes.fromhex there
+    # would crash the broker process and wedge the whole session silently.
+    try:
+        bytes.fromhex(data_hex)
+    except (ValueError, TypeError):
+        return f"error: data_hex is not valid hex: {data_hex!r}"
 
     res = _broker_cmd(session_dir, {"cmd": "write", "data_hex": data_hex}, timeout)
     if res is None:
