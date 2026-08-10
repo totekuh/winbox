@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 
 from winbox import data as _data
-from winbox.vm import VM, VMState, GuestAgent, GuestAgentError, virsh_run
+from winbox.vm import VM, GuestAgent, GuestAgentError, virsh_run
 
 if TYPE_CHECKING:
     from winbox.config import Config
@@ -746,7 +746,15 @@ def provision_vm_disk(cfg: Config) -> None:
         # Sanity-check the zip-shaped downloads beyond size > N (the previous
         # check would happily reuse a partial download stuck above the
         # threshold — captive portal interstitial, MITM error page, etc.).
-        for zpath, label in [(openssh_zip, "OpenSSH"), (x64dbg_zip, "x64dbg")]:
+        for zpath, label in [
+            (openssh_zip, "OpenSSH"),
+            (x64dbg_zip, "x64dbg"),
+            # provision.ps1 Expand-Archives this in-guest on client SKUs; a
+            # size-only download gate can pass an HTML captive-portal page, and
+            # without it here the VM silently ends up with no Python (broken
+            # MCP `python` tool + kdbg) while setup still reports success.
+            (python_embed, "Python embeddable zip"),
+        ]:
             if zpath.exists() and not zipfile.is_zipfile(zpath):
                 raise RuntimeError(
                     f"{label} download at {zpath} is not a valid zip "
@@ -873,7 +881,13 @@ def _settle_firstlogon_boot(cfg: "Config", vm: VM, ga: GuestAgent) -> None:
     deadline = time.monotonic() + 600
     ga_stable = 0
     while time.monotonic() < deadline:
-        if vm.state() == VMState.SHUTOFF:
+        # is_off(), not state()==SHUTOFF: state() folds "crashed"/"in shutdown"
+        # onto SHUTOFF, but a crashed guest still holds the qcow2 open. Treating
+        # that as "settled, shut down" made the next vm.start() hit "already
+        # active" and fail 20+ minutes later with a misleading GA-unreachable
+        # error. is_off() stays False for a crash, so the deadline/force_stop
+        # path below recovers it instead.
+        if vm.is_off():
             console.print("[green][+][/] FirstLogon settled (VM shut down)")
             return
         try:
@@ -946,7 +960,9 @@ def boot_for_provisioning(cfg: Config) -> None:
     launched = False
     for _ in range(15):
         time.sleep(2)
-        if vm.state() == VMState.SHUTOFF:
+        # is_off(), not state()==SHUTOFF — a crashed bootstrap boot must not read
+        # as "bootstrap finished and shut down cleanly" (see _settle_firstlogon_boot).
+        if vm.is_off():
             launched = True
             break
         try:

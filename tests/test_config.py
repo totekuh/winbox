@@ -262,6 +262,22 @@ class TestConfigPersist:
         assert reloaded.profile.virtio_subdir == "w11"
         assert reloaded.profile.install_partition_id == 3
 
+    def test_persist_writes_to_config_source_not_overridden_dir(self, tmp_path):
+        """When load() read a config that set WINBOX_DIR, persist must write back
+        to that same file (config_source), not into the overridden winbox_dir —
+        otherwise load() (which always reads the default path) never sees it."""
+        source = tmp_path / "real" / "config"
+        source.parent.mkdir(parents=True)
+        source.write_text("WINBOX_DIR=/mnt/vms\n")
+        data_dir = tmp_path / "mnt" / "vms"
+
+        cfg = Config(winbox_dir=data_dir, config_source=source)
+        cfg.persist("VM_OS", "win11")
+
+        assert "VM_OS=win11" in source.read_text()
+        # Must NOT have written into the overridden data dir.
+        assert not (data_dir / "config").exists()
+
     def test_persist_rewrites_existing_key_in_place(self, tmp_path):
         cfg = Config(winbox_dir=tmp_path / ".winbox")
         cfg.winbox_dir.mkdir(parents=True)

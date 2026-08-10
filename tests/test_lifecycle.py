@@ -188,6 +188,32 @@ class TestIpDiscovery:
         ):
             assert vm.ip() is None
 
+    def test_known_interface_without_a_lease_yet_returns_none_not_other_nic(self, vm):
+        """The target interface is known but has no lease yet, while a second
+        NIC does. Returning the other NIC's address is the wrong-address bug the
+        filtering exists to prevent — must return None so the caller retries."""
+        only_other = (
+            self.MULTI_NIC.split("\n")[0] + "\n"
+            + " vnet1      52:54:00:11:22:33    ipv4         10.9.9.5/24\n"
+        )
+        with (
+            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(only_other)),
+            patch.object(VM, "interface", return_value="vnet0"),
+        ):
+            assert vm.ip() is None
+
+    def test_start_wakes_a_pmsuspended_domain_via_dompmwakeup(self, vm):
+        """state() folds pmsuspended onto SAVED, whose callers route to start();
+        virsh start can't wake an S3 domain, so start() must issue dompmwakeup."""
+        with (
+            patch.object(VM, "_domstate_raw", return_value="pmsuspended"),
+            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()) as run,
+        ):
+            vm.start()
+        assert run.call_args[0][0] == "dompmwakeup"
+        # It must NOT also try `virsh start`, which would just error.
+        assert not any(c[0][0] == "start" for c in run.call_args_list)
+
     def test_virsh_failure_returns_none(self, vm):
         with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(returncode=1)):
             assert vm.ip() is None
@@ -341,7 +367,8 @@ class TestDestroy:
 
     def test_running_vm_is_forced_off_first(self, vm):
         with (
-            patch.object(VM, "state", return_value=VMState.RUNNING),
+            patch.object(VM, "is_off", return_value=False),
+            patch.object(VM, "exists", return_value=True),
             patch.object(VM, "force_stop") as force_stop,
             patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()),
         ):
@@ -350,18 +377,34 @@ class TestDestroy:
 
     def test_shutoff_vm_is_not_force_stopped(self, vm):
         with (
-            patch.object(VM, "state", return_value=VMState.SHUTOFF),
+            patch.object(VM, "is_off", return_value=True),
+            patch.object(VM, "exists", return_value=True),
             patch.object(VM, "force_stop") as force_stop,
             patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()),
         ):
             vm.destroy()
         force_stop.assert_not_called()
 
+    def test_crashed_vm_is_force_stopped_despite_folding_to_shutoff(self, vm):
+        """The F1 fix: a crashed/pmsuspended domain folds to SHUTOFF/SAVED via
+        state() but is still active with the qcow2 open. destroy() must force it
+        off (is_off() is False) before undefine + disk unlink, or it deletes the
+        disk out from under a live QEMU."""
+        with (
+            patch.object(VM, "is_off", return_value=False),
+            patch.object(VM, "exists", return_value=True),
+            patch.object(VM, "force_stop") as force_stop,
+            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()),
+        ):
+            vm.destroy()
+        force_stop.assert_called_once()
+
     def test_undefine_never_uses_remove_all_storage(self, vm):
         """--remove-all-storage would delete the attached install ISOs, which
         are multi-GB downloads shared across rebuilds."""
         with (
-            patch.object(VM, "state", return_value=VMState.SHUTOFF),
+            patch.object(VM, "is_off", return_value=True),
+            patch.object(VM, "exists", return_value=True),
             patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()) as run,
         ):
             vm.destroy()
@@ -378,7 +421,8 @@ class TestDestroy:
             return _proc() if len(args) == 2 else _proc(returncode=1, stderr="unsupported")
 
         with (
-            patch.object(VM, "state", return_value=VMState.SHUTOFF),
+            patch.object(VM, "is_off", return_value=True),
+            patch.object(VM, "exists", return_value=True),
             patch("winbox.vm.lifecycle.virsh_run", side_effect=fake_virsh),
         ):
             vm.destroy()
@@ -388,7 +432,8 @@ class TestDestroy:
 
     def test_raises_with_manual_cleanup_when_every_undefine_fails(self, vm):
         with (
-            patch.object(VM, "state", return_value=VMState.SHUTOFF),
+            patch.object(VM, "is_off", return_value=True),
+            patch.object(VM, "exists", return_value=True),
             patch(
                 "winbox.vm.lifecycle.virsh_run",
                 return_value=_proc(returncode=1, stderr="in use"),
@@ -402,7 +447,8 @@ class TestDestroy:
         vm.cfg.disk_path.write_bytes(b"disk")
 
         with (
-            patch.object(VM, "state", return_value=VMState.SHUTOFF),
+            patch.object(VM, "is_off", return_value=True),
+            patch.object(VM, "exists", return_value=True),
             patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()),
         ):
             vm.destroy()
@@ -411,7 +457,8 @@ class TestDestroy:
 
     def test_missing_disk_is_not_an_error(self, vm):
         with (
-            patch.object(VM, "state", return_value=VMState.SHUTOFF),
+            patch.object(VM, "is_off", return_value=True),
+            patch.object(VM, "exists", return_value=True),
             patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()),
         ):
             vm.destroy()  # must not raise
@@ -421,7 +468,8 @@ class TestDestroy:
         vm.cfg.disk_path.write_bytes(b"disk")
 
         with (
-            patch.object(VM, "state", return_value=VMState.SHUTOFF),
+            patch.object(VM, "is_off", return_value=True),
+            patch.object(VM, "exists", return_value=True),
             patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()),
             patch(
                 "pathlib.Path.unlink",

@@ -113,6 +113,7 @@ def merge_hive(
         reg_file.write_text(reg_body, encoding="utf-8")
 
         guestfish(disk_path, [f"mount {win_part} /", f"download {hive} {local_hive}"])
+        _require_valid_hive(local_hive, "downloaded")
 
         merge = subprocess.run(
             ["hivexregedit", "--merge", "--prefix", prefix,
@@ -123,13 +124,46 @@ def merge_hive(
             raise OfflineRegistryError(
                 f"hivexregedit merge failed: {merge.stderr.strip() or 'unknown error'}"
             )
+        # hivexregedit can exit 0 yet leave a truncated/garbage hive. Overwriting
+        # the guest's only copy of SYSTEM/SOFTWARE with that — and deleting its
+        # transaction logs — BSODs the guest with STATUS_REGISTRY_CORRUPT on
+        # next boot, unrecoverable short of a rebuild. Check before we upload.
+        _require_valid_hive(local_hive, "merged")
 
+        # Swap the hive in atomically: upload to a sidecar name, drop the logs,
+        # then rename over the live hive (rename within the partition is atomic).
+        # A kill at any point leaves the original hive intact — before the mv it
+        # is untouched; the log removal only makes Windows rebuild them from a
+        # consistent hive. The previous "upload straight over the hive, then rm
+        # logs" order could leave a half-written hive with its logs already gone.
+        staging = f"{hive}.winbox-new"
         guestfish(disk_path, [
             f"mount {win_part} /",
-            f"upload {local_hive} {hive}",
+            f"upload {local_hive} {staging}",
             f"rm-f {hive}.LOG1",
             f"rm-f {hive}.LOG2",
+            f"mv {staging} {hive}",
         ])
+
+
+# A Windows registry hive begins with the "regf" magic. A file that doesn't is
+# either not a hive or a corrupt/truncated one — either way, unsafe to write
+# back over the guest's live hive.
+_HIVE_MAGIC = b"regf"
+
+
+def _require_valid_hive(path: Path, stage: str) -> None:
+    """Raise unless ``path`` looks like a real registry hive."""
+    try:
+        header = path.read_bytes()[:4]
+    except OSError as e:
+        raise OfflineRegistryError(f"cannot read {stage} hive {path}: {e}") from e
+    if header != _HIVE_MAGIC:
+        raise OfflineRegistryError(
+            f"{stage} hive {path} is not a valid registry hive "
+            f"(expected {_HIVE_MAGIC!r} magic, got {header!r}) — refusing to "
+            "write it back over the guest's live hive"
+        )
 
 
 def windows_partition(cfg) -> str:

@@ -63,13 +63,30 @@ class TestToolsAvailable:
             assert offlinereg.tools_available() == missing
 
 
+def _simulate_download(script: str, *, contents: bytes = b"regf" + b"\0" * 508) -> None:
+    """Write ``contents`` to the destination of any guestfish `download` line in
+    ``script`` — the mocked guestfish otherwise never creates the local hive that
+    merge_hive now validates before writing it back."""
+    for line in script.splitlines():
+        if line.startswith("download "):
+            Path(line.split()[-1]).write_bytes(contents)
+
+
 class TestMergeHive:
-    def _run_merge(self, monkeypatch, *, merge_rc=0):
+    def _run_merge(self, monkeypatch, *, merge_rc=0, download=b"regf" + b"\0" * 508,
+                   post_merge_writes: bytes | None = None):
         calls = []
 
         def fake_run(cmd, **kw):
             calls.append(cmd)
+            if cmd[0] == "guestfish":
+                _simulate_download(kw.get("input", ""), contents=download)
+                return _proc()
             if cmd[0] == "hivexregedit":
+                # hivexregedit merges the local hive in place; simulate it
+                # optionally rewriting the file (e.g. to a corrupt one).
+                if post_merge_writes is not None and merge_rc == 0:
+                    Path(cmd[-2]).write_bytes(post_merge_writes)
                 return _proc(merge_rc, stderr="merge blew up" if merge_rc else "")
             return _proc()
 
@@ -98,6 +115,7 @@ class TestMergeHive:
         def fake_run(cmd, **kw):
             if cmd[0] == "guestfish":
                 scripts.append(kw["input"])
+                _simulate_download(kw["input"])
             return _proc()
 
         monkeypatch.setattr(offlinereg.shutil, "which", lambda n: "/usr/bin/" + n)
@@ -111,10 +129,50 @@ class TestMergeHive:
         assert f"rm-f {offlinereg.SYSTEM_HIVE}.LOG1" in upload
         assert f"rm-f {offlinereg.SYSTEM_HIVE}.LOG2" in upload
 
+    def test_uploads_via_staging_then_atomic_rename(self, monkeypatch):
+        """The overwrite must be atomic: upload to a sidecar, drop logs, then
+        rename over the live hive — so a killed upload never leaves a half-
+        written hive with its logs already gone."""
+        scripts = []
+
+        def fake_run(cmd, **kw):
+            if cmd[0] == "guestfish":
+                scripts.append(kw["input"])
+                _simulate_download(kw["input"])
+            return _proc()
+
+        monkeypatch.setattr(offlinereg.shutil, "which", lambda n: "/usr/bin/" + n)
+        monkeypatch.setattr(offlinereg.subprocess, "run", fake_run)
+        offlinereg.merge_hive(
+            Path("/d.qcow2"), hive=offlinereg.SYSTEM_HIVE,
+            prefix="HKEY_LOCAL_MACHINE\\SYSTEM", reg_body="x", win_part="/dev/sda3",
+        )
+
+        upload = scripts[-1]
+        staging = f"{offlinereg.SYSTEM_HIVE}.winbox-new"
+        assert f"upload " in upload and staging in upload
+        assert f"mv {staging} {offlinereg.SYSTEM_HIVE}" in upload
+        # The upload targets the staging path, not the live hive directly.
+        assert f"upload " in upload
+        up_line = next(ln for ln in upload.splitlines() if ln.startswith("upload "))
+        assert up_line.endswith(staging)
+
     def test_a_failed_merge_raises_rather_than_uploading(self, monkeypatch):
         """Uploading an unmerged hive would silently do nothing at all."""
         with pytest.raises(OfflineRegistryError, match="merge blew up"):
             self._run_merge(monkeypatch, merge_rc=1)
+
+    def test_corrupt_downloaded_hive_refuses_to_proceed(self, monkeypatch):
+        """A download that isn't a real hive (regf magic) must abort before any
+        merge/upload — never write garbage back over the guest's live hive."""
+        with pytest.raises(OfflineRegistryError, match="not a valid registry hive"):
+            self._run_merge(monkeypatch, download=b"<html>error</html>")
+
+    def test_merge_that_corrupts_the_hive_refuses_to_upload(self, monkeypatch):
+        """hivexregedit can exit 0 yet leave a truncated hive; that must not be
+        uploaded over the live one."""
+        with pytest.raises(OfflineRegistryError, match="not a valid registry hive"):
+            self._run_merge(monkeypatch, post_merge_writes=b"\x00\x00\x00\x00garbage")
 
     def test_missing_tools_raise_before_touching_the_disk(self, monkeypatch):
         monkeypatch.setattr(offlinereg.shutil, "which", lambda n: None)

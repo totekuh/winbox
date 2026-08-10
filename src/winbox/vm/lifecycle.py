@@ -197,7 +197,19 @@ class VM:
         Rather than leak that distinction into every caller, settle it here:
         wait for the shutdown to finish and start once more. If it never
         settles, the domain is genuinely running and the goal is already met.
+
+        A pmsuspended (ACPI-S3) domain is a different animal: state() folds it
+        onto SAVED, whose callers route here, but `virsh start` cannot wake it
+        ("already active") — the correct verb is `dompmwakeup`. Detect it up
+        front and issue that instead, otherwise the "already active" path below
+        burned 120s in wait_shutdown and returned as if the VM were running
+        while the guest stayed asleep and the agent never answered.
         """
+        raw = self._domstate_raw()
+        if raw is not None and "pmsuspended" in raw:
+            virsh_run("dompmwakeup", self.name, check=False)
+            return
+
         result = virsh_run("start", self.name, check=False)
         if result.returncode == 0:
             return
@@ -228,8 +240,14 @@ class VM:
 
     def destroy(self) -> None:
         """Completely remove the VM, snapshots, NVRAM, and disk (but not ISOs)."""
-        # Stop if running
-        if self.state() in (VMState.RUNNING, VMState.PAUSED):
+        # Force-stop anything that isn't *genuinely* off. state() folds
+        # "crashed" onto SHUTOFF and "pmsuspended" onto SAVED, but in both the
+        # QEMU process is still alive with the qcow2 open — so a `state() in
+        # (RUNNING, PAUSED)` check skipped force_stop and then undefine +
+        # unlink'd the disk out from under a live QEMU. is_off() is the precise
+        # "QEMU has released the disk" predicate (False for crashed/pmsuspended/
+        # saved and for a domain we couldn't query), so stop unless it says off.
+        if self.exists() and not self.is_off():
             self.force_stop()
 
         # Undefine without --remove-all-storage (that deletes attached ISOs too)
@@ -297,9 +315,14 @@ class VM:
                             first_seen_ip = ip_addr
                         if target_iface and current_iface == target_iface:
                             return ip_addr
-        # Fall back to the first IPv4 we saw if interface filtering didn't
-        # pin one (single-NIC case, or if we couldn't determine the iface).
-        return first_seen_ip
+        # Fall back to the first IPv4 only when we couldn't determine the target
+        # interface at all (single-NIC case, or domiflist failed). If we DO know
+        # the target interface but it has no lease yet, returning another NIC's
+        # address is exactly the wrong-address bug the filtering exists to
+        # prevent — return None so the caller waits/retries for the real lease.
+        if target_iface is None:
+            return first_seen_ip
+        return None
 
     def interface(self) -> str | None:
         """Get the VM's network interface name (e.g. 'vnet0')."""

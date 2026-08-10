@@ -34,6 +34,10 @@ class Config:
         "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/"
         "stable-virtio/virtio-win.iso"
     )
+    # The config file load() actually read, so persist() can write back to the
+    # same file even when it set WINBOX_DIR (which would otherwise repoint
+    # config_file). None for a directly-constructed Config; set by load().
+    config_source: Path | None = None
 
     @property
     def profile(self) -> OSProfile:
@@ -111,6 +115,9 @@ class Config:
         config_file = cfg.config_file
         if config_file.exists():
             cfg = cls._apply_overrides(cfg, config_file)
+        # Remember the file we actually read so persist() writes back to it, not
+        # to an overridden WINBOX_DIR that load() would never read from.
+        cfg.config_source = config_file
         return cfg
 
     def persist(self, key: str, value: str) -> None:
@@ -125,9 +132,19 @@ class Config:
         Rewrites an existing assignment in place (preserving comments, blank
         lines, and unrelated keys) and appends otherwise, so a hand-edited
         config survives.
+
+        Writes back to the file ``load()`` actually read (``config_source``),
+        not ``self.config_file``. ``load()`` finds the config from a defaults-
+        only Config *before* any ``WINBOX_DIR`` override is known, so it always
+        reads the default ``~/.winbox/config``; a config that set
+        ``WINBOX_DIR=/mnt/vms`` then made ``self.config_file`` point at
+        ``/mnt/vms/config``, so a persisted ``VM_OS`` was written somewhere
+        ``load()`` never looks and silently vanished. A directly-constructed
+        Config (no ``load()``) has no ``config_source`` and falls back to
+        ``self.config_file``.
         """
-        self.winbox_dir.mkdir(parents=True, exist_ok=True)
-        path = self.config_file
+        path = self.config_source or self.config_file
+        path.parent.mkdir(parents=True, exist_ok=True)
         line = f"{key}={value}"
         lines = path.read_text().splitlines() if path.exists() else []
         for i, existing in enumerate(lines):

@@ -557,6 +557,7 @@ class TestBootForProvisioningLaunchProbe:
 
         vm = MagicMock()
         vm.state.return_value = VMState.RUNNING
+        vm.is_off.return_value = False  # VM stays up; the log never appears
         mock_vm_cls.return_value = vm
 
         ga = MagicMock()
@@ -583,6 +584,7 @@ class TestBootForProvisioningLaunchProbe:
 
         vm = MagicMock()
         vm.state.return_value = VMState.RUNNING
+        vm.is_off.return_value = False  # VM up; provisioning detected via the log
         vm.wait_shutdown.return_value = True
         mock_vm_cls.return_value = vm
 
@@ -607,7 +609,8 @@ class TestBootForProvisioningLaunchProbe:
         from winbox.vm.lifecycle import VMState
 
         vm = MagicMock()
-        vm.state.side_effect = [VMState.RUNNING, VMState.SHUTOFF]
+        # Race: the probe's first is_off() check already sees the VM off.
+        vm.is_off.return_value = True
         vm.wait_shutdown.return_value = True
         mock_vm_cls.return_value = vm
 

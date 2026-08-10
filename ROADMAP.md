@@ -140,6 +140,20 @@ which also removes the deliberately-accepted flock-held-across-spawn window
 duration), but it restructures the `claim(build)` API and the `run_command_bg`
 caller, so it is logged rather than rushed. CONFIRMED, audit-derived.
 
+### 27. Offline Defender disable hardcodes ControlSet001 instead of resolving the active control set
+
+`defender._system_services_reg` writes `Services\*\Start` under a literal
+`HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001`. On a freshly-installed guest the
+current control set *is* 001, but if `HKLM\SYSTEM\Select\Current` is 2 (e.g.
+after a Last-Known-Good rollback), the offline edit lands in an inactive
+control set while the operation prints its green success line, and Windows
+boots from ControlSet002 with Defender fully armed — the user believes it is
+off while it quarantines winbox's tools. The correct fix reads `Select\Current`
+out of the SYSTEM hive first (an extra guestfish/hivex read before rendering
+the `.reg`) and targets `ControlSet00<N>`. Deferred because it needs hive
+introspection the current render-static-`.reg` path doesn't do, and the common
+fresh-VM case (ControlSet001) works. PLAUSIBLE, audit-derived (2026-08-10).
+
 ### 26. kdbg read-surface residuals from the 2026-08-10 audit (accepted / minor)
 
 Three findings from the read-surface audit were left as-is, deliberately:
