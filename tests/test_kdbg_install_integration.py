@@ -58,6 +58,14 @@ def _find_notepad(cfg, store):
     return next((p for p in procs if p.name == "notepad.exe"), None)
 
 
+def _cr3_candidates(proc):
+    """Mirror TargetInfo.masquerade_candidates: only retry the second
+    CR3 half when it was actually read off KPROCESS, never guessed."""
+    if proc.user_directory_table_base:
+        return (proc.directory_table_base, proc.user_directory_table_base)
+    return (proc.directory_table_base,)
+
+
 # ── tests ────────────────────────────────────────────────────────────────
 
 
@@ -76,7 +84,7 @@ def test_install_into_notepad_shared_section(cli_conn, cfg, store):
     cli_conn.query_halt_reason()
     report = install_user_breakpoint(
         cli_conn, cfg.vm_name, store,
-        target_dtb=notepad.directory_table_base,
+        cr3_candidates=_cr3_candidates(notepad),
         user_va=nt_close,
     )
     try:
@@ -115,7 +123,7 @@ def test_install_into_notepad_private_text(cli_conn, cfg, store):
     cli_conn.query_halt_reason()
     report = install_user_breakpoint(
         cli_conn, cfg.vm_name, store,
-        target_dtb=notepad.directory_table_base,
+        cr3_candidates=_cr3_candidates(notepad),
         user_va=npwndproc,
     )
     try:
@@ -131,7 +139,7 @@ def test_install_into_notepad_private_text(cli_conn, cfg, store):
         with pytest.raises(InstallError):
             install_user_breakpoint(
                 cli_conn, cfg.vm_name, store,
-                target_dtb=notepad.directory_table_base,
+                cr3_candidates=_cr3_candidates(notepad),
                 user_va=cookie_va,
             )
     finally:

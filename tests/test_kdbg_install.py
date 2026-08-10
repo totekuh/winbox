@@ -1,15 +1,17 @@
 """Unit tests for install_user_breakpoint via CR3-masquerade.
 
-The install primitive's core logic is:
+The install primitive's core logic, per candidate in ``cr3_candidates``:
 1. Read regs (capture original CR3)
-2. Write target_dtb to vCPU's CR3 via G packet
+2. Write the candidate CR3 to vCPU's CR3 via G packet
 3. Verify CR3 was actually updated
-4. Z0 at user_va
+4. Z0 at user_va — success returns; failure restores and tries the
+   next candidate (if any)
 5. Restore original CR3 via G packet (always — finally clause)
 
-These tests use a fake RspClient to verify the protocol-level
-sequence regardless of any live VM. The CR3-masquerade really
-working against QEMU is covered by test_kdbg_install_integration.
+A single-candidate sequence is the pre-KPTI-retry behavior: one
+attempt, no retry. These tests use a fake RspClient to verify the
+protocol-level sequence regardless of any live VM. The CR3-masquerade
+really working against QEMU is covered by test_kdbg_install_integration.
 """
 
 from __future__ import annotations
@@ -45,6 +47,11 @@ class FakeRsp:
         self.selected_thread: str | None = None
         # Internal "vCPU register file" — what reads see, what G writes update.
         self.regs_blob: bytes = _make_blob()
+        # Tracks whichever CR3 the last G write installed — lets Z0
+        # failure injection be conditioned on "which candidate is
+        # currently masqueraded", to simulate a VA mapped under only
+        # one of two KPTI CR3 halves.
+        self.current_cr3: int = 0x1AE000
         # Track Z0/z0 calls
         self.bps_installed: list[int] = []
         self.bps_removed: list[int] = []
@@ -52,6 +59,7 @@ class FakeRsp:
         self.cr3_writes: list[int] = []
         # Hooks for failure injection
         self.fail_z0_at: int | None = None
+        self.fail_z0_under_cr3: set[int] | None = None
         self.fail_g_response: bytes | None = None
 
     def list_threads(self):
@@ -64,9 +72,14 @@ class FakeRsp:
         return self.regs_blob
 
     def insert_breakpoint(self, addr: int, *, kind: int = 1, hardware: bool = False) -> None:
+        from winbox.kdbg.debugger.rsp import RspError
         if self.fail_z0_at is not None and addr == self.fail_z0_at:
-            from winbox.kdbg.debugger.rsp import RspError
             raise RspError(f"Z0 insert at 0x{addr:x} failed: b'E22'")
+        if self.fail_z0_under_cr3 is not None and self.current_cr3 in self.fail_z0_under_cr3:
+            raise RspError(
+                f"Z0 insert at 0x{addr:x} under CR3 0x{self.current_cr3:x} "
+                f"failed: b'E22'"
+            )
         self.bps_installed.append(addr)
 
     def remove_breakpoint(self, addr: int, *, kind: int = 1, hardware: bool = False) -> None:
@@ -80,6 +93,7 @@ class FakeRsp:
             cr3 = struct.unpack_from("<Q", blob, _CR3_OFFSET)[0]
             self.cr3_writes.append(cr3)
             self.regs_blob = blob
+            self.current_cr3 = cr3
             if self.fail_g_response is not None:
                 resp = self.fail_g_response
                 self.fail_g_response = None
@@ -104,7 +118,7 @@ def test_install_writes_target_dtb_then_restores(fake_cli):
 
     report = install_user_breakpoint(
         fake_cli, "vm", store=None,
-        target_dtb=target_dtb,
+        cr3_candidates=(target_dtb,),
         user_va=user_va,
     )
 
@@ -122,7 +136,7 @@ def test_install_writes_target_dtb_then_restores(fake_cli):
 def test_install_selects_first_vcpu(fake_cli):
     install_user_breakpoint(
         fake_cli, "vm", store=None,
-        target_dtb=0x4D6BB000, user_va=0x7FF6E289A760,
+        cr3_candidates=(0x4D6BB000,), user_va=0x7FF6E289A760,
     )
     assert fake_cli.selected_thread == "01"
 
@@ -134,10 +148,10 @@ def test_install_restores_cr3_when_z0_fails(fake_cli):
     """If Z0 errors (cold page → E22), CR3 must still be restored."""
     fake_cli.fail_z0_at = 0xCAFEBABE
 
-    with pytest.raises(InstallError, match="not paged in"):
+    with pytest.raises(InstallError, match="did not map under any tried CR3"):
         install_user_breakpoint(
             fake_cli, "vm", store=None,
-            target_dtb=0x4D6BB000,
+            cr3_candidates=(0x4D6BB000,),
             user_va=0xCAFEBABE,
         )
 
@@ -154,7 +168,7 @@ def test_install_raises_when_g_packet_rejected(fake_cli):
     with pytest.raises(InstallError, match="rejected"):
         install_user_breakpoint(
             fake_cli, "vm", store=None,
-            target_dtb=0x4D6BB000, user_va=0x7FF6E289A760,
+            cr3_candidates=(0x4D6BB000,), user_va=0x7FF6E289A760,
         )
 
     # The failed G doesn't change regs_blob, so verify never tries to install
@@ -167,7 +181,15 @@ def test_install_raises_when_no_threads(fake_cli):
     with pytest.raises(InstallError, match="no threads"):
         install_user_breakpoint(
             fake_cli, "vm", store=None,
-            target_dtb=0x4D6BB000, user_va=0x7FF6E289A760,
+            cr3_candidates=(0x4D6BB000,), user_va=0x7FF6E289A760,
+        )
+
+
+def test_install_raises_when_no_cr3_candidates(fake_cli):
+    with pytest.raises(InstallError, match="no CR3 candidates"):
+        install_user_breakpoint(
+            fake_cli, "vm", store=None,
+            cr3_candidates=(), user_va=0x7FF6E289A760,
         )
 
 
@@ -192,7 +214,7 @@ def test_install_verifies_cr3_actually_changed(monkeypatch):
     with pytest.raises(InstallError, match="didn't take effect"):
         install_user_breakpoint(
             cli, "vm", store=None,
-            target_dtb=0x4D6BB000, user_va=0x7FF6E289A760,
+            cr3_candidates=(0x4D6BB000,), user_va=0x7FF6E289A760,
         )
 
 
@@ -229,9 +251,73 @@ def test_install_restore_failure_raises_install_error():
     with pytest.raises(InstallError, match="poisoned"):
         install_user_breakpoint(
             cli, "vm", store=None,
-            target_dtb=target_dtb, user_va=user_va,
+            cr3_candidates=(target_dtb,), user_va=user_va,
         )
 
     # Two G writes total: swap and restore. Both attempted (the install
     # didn't bail before getting to restore).
     assert g_count["n"] == 2
+
+
+# ── Multi-candidate (KPTI) retry ────────────────────────────────────────
+
+
+def test_install_retries_second_candidate_when_first_cr3_doesnt_map_va(fake_cli):
+    """Primary CR3 fails to map user_va (KPTI half mismatch); the second
+    known candidate does. Install should succeed via the second one
+    instead of failing outright."""
+    primary_dtb = 0x4D6BB000
+    user_dtb = 0x4D6BC000
+    user_va = 0x7FF6E289A760
+    fake_cli.fail_z0_under_cr3 = {primary_dtb}
+
+    report = install_user_breakpoint(
+        fake_cli, "vm", store=None,
+        cr3_candidates=(primary_dtb, user_dtb),
+        user_va=user_va,
+    )
+
+    assert report.target_dtb == user_dtb
+    assert report.user_va == user_va
+    assert fake_cli.bps_installed == [user_va]
+    # Four G writes: swap-primary, restore-orig (primary attempt failed),
+    # swap-second, restore-orig (final cleanup).
+    assert fake_cli.cr3_writes == [primary_dtb, 0x1AE000, user_dtb, 0x1AE000]
+
+
+def test_install_no_retry_with_single_candidate_matches_old_behavior(fake_cli):
+    """A single-element cr3_candidates behaves exactly like the old
+    single-target_dtb signature: one swap, one restore, no fallback."""
+    dtb = 0x4D6BB000
+    user_va = 0x7FF6E289A760
+
+    install_user_breakpoint(
+        fake_cli, "vm", store=None,
+        cr3_candidates=(dtb,), user_va=user_va,
+    )
+
+    assert fake_cli.cr3_writes == [dtb, 0x1AE000]
+
+
+def test_install_raises_naming_all_tried_cr3s_when_none_map_va(fake_cli):
+    """When every candidate fails Z0, the error must name every CR3
+    tried and must NOT claim a single specific diagnosis (that was the
+    old, sometimes-wrong 'VA likely not paged in' message)."""
+    c1, c2 = 0x4D6BB000, 0x4D6BC000
+    user_va = 0x7FF6E289A760
+    fake_cli.fail_z0_under_cr3 = {c1, c2}
+
+    with pytest.raises(InstallError) as exc_info:
+        install_user_breakpoint(
+            fake_cli, "vm", store=None,
+            cr3_candidates=(c1, c2), user_va=user_va,
+        )
+
+    msg = str(exc_info.value)
+    assert "did not map under any tried CR3" in msg
+    assert f"0x{c1:x}" in msg
+    assert f"0x{c2:x}" in msg
+    assert "not paged in" not in msg
+    # Restored back to original after every attempt, including the last.
+    assert fake_cli.cr3_writes == [c1, 0x1AE000, c2, 0x1AE000]
+    assert fake_cli.bps_installed == []

@@ -639,11 +639,21 @@ def kdbg_user_bp(
         cli.handshake()
         cli.query_halt_reason()
 
+        # KVA-Shadow/KPTI builds split a process's page tables into two
+        # roots; only retry the second when it was actually read off
+        # KPROCESS (never guess — a wrong CR3 write here could patch the
+        # wrong physical page). Mirrors TargetInfo.masquerade_candidates.
+        cr3_candidates = (
+            (target_proc.directory_table_base, target_proc.user_directory_table_base)
+            if target_proc.user_directory_table_base
+            else (target_proc.directory_table_base,)
+        )
+
         with console.status(f"[blue]Installing user bp via CR3 masquerade..."):
             try:
                 report = install_user_breakpoint(
                     cli, cfg.vm_name, store,
-                    target_dtb=target_proc.directory_table_base,
+                    cr3_candidates=cr3_candidates,
                     user_va=user_va,
                     timeout=timeout,
                 )

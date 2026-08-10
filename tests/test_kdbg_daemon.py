@@ -210,10 +210,10 @@ def test_bp_add_soft_user_va_uses_cr3_masquerade(monkeypatch):
 
     captured = {}
 
-    def fake_install(cli, vm_name, store, *, target_dtb, user_va):
-        captured["target_dtb"] = target_dtb
+    def fake_install(cli, vm_name, store, *, cr3_candidates, user_va):
+        captured["cr3_candidates"] = cr3_candidates
         captured["user_va"] = user_va
-        return InstallReport(user_va=user_va, target_dtb=target_dtb, elapsed=0.005)
+        return InstallReport(user_va=user_va, target_dtb=cr3_candidates[0], elapsed=0.005)
 
     monkeypatch.setattr(daemon_mod, "install_user_breakpoint", fake_install)
 
@@ -226,7 +226,8 @@ def test_bp_add_soft_user_va_uses_cr3_masquerade(monkeypatch):
     assert reply["ok"]
     assert reply["result"]["user_mode"] is True
     assert reply["result"]["hw"] is False
-    assert captured["target_dtb"] == 0x4d6bb000
+    # Default _make_session target has no user_dtb -> single candidate.
+    assert captured["cr3_candidates"] == (0x4d6bb000,)
     assert captured["user_va"] == user_va
 
 
@@ -374,7 +375,7 @@ def test_bp_list_includes_demangled_pretty_target():
     from winbox.kdbg.debugger.install import InstallReport
     original = daemon_mod.install_user_breakpoint
     daemon_mod.install_user_breakpoint = lambda *a, **kw: InstallReport(
-        user_va=kw["user_va"], target_dtb=kw["target_dtb"], elapsed=0.001,
+        user_va=kw["user_va"], target_dtb=kw["cr3_candidates"][0], elapsed=0.001,
     )
     try:
         session.handle_op("bp_add", {"target": f"notepad!{mangled}"})
@@ -631,6 +632,24 @@ def test_target_info_cr3_set_or_would_be_wrong_for_bit12_set_dtbs():
     assert t.cr3_set[0] != t.cr3_set[1]
 
 
+def test_masquerade_candidates_includes_verified_user_dtb():
+    t = TargetInfo(
+        pid=8000, dtb=0x1225ad000, name="cyserver.exe",
+        user_dtb=0x1225ac000,
+    )
+    assert t.masquerade_candidates == (0x1225ad000, 0x1225ac000)
+
+
+def test_masquerade_candidates_excludes_xor_guess_when_user_dtb_missing():
+    """Unlike cr3_set, masquerade_candidates must NOT offer the XOR
+    guess as a fallback — that guess is only safe as a passive
+    membership check, not as a value to actively write into CR3 and
+    walk page tables through."""
+    t = TargetInfo(pid=8000, dtb=0x1225ad000, name="cyserver.exe")
+    assert t.masquerade_candidates == (0x1225ad000,)
+    assert t.cr3_set == (0x1225ad000, 0x1225ac000)  # cr3_set still offers it
+
+
 def test_op_cont_accepts_second_cr3_under_kpti():
     """Bp inside a driver fires with the kernel CR3 of the calling
     process. With UserDirectoryTableBase known, that's stored exactly;
@@ -846,6 +865,98 @@ def test_op_write_mem_restores_cr3_even_on_failure():
     assert len(cr3_writes) == 2
     assert cr3_writes[0] == target_dtb
     assert cr3_writes[1] == initial_cr3
+
+
+# ── KPTI CR3-half retry (op_mem / op_write_mem) ─────────────────────────
+
+
+class _FakeRspTwoCr3(FakeRsp):
+    """Memory ops succeed only while masqueraded as ``real_cr3`` — fail
+    with ``RspError`` under any other CR3. Models a KPTI target where a
+    VA is mapped under only one of the process's two CR3 halves.
+    Records every G-packet CR3 write in ``cr3_writes`` (the base
+    FakeRsp doesn't keep one — this one adds it for retry-order
+    assertions)."""
+
+    def __init__(self, *args, real_cr3: int, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.real_cr3 = real_cr3
+        self.cr3_writes: list[int] = []
+        self.writes: list[tuple[int, bytes]] = []
+
+    def _current_cr3(self) -> int:
+        return struct.unpack_from("<Q", self.regs_blob, _CR3_OFFSET)[0]
+
+    def _exchange(self, body, *, timeout=None) -> bytes:
+        if body.startswith(b"G"):
+            blob = bytes.fromhex(body[1:].decode("ascii"))
+            self.regs_blob = blob
+            self.cr3_writes.append(struct.unpack_from("<Q", blob, _CR3_OFFSET)[0])
+            return b"OK"
+        return b"OK"
+
+    def read_memory(self, va, length):
+        from winbox.kdbg.debugger.rsp import RspError
+        if self._current_cr3() != self.real_cr3:
+            raise RspError(f"m failed at 0x{va:x}: not mapped under this CR3")
+        return b"\x90" * length
+
+    def write_memory(self, va, data):
+        from winbox.kdbg.debugger.rsp import RspError
+        if self._current_cr3() != self.real_cr3:
+            raise RspError(f"M failed at 0x{va:x}: not mapped under this CR3")
+        self.writes.append((va, data))
+
+
+def test_op_mem_retries_second_cr3_when_primary_fails_and_user_dtb_known():
+    """Primary dtb doesn't map the VA (KPTI half mismatch), but the
+    verified user_dtb does — op_mem should succeed via the fallback
+    instead of failing outright."""
+    primary_dtb = 0x4d6bb000
+    user_dtb = 0x4d6bc000
+    rsp = _FakeRspTwoCr3(real_cr3=user_dtb)
+    target = TargetInfo(pid=4584, dtb=primary_dtb, name="notepad.exe", user_dtb=user_dtb)
+    session = _make_session(rsp=rsp, target=target)
+
+    reply = session.handle_op("mem", {"va": "0x1000", "length": 8})
+    assert reply["ok"], reply
+    assert reply["result"]["bytes"] == "90" * 8
+    # Primary tried first (and failed), second candidate succeeded.
+    assert rsp.cr3_writes[0] == primary_dtb
+    assert user_dtb in rsp.cr3_writes
+
+
+def test_op_mem_does_not_retry_xor_guess_when_user_dtb_unknown():
+    """Without a verified user_dtb, op_mem must NOT fall back to the
+    cr3_set XOR guess — that guess is only safe as a passive membership
+    check (op_cont), not as a value to actively masquerade into CR3 and
+    walk page tables through. A miss here should fail cleanly, not
+    silently walk through a guessed physical page."""
+    primary_dtb = 0x4d6bb000
+    guess = primary_dtb ^ 0x1000  # what cr3_set's fallback would offer
+    rsp = _FakeRspTwoCr3(real_cr3=guess)  # only the guess would "work"
+    target = TargetInfo(pid=4584, dtb=primary_dtb, name="notepad.exe")  # user_dtb=0
+    session = _make_session(rsp=rsp, target=target)
+
+    reply = session.handle_op("mem", {"va": "0x1000", "length": 8})
+    assert reply["ok"] is False
+    # Only the primary was ever tried — no XOR-guess retry attempted.
+    assert rsp.cr3_writes.count(primary_dtb) >= 1
+    assert guess not in rsp.cr3_writes
+
+
+def test_op_write_mem_retries_second_cr3_when_primary_fails_and_user_dtb_known():
+    primary_dtb = 0x4d6bb000
+    user_dtb = 0x4d6bc000
+    rsp = _FakeRspTwoCr3(real_cr3=user_dtb)
+    target = TargetInfo(pid=4584, dtb=primary_dtb, name="notepad.exe", user_dtb=user_dtb)
+    session = _make_session(rsp=rsp, target=target)
+
+    reply = session.handle_op("write_mem", {"va": "0x1000", "data": "deadbeef"})
+    assert reply["ok"], reply
+    assert rsp.writes == [(0x1000, b"\xde\xad\xbe\xef")]
+    assert rsp.cr3_writes[0] == primary_dtb
+    assert user_dtb in rsp.cr3_writes
 
 
 # ── _validate_module_bases ───────────────────────────────────────────────
@@ -1467,6 +1578,40 @@ def test_op_cont_predicate_unmapped_va_reads_as_zero():
     # [rcx] silently reads as 0 -> 0 == 0 -> true -> predicate_hits, halt.
     assert out["result"]["reason"] == "bp"
     bp = next(iter(session.bps.values()))
+    assert bp.predicate_hits == 1
+    assert bp.predicate_errors == 0
+
+
+def test_op_cont_predicate_mem_deref_retries_second_cr3_when_user_dtb_known():
+    """A predicate deref unmapped under the primary CR3 but mapped
+    under the verified user_dtb must still evaluate against the real
+    value — not silently read as 0 just because the first candidate
+    missed. Same retry path as op_mem, exercised through the predicate
+    reader instead."""
+    user_dtb = 0x4d6bc000
+    rsp = _ScriptedRsp([_blob(rip=_KERNEL_VA, rsp=0x2000, cr3=_TARGET_DTB)])
+    target = TargetInfo(pid=4584, dtb=_TARGET_DTB, name="notepad.exe", user_dtb=user_dtb)
+    session = _make_session(rsp=rsp, target=target)
+    _install_kernel_bp(session, condition="[rsp+0x18] == 0x226048")
+
+    from winbox.kdbg.debugger.rsp import RspError
+
+    def scripted_read(va, length):
+        assert va == 0x2000 + 0x18
+        assert length == 8
+        current_cr3 = struct.unpack_from("<Q", rsp.regs_blob, _CR3_OFFSET)[0]
+        if current_cr3 != user_dtb:
+            raise RspError("E14")  # primary CR3 doesn't map this VA
+        return (0x226048).to_bytes(8, "little")
+
+    rsp.read_memory = scripted_read
+
+    out = session.handle_op("cont", {"timeout": 1.0})
+    assert out["ok"], out
+    assert out["result"]["reason"] == "bp"
+    bp = next(iter(session.bps.values()))
+    # Retried through to the real value and matched — not a false
+    # positive from the unmapped-reads-as-zero fallback.
     assert bp.predicate_hits == 1
     assert bp.predicate_errors == 0
 

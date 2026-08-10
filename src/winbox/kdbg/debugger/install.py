@@ -42,10 +42,14 @@ halted (recoverable), never resumes with wrong CR3.
 
 Invariants:
 
-* **Server 2022 default has KPTI/KVA-shadow OFF**, so target_dtb
-  (= ``EPROCESS.DirectoryTableBase``) is the actual user CR3.
-  KPTI builds may need ``KPROCESS.UserDirectoryTableBase``.
-* The user VA must be paged in. Cold VAs error with QEMU E22.
+* **Server 2022 default has KPTI/KVA-shadow OFF**, so
+  ``EPROCESS.DirectoryTableBase`` alone is the actual user CR3. KPTI
+  builds split this into two page-table roots
+  (``KPROCESS.DirectoryTableBase`` / ``UserDirectoryTableBase``), and
+  ``user_va`` may only be mapped under one of them — the caller passes
+  both as ``cr3_candidates`` and each is tried in turn.
+* The user VA must be paged in under at least one tried candidate.
+  Cold VAs error with QEMU E22.
 """
 
 from __future__ import annotations
@@ -54,7 +58,7 @@ import struct
 import sys
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from winbox.kdbg.hmp import hmp, parse_registers
 
@@ -106,7 +110,7 @@ def install_user_breakpoint(
     vm_name: str,
     store: "SymbolStore",
     *,
-    target_dtb: int,
+    cr3_candidates: Sequence[int],
     user_va: int,
     timeout: float = 10.0,
 ) -> InstallReport:
@@ -117,20 +121,33 @@ def install_user_breakpoint(
     ``cont()`` and wait for the user bp to fire. Caller is responsible
     for removing the user bp later (``cli.remove_breakpoint(user_va)``).
 
-    Raises ``InstallError`` on protocol failure or if the user VA
-    isn't paged in target's address space.
+    ``cr3_candidates`` is tried in order — on KVA-Shadow/KPTI builds a
+    process has two CR3 values (user-mode vs kernel-mode page tables),
+    and ``user_va`` may only be mapped under one of them. Each candidate
+    gets a full swap/verify/Z0/restore attempt; the first that maps
+    ``user_va`` wins. A single-candidate sequence behaves exactly as a
+    plain single-CR3 install always has.
+
+    Raises ``InstallError`` on protocol failure (G-packet rejected, CR3
+    write didn't take effect — these fail immediately, no retry: they
+    aren't "wrong CR3 half", so another candidate wouldn't help) or if
+    ``user_va`` isn't paged in under *any* tried candidate.
     """
     # ``timeout`` is currently informational — no inner loops to bound.
     # Kept in the signature so callers can express intent and so we
     # can add bounded retry logic later without a breaking change.
     _ = timeout
 
+    if not cr3_candidates:
+        raise InstallError(f"no CR3 candidates given for user_va=0x{user_va:x}")
+
     start = time.monotonic()
 
     # Pick a vCPU to masquerade. Default: the one currently selected
     # via Hg from the caller, or vCPU 1 if nothing was selected. Any
     # vCPU works since we're masquerading via debug interface, not
-    # actually running code.
+    # actually running code. Same vCPU is reused across every candidate
+    # attempt below.
     threads = cli.list_threads()
     if not threads:
         raise InstallError("gdbstub returned no threads (vCPUs)")
@@ -141,73 +158,90 @@ def install_user_breakpoint(
     regs = cli.read_registers()
     original_cr3 = struct.unpack_from("<Q", regs, _CR3_OFFSET_IN_G)[0]
 
-    swapped = False
-    try:
-        # Write target_dtb at offset _CR3_OFFSET_IN_G; leave every other
-        # byte unchanged. ``G`` packet with a fresh hex blob.
-        masquerade = bytearray(regs)
-        struct.pack_into("<Q", masquerade, _CR3_OFFSET_IN_G, target_dtb)
-        body = b"G" + bytes(masquerade).hex().encode("ascii")
-        resp = cli._exchange(body)
-        if resp != b"OK":
-            raise InstallError(f"G-packet (set CR3) rejected: {resp!r}")
-        swapped = True
+    tried: list[int] = []
+    last_z0_error: Exception | None = None
 
-        # Sanity check QEMU actually applied it.
-        verify = struct.unpack_from(
-            "<Q", cli.read_registers(), _CR3_OFFSET_IN_G,
-        )[0]
-        if verify != target_dtb:
-            raise InstallError(
-                f"CR3 write didn't take effect: wrote 0x{target_dtb:x}, "
-                f"reads back 0x{verify:x}"
-            )
-
-        # Now Z0 translates user_va via target's page tables.
+    for candidate_cr3 in cr3_candidates:
+        tried.append(candidate_cr3)
+        swapped = False
         try:
-            cli.insert_breakpoint(user_va, kind=1)
-        except Exception as e:
-            raise InstallError(
-                f"Z0 at user_va=0x{user_va:x} failed (user CR3 active — VA "
-                f"likely not paged in): {e}"
-            ) from e
+            # Write candidate_cr3 at offset _CR3_OFFSET_IN_G; leave every
+            # other byte unchanged. ``G`` packet with a fresh hex blob.
+            masquerade = bytearray(regs)
+            struct.pack_into("<Q", masquerade, _CR3_OFFSET_IN_G, candidate_cr3)
+            body = b"G" + bytes(masquerade).hex().encode("ascii")
+            resp = cli._exchange(body)
+            if resp != b"OK":
+                raise InstallError(
+                    f"G-packet (set CR3 0x{candidate_cr3:x}) rejected: {resp!r}"
+                )
+            swapped = True
 
-        return InstallReport(
-            user_va=user_va,
-            target_dtb=target_dtb,
-            elapsed=time.monotonic() - start,
-        )
-    finally:
-        # Restore CR3 unconditionally. If we leave target_dtb in vCPU's
-        # register file and resume, the vCPU runs kernel code with the
-        # wrong page tables = instant BSOD. Failure to restore is
-        # session-fatal — log loudly and re-raise as InstallError so
-        # the daemon's op handler propagates it (and the operator
-        # knows the firing vCPU is poisoned).
-        if swapped:
+            # Sanity check QEMU actually applied it.
+            verify = struct.unpack_from(
+                "<Q", cli.read_registers(), _CR3_OFFSET_IN_G,
+            )[0]
+            if verify != candidate_cr3:
+                raise InstallError(
+                    f"CR3 write didn't take effect: wrote 0x{candidate_cr3:x}, "
+                    f"reads back 0x{verify:x}"
+                )
+
+            # Now Z0 translates user_va via this candidate's page tables.
             try:
-                restore = bytearray(regs)  # ``regs`` already has original CR3
-                struct.pack_into("<Q", restore, _CR3_OFFSET_IN_G, original_cr3)
-                resp = cli._exchange(b"G" + bytes(restore).hex().encode("ascii"))
-                if resp != b"OK":
+                cli.insert_breakpoint(user_va, kind=1)
+            except Exception as e:
+                # This candidate didn't map user_va. If there's another
+                # candidate left, try it instead of failing outright —
+                # that's the whole point of accepting a candidate list.
+                last_z0_error = e
+                continue
+
+            return InstallReport(
+                user_va=user_va,
+                target_dtb=candidate_cr3,
+                elapsed=time.monotonic() - start,
+            )
+        finally:
+            # Restore CR3 unconditionally before moving to the next
+            # candidate (or returning/raising). If we leave a
+            # masqueraded CR3 in vCPU's register file and resume, the
+            # vCPU runs kernel code with the wrong page tables = instant
+            # BSOD. Failure to restore is session-fatal — log loudly and
+            # re-raise as InstallError so the daemon's op handler
+            # propagates it (and the operator knows the firing vCPU is
+            # poisoned).
+            if swapped:
+                try:
+                    restore = bytearray(regs)  # ``regs`` already has original CR3
+                    struct.pack_into("<Q", restore, _CR3_OFFSET_IN_G, original_cr3)
+                    resp = cli._exchange(b"G" + bytes(restore).hex().encode("ascii"))
+                    if resp != b"OK":
+                        print(
+                            f"[kdbg-install] FATAL: CR3 restore G-packet rejected "
+                            f"({resp!r}); vCPU {vcpu} still holds masqueraded "
+                            f"CR3 0x{candidate_cr3:x} — DO NOT resume",
+                            file=sys.stderr, flush=True,
+                        )
+                        raise InstallError(
+                            "CR3 restore failed during install; daemon poisoned"
+                        )
+                except InstallError:
+                    raise
+                except Exception as e:  # noqa: BLE001
                     print(
-                        f"[kdbg-install] FATAL: CR3 restore G-packet rejected "
-                        f"({resp!r}); vCPU {vcpu} still holds masqueraded "
-                        f"CR3 0x{target_dtb:x} — DO NOT resume",
+                        f"[kdbg-install] FATAL: CR3 restore raised "
+                        f"{type(e).__name__}: {e}; vCPU {vcpu} still holds "
+                        f"masqueraded CR3 0x{candidate_cr3:x} — DO NOT resume",
                         file=sys.stderr, flush=True,
                     )
                     raise InstallError(
                         "CR3 restore failed during install; daemon poisoned"
-                    )
-            except InstallError:
-                raise
-            except Exception as e:  # noqa: BLE001
-                print(
-                    f"[kdbg-install] FATAL: CR3 restore raised "
-                    f"{type(e).__name__}: {e}; vCPU {vcpu} still holds "
-                    f"masqueraded CR3 0x{target_dtb:x} — DO NOT resume",
-                    file=sys.stderr, flush=True,
-                )
-                raise InstallError(
-                    "CR3 restore failed during install; daemon poisoned"
-                ) from e
+                    ) from e
+
+    # Every candidate exhausted without mapping user_va.
+    tried_str = ", ".join(f"0x{c:x}" for c in tried)
+    raise InstallError(
+        f"user_va=0x{user_va:x} did not map under any tried CR3 "
+        f"({tried_str}); last error: {last_z0_error}"
+    ) from last_z0_error

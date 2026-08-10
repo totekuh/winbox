@@ -176,6 +176,25 @@ class TargetInfo:
             return (self.dtb, self.user_dtb)
         return (self.dtb, self.dtb ^ 0x1000)
 
+    @property
+    def masquerade_candidates(self) -> tuple[int, ...]:
+        """CR3 values safe to *write* into a vCPU for masquerade reads/writes.
+
+        Unlike ``cr3_set``, this never includes the ``dtb ^ 0x1000``
+        guess. ``cr3_set`` only ever compares against a CR3 QEMU already
+        reports (a passive membership check — a wrong guess just fails
+        to match). Masquerade actively writes a candidate into CR3 and
+        walks page tables through it; a wrong guess there could resolve
+        to some *other* valid-looking physical page and silently read,
+        write, or patch the wrong process's memory instead of failing
+        cleanly. So: only ``dtb`` alone when ``user_dtb`` is unknown (no
+        retry — current single-CR3 behavior, unchanged), or both when
+        ``user_dtb`` was actually read from ``KPROCESS``.
+        """
+        if self.user_dtb:
+            return (self.dtb, self.user_dtb)
+        return (self.dtb,)
+
 
 # ── Daemon process ──────────────────────────────────────────────────────
 
@@ -275,14 +294,15 @@ class DaemonSession:
     # ── CR3 masquerade plumbing ─────────────────────────────────────────
 
     @contextmanager
-    def _cr3_masquerade(self, vcpu: str, regs: bytes):
-        """Context manager: enter target's CR3 on ``vcpu``, restore on exit.
+    def _cr3_masquerade(self, vcpu: str, regs: bytes, *, cr3: int):
+        """Context manager: enter ``cr3`` on ``vcpu``, restore on exit.
 
         Centralises the four-step dance that op_mem / op_write_mem /
         _mem_qword_reader all used to repeat with a ``with suppress(Exception)``
         on the restore. Suppressing the restore failure was a silent BSOD
-        bomb — if we leave target_dtb in the firing vCPU's register file
-        and resume, the vCPU runs kernel code with the wrong page tables.
+        bomb — if we leave a masqueraded CR3 in the firing vCPU's register
+        file and resume, the vCPU runs kernel code with the wrong page
+        tables.
 
         On restore failure: set ``self._cr3_corrupted`` so every
         subsequent op short-circuits with a clear error, log to stderr,
@@ -292,9 +312,13 @@ class DaemonSession:
         ``vcpu`` must already be selected via ``rsp.select_thread``.
         ``regs`` is the full g-packet blob captured before masquerade
         (used to extract original CR3 and as the template for restore).
+        ``cr3`` is the value to masquerade as — callers that need to try
+        more than one candidate (see ``_cr3_masqueraded_call``) enter
+        this context once per candidate rather than this context picking
+        one itself.
         """
         original_cr3 = struct.unpack_from("<Q", regs, _CR3_OFFSET_IN_G)[0]
-        target_dtb = self.target.dtb
+        target_dtb = cr3
 
         # Swap in target_dtb.
         mod = bytearray(regs)
@@ -337,6 +361,32 @@ class DaemonSession:
                 raise CR3RestoreError(
                     "CR3 restore failed; daemon poisoned"
                 ) from e
+
+    def _cr3_masqueraded_call(self, vcpu: str, regs: bytes, fn):
+        """Run ``fn()`` under each of ``self.target.masquerade_candidates``
+        in turn, stopping at the first that doesn't raise ``RspError``.
+
+        On builds with a verified ``user_dtb``, the captured ``dtb`` may
+        be the wrong CR3 half for a given VA (KVA-Shadow/KPTI splits
+        user/kernel page tables). A single-candidate target (``user_dtb``
+        unknown) behaves exactly as before — one attempt, no retry.
+
+        Only ``RspError`` from ``fn()`` triggers a retry — that's the
+        gdbstub telling us the VA didn't map under this CR3. A
+        ``RuntimeError`` from ``_cr3_masquerade`` itself (G-swap
+        rejected) or a ``CR3RestoreError`` (restore failed, session
+        poisoned) propagate immediately: neither is "wrong CR3 half",
+        and retrying against another candidate wouldn't fix either.
+        """
+        last_error: RspError | None = None
+        for candidate in self.target.masquerade_candidates:
+            try:
+                with self._cr3_masquerade(vcpu, regs, cr3=candidate):
+                    return fn()
+            except RspError as e:
+                last_error = e
+                continue
+        raise last_error
 
     # ── ops ─────────────────────────────────────────────────────────────
 
@@ -433,7 +483,7 @@ class DaemonSession:
                 if is_user:
                     report = install_user_breakpoint(
                         self.rsp, self.cfg.vm_name, self.store,
-                        target_dtb=self.target.dtb,
+                        cr3_candidates=self.target.masquerade_candidates,
                         user_va=va,
                     )
                     elapsed_ms = report.elapsed * 1000.0
@@ -746,8 +796,9 @@ class DaemonSession:
         self.rsp.select_thread(vcpu)
         regs = self.rsp.read_registers()
 
-        with self._cr3_masquerade(vcpu, regs):
-            data = self.rsp.read_memory(va, length)
+        data = self._cr3_masqueraded_call(
+            vcpu, regs, lambda: self.rsp.read_memory(va, length)
+        )
 
         return {"va": f"0x{va:x}", "bytes": data.hex()}
 
@@ -779,9 +830,10 @@ class DaemonSession:
         self.rsp.select_thread(vcpu)
         regs = self.rsp.read_registers()
 
-        with self._cr3_masquerade(vcpu, regs):
-            # gdb ``M addr,len:hex`` writes payload bytes at addr.
-            self.rsp.write_memory(va, payload)
+        # gdb ``M addr,len:hex`` writes payload bytes at addr.
+        self._cr3_masqueraded_call(
+            vcpu, regs, lambda: self.rsp.write_memory(va, payload)
+        )
 
         return {"va": f"0x{va:x}", "length": len(payload)}
 
@@ -883,21 +935,24 @@ class DaemonSession:
     def _mem_qword_reader(self, fired_regs: bytes):
         """Build a closure that reads a qword from target's address space.
 
-        Uses the shared ``_cr3_masquerade`` context manager (same dance
-        as op_mem / op_write_mem). Per-call cost is 3 RSP packets
+        Uses ``_cr3_masqueraded_call`` (same dance as op_mem / op_write_mem),
+        so on a build with a verified ``user_dtb`` a read that's unmapped
+        under the primary CR3 gets retried against the other half before
+        giving up. Per-call cost is 3 RSP packets per candidate tried
         (G-swap, m, G-restore). The firing vCPU must still be selected
-        when the closure runs — caller's responsibility to invoke
-        before yielding control.
+        when the closure runs — caller's responsibility to invoke before
+        yielding control.
 
         Failure modes:
-          * Read rejected (unmapped VA, gdbstub error) → return 0. The
-            documented predicate semantic is that unmapped derefs read
-            as zero so a check like ``[rcx+0x10] != 0`` composes with
-            dangling-pointer cases without the operator pre-validating
-            the deref. The cost: a real transport hiccup looks the
-            same as an unmapped read inside the predicate. Acceptable
-            because the surrounding session would also be visibly
-            broken (next op fails for other reasons).
+          * Read rejected under every candidate CR3 (unmapped VA, gdbstub
+            error) → return 0. The documented predicate semantic is that
+            unmapped derefs read as zero so a check like
+            ``[rcx+0x10] != 0`` composes with dangling-pointer cases
+            without the operator pre-validating the deref. The cost: a
+            real transport hiccup looks the same as an unmapped read
+            inside the predicate. Acceptable because the surrounding
+            session would also be visibly broken (next op fails for
+            other reasons).
           * G-swap rejected → ``PredicateRuntimeError`` (op_cont converts
             to ``reason="predicate_error"`` and stays halted; this is a
             session-level failure, not a data-level miss).
@@ -915,12 +970,13 @@ class DaemonSession:
 
         def _read(addr: int) -> int:
             try:
-                with session._cr3_masquerade(vcpu_hint, fired_regs):
-                    try:
-                        data = rsp.read_memory(addr, 8)
-                    except RspError:
-                        # Unmapped or otherwise rejected — predicate sees 0.
-                        return 0
+                data = session._cr3_masqueraded_call(
+                    vcpu_hint, fired_regs, lambda: rsp.read_memory(addr, 8)
+                )
+            except RspError:
+                # Unmapped (or rejected) under every candidate CR3 —
+                # predicate sees 0.
+                return 0
             except CR3RestoreError:
                 # Don't dress this up as a predicate failure — the
                 # session is dead and the operator needs to know.
