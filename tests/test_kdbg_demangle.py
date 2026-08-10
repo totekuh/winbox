@@ -49,6 +49,42 @@ def test_demangle_handles_subprocess_timeout():
         assert demangle("?Foo@@YAHXZ") == "?Foo@@YAHXZ"
 
 
+def _fake_undname(stdout: str):
+    from unittest.mock import MagicMock
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.stdout = stdout.encode("utf-8")
+    return proc
+
+
+def test_demangle_two_line_echo_output():
+    """The normal case: llvm-undname echoes the input then the decoded name."""
+    demangle.cache_clear()
+    with patch("shutil.which", return_value="/usr/bin/llvm-undname"), \
+         patch("subprocess.run", return_value=_fake_undname(
+             "?Foo@@YAHXZ\nint __cdecl Foo(void)\n")):
+        assert demangle("?Foo@@YAHXZ") == "int __cdecl Foo(void)"
+
+
+def test_demangle_single_line_output_still_decodes():
+    """A build/mode that prints ONLY the decoded name (no input echo) must
+    still be used — the old len>=2 guard returned the raw mangling here."""
+    demangle.cache_clear()
+    with patch("shutil.which", return_value="/usr/bin/llvm-undname"), \
+         patch("subprocess.run", return_value=_fake_undname(
+             "int __cdecl Foo(void)\n")):
+        assert demangle("?Foo@@YAHXZ") == "int __cdecl Foo(void)"
+
+
+def test_demangle_echo_only_no_decode_falls_back():
+    """If the only output equals the input (no decode happened), return the
+    original rather than a bogus 'decoded' value."""
+    demangle.cache_clear()
+    with patch("shutil.which", return_value="/usr/bin/llvm-undname"), \
+         patch("subprocess.run", return_value=_fake_undname("?Foo@@YAHXZ\n")):
+        assert demangle("?Foo@@YAHXZ") == "?Foo@@YAHXZ"
+
+
 # ── pretty_symbol module-prefix handling ───────────────────────────────
 
 

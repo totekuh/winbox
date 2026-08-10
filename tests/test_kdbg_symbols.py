@@ -22,6 +22,56 @@ from winbox.kdbg.symbols import (
 )
 
 
+class TestResolveNtBaseMzGuard:
+    """resolve_nt_base derives nt's base from IDT[0] = KiDivideErrorFault. On
+    KVA-Shadow/KPTI guests IDT[0] is the KiDivideErrorFaultShadow trampoline, so
+    the computed base is wrong; the MZ-header check turns a silently-wrong base
+    into a clean failure."""
+
+    RVA = 0x100000
+    BASE = 0xFFFFF80000000000  # page-aligned + canonical-high
+
+    def _cfg(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(vm_name="winbox")
+
+    def _idt_entry_for(self, handler: int) -> bytes:
+        entry = bytearray(16)
+        entry[0:2] = (handler & 0xFFFF).to_bytes(2, "little")
+        entry[6:8] = ((handler >> 16) & 0xFFFF).to_bytes(2, "little")
+        entry[8:12] = ((handler >> 32) & 0xFFFFFFFF).to_bytes(4, "little")
+        return bytes(entry)
+
+    def _patch(self, monkeypatch, *, mz: bytes):
+        handler = self.BASE + self.RVA
+        idt_base = 0xFFFFF78000000000
+        monkeypatch.setattr(
+            symbols, "read_cpu_state", lambda vm: {"IDT_BASE": idt_base}
+        )
+
+        def fake_read(vm, va, size):
+            if va == idt_base:
+                return self._idt_entry_for(handler)
+            if va == self.BASE:
+                return mz
+            raise AssertionError(f"unexpected read at 0x{va:x}")
+
+        monkeypatch.setattr(symbols, "read_virt_current", fake_read)
+
+    def test_valid_mz_returns_base(self, monkeypatch):
+        from winbox.kdbg.symbols import resolve_nt_base
+        self._patch(monkeypatch, mz=b"MZ")
+        assert resolve_nt_base(self._cfg(), {"KiDivideErrorFault": self.RVA}) == self.BASE
+
+    def test_missing_mz_raises_instead_of_returning_wrong_base(self, monkeypatch):
+        from winbox.kdbg.symbols import resolve_nt_base
+        # Simulates the KPTI case: the page-aligned/canonical checks pass but
+        # the base doesn't point at ntoskrnl.
+        self._patch(monkeypatch, mz=b"\x00\x00")
+        with pytest.raises(SymbolLoadError, match="MZ header"):
+            resolve_nt_base(self._cfg(), {"KiDivideErrorFault": self.RVA})
+
+
 def _save_nt(store: SymbolStore, build: str = "ABCD1234", types: dict | None = None) -> None:
     store.save(
         module="nt",

@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 import logging
 
-from winbox.kdbg.hmp import HmpError, read_cpu_state
+from winbox.kdbg.hmp import HmpError, hmp, parse_registers
 from winbox.kdbg.memory import (
     PageWalkError,
     WalkCache,
@@ -85,7 +85,15 @@ class UserModuleRecord:
 
 
 def _cpu_cr3(vm_name: str) -> int:
-    return read_cpu_state(vm_name)["CR3"]
+    # Parse only the registers, not the IDT. read_cpu_state() also runs
+    # parse_idt() and raises HmpError("IDT entry not found") when the dump has
+    # no IDT= line — which made `kdbg ps`/`kdbg lm` (they only need CR3) fail
+    # for a completely unrelated reason even though CR3 was present.
+    regs = parse_registers(hmp(vm_name, "info registers"))
+    try:
+        return regs["CR3"]
+    except KeyError:
+        raise HmpError("CR3 not found in `info registers` output")
 
 
 # Thin compat shims so the rest of this module reads as it did pre-K3.
@@ -227,11 +235,19 @@ def find_process(
     cr3: int | None = None,
     cache: WalkCache | None = None,
 ) -> ProcessRecord | None:
-    """Return the first matching process, or None."""
+    """Return the first matching process, or None.
+
+    Name matches are against ``EPROCESS.ImageFileName``, a 15-byte kernel field
+    — so ``proc.name`` is truncated to 15 chars and a requested name of 16+
+    chars (``SecurityHealthService.exe``, ``MpDefenderCoreService.exe``) could
+    never match its full form. We compare against the same 15-char truncation
+    of the request; this makes the match a 15-char-prefix match, which is
+    inherently ambiguous for names sharing that prefix — the first is returned.
+    """
     for proc in list_processes(vm_name, store, cr3=cr3, cache=cache):
         if pid is not None and proc.pid == pid:
             return proc
-        if name is not None and proc.name.lower() == name.lower():
+        if name is not None and proc.name.lower() == name.lower()[:15]:
             return proc
     return None
 

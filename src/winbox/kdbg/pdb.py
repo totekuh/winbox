@@ -329,9 +329,18 @@ def parse_types(text: str, wanted: Iterable[str]) -> dict[str, StructLayout]:
 
     missing = wanted_set - layouts.keys()
     if missing:
-        # Don't raise — better to load partial types than block the whole
-        # symbol build. Caller can check what they got via SymbolStore.info.
-        pass
+        # Warn loudly instead of the previous silent `pass`: a missing wanted
+        # type otherwise surfaces only as a confusing "type not found" deep in
+        # a later walk. Truncation by timeout / non-zero exit is already caught
+        # upstream in _run_dump (it raises), and a wanted type can legitimately
+        # be forward-ref-only or absent, so this stays a warning — not a hard
+        # failure that would reject those valid partial loads. The daemon log
+        # captures it so an incomplete struct map is diagnosable.
+        _log.warning(
+            "parse_types: %d/%d wanted type(s) not found (%s) — struct map is "
+            "incomplete; llvm-pdbutil output may be truncated",
+            len(missing), len(wanted_set), ", ".join(sorted(missing)),
+        )
 
     return layouts
 

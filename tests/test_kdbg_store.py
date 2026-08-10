@@ -44,6 +44,31 @@ def _save_nt(store: SymbolStore, *, base: int | None = 0xFFFFF80559800000) -> No
     )
 
 
+def test_load_is_memoized_until_the_file_changes(tmp_path):
+    """load() re-parsed the whole multi-MB store on every call, and a single
+    module walk calls it once per entry via struct()/resolve(). It must cache
+    the parse and invalidate only when the file's mtime changes."""
+    import os
+
+    store = SymbolStore(tmp_path)
+    _save_nt(store)
+
+    first = store.load("nt")
+    second = store.load("nt")
+    assert first is second, "second load must return the cached object, not re-parse"
+
+    # struct()/resolve() go through load() and must hit the same cache.
+    assert store.struct("_EPROCESS") is first["types"]["_EPROCESS"]
+
+    # An atomic load_module rewrite bumps mtime → cache invalidates.
+    path = store._module_path("nt")
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    third = store.load("nt")
+    assert third is not first, "an mtime change must force a fresh parse"
+    assert third == first, "content is unchanged, only the object identity"
+
+
 def test_save_and_info(tmp_path):
     store = SymbolStore(tmp_path)
     _save_nt(store)

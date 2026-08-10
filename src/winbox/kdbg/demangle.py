@@ -47,12 +47,17 @@ def demangle(mangled: str) -> str:
         return mangled
     if result.returncode != 0:
         return mangled
-    out = result.stdout.decode("utf-8", errors="replace").strip().splitlines()
-    # llvm-undname echoes: <input>\n<demangled>
-    # We want the second line; if missing, fall back to original.
-    if len(out) >= 2 and out[-1].strip():
-        return out[-1].strip()
-    return mangled
+    out = result.stdout.decode("utf-8", errors="replace").splitlines()
+    lines = [ln.strip() for ln in out if ln.strip()]
+    if not lines:
+        return mangled
+    # llvm-undname normally echoes the input then the decoded name, so the
+    # decoded name is the last non-empty line. Don't hard-require the echo
+    # (len>=2): a build/mode that prints only the decoded name would otherwise
+    # fall through and return the raw mangling. If the last line still equals
+    # the input, no decode happened — fall back to the original.
+    decoded = lines[-1]
+    return decoded if decoded != mangled else mangled
 
 
 def pretty_symbol(qualified: str) -> str:

@@ -140,6 +140,31 @@ which also removes the deliberately-accepted flock-held-across-spawn window
 duration), but it restructures the `claim(build)` API and the `run_command_bg`
 caller, so it is logged rather than rushed. CONFIRMED, audit-derived.
 
+### 26. kdbg read-surface residuals from the 2026-08-10 audit (accepted / minor)
+
+Three findings from the read-surface audit were left as-is, deliberately:
+
+* **`probe_port` treats every IPv6/unparsed listener as matching any host**
+  (`hmp.py`). `_listening_sockets` records tcp6 LISTEN sockets as `(None,
+  port)` and `probe_port` matches `None` against any host — a *deliberate*
+  false-positive-over-false-negative choice (documented in the function's
+  docstring) so a v6-wildcard gdbstub isn't read as absent. The cost is that an
+  unrelated tcp6 listener on the same port reads as "stub up", and
+  `ensure_not_paused` may connect to a foreign socket. A proper fix decodes the
+  v6 address and does host-family-aware matching; until then the trade-off
+  stands.
+* **`DirectoryTableBase` is recorded with no sanity check** (`walk.py`) while
+  the adjacent `UserDirectoryTableBase` gets a page-aligned/`<2^52` guard. This
+  is the same class as item 18 (offset assumptions with no runtime check).
+  Unlike `user_dtb`, the primary `dtb` has no safe fallback (0 is useless), and
+  a wrong `DirectoryTableBase` offset breaks the whole store loudly elsewhere,
+  so a targeted guard here is low-value — folded into item 18.
+* **`find_process` materializes the whole process table for a single lookup**
+  (`walk.py`). A lazy generator that stops at the first match would save the
+  per-EPROCESS reads after the target. Minor perf; the per-walk cost dropped
+  sharply once `SymbolStore.load` was memoized (2026-08-10), so this is a low
+  priority.
+
 ### 10. Conditional breakpoints fail closed and indistinguishably from a real null
 
 `_mem_qword_reader` (`daemon.py:883-941`) returns `0` both when a VA is

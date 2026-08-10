@@ -323,3 +323,41 @@ def test_list_processes_rejects_zero_user_dtb(monkeypatch):
     (sentinel meaning "no second CR3 known")."""
     p = _list_proc_with_user_dtb(monkeypatch, 0)
     assert p.user_directory_table_base == 0
+
+
+def test_cpu_cr3_reads_cr3_without_requiring_an_idt_line(monkeypatch):
+    """_cpu_cr3 (used by `kdbg ps`/`lm`, which only need CR3) must not fail
+    just because the register dump has no IDT= line — it used to route through
+    read_cpu_state, whose parse_idt raised HmpError on a missing IDT."""
+    from winbox.kdbg.walk import _cpu_cr3
+
+    dump_without_idt = "RAX=0000000000000000 RIP=fffff80000000000\nCR3=00000000001aa000\n"
+    monkeypatch.setattr(walk, "hmp", lambda vm, cmd: dump_without_idt)
+    assert _cpu_cr3("winbox") == 0x1AA000
+
+
+def test_cpu_cr3_raises_hmperror_when_cr3_absent(monkeypatch):
+    from winbox.kdbg.hmp import HmpError
+    from winbox.kdbg.walk import _cpu_cr3
+
+    monkeypatch.setattr(walk, "hmp", lambda vm, cmd: "RAX=0 RIP=0\n")
+    with pytest.raises(HmpError, match="CR3 not found"):
+        _cpu_cr3("winbox")
+
+
+def test_find_process_matches_name_longer_than_15_chars(monkeypatch):
+    """EPROCESS.ImageFileName is a 15-byte kernel field, so a real name like
+    'SecurityHealthService.exe' arrives truncated to 15 chars. find_process
+    must still match it (against the 15-char prefix) instead of never matching."""
+    from winbox.kdbg.walk import find_process
+
+    truncated = "SecurityHealth"[:15] + "S"  # 15 chars, as the kernel stores it
+    rec = ProcessRecord(
+        pid=1234, name=truncated, eprocess=0x1000,
+        directory_table_base=0x2000, user_directory_table_base=0,
+    )
+    monkeypatch.setattr(walk, "list_processes", lambda *a, **k: [rec])
+
+    assert find_process("winbox", None, name="SecurityHealthService.exe") is rec
+    # A different long name that truncates differently must NOT match.
+    assert find_process("winbox", None, name="NotepadPlusPlusReally.exe") is None

@@ -174,6 +174,21 @@ def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
             f"computed nt base 0x{base:x} is not canonical-high — "
             "something is wrong with the IDT read"
         )
+    # Confirm the computed base actually points at ntoskrnl by checking for the
+    # MZ header. This is the guard for KVA-Shadow/KPTI guests: there IDT[0]
+    # targets the KiDivideErrorFaultShadow trampoline in .KVASCODE, not
+    # KiDivideErrorFault, so `handler - rva` lands on the wrong page. The
+    # page-aligned/canonical checks above pass whenever the shadow delta is a
+    # page multiple, which would otherwise cache a silently-wrong base and make
+    # every later walk read garbage. Turn that into a clean, named failure.
+    head = read_virt_current(cfg.vm_name, base, 2)
+    if head[:2] != b"MZ":
+        raise SymbolLoadError(
+            f"computed nt base 0x{base:x} does not point at an MZ header "
+            f"(got {head[:2]!r}) — IDT[0] is likely a KPTI/KVA-Shadow "
+            "trampoline, not KiDivideErrorFault; nt base cannot be derived "
+            "this way on this guest"
+        )
     return base
 
 

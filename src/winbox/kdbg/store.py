@@ -88,6 +88,12 @@ class SymbolStore:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
+        # module -> (mtime_ns, parsed data). load() re-reads the multi-MB JSON
+        # on every call, and a single module walk calls it once per entry via
+        # store.struct()/resolve(); without this an ~200-module `kdbg lm`
+        # re-parsed the whole nt store ~200 times. Keyed on mtime so an atomic
+        # load_module rewrite (tempfile + rename bumps mtime) invalidates it.
+        self._load_cache: dict[str, tuple[int, dict[str, Any]]] = {}
 
     # ── Index management ────────────────────────────────────────────────
 
@@ -185,7 +191,13 @@ class SymbolStore:
 
     def load(self, module: str) -> dict[str, Any]:
         path = self._module_path(module)
-        return json.loads(path.read_text(encoding="utf-8"))
+        mtime = path.stat().st_mtime_ns
+        cached = self._load_cache.get(module)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self._load_cache[module] = (mtime, data)
+        return data
 
     def info(self, module: str) -> ModuleInfo:
         data = self.load(module)

@@ -39,14 +39,20 @@ def hmp(
     Both old in-tree wrappers (``cli/kdbg._hmp`` and ``mcp._kdbg_hmp``)
     routed through this — keep them out of new code.
     """
-    result = subprocess.run(
-        [
-            "virsh", "-c", "qemu:///system",
-            "qemu-monitor-command", vm_name,
-            "--hmp", command,
-        ],
-        capture_output=True, text=True, check=False, timeout=timeout,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "virsh", "-c", "qemu:///system",
+                "qemu-monitor-command", vm_name,
+                "--hmp", command,
+            ],
+            capture_output=True, text=True, check=False, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        # Surface as HmpError so walkers (which catch HmpError/PageWalkError to
+        # log a truncation and return partial data) don't die on an unhandled
+        # TimeoutExpired escaping the whole MCP tool call.
+        raise HmpError(f"HMP {command!r} timed out after {timeout}s") from e
     if mode == "tuple":
         return result.returncode, result.stdout.strip(), result.stderr.strip()
     if mode != "raise":
