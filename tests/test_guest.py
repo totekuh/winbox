@@ -330,3 +330,143 @@ class TestPingIsChannelFirst:
         monkeypatch.setattr("time.sleep", lambda *_: None)
 
         ga.wait(timeout=5, interval=0)  # must return, not raise
+
+
+class TestStartGuestExecLaunchRetry:
+    """The launch-transport retry lives at the guest layer, so every entry point
+    (exec, exec_argv, exec_background, exec_detached) inherits it — not just the
+    CLI `run_command`. It is deliberately narrow: only GuestAgentUnreachable (the
+    agent was never reached, so guest-exec never executed) is retried. A plain
+    GuestAgentError — which a reply lost *after* the process spawned also looks
+    like — is raised immediately, because re-sending it could double-run a
+    non-idempotent command. See _start_guest_exec's docstring."""
+
+    def _make_ga(self):
+        from winbox.config import Config
+        from winbox.vm.guest import GuestAgent
+        return GuestAgent(Config())
+
+    @pytest.fixture(autouse=True)
+    def _no_launch_sleep(self, monkeypatch):
+        # Don't actually sleep between launch retries.
+        monkeypatch.setattr("winbox.vm.guest.time.sleep", lambda *_: None)
+
+    def test_retries_unreachable_launch_then_succeeds(self, monkeypatch):
+        from winbox.vm.guest import GuestAgentUnreachable
+
+        ga = self._make_ga()
+        calls = [0]
+
+        def fake_raw(payload, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                # Agent never reached — nothing spawned, so retry is safe.
+                raise GuestAgentUnreachable(
+                    "Guest agent command failed: agent is not responding"
+                )
+            return {"return": {"pid": 4242}}
+
+        monkeypatch.setattr(ga, "_raw_command", fake_raw)
+        assert ga._start_guest_exec({"execute": "guest-exec"}) == 4242
+        assert calls[0] == 2
+
+    def test_plain_agent_error_is_not_retried(self, monkeypatch):
+        """A plain GuestAgentError (the agent answered, or a reply lost after
+        the process already spawned) must not be re-sent — double-run hazard."""
+        from winbox.vm.guest import GuestAgentError
+
+        ga = self._make_ga()
+        calls = [0]
+
+        def fake_raw(payload, **kw):
+            calls[0] += 1
+            raise GuestAgentError("guest-exec failed: some agent-side error")
+
+        monkeypatch.setattr(ga, "_raw_command", fake_raw)
+        with pytest.raises(GuestAgentError, match="agent-side error"):
+            ga._start_guest_exec({"execute": "guest-exec"})
+        assert calls[0] == 1
+
+    def test_missing_pid_raises_immediately(self, monkeypatch):
+        """No PID on a successful response is a degenerate result; re-sending it
+        has the same double-run hazard, so it raises without retry."""
+        ga = self._make_ga()
+        calls = [0]
+
+        def fake_raw(payload, **kw):
+            calls[0] += 1
+            return {"return": {}}
+
+        monkeypatch.setattr(ga, "_raw_command", fake_raw)
+        with pytest.raises(Exception, match="no PID"):
+            ga._start_guest_exec({"execute": "guest-exec"})
+        assert calls[0] == 1
+
+    def test_persistent_unreachable_raises_after_retries(self, monkeypatch):
+        from winbox.vm.guest import GuestAgentUnreachable, _LAUNCH_RETRIES
+
+        ga = self._make_ga()
+        calls = [0]
+
+        def fake_raw(payload, **kw):
+            calls[0] += 1
+            raise GuestAgentUnreachable("persistent unreachable")
+
+        monkeypatch.setattr(ga, "_raw_command", fake_raw)
+        with pytest.raises(GuestAgentUnreachable, match="persistent"):
+            ga._start_guest_exec({"execute": "guest-exec"})
+        assert calls[0] == _LAUNCH_RETRIES
+
+    def test_exec_background_inherits_retry(self, monkeypatch):
+        from winbox.vm.guest import GuestAgentUnreachable
+
+        ga = self._make_ga()
+        calls = [0]
+
+        def fake_raw(payload, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise GuestAgentUnreachable("agent not responding")
+            return {"return": {"pid": 55}}
+
+        monkeypatch.setattr(ga, "_raw_command", fake_raw)
+        assert ga.exec_background("whoami") == 55
+        assert calls[0] == 2
+
+    def test_exec_detached_inherits_retry(self, monkeypatch):
+        from winbox.vm.guest import GuestAgentUnreachable
+
+        ga = self._make_ga()
+        calls = [0]
+
+        def fake_raw(payload, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise GuestAgentUnreachable("agent not responding")
+            return {"return": {"pid": 88}}
+
+        monkeypatch.setattr(ga, "_raw_command", fake_raw)
+        assert ga.exec_detached("whoami") == 88
+        assert calls[0] == 2
+
+    def test_happy_path_launches_exactly_once(self, monkeypatch):
+        """A successful exec must not fire the launch retry — otherwise it would
+        consume an extra _raw_command and desync a canned response sequence."""
+        from tests.conftest import nonce_aware
+
+        ga = self._make_ga()
+        launches = [0]
+        base = nonce_aware([
+            {"return": {"pid": 42}},
+            {"return": {"exited": True, "exitcode": 0}},
+        ])
+
+        def counting(payload, **kw):
+            if payload.get("execute") == "guest-exec":
+                launches[0] += 1
+            return base(payload, **kw)
+
+        monkeypatch.setattr(ga, "_raw_command", counting)
+        result = ga.exec("whoami", timeout=10, poll_interval=0)
+        assert result.exitcode == 0
+        assert launches[0] == 1

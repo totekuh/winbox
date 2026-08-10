@@ -37,6 +37,13 @@ _MAX_TRANSIENT_ERRORS = 5
 # answer from the agent settles it; a transport failure is not an answer.
 _UNKNOWN_PID_PROBE_ATTEMPTS = 3
 
+# How many times a guest-exec *launch* is retried on a pre-launch failure (the
+# GA pipe-broker race, a libvirt transport hiccup, or a call that returns no
+# PID). Every one of those means nothing ran, so retrying is idempotent-safe —
+# unlike anything post-launch, which may re-run a non-idempotent command.
+_LAUNCH_RETRIES = 3
+_LAUNCH_RETRY_DELAY = 0.5
+
 
 # virsh stderr fragments that mean the agent was never reached. Everything
 # else on a non-zero exit is the agent answering with an error of its own —
@@ -184,6 +191,49 @@ class GuestAgent:
                 )
             time.sleep(interval)
 
+    def _start_guest_exec(self, payload: dict) -> int:
+        """Launch a guest-exec, retrying only when the agent was never reached.
+
+        This is the single owner of launch-transport retry (run_command no
+        longer wraps it). The retry is deliberately narrow: only
+        ``GuestAgentUnreachable`` — the channel is down, the agent is not
+        responding, the domain is gone, or the reply was unparseable JSON — is
+        retried, because those mean the ``guest-exec`` never reached qemu-ga, so
+        no process was spawned and re-sending cannot double-run anything.
+
+        Everything else is *not* retried:
+
+        * A plain ``GuestAgentError`` means qemu-ga answered with an error of
+          its own. A reply that is lost *after* the process was spawned can also
+          surface this way, and re-sending would run a non-idempotent command
+          (installer, PoC) twice — so it is raised, not retried.
+        * A response with no PID is a degenerate success; re-sending it has the
+          same double-run hazard, so it is raised immediately.
+
+        ``GuestExecTimeout`` / ``GuestExecAbandoned`` cannot occur here — they
+        originate later, in ``_poll_exec``.
+        """
+        for attempt in range(_LAUNCH_RETRIES):
+            try:
+                response = self._raw_command(payload)
+            except GuestAgentUnreachable as e:
+                # The agent was never reached: nothing ran, so retry is safe.
+                if attempt < _LAUNCH_RETRIES - 1:
+                    logger.debug(
+                        "guest-exec launch unreachable (attempt %d/%d), "
+                        "retrying: %s", attempt + 1, _LAUNCH_RETRIES, e,
+                    )
+                    time.sleep(_LAUNCH_RETRY_DELAY)
+                    continue
+                raise
+            pid = response.get("return", {}).get("pid")
+            if pid is None:
+                raise GuestAgentError("Failed to start process — no PID returned")
+            return pid
+        # Unreachable: the loop either returns a PID or raises on the last
+        # attempt. Kept explicit so a future edit can't fall off the end.
+        raise GuestAgentUnreachable("guest-exec launch exhausted retries")
+
     def exec_detached(self, command: str) -> int:
         """Fire a command in the guest and return immediately.
 
@@ -198,11 +248,7 @@ class GuestAgent:
                 "capture-output": False,
             },
         }
-        response = self._raw_command(payload)
-        pid = response.get("return", {}).get("pid")
-        if pid is None:
-            raise GuestAgentError("Failed to start process — no PID returned")
-        return pid
+        return self._start_guest_exec(payload)
 
     def exec_background(self, command: str) -> int:
         """Start a command with output capture but don't poll for completion.
@@ -218,11 +264,7 @@ class GuestAgent:
                 "capture-output": True,
             },
         }
-        response = self._raw_command(payload)
-        pid = response.get("return", {}).get("pid")
-        if pid is None:
-            raise GuestAgentError("Failed to start process — no PID returned")
-        return pid
+        return self._start_guest_exec(payload)
 
     def _kill_and_reap(self, pid: int) -> None:
         """Kill a runaway process tree and free every slot it leaves behind.
@@ -465,10 +507,7 @@ class GuestAgent:
                 "capture-output": True,
             },
         }
-        response = self._raw_command(payload)
-        pid = response.get("return", {}).get("pid")
-        if pid is None:
-            raise GuestAgentError("Failed to start process — no PID returned")
+        pid = self._start_guest_exec(payload)
 
         # A completed result is ours only if it carries the nonce we echoed.
         def resolve(ret: dict) -> dict | None:
@@ -522,10 +561,7 @@ class GuestAgent:
                 "capture-output": True,
             },
         }
-        response = self._raw_command(payload)
-        pid = response.get("return", {}).get("pid")
-        if pid is None:
-            raise GuestAgentError("Failed to start process — no PID returned")
+        pid = self._start_guest_exec(payload)
 
         first_poll = True
 

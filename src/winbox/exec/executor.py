@@ -9,13 +9,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from winbox.vm.guest import (
-    ExecResult,
-    GuestAgent,
-    GuestAgentError,
-    GuestExecAbandoned,
-    GuestExecTimeout,
-)
+from winbox.vm.guest import ExecResult, GuestAgent
 from winbox.jobs import Job, JobMode, JobStatus, JobStore
 from winbox.utils import human_size
 
@@ -23,23 +17,6 @@ if TYPE_CHECKING:
     from winbox.config import Config
 
 console = Console()
-
-
-def _command_already_ran(err: GuestAgentError) -> bool:
-    """True when this error means the guest already launched the command.
-
-    The retry loop below exists for the GA pipe race, which fails *before* the
-    process starts — retrying is free. Anything that already ran is the
-    opposite: a retry re-runs a half-completed, non-idempotent operation
-    (installers, registry writers, exploit PoCs).
-
-    The axis is launch-phase vs poll-phase, not transport vs timeout. A
-    transport failure during the *poll* means the command started and was then
-    killed, which is why guest.py raises GuestExecAbandoned there rather than
-    letting the transport error through — classifying that as retryable would
-    be a licence to run it twice.
-    """
-    return isinstance(err, (GuestExecTimeout, GuestExecAbandoned))
 
 
 def resolve_exe(exe: str, tools_dir: Path) -> str:
@@ -108,36 +85,31 @@ def run_command(
     marker.touch()
     marker_time = time.time()
 
-    # Execute via guest agent (retry on "handle is invalid" — GA pipe race).
+    # The launch-transport retry (the GA pipe/transport race that fails *before*
+    # the process starts) now lives one layer down, in GuestAgent.exec via
+    # _start_guest_exec — a single layer, so it is not re-wrapped here (wrapping
+    # it stacked the two 3x loops into up to 9 attempts). A GuestAgentError that
+    # still escapes ga.exec has either already run (timeout/abandoned) or
+    # exhausted the launch retry, so it must propagate untouched — cli/exec.py
+    # renders it with a VM-state hint.
+    #
+    # What remains here is the os-path-only retry for the *post-launch* pipe
+    # race: a result that comes back carrying "handle is invalid" in its own
+    # output (the process launched but its stdio handle broke). Re-running can
+    # double-execute, so this stays an interactive-only convenience and is
+    # deliberately not applied to the automated python/powershell MCP tools.
     # Uses cmd.exe /c for cd /d and tools PATH; exec_argv() is available for
     # callers that don't need shell features (pipes, redirects, cd).
     max_retries = 3
     result: ExecResult | None = None
     for attempt in range(max_retries):
-        try:
-            attempt_result = ga.exec(full_cmd, timeout=timeout)
-        except GuestAgentError as e:
-            if _command_already_ran(e):
-                raise
-            if attempt < max_retries - 1:
-                console.print(f"[yellow][!][/] GA error, retrying ({attempt + 1}/{max_retries})...")
-                time.sleep(0.5)
-                continue
-            raise
-        # Only commit `result` once we have a fresh one for this attempt
-        # — keeps the loop free of "did `result` come from this iteration
-        # or a stale prior one?" ambiguity.
-        result = attempt_result
+        result = ga.exec(full_cmd, timeout=timeout)
         if "handle is invalid" not in result.stdout.lower() + result.stderr.lower():
             break
         if attempt < max_retries - 1:
             console.print(f"[yellow][!][/] GA pipe race detected, retrying ({attempt + 1}/{max_retries})...")
             time.sleep(0.5)
-    if result is None:
-        # Defensive: this can only happen if every attempt raised GuestAgentError
-        # AND the final attempt's `raise` was somehow swallowed (shouldn't be
-        # possible). Surface explicitly rather than letting the next access fail.
-        raise GuestAgentError(f"exec failed after {max_retries} retries with no result")
+    assert result is not None  # the loop body runs at least once
 
     # Print stdout/stderr
     if result.stdout:

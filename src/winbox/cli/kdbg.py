@@ -45,6 +45,7 @@ from winbox.kdbg.debugger import (
     RspError,
     fork_daemon,
     install_user_breakpoint,
+    masquerade_cr3_candidates,
 )
 from winbox.kdbg.format import format_struct as _format_struct, format_sym as _format_sym
 from winbox.kdbg.hmp import (
@@ -642,11 +643,10 @@ def kdbg_user_bp(
         # KVA-Shadow/KPTI builds split a process's page tables into two
         # roots; only retry the second when it was actually read off
         # KPROCESS (never guess — a wrong CR3 write here could patch the
-        # wrong physical page). Mirrors TargetInfo.masquerade_candidates.
-        cr3_candidates = (
-            (target_proc.directory_table_base, target_proc.user_directory_table_base)
-            if target_proc.user_directory_table_base
-            else (target_proc.directory_table_base,)
+        # wrong physical page). Shared rule — see masquerade_cr3_candidates.
+        cr3_candidates = masquerade_cr3_candidates(
+            target_proc.directory_table_base,
+            target_proc.user_directory_table_base,
         )
 
         with console.status(f"[blue]Installing user bp via CR3 masquerade..."):

@@ -650,6 +650,17 @@ def test_masquerade_candidates_excludes_xor_guess_when_user_dtb_missing():
     assert t.cr3_set == (0x1225ad000, 0x1225ac000)  # cr3_set still offers it
 
 
+def test_masquerade_candidates_dedupes_equal_halves():
+    """A build that reports user_dtb == dtb must not yield the same CR3 twice —
+    it would double the RSP round-trips and list the value twice in an
+    exhausted-candidates error, reading as if two distinct halves were tried."""
+    t = TargetInfo(
+        pid=8000, dtb=0x1225ad000, name="cyserver.exe",
+        user_dtb=0x1225ad000,
+    )
+    assert t.masquerade_candidates == (0x1225ad000,)
+
+
 def test_op_cont_accepts_second_cr3_under_kpti():
     """Bp inside a driver fires with the kernel CR3 of the calling
     process. With UserDirectoryTableBase known, that's stored exactly;

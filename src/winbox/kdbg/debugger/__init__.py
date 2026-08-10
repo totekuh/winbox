@@ -20,6 +20,7 @@ from winbox.kdbg.debugger.daemon import (
     DaemonSession,
     fork_daemon,
     lock_path,
+    masquerade_cr3_candidates,
     session_path,
     sock_path,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "fork_daemon",
     "install_user_breakpoint",
     "lock_path",
+    "masquerade_cr3_candidates",
     "session_path",
     "sock_path",
 ]

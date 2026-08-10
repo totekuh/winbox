@@ -73,6 +73,24 @@ whichever CR3 happens to be active rather than the target's. Needs a repro
 against the actual code path before fixing — this is one live observation,
 not a bisected cause.
 
+### 22. Background jobs have no result-identity protection against PID recycling
+
+`exec()` (nonce) and `exec_argv()` (look-behind) both verify that a
+guest-exec result actually belongs to the command that asked for it — the
+guard against qemu-ga handing back an abandoned result parked on a recycled
+Windows PID. Background jobs skip that entirely: `run_command_bg` →
+`exec_background`/`exec_detached` return a raw PID, and `JobStore` later
+polls `exec_status(pid)` with no nonce and no look-behind, so a buffered job
+whose short-lived PID gets recycled can read a foreign result. `--log` mode
+sidesteps it (output is redirected to files on VirtIO-FS, not the agent's
+buffered slot); the buffered (`JobMode.BUFFERED`) path is the exposure. The
+guest-layer launch retry added on 2026-08-10 (`_start_guest_exec`) covers
+these paths' *launch* but not their *result identity* — a real fix needs a
+job-scoped nonce echoed at spawn and checked at status-read, which is a
+bigger change than the foreground path took. Not yet reproduced;
+audit-derived from the same PID-recycle mechanism `git log` already fixed for
+the foreground path.
+
 ### 10. Conditional breakpoints fail closed and indistinguishably from a real null
 
 `_mem_qword_reader` (`daemon.py:883-941`) returns `0` both when a VA is

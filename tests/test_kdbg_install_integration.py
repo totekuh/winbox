@@ -18,7 +18,11 @@ import pytest
 
 from winbox.config import Config
 from winbox.kdbg import SymbolStore
-from winbox.kdbg.debugger import RspClient, install_user_breakpoint
+from winbox.kdbg.debugger import (
+    RspClient,
+    install_user_breakpoint,
+    masquerade_cr3_candidates,
+)
 from winbox.kdbg.hmp import probe_port
 from winbox.kdbg.walk import list_processes
 
@@ -59,11 +63,11 @@ def _find_notepad(cfg, store):
 
 
 def _cr3_candidates(proc):
-    """Mirror TargetInfo.masquerade_candidates: only retry the second
-    CR3 half when it was actually read off KPROCESS, never guessed."""
-    if proc.user_directory_table_base:
-        return (proc.directory_table_base, proc.user_directory_table_base)
-    return (proc.directory_table_base,)
+    """Use the shared masquerade CR3 rule so this integration path exercises the
+    exact same selection the CLI and TargetInfo do."""
+    return masquerade_cr3_candidates(
+        proc.directory_table_base, proc.user_directory_table_base
+    )
 
 
 # ── tests ────────────────────────────────────────────────────────────────

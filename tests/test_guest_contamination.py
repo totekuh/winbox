@@ -514,16 +514,24 @@ class TestPollPhaseTransportMeansTheCommandRan:
         assert excinfo.value.pid == 4242
         assert not isinstance(excinfo.value, GuestAgentUnreachable)
 
-    def test_executor_will_not_retry_it(self):
-        """The point of the type: this is what stops a second install."""
-        from winbox.exec.executor import _command_already_ran
-        from winbox.vm.guest import (
-            GuestAgentError, GuestAgentUnreachable, GuestExecAbandoned,
-            GuestExecTimeout,
-        )
+    def test_executor_will_not_retry_it(self, cfg):
+        """The point of the type: this is what stops a second install.
 
-        assert _command_already_ran(GuestExecAbandoned("x", pid=1)) is True
-        assert _command_already_ran(GuestExecTimeout("x", pid=1)) is True
-        assert _command_already_ran(GuestAgentUnreachable("x")) is False
-        # A pre-launch "no PID returned" must stay retryable.
-        assert _command_already_ran(GuestAgentError("no PID returned")) is False
+        run_command no longer inspects the error — launch-transport retry lives
+        in GuestAgent.exec (_start_guest_exec). The guarantee is now end-to-end:
+        an already-ran failure (timeout/abandoned) escaping ga.exec propagates
+        untouched, so the command is never issued a second time."""
+        from unittest.mock import MagicMock
+
+        from winbox.exec.executor import run_command
+        from winbox.vm.guest import GuestExecAbandoned, GuestExecTimeout
+
+        for err in (
+            GuestExecTimeout("timed out", pid=1),
+            GuestExecAbandoned("abandoned on recycled PID", pid=1),
+        ):
+            ga = MagicMock()
+            ga.exec.side_effect = err
+            with pytest.raises(type(err)):
+                run_command(cfg, ga, "installer.exe", ("/S",), timeout=1)
+            assert ga.exec.call_count == 1

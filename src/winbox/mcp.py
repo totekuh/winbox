@@ -6,12 +6,20 @@ import json as _json
 import shutil
 import textwrap
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 from winbox.config import Config
-from winbox.vm import VM, VMState, GuestAgent, GuestAgentError
+from winbox.vm import (
+    VM,
+    VMState,
+    GuestAgent,
+    GuestAgentError,
+    GuestAgentUnreachable,
+    GuestExecAbandoned,
+)
 
 mcp = FastMCP(
     "winbox",
@@ -80,6 +88,46 @@ def _ensure_vm_ready() -> tuple[Config, VM, GuestAgent]:
     return cfg, vm, ga
 
 
+# ─── Internal: guest-exec error translation ────────────────────────────────
+
+def _guest_error_message(exc: GuestAgentError, vm: VM) -> str:
+    """Turn a guest-exec failure into an actionable one-liner for the client.
+
+    Mirrors the UX ``cli/exec.py`` already gives on the terminal: surface the
+    error, and — when the VM is no longer running, or the transport was lost
+    mid-command — say what likely happened and what to do about it. Without
+    this, a lost guest agent reached the MCP client as a bare exception string.
+    """
+    base = str(exc)
+    try:
+        state = vm.state()
+    except Exception:
+        state = None
+    if state is not None and state != VMState.RUNNING:
+        return f"{base}\nVM state: {state.value} — try 'winbox up' and retry."
+    if isinstance(exc, (GuestExecAbandoned, GuestAgentUnreachable)):
+        return (
+            f"{base}\nGuest agent unreachable — the VM may have rebooted or "
+            f"paused; try 'winbox up --reboot' and retry."
+        )
+    return base
+
+
+@contextmanager
+def _guest_errors(vm: VM):
+    """Re-raise a guest-exec failure as a RuntimeError with an actionable hint.
+
+    FastMCP renders a raised RuntimeError as a tool error the client sees —
+    the same path ``_ensure_vm_ready`` already uses for VM-not-ready states.
+    Only GA transport/exec failures are translated; a command that *ran* and
+    merely exited non-zero still flows back as a normal result.
+    """
+    try:
+        yield
+    except GuestAgentError as e:
+        raise RuntimeError(_guest_error_message(e, vm)) from e
+
+
 # ─── Internal: Python execution ────────────────────────────────────────────
 
 def _exec_python(
@@ -121,10 +169,11 @@ def _exec_python(
         args_path.write_text(_json.dumps(args), encoding="utf-8")
 
     try:
-        result = ga.exec(
-            f"python.exe {vm_script}",
-            timeout=timeout,
-        )
+        with _guest_errors(vm):
+            result = ga.exec(
+                f"python.exe {vm_script}",
+                timeout=timeout,
+            )
         return {
             "exitcode": result.exitcode,
             "stdout": result.stdout,
@@ -677,7 +726,8 @@ def eventlogs(
     except ValueError as e:
         return f"error: {e}"
 
-    result = ga.exec_powershell(script, timeout=timeout)
+    with _guest_errors(vm):
+        result = ga.exec_powershell(script, timeout=timeout)
     if result.exitcode != 0:
         msg = (result.stderr or result.stdout or "Get-WinEvent failed").strip()
         return f"error (exit {result.exitcode}): {msg}"
@@ -743,7 +793,8 @@ def eventlogs_clear(
     except ValueError as e:
         return f"error: {e}"
 
-    result = ga.exec_powershell(script, timeout=timeout)
+    with _guest_errors(vm):
+        result = ga.exec_powershell(script, timeout=timeout)
     if result.exitcode != 0:
         msg = (result.stderr or result.stdout or "wevtutil cl failed").strip()
         return f"error (exit {result.exitcode}): {msg}"
@@ -1022,7 +1073,8 @@ def service_stop(name: str, timeout: int = 30) -> str:
         timeout: Execution timeout in seconds (default 30).
     """
     cfg, vm, ga = _ensure_vm_ready()
-    result = ga.exec(f"sc.exe stop {name}", timeout=timeout)
+    with _guest_errors(vm):
+        result = ga.exec(f"sc.exe stop {name}", timeout=timeout)
     return _format_exec_result(result)
 
 
@@ -1038,7 +1090,8 @@ def service_start(name: str, timeout: int = 30) -> str:
         timeout: Execution timeout in seconds (default 30).
     """
     cfg, vm, ga = _ensure_vm_ready()
-    result = ga.exec(f"sc.exe start {name}", timeout=timeout)
+    with _guest_errors(vm):
+        result = ga.exec(f"sc.exe start {name}", timeout=timeout)
     return _format_exec_result(result)
 
 
@@ -1061,7 +1114,9 @@ def av_status(timeout: int = 15) -> str:
     from winbox import defender
 
     cfg, vm, ga = _ensure_vm_ready()
-    return _format_exec_result(defender.status(ga, timeout=timeout))
+    with _guest_errors(vm):
+        status = defender.status(ga, timeout=timeout)
+    return _format_exec_result(status)
 
 
 @mcp.tool()
@@ -1081,7 +1136,8 @@ def av_enable() -> str:
     cfg, vm, ga = _ensure_vm_ready()
     steps: list[str] = []
     try:
-        outcome = defender.enable(ga, progress=steps.append)
+        with _guest_errors(vm):
+            outcome = defender.enable(ga, progress=steps.append)
     except defender.DefenderError as e:
         detail = _format_exec_result(e.result) if e.result is not None else ""
         return f"error: {e}\n{detail}".rstrip()

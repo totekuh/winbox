@@ -140,6 +140,31 @@ class StopState:
     raw_regs: bytes       # full g-packet blob — kept so re-reads are cheap
 
 
+def masquerade_cr3_candidates(dtb: int, user_dtb: int) -> tuple[int, ...]:
+    """CR3 values safe to *write* into a vCPU for masquerade reads/writes.
+
+    The single source of truth for this rule — used by ``TargetInfo``, the
+    ``kdbg_user_bp`` CLI, and ``install_user_breakpoint``. Keep it one function:
+    the invariant is safety-critical (never actively write a *guessed* CR3), so
+    it must not drift between call sites.
+
+    Unlike ``cr3_set``, this never includes the ``dtb ^ 0x1000`` guess.
+    ``cr3_set`` only ever compares against a CR3 QEMU already reports (a passive
+    membership check — a wrong guess just fails to match). Masquerade actively
+    writes a candidate into CR3 and walks page tables through it; a wrong guess
+    there could resolve to some *other* valid-looking physical page and silently
+    read, write, or patch the wrong process's memory instead of failing cleanly.
+
+    So: only ``dtb`` when ``user_dtb`` is unknown (0), or both when ``user_dtb``
+    was actually read from ``KPROCESS`` — and never the same value twice (a build
+    that reports ``user_dtb == dtb`` must not double the RSP round-trips or list
+    the same CR3 twice in an exhausted-candidates error).
+    """
+    if user_dtb and user_dtb != dtb:
+        return (dtb, user_dtb)
+    return (dtb,)
+
+
 @dataclass
 class TargetInfo:
     pid: int
@@ -180,20 +205,9 @@ class TargetInfo:
     def masquerade_candidates(self) -> tuple[int, ...]:
         """CR3 values safe to *write* into a vCPU for masquerade reads/writes.
 
-        Unlike ``cr3_set``, this never includes the ``dtb ^ 0x1000``
-        guess. ``cr3_set`` only ever compares against a CR3 QEMU already
-        reports (a passive membership check — a wrong guess just fails
-        to match). Masquerade actively writes a candidate into CR3 and
-        walks page tables through it; a wrong guess there could resolve
-        to some *other* valid-looking physical page and silently read,
-        write, or patch the wrong process's memory instead of failing
-        cleanly. So: only ``dtb`` alone when ``user_dtb`` is unknown (no
-        retry — current single-CR3 behavior, unchanged), or both when
-        ``user_dtb`` was actually read from ``KPROCESS``.
+        Thin accessor over the shared rule — see ``masquerade_cr3_candidates``.
         """
-        if self.user_dtb:
-            return (self.dtb, self.user_dtb)
-        return (self.dtb,)
+        return masquerade_cr3_candidates(self.dtb, self.user_dtb)
 
 
 # ── Daemon process ──────────────────────────────────────────────────────

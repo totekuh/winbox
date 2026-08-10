@@ -8,7 +8,6 @@ import pytest
 from winbox.exec.executor import resolve_exe, run_command, run_command_bg
 from winbox.vm.guest import (
     ExecResult,
-    GuestAgentError,
     GuestAgentUnreachable,
     GuestExecAbandoned,
     GuestExecTimeout,
@@ -147,10 +146,13 @@ class TestRunCommandQuoting:
 
 
 class TestRunCommandRetryPolicy:
-    """The retry loop exists for one thing: the guest-agent pipe race, which
-    fails before the guest process starts. Anything that means the command
-    already ran must not be retried — `winbox exec installer.exe /S` running
-    three partial installs off one command line is worse than one failure."""
+    """run_command retries exactly one thing: the *post-launch* pipe race, where
+    the process started but its stdio handle broke and 'handle is invalid' comes
+    back inside the command's own output. Launch-transport retries live one layer
+    down in GuestAgent.exec; anything that means the command already ran
+    (timeout/abandoned) must propagate untouched — `winbox exec installer.exe /S`
+    running three partial installs off one command line is worse than one
+    failure."""
 
     def _ga(self):
         ga = MagicMock()
@@ -190,12 +192,14 @@ class TestRunCommandRetryPolicy:
 
         assert ga.exec.call_count == 1
 
-    def test_transient_ga_error_is_still_retried(self, cfg):
-        """The pipe race this loop was built for must keep working."""
+    def test_post_launch_pipe_race_in_output_is_retried(self, cfg):
+        """The one retry run_command still owns: a *post-launch* pipe race,
+        where the process launched but its stdio handle broke and 'handle is
+        invalid' rides back inside the command's own output. (Launch-transport
+        retries moved down into GuestAgent.exec.)"""
         ga = self._ga()
         ga.exec.side_effect = [
-            # Pre-launch transport failure — nothing ran, so retry is free.
-            GuestAgentUnreachable("Guest agent command failed: The handle is invalid."),
+            ExecResult(exitcode=1, stdout="The handle is invalid.\n", stderr=""),
             ExecResult(exitcode=0, stdout="ok", stderr=""),
         ]
 
@@ -204,28 +208,16 @@ class TestRunCommandRetryPolicy:
         assert rc == 0
         assert ga.exec.call_count == 2
 
-
-class TestPreLaunchTimeoutTextIsStillRetried:
-    """libvirt renders its own pre-launch failures as "operation timed out".
-
-    The old classifier matched on that substring, so a transport failure that
-    never started anything was treated as "already ran" and the retry loop —
-    the entire reason this code exists — silently switched itself off.
-    """
-
-    def test_libvirt_operation_timeout_is_retried(self, cfg):
-        ga = MagicMock()
-        ga.exec.side_effect = [
-            GuestAgentUnreachable(
-                "Guest agent command failed: error: operation timed out"
-            ),
-            ExecResult(exitcode=0, stdout="ok", stderr=""),
-        ]
-
-        rc = run_command(cfg, ga, "whoami.exe", (), timeout=60)
-
-        assert rc == 0
-        assert ga.exec.call_count == 2, (
-            "a pre-launch failure whose message says 'timed out' must still "
-            "be retried — nothing ran"
+    def test_launch_exception_is_not_re_retried(self, cfg):
+        """A launch-transport failure escaping ga.exec has already been retried
+        inside exec (_start_guest_exec); run_command must not wrap it in a
+        second retry loop — that stacked the two into up to 9 attempts."""
+        ga = self._ga()
+        ga.exec.side_effect = GuestAgentUnreachable(
+            "Guest agent command failed: error: operation timed out"
         )
+
+        with pytest.raises(GuestAgentUnreachable):
+            run_command(cfg, ga, "whoami.exe", (), timeout=60)
+
+        assert ga.exec.call_count == 1
