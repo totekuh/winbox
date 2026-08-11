@@ -199,8 +199,6 @@ class Config:
                 or (value[0] == "'" and value[-1] == "'")
             ):
                 value = value[1:-1]
-            # Expand ~ and env vars
-            value = os.path.expandvars(os.path.expanduser(value))
 
             attr = mapping.get(key)
             if attr is None:
@@ -209,6 +207,12 @@ class Config:
                     path, lineno, key, ", ".join(sorted(mapping)),
                 )
                 continue
+            # Expand ~ and env vars, but never for credential fields: a
+            # literal '$', '${...}' or leading '~' in a password/username
+            # must be preserved verbatim, otherwise autologin/ssh would
+            # authenticate with silently mangled credentials.
+            if attr not in {"vm_password", "vm_user"}:
+                value = os.path.expandvars(os.path.expanduser(value))
             if attr in int_fields:
                 try:
                     parsed = int(value)

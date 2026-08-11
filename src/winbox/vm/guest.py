@@ -379,7 +379,22 @@ class GuestAgent:
                 continue
             ret = status.get("return", {})
             if ret.get("exited"):
-                resolved = resolve(ret)
+                try:
+                    resolved = resolve(ret)
+                except GuestAgentError as e:
+                    # `resolve` isn't pure — exec_argv's talks to the agent to
+                    # settle identity, and an unsettleable probe raises. That
+                    # escaped here without killing the process we started and,
+                    # worse, as GuestAgentUnreachable ("nothing ran") for a
+                    # command that had already spawned. Mirror the poll-phase
+                    # transport branch: kill/reap and report ran-and-killed.
+                    self._kill_and_reap(pid)
+                    raise GuestExecAbandoned(
+                        f"Could not establish this command's identity on PID "
+                        f"{pid}; it had already started and has been killed: "
+                        f"{e}",
+                        pid=pid,
+                    ) from e
                 if resolved is not None:
                     return resolved
                 # Not ours: a stale entry parked on this recycled PID. Reading

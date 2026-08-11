@@ -2332,6 +2332,7 @@ from winbox.kdbg import (
     resolve_nt_base as _kdbg_resolve_nt_base,
 )
 from winbox.kdbg.hmp import HmpError as _KdbgHmpError
+from winbox.kdbg.pe import PeError as _KdbgPeError
 from winbox.kdbg.walk import list_modules as _kdbg_list_modules
 from winbox.kdbg.walk import list_processes as _kdbg_list_processes
 from winbox.kdbg.walk import list_user_modules as _kdbg_list_user_modules
@@ -2368,7 +2369,10 @@ def kdbg_symbols_load() -> str:
     """
     cfg, vm, ga = _ensure_vm_ready()
     store = _kdbg_get_store()
-    info = _kdbg_load_nt(cfg, ga, store)
+    try:
+        info = _kdbg_load_nt(cfg, ga, store)
+    except (_KdbgSymbolLoadError, _KdbgStoreError, _KdbgPeError) as e:
+        return f"error: {e}"
     base_txt = f"base=0x{info.base:x}" if info.base else "base=unresolved"
     return (
         f"nt {info.build}: {info.symbol_count} symbols, {info.type_count} types, {base_txt}"
@@ -2585,7 +2589,7 @@ def kdbg_user_symbols_load(pid: int, module: str) -> str:
             base=match.base,
             wanted_types=(),
         )
-    except (_KdbgSymbolLoadError, _KdbgStoreError) as e:
+    except (_KdbgSymbolLoadError, _KdbgStoreError, _KdbgPeError) as e:
         return f"error: {e}"
 
     return (

@@ -93,7 +93,11 @@ def autologin_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     for args in _enable_argv(cfg.vm_user, cfg.vm_password):
         result = ga.exec_argv("reg.exe", args, timeout=15)
         if result.exitcode != 0:
-            console.print(f"[red][-][/] Failed: reg.exe {' '.join(args)}")
+            # Never echo the /d payload — it carries the VM password. Report the
+            # operation and value name only.
+            value = args[args.index("/v") + 1] if "/v" in args else ""
+            console.print("[red][-][/] Failed:")
+            console.print(f"    reg.exe {args[0]} {args[1]} /v {value}", markup=False, highlight=False)
             console.print(f"    {result.stderr.strip()}", markup=False, highlight=False)
             raise SystemExit(1)
 
@@ -110,7 +114,8 @@ def autologin_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
         result = ga.exec_argv("reg.exe", args, timeout=15)
         # reg delete returns 1 if the value is already absent — that's fine.
         if result.exitcode != 0 and args[0] != "delete":
-            console.print(f"[red][-][/] Failed: reg.exe {' '.join(args)}")
+            console.print("[red][-][/] Failed:")
+            console.print(f"    reg.exe {' '.join(args)}", markup=False, highlight=False)
             console.print(f"    {result.stderr.strip()}", markup=False, highlight=False)
             raise SystemExit(1)
 
@@ -123,7 +128,8 @@ def autologin_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Show current autologin status."""
     result = ga.exec_powershell(_STATUS_SCRIPT, timeout=15)
     if result.exitcode != 0:
-        console.print(f"[red][-][/] Failed to query status: {result.stderr.strip()}")
+        console.print("[red][-][/] Failed to query status:")
+        console.print(f"    {result.stderr.strip()}", markup=False, highlight=False)
         raise SystemExit(1)
 
     console.print(result.stdout.strip(), markup=False, highlight=False)

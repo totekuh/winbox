@@ -67,6 +67,25 @@ class TestAutologinEnable:
         assert result.exit_code != 0
         assert "Failed" in result.output
 
+    def test_enable_failure_does_not_echo_password(self, runner, mock_env, cfg, monkeypatch):
+        """A reg.exe failure must not print the DefaultPassword payload, even
+        when the password contains rich markup (which would otherwise crash the
+        markup-enabled console.print)."""
+        secret = "p[/x]ss[bold]word"
+        monkeypatch.setattr(cfg, "vm_password", secret, raising=False)
+        # Fail only on the DefaultPassword write so we hit that argv on the error path.
+        def fake_exec_argv(path, args, **kwargs):
+            if "DefaultPassword" in args:
+                return ExecResult(exitcode=1, stdout="", stderr="ERROR: Access denied")
+            return ExecResult(exitcode=0, stdout="", stderr="")
+
+        mock_env.exec_argv.side_effect = fake_exec_argv
+        result = runner.invoke(cli, ["autologin", "enable"])
+        assert result.exit_code != 0
+        assert "Failed" in result.output
+        assert secret not in result.output
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+
 
 # ─── disable ─────────────────────────────────────────────────────────────────
 

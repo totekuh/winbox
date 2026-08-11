@@ -214,6 +214,19 @@ class TestIpDiscovery:
         # It must NOT also try `virsh start`, which would just error.
         assert not any(c[0][0] == "start" for c in run.call_args_list)
 
+    def test_start_raises_when_dompmwakeup_fails(self, vm):
+        """A failed dompmwakeup must surface, not report false success while the
+        guest stays asleep."""
+        with (
+            patch.object(VM, "_domstate_raw", return_value="pmsuspended"),
+            patch(
+                "winbox.vm.lifecycle.virsh_run",
+                return_value=_proc(returncode=1, stderr="wakeup boom"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="dompmwakeup"):
+                vm.start()
+
     def test_virsh_failure_returns_none(self, vm):
         with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(returncode=1)):
             assert vm.ip() is None

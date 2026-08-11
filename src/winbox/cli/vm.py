@@ -7,6 +7,7 @@ import subprocess
 import time
 
 import click
+from rich.markup import escape
 
 from winbox.cli import console, ensure_running, needs_vm
 from winbox.config import Config
@@ -210,14 +211,14 @@ def snapshot(ctx: click.Context, name: str | None) -> None:
         _graceful_shutdown(vm, ga)
         console.print("[green][+][/] VM stopped")
 
-    console.print(f"[blue][*][/] Creating snapshot '{name}'...")
+    console.print(f"[blue][*][/] Creating snapshot '{escape(name)}'...")
     try:
         vm.snapshot_create(name)
     except Exception as e:
-        console.print(f"[red][-][/] Failed to create snapshot '{name}':")
+        console.print(f"[red][-][/] Failed to create snapshot '{escape(name)}':")
         console.print(f"    {e}", markup=False, highlight=False)
         raise SystemExit(1)
-    console.print(f"[green][+][/] Snapshot '{name}' created")
+    console.print(f"[green][+][/] Snapshot '{escape(name)}' created")
 
 
 @click.command()
@@ -229,13 +230,13 @@ def restore(ctx: click.Context, name: str) -> None:
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
-    console.print(f"[blue][*][/] Restoring snapshot '{name}'...")
+    console.print(f"[blue][*][/] Restoring snapshot '{escape(name)}'...")
     try:
         vm.snapshot_revert(name)
     except Exception:
-        console.print(f"[red][-][/] Failed to restore snapshot '{name}'")
+        console.print(f"[red][-][/] Failed to restore snapshot '{escape(name)}'")
         raise SystemExit(1)
-    console.print(f"[green][+][/] Restored to '{name}'")
+    console.print(f"[green][+][/] Restored to '{escape(name)}'")
 
     if vm.state() == VMState.RUNNING:
         console.print("[blue][*][/] Waiting for guest agent...")

@@ -361,6 +361,45 @@ class TestExecArgvPollResilience:
             p.get("arguments", {}).get("path") == "taskkill" for p in fake.payloads
         )
 
+    def test_unsettleable_identity_probe_is_abandoned_not_unreachable(
+        self, monkeypatch
+    ):
+        """exec_argv's resolve queries the agent to settle identity, and an
+        unsettleable unknown-PID probe raises. That escaped _poll_exec as
+        GuestAgentUnreachable ("nothing ran") for a command that had already
+        spawned, and without killing/reaping the started PID."""
+        from winbox.vm.guest import GuestAgentUnreachable, GuestExecAbandoned
+
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+        calls: list[dict] = []
+        status_reads = {"n": 0}
+
+        def agent(payload, **kwargs):
+            calls.append(payload)
+            if payload.get("execute") == "guest-exec":
+                return {"return": {"pid": 4242}}
+            pid = payload["arguments"]["pid"]
+            if pid == 4242:
+                status_reads["n"] += 1
+                # The poll's own read reports exited; the look-behind read
+                # reports "not exited", forcing resolve to the unknown-PID
+                # probe to settle identity.
+                if status_reads["n"] == 1:
+                    return {"return": {"exited": True, "exitcode": 0}}
+                return {"return": {"exited": False}}
+            # The unknown-PID probe can never be settled.
+            raise GuestAgentUnreachable("Guest agent command failed: agent gone")
+
+        ga = _ga(monkeypatch, agent)
+        with pytest.raises(GuestExecAbandoned) as excinfo:
+            ga.exec_argv("msiexec.exe", ["/i", "x.msi"], timeout=1, poll_interval=0)
+
+        assert excinfo.value.pid == 4242
+        assert not isinstance(excinfo.value, GuestAgentUnreachable)
+        assert any(
+            c.get("arguments", {}).get("path") == "taskkill" for c in calls
+        ), "a command abandoned mid-identity-check must be killed and reaped"
+
 
 class TestErrorTypesDistinguishLaunchFromTransport:
     """The one question callers must answer is "did it reach the guest?".

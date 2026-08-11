@@ -207,7 +207,10 @@ class VM:
         """
         raw = self._domstate_raw()
         if raw is not None and "pmsuspended" in raw:
-            virsh_run("dompmwakeup", self.name, check=False)
+            result = virsh_run("dompmwakeup", self.name, check=False)
+            if result.returncode != 0:
+                msg = result.stderr.strip() or f"virsh exit {result.returncode}"
+                raise RuntimeError(f"virsh dompmwakeup {self.name} failed: {msg}")
             return
 
         result = virsh_run("start", self.name, check=False)

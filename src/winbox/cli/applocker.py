@@ -188,7 +188,8 @@ def applocker_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     # transient guest stall rather than time out and get taskkill'd.
     result = ga.exec_powershell(_STATUS_SCRIPT, timeout=90)
     if result.exitcode != 0:
-        console.print(f"[red][-][/] Failed to query status: {result.stderr.strip()}")
+        console.print("[red][-][/] Failed to query status:")
+        console.print(f"    {result.stderr.strip()}", markup=False, highlight=False)
         raise SystemExit(1)
 
     console.print(result.stdout.strip(), markup=False, highlight=False)

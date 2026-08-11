@@ -125,6 +125,28 @@ class TestSnapshotErrorSurfacing:
         assert "VM not found" in result.output
         mock_env._vm.snapshot_create.assert_not_called()
 
+    def test_markup_hostile_name_does_not_crash(self, runner, mock_env):
+        """A snapshot name with rich-markup characters must not raise MarkupError."""
+        mock_env._vm.state.return_value = VMState.SHUTOFF
+        mock_env._vm.exists.return_value = True
+
+        result = runner.invoke(cli, ["snapshot", "foo[/]"])
+        assert result.exit_code == 0
+        assert result.exception is None
+        assert "foo[/]" in result.output
+        mock_env._vm.snapshot_create.assert_called_once_with("foo[/]")
+
+    def test_markup_hostile_name_on_restore(self, runner, mock_env):
+        """restore must escape the name in its markup-enabled prints too."""
+        mock_env._vm.state.return_value = VMState.SHUTOFF
+        mock_env._vm.exists.return_value = True
+
+        result = runner.invoke(cli, ["restore", "foo[/]"])
+        assert result.exit_code == 0
+        assert result.exception is None
+        assert "foo[/]" in result.output
+        mock_env._vm.snapshot_revert.assert_called_once_with("foo[/]")
+
 
 class TestSnapshotList:
     """Bare `winbox snapshot` with no name should list existing snapshots."""

@@ -214,6 +214,21 @@ class TestAppLockerStatus:
         assert result.exit_code != 0
         assert "Failed to query" in result.output
 
+    def test_status_query_fails_with_markup_chars_in_stderr(self, runner, mock_env):
+        # Guest-controlled PowerShell stderr can contain rich markup
+        # metacharacters (bracketed .NET type names, a stray `[/]`). It is
+        # echoed verbatim and must not be parsed as markup and crash.
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=1,
+            stdout="",
+            stderr="Cannot convert [System.String] to type [/] boom",
+        )
+
+        result = runner.invoke(cli, ["applocker", "status"])
+        assert result.exit_code != 0, result.output
+        assert "Failed to query" in result.output
+        assert "[System.String]" in result.output
+
 
 # ─── policy content ──────────────────────────────────────────────────────────
 

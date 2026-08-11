@@ -176,6 +176,20 @@ class TestConfigOverrides:
         cfg = Config._apply_overrides(Config(), config_file)
         assert cfg.vm_name == "expanded"
 
+    def test_credentials_not_expanded(self, tmp_path, monkeypatch):
+        # A '$', '${...}' or leading '~' in a password/username must be
+        # preserved verbatim — expansion would silently mangle credentials.
+        monkeypatch.setenv("USER", "totekuh")
+        monkeypatch.setenv("HOME", "/home/totekuh")
+        config_file = tmp_path / "config"
+        config_file.write_text(
+            "VM_PASSWORD=Secret$USER!\n"
+            "VM_USER=~admin${HOME}\n"
+        )
+        cfg = Config._apply_overrides(Config(), config_file)
+        assert cfg.vm_password == "Secret$USER!"
+        assert cfg.vm_user == "~admin${HOME}"
+
     def test_lines_without_equals_ignored(self, tmp_path):
         config_file = tmp_path / "config"
         config_file.write_text("no_equals_here\nVM_NAME=valid\n")
