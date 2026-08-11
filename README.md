@@ -165,6 +165,7 @@ Long-running tools can run in the background:
 ```bash
 winbox exec --bg Seatbelt.exe -group=all             # output buffered in guest agent memory
 winbox exec --bg --log Certify.exe find /vulnerable   # output redirected to log files (tail -f)
+winbox exec --bg --user alice --password secret whoami # background job as a local Windows user
 winbox jobs list                                      # check status
 winbox jobs output <job-id>                           # print output
 winbox jobs kill <job-id>                             # kill a running job
@@ -345,9 +346,9 @@ User-mode primitives:
 
 | Tool | Description |
 |------|-------------|
-| `exec(command, user?, password?, background?)` | Execute a cmd.exe command, optionally as a local Windows user or in the background |
-| `python(code, user?, password?, background?)` | Execute Python code in the VM, optionally as a local Windows user or in the background |
-| `powershell(script, user?, password?, background?)` | Execute encoded PowerShell, optionally as a local Windows user or in the background |
+| `exec(command, user?, password?, background?)` | Execute a cmd.exe command, optionally as a local Windows user, in the background, or both |
+| `python(code, user?, password?, background?)` | Execute Python code, optionally as a local Windows user, in the background, or both |
+| `powershell(script, user?, password?, background?)` | Execute encoded PowerShell, optionally as a local Windows user, in the background, or both |
 | `job_result(job_id)` | Retrieve output of a background `exec`/`python`/`powershell` job (non-blocking poll; also visible to `winbox jobs`) |
 | `ioctl(device, code, input_hex, output_size)` | Send DeviceIoControl to a driver — no ctypes boilerplate |
 | `reg_query(key, value?)` | Query registry key or value |

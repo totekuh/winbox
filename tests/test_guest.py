@@ -180,6 +180,47 @@ class TestCredentialedExecution:
         assert "-t" not in arguments["arg"]
         assert arguments["capture-output"] is True
 
+    @pytest.mark.parametrize("qualified", [r"WINBOX\rpcprobe", r".\rpcprobe"])
+    def test_local_qualified_username_is_normalized_for_runex(
+        self, monkeypatch, qualified,
+    ):
+        from winbox.vm.guest import RUNEX_PATH
+
+        ga = self._ga()
+        seen = {}
+        monkeypatch.setattr(
+            ga, "_start_guest_exec",
+            lambda payload: seen.setdefault("payload", payload) and 123,
+        )
+
+        ga.exec_background(
+            "whoami", user=qualified, password="Cobalt!Raven_2026-47",
+        )
+
+        arguments = seen["payload"]["arguments"]
+        assert arguments["path"] == RUNEX_PATH
+        assert arguments["arg"][:2] == ["rpcprobe", "Cobalt!Raven_2026-47"]
+
+    def test_powershell_background_forwards_credentials(self, monkeypatch):
+        ga = self._ga()
+        seen = {}
+
+        def fake_background(command, **kwargs):
+            seen.update(command=command, kwargs=kwargs)
+            return 321
+
+        monkeypatch.setattr(ga, "exec_background", fake_background)
+
+        pid = ga.exec_powershell_background(
+            "whoami", user=r"WINBOX\rpcprobe", password="secret",
+        )
+
+        assert pid == 321
+        assert "-EncodedCommand" in seen["command"]
+        assert seen["kwargs"] == {
+            "user": r"WINBOX\rpcprobe", "password": "secret",
+        }
+
     def test_powershell_forwards_credentials(self, monkeypatch):
         ga = self._ga()
         seen = {}

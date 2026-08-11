@@ -279,60 +279,6 @@ def _execution_json(result) -> str:
 
 
 @mcp.tool()
-def exec(
-    command: str,
-    timeout: int = 300,
-    user: str | None = None,
-    password: str | None = None,
-    background: bool = False,
-) -> str:
-    """Execute a cmd.exe command, optionally as a local user or in the background."""
-    cfg, vm, ga = _ensure_vm_ready()
-    if background:
-        if user is not None or password is not None:
-            raise ValueError("background execution does not support alternate credentials")
-        return _launch_bg_job(
-            cfg, lambda job_id: ga.exec_background(command), _bg_label("exec", command),
-        )
-    with _guest_errors(vm):
-        if user is None and password is None:
-            result = ga.exec(command, timeout=timeout)
-        else:
-            result = ga.exec(
-                command, timeout=timeout, user=user, password=password,
-            )
-    return _execution_json(result)
-
-
-@mcp.tool()
-def powershell(
-    script: str,
-    timeout: int = 600,
-    user: str | None = None,
-    password: str | None = None,
-    background: bool = False,
-) -> str:
-    """Execute PowerShell, optionally as a local user or in the background."""
-    cfg, vm, ga = _ensure_vm_ready()
-    if background:
-        if user is not None or password is not None:
-            raise ValueError("background execution does not support alternate credentials")
-        return _launch_bg_job(
-            cfg,
-            lambda job_id: ga.exec_powershell_background(script),
-            _bg_label("powershell", script),
-        )
-    with _guest_errors(vm):
-        if user is None and password is None:
-            result = ga.exec_powershell(script, timeout=timeout)
-        else:
-            result = ga.exec_powershell(
-                script, timeout=timeout, user=user, password=password,
-            )
-    return _execution_json(result)
-
-
-@mcp.tool()
 def python(
     code: str, timeout: int = 300,
     user: str | None = None, password: str | None = None,
@@ -361,15 +307,19 @@ def python(
         background: Launch detached and return a job handle instead of waiting.
     """
     if background:
-        if user is not None or password is not None:
-            raise ValueError("background execution does not support alternate credentials")
         cfg, vm, ga = _ensure_vm_ready()
 
         def _launch(job_id: int) -> int:
             job_dir = cfg.shared_dir / ".mcp" / "jobs" / str(job_id)
             job_dir.mkdir(parents=True, exist_ok=True)
             (job_dir / "script.py").write_text(code, encoding="utf-8")
-            return ga.exec_background(f"python.exe Z:\\.mcp\\jobs\\{job_id}\\script.py")
+            kwargs = {}
+            if user is not None or password is not None:
+                kwargs.update(user=user, password=password)
+            return ga.exec_background(
+                f"python.exe Z:\\.mcp\\jobs\\{job_id}\\script.py",
+                **kwargs,
+            )
 
         return _launch_bg_job(cfg, _launch, _bg_label("python", code))
 
@@ -389,14 +339,21 @@ def python(
 # ─── powershell ─────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def powershell(code: str, timeout: int = 300, background: bool = False) -> str:
+def powershell(
+    script: str,
+    timeout: int = 600,
+    user: str | None = None,
+    password: str | None = None,
+    background: bool = False,
+) -> str:
     """Execute PowerShell (Windows PowerShell 5.1) inside the Windows VM.
 
-    Runs as Administrator. Use this instead of shelling out to powershell.exe
-    from the `python` tool — it removes the nested-quoting tax (backslash paths
-    and quotes pass through verbatim) and returns errors as readable plain text
-    (PowerShell's CLIXML stderr serialization is decoded for you; progress noise
-    is dropped).
+    Runs in the privileged guest-agent context by default, or as the specified
+    local user when both ``user`` and ``password`` are supplied. Use this
+    instead of shelling out to powershell.exe from the `python` tool — it
+    removes the nested-quoting tax (backslash paths and quotes pass through
+    verbatim) and returns errors as readable plain text (PowerShell's CLIXML
+    stderr serialization is decoded for you; progress noise is dropped).
 
     Returns a JSON-encoded ``{"stdout": str, "stderr": str, "exitcode": int}``,
     same shape as `python`, so a script that prints JSON to stdout can be
@@ -415,35 +372,48 @@ def powershell(code: str, timeout: int = 300, background: bool = False) -> str:
     PowerShell error lands on stderr with exitcode 0 (standard PS behavior).
 
     Args:
-        code: PowerShell source to execute.
-        timeout: Execution timeout in seconds (default 300). Ignored when
+        script: PowerShell source to execute.
+        timeout: Execution timeout in seconds (default 600). Ignored when
             background=True (the job is never waited on here).
+        user: Optional local Windows username.
+        password: Password for ``user``; both must be supplied together.
         background: Launch detached and return a job handle instead of waiting.
     """
     cfg, vm, ga = _ensure_vm_ready()
     if background:
+        kwargs = {}
+        if user is not None or password is not None:
+            kwargs.update(user=user, password=password)
         return _launch_bg_job(
             cfg,
-            lambda job_id: ga.exec_powershell_background(code),
-            _bg_label("powershell", code),
+            lambda job_id: ga.exec_powershell_background(
+                script, **kwargs,
+            ),
+            _bg_label("powershell", script),
         )
-    result = ga.exec_powershell(code, timeout=timeout)
-    return _json.dumps({
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "exitcode": result.exitcode,
-    })
+    kwargs = {"timeout": timeout}
+    if user is not None or password is not None:
+        kwargs.update(user=user, password=password)
+    result = ga.exec_powershell(script, **kwargs)
+    return _execution_json(result)
 
 
 # ─── exec ────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def exec(command: str, timeout: int = 300, background: bool = False) -> str:  # noqa: A001
+def exec(  # noqa: A001
+    command: str,
+    timeout: int = 300,
+    user: str | None = None,
+    password: str | None = None,
+    background: bool = False,
+) -> str:
     """Run a command line in the Windows VM via cmd.exe.
 
     The plain-command counterpart to `python`/`powershell`: run a native exe, a
-    built-in, a batch line — anything cmd.exe accepts — as Administrator, with
-    no Python-subprocess wrapper. Returns a JSON-encoded
+    built-in, a batch line — anything cmd.exe accepts — in the privileged
+    guest-agent context by default or as the specified local user, with no
+    Python-subprocess wrapper. Returns a JSON-encoded
     ``{"stdout": str, "stderr": str, "exitcode": int}``.
 
     With ``background=True`` the call is fire-and-forget: it launches the command
@@ -457,21 +427,27 @@ def exec(command: str, timeout: int = 300, background: bool = False) -> str:  # 
         command: The command line to run (as passed to ``cmd.exe /c``).
         timeout: Execution timeout in seconds (default 300). Ignored when
             background=True (the job is never waited on here).
+        user: Optional local Windows username.
+        password: Password for ``user``; both must be supplied together.
         background: Launch detached and return a job handle instead of waiting.
     """
     cfg, vm, ga = _ensure_vm_ready()
     if background:
+        kwargs = {}
+        if user is not None or password is not None:
+            kwargs.update(user=user, password=password)
         return _launch_bg_job(
             cfg,
-            lambda job_id: ga.exec_background(command),
+            lambda job_id: ga.exec_background(
+                command, **kwargs,
+            ),
             _bg_label("exec", command),
         )
-    result = ga.exec(command, timeout=timeout)
-    return _json.dumps({
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "exitcode": result.exitcode,
-    })
+    kwargs = {"timeout": timeout}
+    if user is not None or password is not None:
+        kwargs.update(user=user, password=password)
+    result = ga.exec(command, **kwargs)
+    return _execution_json(result)
 
 
 # ─── job_result ──────────────────────────────────────────────────────────────

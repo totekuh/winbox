@@ -47,6 +47,7 @@ _LAUNCH_RETRIES = 3
 _LAUNCH_RETRY_DELAY = 0.5
 
 RUNEX_PATH = r"C:\Tools\RunEx.exe"
+_LOCAL_COMPUTER_NAME = "WINBOX"
 _RUNEX_EXCEPTION_MARKER = "[-] RunExException:"
 
 
@@ -61,6 +62,15 @@ def _runex_args(
     path: str,
     args: list[str],
 ) -> list[str]:
+    # RunEx takes a local username and a separate --domain option.  Winbox
+    # intentionally does not expose domain execution yet, but callers commonly
+    # spell a local account as ``WINBOX\alice`` (the form returned by whoami)
+    # or ``.\alice``.  Treat those two prefixes as local aliases instead of
+    # passing a backslash-containing username that RunEx cannot launch.
+    if "\\" in user:
+        qualifier, local_user = user.split("\\", 1)
+        if qualifier == "." or qualifier.casefold() == _LOCAL_COMPUTER_NAME.casefold():
+            user = local_user
     # Passthrough preserves stdout and stderr as separate inherited handles.
     # RunEx's buffered mode merges them. Do not pass -t with -P: RunEx ignores
     # that combination and prints a warning. qemu-ga owns the outer timeout
@@ -797,7 +807,13 @@ class GuestAgent:
             **kwargs,
         )
 
-    def exec_powershell_background(self, script: str) -> int:
+    def exec_powershell_background(
+        self,
+        script: str,
+        *,
+        user: str | None = None,
+        password: str | None = None,
+    ) -> int:
         """Launch a PowerShell script fire-and-forget; return the guest PID.
 
         The launch returns as soon as the process is spawned — before the
@@ -811,8 +827,12 @@ class GuestAgent:
         """
         script = f"$ProgressPreference = 'SilentlyContinue'\n{script}"
         encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        kwargs = {}
+        if user is not None or password is not None:
+            kwargs.update(user=user, password=password)
         return self.exec_background(
-            f"powershell -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+            f"powershell -ExecutionPolicy Bypass -EncodedCommand {encoded}",
+            **kwargs,
         )
 
     def shutdown(self) -> None:

@@ -468,6 +468,58 @@ class TestBackgroundExec:
         ga.exec_background.assert_called_once_with("trigger.exe")
         ga.exec.assert_not_called()
 
+    def test_exec_background_forwards_alternate_credentials(self, mock_mcp):
+        import json
+        from winbox.mcp import exec as exec_tool
+        ga, vm, cfg = mock_mcp
+        ga.exec_background.return_value = 556
+
+        out = json.loads(exec_tool(
+            "whoami", background=True,
+            user=r"WINBOX\rpcprobe", password="Cobalt!Raven_2026-47",
+        ))
+
+        assert out == {"background": True, "job_id": 1, "pid": 556}
+        ga.exec_background.assert_called_once_with(
+            "whoami",
+            user=r"WINBOX\rpcprobe",
+            password="Cobalt!Raven_2026-47",
+        )
+
+    def test_python_background_forwards_alternate_credentials(self, mock_mcp):
+        import json
+        from winbox.mcp import python
+        ga, vm, cfg = mock_mcp
+        ga.exec_background.return_value = 4332
+
+        out = json.loads(python(
+            "import getpass; print(getpass.getuser())", background=True,
+            user="rpcprobe", password="Cobalt!Raven_2026-47",
+        ))
+
+        assert out == {"background": True, "job_id": 1, "pid": 4332}
+        ga.exec_background.assert_called_once_with(
+            r"python.exe Z:\.mcp\jobs\1\script.py",
+            user="rpcprobe",
+            password="Cobalt!Raven_2026-47",
+        )
+
+    def test_powershell_background_forwards_alternate_credentials(self, mock_mcp):
+        import json
+        from winbox.mcp import powershell
+        ga, vm, cfg = mock_mcp
+        ga.exec_powershell_background.return_value = 1000
+
+        out = json.loads(powershell(
+            "whoami", background=True,
+            user="rpcprobe", password="Cobalt!Raven_2026-47",
+        ))
+
+        assert out == {"background": True, "job_id": 1, "pid": 1000}
+        ga.exec_powershell_background.assert_called_once_with(
+            "whoami", user="rpcprobe", password="Cobalt!Raven_2026-47",
+        )
+
     def test_exec_sync_runs_and_returns_structured_json(self, mock_mcp):
         import json
         from winbox.mcp import exec as exec_tool

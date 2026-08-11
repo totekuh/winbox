@@ -329,6 +329,37 @@ class TestCredentialedExec:
             assert result["exitcode"] == 0, result
             assert expected in result["stdout"].lower()
 
+    def test_mcp_background_handlers_run_as_qualified_local_user(self, tool):
+        expected = f"winbox\\{self.USER}".lower()
+        qualified = f"WINBOX\\{self.USER}"
+        launches = (
+            tool("exec")(
+                "whoami", background=True,
+                user=qualified, password=self.PASSWORD,
+            ),
+            tool("python")(
+                "import subprocess; print(subprocess.check_output(['whoami'], text=True).strip())",
+                background=True, user=qualified, password=self.PASSWORD,
+            ),
+            tool("powershell")(
+                "[Security.Principal.WindowsIdentity]::GetCurrent().Name",
+                background=True, user=qualified, password=self.PASSWORD,
+            ),
+        )
+
+        for raw_launch in launches:
+            launch = json.loads(raw_launch)
+            assert launch["background"] is True, launch
+            result = None
+            for _ in range(30):
+                result = json.loads(tool("job_result")(launch["job_id"]))
+                if not result.get("running"):
+                    break
+                time.sleep(0.25)
+            assert result and result.get("running") is False, result
+            assert result["exitcode"] == 0, result
+            assert expected in result["stdout"].lower(), result
+
     def test_real_mcp_stdio_server_runs_as_local_user(self):
         """Cross the real stdio transport, not the direct tool-function shim."""
         import anyio
@@ -398,6 +429,70 @@ class TestCredentialedExec:
         for result in anyio.run(exercise_server):
             assert result["exitcode"] == 0, result
             assert expected in result["stdout"].lower()
+
+    def test_real_mcp_stdio_background_runs_as_qualified_local_user(self):
+        """Exercise credentialed background jobs through real MCP framing."""
+        import anyio
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        expected = f"winbox\\{self.USER}".lower()
+        qualified = f"WINBOX\\{self.USER}"
+
+        async def exercise_server():
+            server = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "winbox", "mcp"],
+                cwd=os.getcwd(),
+                env=os.environ.copy(),
+            )
+            async with stdio_client(server) as (read_stream, write_stream):
+                async with ClientSession(
+                    read_stream,
+                    write_stream,
+                    read_timeout_seconds=timedelta(seconds=120),
+                ) as session:
+                    await session.initialize()
+                    calls = (
+                        ("exec", {"command": "whoami"}),
+                        ("python", {"code": (
+                            "import subprocess; print(subprocess.check_output("
+                            "['whoami'], text=True).strip())"
+                        )}),
+                        ("powershell", {"script": (
+                            "[Security.Principal.WindowsIdentity]"
+                            "::GetCurrent().Name"
+                        )}),
+                    )
+                    results = []
+                    for name, arguments in calls:
+                        response = await session.call_tool(name, {
+                            **arguments,
+                            "background": True,
+                            "user": qualified,
+                            "password": self.PASSWORD,
+                        })
+                        assert not response.isError, response
+                        launch = json.loads(response.content[0].text)
+                        assert launch["background"] is True, launch
+
+                        result = None
+                        for _ in range(30):
+                            polled = await session.call_tool(
+                                "job_result", {"job_id": launch["job_id"]},
+                            )
+                            assert not polled.isError, polled
+                            result = json.loads(polled.content[0].text)
+                            if not result.get("running"):
+                                break
+                            await anyio.sleep(0.25)
+                        results.append(result)
+                    return results
+
+        for result in anyio.run(exercise_server):
+            assert result and result.get("running") is False, result
+            assert result["exitcode"] == 0, result
+            assert expected in result["stdout"].lower(), result
 
 
 # ─── files ──────────────────────────────────────────────────────────────────
