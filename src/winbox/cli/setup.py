@@ -167,6 +167,7 @@ def _setup_inner(
         installer.download_winfsp(cfg)
         installer.download_python(cfg)
         installer.download_python_embed(cfg)
+        installer.download_runex(cfg)
         installer.download_x64dbg(cfg)
         installer.extract_virtiofs(cfg)
         installer.generate_ssh_keypair(cfg)
@@ -260,10 +261,11 @@ def provision(cfg: Config, vm: VM, ga: GuestAgent) -> None:
         console.print(result.stderr, end="", markup=False, style="red", highlight=False)
 
     # Clean up provisioning files from shared tools dir
-    for name in ("provision.ps1", ".ssh_pubkey"):
+    for name in ("provision.ps1", ".ssh_pubkey", installer.RUNEX_EXE):
         (cfg.tools_dir / name).unlink(missing_ok=True)
 
     if result.exitcode == 0:
+        installer._verify_runex(ga)
         console.print("[green][+][/] Provisioning complete")
     else:
         console.print(f"[yellow][!][/] Provisioning exited with code {result.exitcode}")

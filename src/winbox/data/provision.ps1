@@ -36,6 +36,26 @@ try {
     Write-Host "[!] Could not fully disable Defender: $_"
 }
 
+# --- RunEx (credentialed execution helper) ---
+$runExSource = "$provDir\RunEx.exe"
+$runExTarget = "C:\Tools\RunEx.exe"
+$runExSha256 = "f1603cdbdc7a2fa20aeb94f09f0002d91ee968cb0021534fde3d54bb2bca59a7"
+try {
+    if (-not (Test-Path $runExSource)) { throw "RunEx.exe is missing from provisioning payload" }
+    if ((Get-FileHash $runExSource -Algorithm SHA256).Hash.ToLowerInvariant() -ne $runExSha256) {
+        throw "RunEx.exe payload failed SHA-256 verification"
+    }
+    New-Item -ItemType Directory -Path "C:\Tools" -Force | Out-Null
+    Copy-Item $runExSource $runExTarget -Force
+    if ((Get-FileHash $runExTarget -Algorithm SHA256).Hash.ToLowerInvariant() -ne $runExSha256) {
+        throw "installed RunEx.exe failed SHA-256 verification"
+    }
+    Write-Host "[+] RunEx installed at $runExTarget"
+} catch {
+    Write-Host "[!] RunEx installation failed: $_"
+    $script:ProvisionFailed = $true
+}
+
 # --- Disable Firewall ---
 Write-Host "[*] Disabling firewall..."
 try {

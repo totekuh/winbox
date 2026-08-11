@@ -1,7 +1,7 @@
 """Tests for winbox.executor — path resolution and the exec retry policy."""
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -221,3 +221,47 @@ class TestRunCommandRetryPolicy:
             run_command(cfg, ga, "whoami.exe", (), timeout=60)
 
         assert ga.exec.call_count == 1
+
+
+class TestCredentialedExecCli:
+    def test_forwards_user_and_password(self, runner, mock_env):
+        from winbox.cli import cli
+
+        with patch("winbox.cli.exec.run_command", return_value=0) as run:
+            result = runner.invoke(
+                cli,
+                ["exec", "--user", "alice", "--password", "p&ss word", "whoami"],
+            )
+
+        assert result.exit_code == 0
+        assert run.call_args.kwargs["user"] == "alice"
+        assert run.call_args.kwargs["password"] == "p&ss word"
+
+    @pytest.mark.parametrize(
+        "options", [["--user", "alice"], ["--password", "secret"]],
+    )
+    def test_requires_both_options(self, runner, mock_env, options):
+        from winbox.cli import cli
+
+        result = runner.invoke(cli, ["exec", *options, "whoami"])
+
+        assert result.exit_code != 0
+        assert "must be supplied together" in result.output
+
+    def test_background_forwards_credentials(self, runner, mock_env):
+        from winbox.cli import cli
+        from winbox.jobs import Job, JobMode
+
+        job = Job(1, 123, "whoami", JobMode.BUFFERED)
+        with patch("winbox.cli.exec.run_command_bg", return_value=job) as run:
+            result = runner.invoke(
+                cli,
+                [
+                    "exec", "--user", "alice", "--password", "secret",
+                    "--bg", "whoami",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert run.call_args.kwargs["user"] == "alice"
+        assert run.call_args.kwargs["password"] == "secret"

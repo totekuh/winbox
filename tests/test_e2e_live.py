@@ -20,8 +20,11 @@ are deliberately last in the file, since pytest runs in definition order.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import time
+from datetime import timedelta
 
 import pytest
 from click.testing import CliRunner
@@ -275,6 +278,124 @@ class TestExec:
         """The authoritative readiness signal agrees with a real round-trip."""
         assert vm.agent_connected() is True
         assert ga.ping() is True
+
+
+class TestCredentialedExec:
+    USER = "_winbox_e2e_user"
+    PASSWORD = "WbxE2E!&26"
+
+    @pytest.fixture(autouse=True)
+    def disposable_user(self, ga):
+        # Direct argv keeps the metacharacter-bearing password out of cmd.exe.
+        ga.exec_argv("net.exe", ["user", self.USER, "/delete"], timeout=30)
+        created = ga.exec_argv(
+            "net.exe", ["user", self.USER, self.PASSWORD, "/add"], timeout=30,
+        )
+        assert created.exitcode == 0, created.stderr
+        try:
+            yield
+        finally:
+            ga.exec_argv("net.exe", ["user", self.USER, "/delete"], timeout=30)
+
+    def test_runex_is_installed(self, ga):
+        result = ga.exec(r"if exist C:\Tools\RunEx.exe (exit /b 0) else (exit /b 1)")
+        assert result.exitcode == 0
+
+    def test_cli_exec_runs_as_local_user(self, run):
+        result = run(
+            "exec", "--user", self.USER, "--password", self.PASSWORD,
+            "whoami.exe",
+        )
+        assert f"winbox\\{self.USER}" in result.output.lower()
+
+    def test_mcp_exec_python_and_powershell_run_as_local_user(self, tool):
+        expected = f"winbox\\{self.USER}".lower()
+
+        cmd_result = json.loads(tool("exec")(
+            "whoami", user=self.USER, password=self.PASSWORD,
+        ))
+        py_result = json.loads(tool("python")(
+            "import subprocess; print(subprocess.check_output(['whoami'], text=True).strip())",
+            user=self.USER, password=self.PASSWORD,
+        ))
+        ps_result = json.loads(tool("powershell")(
+            "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
+            user=self.USER, password=self.PASSWORD,
+        ))
+
+        for result in (cmd_result, py_result, ps_result):
+            assert result["exitcode"] == 0, result
+            assert expected in result["stdout"].lower()
+
+    def test_real_mcp_stdio_server_runs_as_local_user(self):
+        """Cross the real stdio transport, not the direct tool-function shim."""
+        import anyio
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        expected = f"winbox\\{self.USER}".lower()
+
+        async def exercise_server():
+            server = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "winbox", "mcp"],
+                cwd=os.getcwd(),
+                env=os.environ.copy(),
+            )
+            async with stdio_client(server) as (read_stream, write_stream):
+                async with ClientSession(
+                    read_stream,
+                    write_stream,
+                    read_timeout_seconds=timedelta(seconds=120),
+                ) as session:
+                    await session.initialize()
+                    calls = (
+                        (
+                            "exec",
+                            {
+                                "command": "whoami",
+                                "timeout": 60,
+                                "user": self.USER,
+                                "password": self.PASSWORD,
+                            },
+                        ),
+                        (
+                            "python",
+                            {
+                                "code": (
+                                    "import subprocess; "
+                                    "print(subprocess.check_output(["
+                                    "'whoami'], text=True).strip())"
+                                ),
+                                "timeout": 60,
+                                "user": self.USER,
+                                "password": self.PASSWORD,
+                            },
+                        ),
+                        (
+                            "powershell",
+                            {
+                                "script": (
+                                    "[System.Security.Principal.WindowsIdentity]"
+                                    "::GetCurrent().Name"
+                                ),
+                                "timeout": 60,
+                                "user": self.USER,
+                                "password": self.PASSWORD,
+                            },
+                        ),
+                    )
+                    results = []
+                    for name, arguments in calls:
+                        response = await session.call_tool(name, arguments)
+                        assert not response.isError, response
+                        assert len(response.content) == 1, response
+                        results.append(json.loads(response.content[0].text))
+                    return results
+
+        for result in anyio.run(exercise_server):
+            assert result["exitcode"] == 0, result
+            assert expected in result["stdout"].lower()
 
 
 # ─── files ──────────────────────────────────────────────────────────────────

@@ -143,6 +143,8 @@ def _exec_python(
     code: str,
     timeout: int = 300,
     args: dict | None = None,
+    user: str | None = None,
+    password: str | None = None,
 ) -> dict:
     """Write Python code to VirtIO-FS and execute in VM.
 
@@ -179,10 +181,13 @@ def _exec_python(
 
     try:
         with _guest_errors(vm):
-            result = ga.exec(
-                f"python.exe {vm_script}",
-                timeout=timeout,
-            )
+            if user is None and password is None:
+                result = ga.exec(f"python.exe {vm_script}", timeout=timeout)
+            else:
+                result = ga.exec_argv(
+                    "python.exe", [vm_script], timeout=timeout,
+                    user=user, password=password,
+                )
         return {
             "exitcode": result.exitcode,
             "stdout": result.stdout,
@@ -233,12 +238,60 @@ def _format_exec_result(result: dict) -> str:
 
 # ─── Tool 1: python ────────────────────────────────────────────────────────
 
+def _execution_json(result) -> str:
+    return _json.dumps({
+        "stdout": result.stdout, "stderr": result.stderr,
+        "exitcode": result.exitcode,
+    })
+
+
 @mcp.tool()
-def python(code: str, timeout: int = 300) -> str:
+def exec(
+    command: str,
+    timeout: int = 300,
+    user: str | None = None,
+    password: str | None = None,
+) -> str:
+    """Execute a cmd.exe command in the VM, optionally as a local user."""
+    _, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        if user is None and password is None:
+            result = ga.exec(command, timeout=timeout)
+        else:
+            result = ga.exec(
+                command, timeout=timeout, user=user, password=password,
+            )
+    return _execution_json(result)
+
+
+@mcp.tool()
+def powershell(
+    script: str,
+    timeout: int = 600,
+    user: str | None = None,
+    password: str | None = None,
+) -> str:
+    """Execute an encoded PowerShell script, optionally as a local user."""
+    _, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        if user is None and password is None:
+            result = ga.exec_powershell(script, timeout=timeout)
+        else:
+            result = ga.exec_powershell(
+                script, timeout=timeout, user=user, password=password,
+            )
+    return _execution_json(result)
+
+
+@mcp.tool()
+def python(
+    code: str, timeout: int = 300,
+    user: str | None = None, password: str | None = None,
+) -> str:
     """Execute Python code inside the Windows VM.
 
-    The code runs as Administrator with full access to Win32 APIs via ctypes,
-    the registry via winreg, WMI, COM, and everything else Python can do.
+    By default the code runs in winbox's privileged guest-agent context. Pass
+    both user and password to run it as that local Windows user instead.
 
     Returns a JSON-encoded ``{"stdout": str, "stderr": str, "exitcode": int}``.
     Structured (not prose) so a script that prints valid JSON to stdout can be
@@ -248,7 +301,12 @@ def python(code: str, timeout: int = 300) -> str:
         code: Python source code to execute.
         timeout: Execution timeout in seconds (default 300).
     """
-    result = _exec_python(code, timeout=timeout)
+    if user is None and password is None:
+        result = _exec_python(code, timeout=timeout)
+    else:
+        result = _exec_python(
+            code, timeout=timeout, user=user, password=password,
+        )
     return _json.dumps({
         "stdout": result["stdout"],
         "stderr": result["stderr"],

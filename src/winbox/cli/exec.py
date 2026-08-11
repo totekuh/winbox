@@ -22,10 +22,13 @@ from winbox.exec import open_shell
 @click.option("--timeout", default=300, help="Execution timeout in seconds.")
 @click.option("--bg", is_flag=True, help="Run in background, return immediately.")
 @click.option("--log", is_flag=True, help="Redirect output to log files (with --bg).")
+@click.option("--user", help="Run as this local Windows user.")
+@click.option("--password", help="Password for --user.")
 @needs_vm()
 def exec_cmd(
     cfg: Config, vm: VM, ga: GuestAgent,
     command: tuple[str, ...], timeout: int, bg: bool, log: bool,
+    user: str | None, password: str | None,
 ) -> None:
     """Execute a command in the Windows VM.
 
@@ -40,10 +43,12 @@ def exec_cmd(
         # for log mode; silently dropping it violated least-surprise and
         # masked typos. Hard-fail with the standard Click "Error:" prefix.
         raise click.UsageError("--log requires --bg")
+    if (user is None) != (password is None):
+        raise click.UsageError("--user and --password must be supplied together")
 
     if bg:
         from winbox.jobs import JobMode
-        job = run_command_bg(cfg, ga, exe, args, log=log)
+        job = run_command_bg(cfg, ga, exe, args, log=log, user=user, password=password)
         console.print(f"[green][+][/] Job {job.id} started (PID {job.pid})")
         if job.mode == JobMode.LOG:
             from winbox.jobs import JobStore
@@ -55,7 +60,7 @@ def exec_cmd(
         return
 
     try:
-        exitcode = run_command(cfg, ga, exe, args, timeout=timeout)
+        exitcode = run_command(cfg, ga, exe, args, timeout=timeout, user=user, password=password)
     except GuestAgentError as e:
         # Mid-execution GA disconnect (VM rebooted, crashed, or paused).
         # The command may or may not have completed on the guest side —

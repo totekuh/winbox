@@ -298,6 +298,51 @@ class TestPythonTool:
         parsed = json.loads(result)
         assert parsed == {"stdout": "", "stderr": "", "exitcode": 0}
 
+    def test_credentials_are_forwarded(self, mock_mcp):
+        from winbox.mcp import python
+
+        with patch("winbox.mcp._exec_python") as execute:
+            execute.return_value = {
+                "stdout": "ok", "stderr": "", "exitcode": 0,
+            }
+            python("print('ok')", user="alice", password="secret")
+
+        execute.assert_called_once_with(
+            "print('ok')", timeout=300, user="alice", password="secret",
+        )
+
+
+class TestMcpExecSurfaces:
+    def test_exec_forwards_credentials(self, mock_mcp):
+        import json
+        from winbox.mcp import exec as exec_tool
+
+        ga, _, _ = mock_mcp
+        ga.exec.return_value = ExecResult(9, "out", "err")
+        result = json.loads(
+            exec_tool("exit /b 9", user="alice", password="secret")
+        )
+
+        ga.exec.assert_called_with(
+            "exit /b 9", timeout=300, user="alice", password="secret",
+        )
+        assert result == {"stdout": "out", "stderr": "err", "exitcode": 9}
+
+    def test_powershell_forwards_credentials(self, mock_mcp):
+        import json
+        from winbox.mcp import powershell
+
+        ga, _, _ = mock_mcp
+        ga.exec_powershell.return_value = ExecResult(0, "alice", "")
+        result = json.loads(
+            powershell("whoami", user="alice", password="secret")
+        )
+
+        ga.exec_powershell.assert_called_with(
+            "whoami", timeout=600, user="alice", password="secret",
+        )
+        assert result["stdout"] == "alice"
+
 
 # ─── ioctl tool ─────────────────────────────────────────────────────────────
 

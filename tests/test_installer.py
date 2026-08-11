@@ -12,11 +12,15 @@ from winbox.setup.installer import (
     PYTHON_EXE,
     PYTHON_URL,
     REQUIRED_TOOLS,
+    RUNEX_EXE,
+    RUNEX_SHA256,
+    RUNEX_URL,
     X64DBG_URL,
     X64DBG_ZIP,
     check_prereqs,
     _find_mkisofs,
     boot_for_provisioning,
+    copy_setup_files,
     create_clean_snapshot,
     create_directories,
     generate_ssh_keypair,
@@ -24,6 +28,7 @@ from winbox.setup.installer import (
     download_openssh,
     download_winfsp,
     download_python,
+    download_runex,
     download_x64dbg,
     extract_virtiofs,
     build_unattend_image,
@@ -286,6 +291,70 @@ class TestDownloads:
         """URL must point at the regular Python installer, not the embeddable zip."""
         assert PYTHON_URL.endswith("-amd64.exe")
         assert "embed" not in PYTHON_URL
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_runex_verifies_and_atomically_installs(self, mock_run, cfg):
+        import hashlib
+
+        payload = b"published-runex"
+        part = cfg.iso_dir / f"{RUNEX_EXE}.part"
+
+        def fake_wget(*args, **kwargs):
+            part.write_bytes(payload)
+
+        mock_run.side_effect = fake_wget
+        with patch(
+            "winbox.setup.installer.RUNEX_SHA256",
+            hashlib.sha256(payload).hexdigest(),
+        ):
+            result = download_runex(cfg)
+
+        assert result == cfg.iso_dir / RUNEX_EXE
+        assert result.read_bytes() == payload
+        assert not part.exists()
+        assert RUNEX_URL in mock_run.call_args[0][0]
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_runex_reuses_hash_verified_cache(self, mock_run, cfg):
+        import hashlib
+
+        payload = b"cached-runex"
+        dest = cfg.iso_dir / RUNEX_EXE
+        dest.write_bytes(payload)
+        with patch(
+            "winbox.setup.installer.RUNEX_SHA256",
+            hashlib.sha256(payload).hexdigest(),
+        ):
+            assert download_runex(cfg) == dest
+        mock_run.assert_not_called()
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_runex_rejects_bad_checksum(self, mock_run, cfg):
+        part = cfg.iso_dir / f"{RUNEX_EXE}.part"
+        mock_run.side_effect = lambda *a, **kw: part.write_bytes(b"wrong")
+
+        with pytest.raises(RuntimeError, match="SHA-256"):
+            download_runex(cfg)
+
+        assert not (cfg.iso_dir / RUNEX_EXE).exists()
+        assert not part.exists()
+
+    def test_runex_release_is_pinned(self):
+        assert "/releases/download/v2.1/RunEx.exe" in RUNEX_URL
+        assert len(RUNEX_SHA256) == 64
+
+    def test_copy_setup_files_stages_runex_for_reprovisioning(self, cfg):
+        cached = cfg.iso_dir / RUNEX_EXE
+        cached.write_bytes(b"runex")
+
+        with patch(
+            "winbox.setup.installer.download_runex", return_value=cached,
+        ) as download:
+            copy_setup_files(cfg)
+
+        download.assert_called_once_with(cfg)
+        assert (cfg.tools_dir / RUNEX_EXE).read_bytes() == b"runex"
+        assert (cfg.tools_dir / "provision.ps1").exists()
 
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_x64dbg(self, mock_run, cfg):
@@ -650,10 +719,10 @@ class TestProvisionPayloadPythonCheck:
     def _write_payload(self, cfg, *, python_exe=True, python_embed=True):
         from winbox.setup.installer import (
             OPENSSH_ZIP, PYTHON_EMBED_ZIP, PYTHON_EXE, WINFSP_MSI,
-            _virtiofs_cache_path,
+            RUNEX_EXE, _virtiofs_cache_path,
         )
 
-        for name in (OPENSSH_ZIP, WINFSP_MSI):
+        for name in (OPENSSH_ZIP, WINFSP_MSI, RUNEX_EXE):
             (cfg.iso_dir / name).write_bytes(b"x")
         _virtiofs_cache_path(cfg).write_bytes(b"x")
         if python_exe:
@@ -992,6 +1061,38 @@ class TestVerifyPython:
         ga = self._ga([ExecResult(0, "Python 3.13.13", "")])
         _verify_python(ga)
         assert '"' not in ga.exec.call_args_list[0][0][0]
+
+
+class TestVerifyRunEx:
+    def test_accepts_the_pinned_guest_binary(self, capsys):
+        from winbox.setup.installer import _verify_runex
+        from winbox.vm.guest import ExecResult
+
+        ga = MagicMock()
+        ga.exec_powershell.return_value = ExecResult(0, RUNEX_SHA256, "")
+
+        _verify_runex(ga)
+
+        assert "Guest RunEx verified" in capsys.readouterr().out
+        command = ga.exec_powershell.call_args.args[0]
+        assert r"C:\Tools\RunEx.exe" in command
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            pytest.param((1, "", "missing"), id="missing"),
+            pytest.param((0, "deadbeef", ""), id="wrong-hash"),
+        ],
+    )
+    def test_rejects_a_missing_or_corrupt_guest_binary(self, result):
+        from winbox.setup.installer import _verify_runex
+        from winbox.vm.guest import ExecResult
+
+        ga = MagicMock()
+        ga.exec_powershell.return_value = ExecResult(*result)
+
+        with pytest.raises(RuntimeError, match="missing or corrupt"):
+            _verify_runex(ga)
 
 
 # ─── hivexregedit prereq ────────────────────────────────────────────────────

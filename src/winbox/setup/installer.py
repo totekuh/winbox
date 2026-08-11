@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -235,6 +236,10 @@ PYTHON_EXE = "python-3.13.13-amd64.exe"
 PYTHON_EMBED_URL = "https://www.python.org/ftp/python/3.13.13/python-3.13.13-embed-amd64.zip"
 PYTHON_EMBED_ZIP = "python-3.13.13-embed-amd64.zip"
 
+RUNEX_URL = "https://github.com/totekuh/RunEx/releases/download/v2.1/RunEx.exe"
+RUNEX_EXE = "RunEx.exe"
+RUNEX_SHA256 = "f1603cdbdc7a2fa20aeb94f09f0002d91ee968cb0021534fde3d54bb2bca59a7"
+
 X64DBG_URL = (
     "https://github.com/x64dbg/x64dbg/releases/download/2025.08.19/"
     "snapshot_2025-08-19_19-40.zip"
@@ -329,6 +334,39 @@ def download_python_embed(cfg: Config) -> Path:
     return dest
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_runex(cfg: Config) -> Path:
+    """Ensure the pinned, hash-verified RunEx binary is cached."""
+    dest = cfg.iso_dir / RUNEX_EXE
+    if dest.exists() and _sha256(dest) == RUNEX_SHA256:
+        console.print("[green][+][/] RunEx cached")
+        return dest
+    dest.unlink(missing_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    part.unlink(missing_ok=True)
+    console.print("[blue][*][/] Downloading RunEx...")
+    try:
+        subprocess.run(
+            ["wget", "-q", "--show-progress", "-O", str(part), RUNEX_URL],
+            check=True,
+        )
+        if not part.exists() or _sha256(part) != RUNEX_SHA256:
+            raise RuntimeError("RunEx download failed SHA-256 verification")
+        os.replace(part, dest)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+    console.print("[green][+][/] RunEx downloaded and verified")
+    return dest
+
+
 def download_x64dbg(cfg: Config) -> Path:
     """Download the x64dbg snapshot zip if not cached."""
     dest = cfg.iso_dir / X64DBG_ZIP
@@ -409,6 +447,8 @@ def copy_setup_files(cfg: Config) -> None:
     src = _data.path("provision.ps1")
     dst = cfg.tools_dir / "provision.ps1"
     dst.write_bytes(Path(src).read_bytes())
+    runex = download_runex(cfg)
+    shutil.copy2(runex, cfg.tools_dir / RUNEX_EXE)
     # Copy SSH pubkey so provision.ps1 can find it at Z:\tools\.ssh_pubkey
     if cfg.ssh_pubkey.exists():
         shutil.copy2(cfg.ssh_pubkey, cfg.tools_dir / ".ssh_pubkey")
@@ -732,6 +772,7 @@ def provision_vm_disk(cfg: Config) -> None:
         python_exe = cfg.iso_dir / PYTHON_EXE
         python_embed = cfg.iso_dir / PYTHON_EMBED_ZIP
         x64dbg_zip = cfg.iso_dir / X64DBG_ZIP
+        runex_exe = cfg.iso_dir / RUNEX_EXE
         # provision.ps1 picks its Python payload by probing the guest's
         # ProductType, so the build has to ship the one that probe will ask
         # for. Shipping the wrong one isn't an error there — it just quietly
@@ -745,6 +786,7 @@ def provision_vm_disk(cfg: Config) -> None:
         missing_files = []
         for path, label in [
             (openssh_zip, "OpenSSH"), (winfsp_msi, "WinFsp"), (virtiofs_exe, "virtiofs"),
+            (runex_exe, "RunEx"),
             required_python,
         ]:
             if not path.exists():
@@ -790,6 +832,7 @@ def provision_vm_disk(cfg: Config) -> None:
                 zf.write(python_embed, PYTHON_EMBED_ZIP)
             if x64dbg_zip.exists():
                 zf.write(x64dbg_zip, X64DBG_ZIP)
+            zf.write(runex_exe, RUNEX_EXE)
 
         # Copy bootstrap.ps1 to temp dir
         bootstrap_src = _data.path("bootstrap.ps1")
@@ -1065,6 +1108,18 @@ def _verify_python(ga: GuestAgent) -> None:
     )
 
 
+def _verify_runex(ga: GuestAgent) -> None:
+    result = ga.exec_powershell(
+        "(Get-FileHash -Algorithm SHA256 'C:\\Tools\\RunEx.exe').Hash.ToLowerInvariant()",
+        timeout=30,
+    )
+    if result.exitcode != 0 or RUNEX_SHA256 not in result.stdout.lower():
+        raise RuntimeError(
+            "RunEx is missing or corrupt in the guest. Re-run 'winbox provision'."
+        )
+    console.print("[green][+][/] Guest RunEx verified")
+
+
 def _verify_provisioning(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Boot the VM once more and assert provision.ps1 actually finished.
 
@@ -1089,6 +1144,7 @@ def _verify_provisioning(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     if "OK" in sentinel_check.stdout:
         console.print("[green][+][/] Provisioning sentinel verified")
         _verify_python(ga)
+        _verify_runex(ga)
         _shutdown_and_wait(vm, ga)
         return
 

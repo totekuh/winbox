@@ -62,6 +62,8 @@ def run_command(
     args: tuple[str, ...],
     *,
     timeout: int = 300,
+    user: str | None = None,
+    password: str | None = None,
 ) -> int:
     """Execute a command in the Windows VM and display results.
 
@@ -103,7 +105,12 @@ def run_command(
     max_retries = 3
     result: ExecResult | None = None
     for attempt in range(max_retries):
-        result = ga.exec(full_cmd, timeout=timeout)
+        if user is None and password is None:
+            result = ga.exec(full_cmd, timeout=timeout)
+        else:
+            result = ga.exec(
+                full_cmd, timeout=timeout, user=user, password=password,
+            )
         if "handle is invalid" not in result.stdout.lower() + result.stderr.lower():
             break
         if attempt < max_retries - 1:
@@ -130,6 +137,8 @@ def run_command_bg(
     args: tuple[str, ...],
     *,
     log: bool = False,
+    user: str | None = None,
+    password: str | None = None,
 ) -> Job:
     """Launch a command in the Windows VM as a background job.
 
@@ -151,10 +160,18 @@ def run_command_bg(
             stdout_path = store.vm_log_path(job_id, "stdout")
             stderr_path = store.vm_log_path(job_id, "stderr")
             wrapped = f"{full_cmd} > {stdout_path} 2> {stderr_path}"
-            pid = ga.exec_detached(wrapped)
+            if user is None and password is None:
+                pid = ga.exec_detached(wrapped)
+            else:
+                pid = ga.exec_detached(wrapped, user=user, password=password)
             mode = JobMode.LOG
         else:
-            pid = ga.exec_background(full_cmd)
+            if user is None and password is None:
+                pid = ga.exec_background(full_cmd)
+            else:
+                pid = ga.exec_background(
+                    full_cmd, user=user, password=password,
+                )
             mode = JobMode.BUFFERED
         return Job(
             id=job_id, pid=pid,

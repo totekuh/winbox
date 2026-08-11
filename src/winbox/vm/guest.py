@@ -44,6 +44,36 @@ _UNKNOWN_PID_PROBE_ATTEMPTS = 3
 _LAUNCH_RETRIES = 3
 _LAUNCH_RETRY_DELAY = 0.5
 
+RUNEX_PATH = r"C:\Tools\RunEx.exe"
+_RUNEX_EXCEPTION_MARKER = "[-] RunExException:"
+
+
+def _validate_credentials(user: str | None, password: str | None) -> None:
+    if (user is None) != (password is None):
+        raise ValueError("--user and --password must be supplied together")
+
+
+def _runex_args(
+    user: str,
+    password: str,
+    path: str,
+    args: list[str],
+) -> list[str]:
+    # Passthrough preserves stdout and stderr as separate inherited handles.
+    # RunEx's buffered mode merges them. Do not pass -t with -P: RunEx ignores
+    # that combination and prints a warning. qemu-ga owns the outer timeout
+    # and kills the RunEx/child process tree when it expires.
+    return [user, password, "-P", "-p", "--", path, *args]
+
+
+def _normalized_runex_exitcode(
+    exitcode: int, stdout: str, stderr: str,
+) -> int:
+    """Compensate for RunEx v2.1 returning zero on its own exceptions."""
+    if exitcode == 0 and _RUNEX_EXCEPTION_MARKER in stdout + stderr:
+        return 1
+    return exitcode
+
 
 # virsh stderr fragments that mean the agent was never reached. Everything
 # else on a non-zero exit is the agent answering with an error of its own —
@@ -234,33 +264,65 @@ class GuestAgent:
         # attempt. Kept explicit so a future edit can't fall off the end.
         raise GuestAgentUnreachable("guest-exec launch exhausted retries")
 
-    def exec_detached(self, command: str) -> int:
+    def exec_detached(
+        self,
+        command: str,
+        *,
+        user: str | None = None,
+        password: str | None = None,
+    ) -> int:
         """Fire a command in the guest and return immediately.
 
         Returns the guest PID. No output capture, no polling — the process
         runs in the background until it exits on its own.
         """
+        _validate_credentials(user, password)
+        path, args = "cmd.exe", ["/c", command]
+        if user is not None:
+            path = RUNEX_PATH
+            args = _runex_args(
+                user,
+                password,
+                "cmd.exe",
+                ["/d", "/s", "/c", command],
+            )
         payload = {
             "execute": "guest-exec",
             "arguments": {
-                "path": "cmd.exe",
-                "arg": ["/c", command],
+                "path": path,
+                "arg": args,
                 "capture-output": False,
             },
         }
         return self._start_guest_exec(payload)
 
-    def exec_background(self, command: str) -> int:
+    def exec_background(
+        self,
+        command: str,
+        *,
+        user: str | None = None,
+        password: str | None = None,
+    ) -> int:
         """Start a command with output capture but don't poll for completion.
 
         Returns the guest PID immediately. Output stays buffered in the
         guest agent until retrieved via exec_status().
         """
+        _validate_credentials(user, password)
+        path, args = "cmd.exe", ["/c", command]
+        if user is not None:
+            path = RUNEX_PATH
+            args = _runex_args(
+                user,
+                password,
+                "cmd.exe",
+                ["/d", "/s", "/c", command],
+            )
         payload = {
             "execute": "guest-exec",
             "arguments": {
-                "path": "cmd.exe",
-                "arg": ["/c", command],
+                "path": path,
+                "arg": args,
                 "capture-output": True,
             },
         }
@@ -475,11 +537,16 @@ class GuestAgent:
         }
         response = self._raw_command(payload)
         ret = response.get("return", {})
+        stdout = _decode_b64(ret.get("out-data", ""))
+        stderr = _decode_b64(ret.get("err-data", ""))
+        exitcode = ret.get("exitcode", -1)
         return {
             "exited": ret.get("exited", False),
-            "exitcode": ret.get("exitcode", -1),
-            "stdout": _decode_b64(ret.get("out-data", "")),
-            "stderr": _decode_b64(ret.get("err-data", "")),
+            "exitcode": _normalized_runex_exitcode(
+                exitcode, stdout, stderr,
+            ),
+            "stdout": stdout,
+            "stderr": stderr,
         }
 
     def exec(
@@ -488,6 +555,8 @@ class GuestAgent:
         *,
         timeout: int = 300,
         poll_interval: float = 0.5,
+        user: str | None = None,
+        password: str | None = None,
     ) -> ExecResult:
         """Execute a command in the guest via cmd.exe and return the result.
 
@@ -504,8 +573,27 @@ class GuestAgent:
         so it is discarded (the read frees the stale entry) and polling
         continues. The nonce is stripped before returning.
         """
+        _validate_credentials(user, password)
         if poll_interval <= 0:
             poll_interval = 0.5
+
+        if user is not None:
+            # Keep RunEx itself as the process tracked by qemu-ga. In
+            # particular, a bad password fails before the child can print an
+            # exec nonce, so using exec()'s nonce protocol here would mistake
+            # RunEx's own error for a stale PID result. exec_argv() uses the
+            # guest-agent slot look-behind protocol and preserves that error.
+            return self.exec_argv(
+                RUNEX_PATH,
+                _runex_args(
+                    user,
+                    password,
+                    "cmd.exe",
+                    ["/d", "/s", "/c", command],
+                ),
+                timeout=timeout,
+                poll_interval=poll_interval,
+            )
 
         nonce = f"__wbx{uuid.uuid4().hex[:16]}__"
         # `&&` (not `&`) so the nonce is written by a command that has already
@@ -554,6 +642,8 @@ class GuestAgent:
         *,
         timeout: int = 300,
         poll_interval: float = 0.5,
+        user: str | None = None,
+        password: str | None = None,
     ) -> ExecResult:
         """Execute a command by passing path and args directly to guest-exec.
 
@@ -565,14 +655,24 @@ class GuestAgent:
         the method — so identity is established out of band, see
         ``_resolve_first`` below.
         """
+        _validate_credentials(user, password)
         if poll_interval <= 0:
             poll_interval = 0.5
 
+        launch_path, launch_args = path, list(args)
+        if user is not None:
+            launch_path = RUNEX_PATH
+            launch_args = _runex_args(
+                user,
+                password,
+                path,
+                list(args),
+            )
         payload = {
             "execute": "guest-exec",
             "arguments": {
-                "path": path,
-                "arg": list(args),
+                "path": launch_path,
+                "arg": launch_args,
                 "capture-output": True,
             },
         }
@@ -626,6 +726,10 @@ class GuestAgent:
         exitcode = ret.get("exitcode", -1)
         stdout = _decode_b64(ret.get("out-data", ""))
         stderr = _decode_b64(ret.get("err-data", ""))
+        if user is not None or path.casefold() == RUNEX_PATH.casefold():
+            exitcode = _normalized_runex_exitcode(
+                exitcode, stdout, stderr,
+            )
 
         return ExecResult(exitcode=exitcode, stdout=stdout, stderr=stderr)
 
@@ -634,6 +738,8 @@ class GuestAgent:
         script: str,
         *,
         timeout: int = 600,
+        user: str | None = None,
+        password: str | None = None,
     ) -> ExecResult:
         """Execute a PowerShell command/script in the guest.
 
@@ -648,7 +754,12 @@ class GuestAgent:
         script = f"$ProgressPreference = 'SilentlyContinue'\n{script}"
         encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
         cmd = f"powershell -ExecutionPolicy Bypass -EncodedCommand {encoded}"
-        result = self.exec(cmd, timeout=timeout)
+        if user is None and password is None:
+            result = self.exec(cmd, timeout=timeout)
+        else:
+            result = self.exec(
+                cmd, timeout=timeout, user=user, password=password,
+            )
         return ExecResult(
             exitcode=result.exitcode,
             stdout=result.stdout,
@@ -660,6 +771,8 @@ class GuestAgent:
         path: str,
         *,
         timeout: int = 600,
+        user: str | None = None,
+        password: str | None = None,
     ) -> ExecResult:
         """Execute a PowerShell script file in the guest.
 
@@ -671,10 +784,13 @@ class GuestAgent:
         "Illegal characters in path". Passing argv directly sidesteps shell
         quoting altogether, which also means paths with spaces just work.
         """
+        kwargs = {"timeout": timeout}
+        if user is not None or password is not None:
+            kwargs.update(user=user, password=password)
         return self.exec_argv(
             "powershell.exe",
             ["-ExecutionPolicy", "Bypass", "-File", path],
-            timeout=timeout,
+            **kwargs,
         )
 
     def shutdown(self) -> None:

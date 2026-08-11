@@ -44,7 +44,7 @@ PS C:\Windows\system32>
 - **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
 - **Malware detonation lab** — `winbox capture` (host-side pcap on the bridge — prefers `dumpcap`, which Kali's Wireshark package lets the `wireshark` group run without root, falling back to `tcpdump` otherwise), `winbox sinkhole` (zero-dependency DNS sinkhole that answers every C2 lookup with the bridge IP and logs the domain, plus optional INETSim fake services), and `winbox detonate check` (read-only preflight that refuses to go green unless the guest genuinely can't reach the internet). See [docs/malware-detonation.md](docs/malware-detonation.md)
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
-- **MCP server** — 54 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including Defender enable/disable/status, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
+- **MCP server** — 56 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including credentialed exec/Python/PowerShell, Defender enable/disable/status, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
 - **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`; `--mode auto` falls back to software 0xCC where the 4 DR slots run out, but note HVCI blocks software breakpoints on Windows 11), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
 - **VNC display** via virt-manager (`winbox vnc`) — plain VGA, no clipboard/resize
 - **x64dbg in the guest** — bundled in setup, extracted to `C:\Tools\x64dbg`, both x32 and x64 on PATH
@@ -144,6 +144,7 @@ winbox exec whoami
 winbox exec ipconfig /all
 winbox exec Rubeus.exe kerberoast /domain:corp.local
 winbox exec --timeout 300 SharpHound.exe -c All     # --timeout must come BEFORE the command
+winbox exec --user alice --password secret whoami   # run as a local Windows user
 ```
 
 The VM starts automatically if it's not running.
@@ -328,13 +329,15 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (54):**
+**Available tools (56):**
 
 User-mode primitives:
 
 | Tool | Description |
 |------|-------------|
-| `python(code)` | Execute Python code in the VM (ctypes, winreg, COM, WMI — full Win32 access) |
+| `exec(command, user?, password?)` | Execute a cmd.exe command, optionally as a local Windows user |
+| `python(code, user?, password?)` | Execute Python code in the VM, optionally as a local Windows user |
+| `powershell(script, user?, password?)` | Execute encoded PowerShell, optionally as a local Windows user |
 | `ioctl(device, code, input_hex, output_size)` | Send DeviceIoControl to a driver — no ctypes boilerplate |
 | `reg_query(key, value?)` | Query registry key or value |
 | `reg_set(key, value, data, value_type)` | Set registry value (creates key if needed) |

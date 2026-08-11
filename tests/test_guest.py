@@ -69,6 +69,137 @@ class TestExecResult:
         assert r.stderr == "error msg"
 
 
+class TestCredentialedExecution:
+    def _ga(self):
+        from winbox.config import Config
+        from winbox.vm.guest import GuestAgent
+
+        return GuestAgent(Config())
+
+    def test_exec_argv_is_wrapped_in_runex_without_shell_parsing(self, monkeypatch):
+        from winbox.vm.guest import RUNEX_PATH
+
+        ga = self._ga()
+        seen = {}
+        def start(payload):
+            seen["payload"] = payload
+            return 123
+
+        monkeypatch.setattr(ga, "_start_guest_exec", start)
+        monkeypatch.setattr(
+            ga, "_poll_exec",
+            lambda *a, **kw: {"exitcode": 7, "out-data": "", "err-data": ""},
+        )
+
+        result = ga.exec_argv(
+            "python.exe", ["-c", "print('x & y')"], timeout=30,
+            user="low user", password="p&ss word",
+        )
+
+        arguments = seen["payload"]["arguments"]
+        assert arguments["path"] == RUNEX_PATH
+        assert arguments["arg"][:2] == ["low user", "p&ss word"]
+        assert arguments["arg"][-3:] == [
+            "python.exe", "-c", "print('x & y')",
+        ]
+        assert "-P" in arguments["arg"]
+        assert "-p" in arguments["arg"]
+        assert "-t" not in arguments["arg"]
+        assert result.exitcode == 7
+
+    def test_runex_exception_with_zero_process_exit_becomes_failure(self, monkeypatch):
+        ga = self._ga()
+        encoded = base64.b64encode(
+            b"[-] RunExException: The user name or password is incorrect"
+        ).decode()
+        monkeypatch.setattr(ga, "_start_guest_exec", lambda payload: 123)
+        monkeypatch.setattr(
+            ga,
+            "_poll_exec",
+            lambda *a, **kw: {
+                "exitcode": 0, "out-data": encoded, "err-data": "",
+            },
+        )
+
+        result = ga.exec_argv(
+            "whoami.exe", [], user="alice", password="wrong",
+        )
+
+        assert result.exitcode == 1
+        assert "RunExException" in result.stdout
+
+    def test_exec_routes_runex_through_direct_argv_polling(self, monkeypatch):
+        from winbox.vm.guest import RUNEX_PATH
+
+        ga = self._ga()
+        seen = {}
+
+        def fake_exec_argv(path, args, **kwargs):
+            seen.update(path=path, args=args, kwargs=kwargs)
+            return ExecResult(5, "", "bad credentials")
+
+        monkeypatch.setattr(ga, "exec_argv", fake_exec_argv)
+
+        result = ga.exec(
+            "whoami", timeout=29, poll_interval=0.25,
+            user="alice", password="wrong",
+        )
+
+        assert seen["path"] == RUNEX_PATH
+        assert seen["args"][:2] == ["alice", "wrong"]
+        assert seen["args"][-5:] == ["cmd.exe", "/d", "/s", "/c", "whoami"]
+        assert seen["kwargs"] == {"timeout": 29, "poll_interval": 0.25}
+        assert result == ExecResult(5, "", "bad credentials")
+
+    @pytest.mark.parametrize(
+        "user,password", [("alice", None), (None, "secret")],
+    )
+    def test_credentials_must_be_supplied_together(self, user, password):
+        ga = self._ga()
+        with pytest.raises(ValueError, match="supplied together"):
+            ga.exec("whoami", user=user, password=password)
+
+    def test_background_runex_uses_passthrough_without_internal_timeout(
+        self, monkeypatch,
+    ):
+        from winbox.vm.guest import RUNEX_PATH
+
+        ga = self._ga()
+        seen = {}
+        def start(payload):
+            seen["payload"] = payload
+            return 123
+
+        monkeypatch.setattr(ga, "_start_guest_exec", start)
+
+        ga.exec_background("whoami", user="alice", password="secret")
+
+        arguments = seen["payload"]["arguments"]
+        assert arguments["path"] == RUNEX_PATH
+        assert "-P" in arguments["arg"]
+        assert "-t" not in arguments["arg"]
+        assert arguments["capture-output"] is True
+
+    def test_powershell_forwards_credentials(self, monkeypatch):
+        ga = self._ga()
+        seen = {}
+
+        def fake_exec(command, **kwargs):
+            seen.update(command=command, kwargs=kwargs)
+            return ExecResult(0, "ok", "")
+
+        monkeypatch.setattr(ga, "exec", fake_exec)
+        result = ga.exec_powershell(
+            "whoami", user="alice", password="secret", timeout=44,
+        )
+
+        assert "-EncodedCommand" in seen["command"]
+        assert seen["kwargs"] == {
+            "timeout": 44, "user": "alice", "password": "secret",
+        }
+        assert result.stdout == "ok"
+
+
 class TestExecPollTolerance:
     """Audit fix: ga.exec used to die on a single transient mid-poll error.
     Now it tolerates up to 5 consecutive errors before giving up."""

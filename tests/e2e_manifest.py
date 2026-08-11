@@ -171,7 +171,9 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
 # ─── MCP tools ──────────────────────────────────────────────────────────────
 
 MCP_COVERAGE: dict[str, tuple[str, str]] = {
+    "exec": (LIVE, "including credentialed local-user execution"),
     "python": (LIVE, ""),
+    "powershell": (LIVE, ""),
     "ps": (LIVE, ""),
     "ioctl": (LIVE, "error path — a real device IOCTL depends on a driver "
                     "that is not part of a stock image"),
