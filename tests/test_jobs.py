@@ -171,6 +171,28 @@ class TestJob:
         assert job.exitcode is None
         assert job.stdout == ""
         assert job.stderr == ""
+        assert job.nonce == ""
+
+    def test_job_nonce_serialization(self):
+        """Job with nonce roundtrips through to_dict/from_dict."""
+        nonce = "__wbx0123456789abcdef__"
+        original = Job(
+            id=5, pid=500, command="bg.exe",
+            mode=JobMode.BUFFERED, nonce=nonce,
+        )
+        d = original.to_dict()
+        assert d["nonce"] == nonce
+        restored = Job.from_dict(d)
+        assert restored.nonce == nonce
+
+    def test_job_nonce_missing_from_dict(self):
+        """Old persisted jobs without a nonce field deserialize with nonce=''."""
+        d = {
+            "id": 1, "pid": 100, "command": "old.exe",
+            "mode": "buffered", "status": "done",
+        }
+        job = Job.from_dict(d)
+        assert job.nonce == ""
 
 
 # ─── exec --bg ────────────────────────────────────────────────────────────────
@@ -318,6 +340,10 @@ class TestJobsKill:
         store = JobStore(cfg)
         store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
                        status=JobStatus.RUNNING))
+        # Status check first — still running.
+        mock_env.exec_status.return_value = {
+            "exited": False, "exitcode": -1, "stdout": "", "stderr": "",
+        }
         mock_env.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
         result = runner.invoke(cli, ["jobs", "kill", "1"])
         assert result.exit_code == 0
@@ -339,16 +365,12 @@ class TestJobsKill:
         assert "not found" in result.output
 
     def test_kill_of_already_finished_job_keeps_its_result(self, runner, cfg, mock_env):
-        """Regression: taskkill exits 128 when the PID is gone. That used to
-        be reported as a successful kill, the job overwritten with
-        FAILED/-1, and `ga.reap` called — throwing away the completed run's
-        buffered output."""
+        """Status is checked BEFORE taskkill to avoid killing a recycled PID.
+        If the job has already exited, its result is recorded without ever
+        calling taskkill."""
         store = JobStore(cfg)
         store.add(Job(id=1, pid=4812, command="sharphound.exe", mode=JobMode.BUFFERED,
                        status=JobStatus.RUNNING))
-        mock_env.exec.return_value = ExecResult(
-            exitcode=128, stdout='ERROR: The process "4812" not found.', stderr=""
-        )
         mock_env.exec_status.return_value = {
             "exited": True, "exitcode": 0,
             "stdout": "50 hosts collected\n", "stderr": "",
@@ -363,13 +385,15 @@ class TestJobsKill:
         assert reloaded.status == JobStatus.DONE
         assert reloaded.exitcode == 0
         assert reloaded.stdout == "50 hosts collected\n"
+        # taskkill should never have been called — the exit status was
+        # discovered before any kill attempt.
+        mock_env.exec.assert_not_called()
         mock_env.reap.assert_not_called()
 
     def test_kill_of_finished_failed_job_records_real_exitcode(self, runner, cfg, mock_env):
         store = JobStore(cfg)
         store.add(Job(id=1, pid=4812, command="x.exe", mode=JobMode.BUFFERED,
                        status=JobStatus.RUNNING))
-        mock_env.exec.return_value = ExecResult(exitcode=128, stdout="not found", stderr="")
         mock_env.exec_status.return_value = {
             "exited": True, "exitcode": 3, "stdout": "", "stderr": "boom\n",
         }
@@ -381,6 +405,8 @@ class TestJobsKill:
         assert reloaded.status == JobStatus.FAILED
         assert reloaded.exitcode == 3
         assert reloaded.stderr == "boom\n"
+        # No taskkill attempt when the job already exited.
+        mock_env.exec.assert_not_called()
 
     def test_kill_denied_is_an_error_and_leaves_job_running(self, runner, cfg, mock_env):
         """taskkill exit 1 = access denied. The process is still alive, so
@@ -388,12 +414,13 @@ class TestJobsKill:
         store = JobStore(cfg)
         store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
                        status=JobStatus.RUNNING))
-        mock_env.exec.return_value = ExecResult(
-            exitcode=1, stdout="ERROR: Access is denied.", stderr=""
-        )
+        # Status check first — not exited, so we proceed to taskkill.
         mock_env.exec_status.return_value = {
             "exited": False, "exitcode": -1, "stdout": "", "stderr": "",
         }
+        mock_env.exec.return_value = ExecResult(
+            exitcode=1, stdout="ERROR: Access is denied.", stderr=""
+        )
 
         result = runner.invoke(cli, ["jobs", "kill", "1"])
 
@@ -409,6 +436,8 @@ class TestJobsKill:
         store = JobStore(cfg)
         store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
                        status=JobStatus.RUNNING))
+        # _exited_status probe fails → returns None → proceeds to taskkill
+        mock_env.exec_status.side_effect = GuestAgentError("no such pid")
         mock_env.exec.side_effect = GuestAgentError("connection lost")
         result = runner.invoke(cli, ["jobs", "kill", "1"])
         assert result.exit_code == 1

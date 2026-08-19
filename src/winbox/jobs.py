@@ -43,6 +43,7 @@ class Job:
     started: float = field(default_factory=time.time)
     stdout: str = ""
     stderr: str = ""
+    nonce: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -55,6 +56,7 @@ class Job:
             "started": self.started,
             "stdout": self.stdout,
             "stderr": self.stderr,
+            "nonce": self.nonce,
         }
 
     @classmethod
@@ -69,6 +71,7 @@ class Job:
             started=d.get("started", 0.0),
             stdout=d.get("stdout", ""),
             stderr=d.get("stderr", ""),
+            nonce=d.get("nonce", ""),
         )
 
 

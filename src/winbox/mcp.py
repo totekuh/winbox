@@ -259,17 +259,28 @@ def _bg_label(kind: str, code: str) -> str:
 
 
 def _launch_bg_job(cfg: Config, launch, label: str) -> str:
-    """Claim a job id, run ``launch(job_id) -> pid`` under the store lock,
-    persist a BUFFERED Job, and return a ``{background, job_id, pid}`` handle.
+    """Claim a job id, run ``launch(job_id, nonce) -> pid`` under the store
+    lock, persist a BUFFERED Job with a PID-recycle nonce, and return a
+    ``{background, job_id, pid}`` handle.
+
+    The caller's ``launch`` function must prefix its command with
+    ``echo {nonce}&&`` so the nonce appears at the start of stdout.
+    ``job_result`` later verifies this nonce before accepting output,
+    preventing a recycled PID's unrelated output from being attributed
+    to this job.
 
     Shares the JobStore that backs ``winbox exec --bg``, so a job launched here
     is visible to ``winbox jobs list`` and killable with ``winbox jobs kill``.
     """
     store = JobStore(cfg)
+    nonce = f"__wbx{uuid.uuid4().hex[:16]}__"
 
     def _build(job_id: int) -> Job:
-        pid = launch(job_id)
-        return Job(id=job_id, pid=pid, command=label, mode=JobMode.BUFFERED)
+        pid = launch(job_id, nonce)
+        return Job(
+            id=job_id, pid=pid, command=label,
+            mode=JobMode.BUFFERED, nonce=nonce,
+        )
 
     job = store.claim(_build)
     return _json.dumps({"background": True, "job_id": job.id, "pid": job.pid})
@@ -315,7 +326,7 @@ def python(
     if background:
         cfg, vm, ga = _ensure_vm_ready()
 
-        def _launch(job_id: int) -> int:
+        def _launch(job_id: int, nonce: str) -> int:
             job_dir = cfg.shared_dir / ".mcp" / "jobs" / str(job_id)
             job_dir.mkdir(parents=True, exist_ok=True)
             (job_dir / "script.py").write_text(code, encoding="utf-8")
@@ -323,7 +334,7 @@ def python(
             if user is not None or password is not None:
                 kwargs.update(user=user, password=password)
             return ga.exec_background(
-                f"python.exe Z:\\.mcp\\jobs\\{job_id}\\script.py",
+                f"echo {nonce}&&python.exe Z:\\.mcp\\jobs\\{job_id}\\script.py",
                 **kwargs,
             )
 
@@ -387,13 +398,20 @@ def powershell(
     """
     cfg, vm, ga = _ensure_vm_ready()
     if background:
+        import base64 as _b64
+
+        tagged_script = f"$ProgressPreference = 'SilentlyContinue'\n{script}"
+        encoded = _b64.b64encode(
+            tagged_script.encode("utf-16-le"),
+        ).decode("ascii")
+        ps_cmd = f"powershell -ExecutionPolicy Bypass -EncodedCommand {encoded}"
         kwargs = {}
         if user is not None or password is not None:
             kwargs.update(user=user, password=password)
         return _launch_bg_job(
             cfg,
-            lambda job_id: ga.exec_powershell_background(
-                script, **kwargs,
+            lambda job_id, nonce: ga.exec_background(
+                f"echo {nonce}&&{ps_cmd}", **kwargs,
             ),
             _bg_label("powershell", script),
         )
@@ -444,8 +462,8 @@ def exec(  # noqa: A001
             kwargs.update(user=user, password=password)
         return _launch_bg_job(
             cfg,
-            lambda job_id: ga.exec_background(
-                command, **kwargs,
+            lambda job_id, nonce: ga.exec_background(
+                f"echo {nonce}&&{command}", **kwargs,
             ),
             _bg_label("exec", command),
         )
@@ -509,8 +527,28 @@ def job_result(job_id: int) -> str:
     if not status["exited"]:
         return _json.dumps({"job_id": job.id, "pid": job.pid, "running": True})
 
+    # ── Nonce verification (PID-recycle protection) ──────────────────────
+    # BUFFERED jobs carry a nonce that was echo'd at the start of the
+    # command.  If the output doesn't contain it, this PID was recycled
+    # and the output belongs to an unrelated process.
+    stdout = status["stdout"]
+    if job.nonce:
+        if job.nonce not in stdout:
+            job.status = JobStatus.LOST
+            store.update(job)
+            return _json.dumps({
+                "job_id": job.id, "pid": job.pid,
+                "error": "PID recycled — nonce mismatch",
+            })
+        # Strip the nonce line from stdout — it's bookkeeping, not output.
+        for sep in ("\r\n", "\n", ""):
+            prefix = job.nonce + sep
+            if stdout.startswith(prefix):
+                stdout = stdout[len(prefix):]
+                break
+
     job.exitcode = status["exitcode"]
-    job.stdout = status["stdout"]
+    job.stdout = stdout
     job.stderr = _clixml_to_text(status["stderr"])
     job.status = JobStatus.DONE if job.exitcode == 0 else JobStatus.FAILED
     store.update(job)
@@ -2239,6 +2277,15 @@ def _broker_cmd(session_dir: Path, cmd: dict, timeout: int) -> dict | None:
     return _poll_result(session_dir / f"result.{seq}.json", timeout)
 
 
+def _is_broker_alive(ga, pid: int) -> bool:
+    """Check if PID is still a python.exe process (our broker)."""
+    try:
+        r = ga.exec(f'tasklist /FI "PID eq {pid}" /FI "IMAGENAME eq python.exe" /NH', timeout=5)
+        return "python.exe" in r.stdout.lower()
+    except GuestAgentError:
+        return False
+
+
 # ─── Tool 11: pipe_open / pipe_send / pipe_recv / pipe_close ─────────────────
 
 @mcp.tool()
@@ -2330,7 +2377,8 @@ def pipe_open(name: str, access: str = "readwrite", timeout: int = 10) -> str:
         if pid is not None:
             try:
                 _, _, ga = _ensure_vm_ready()
-                ga.exec_argv("taskkill.exe", ["/F", "/PID", str(pid)], timeout=5)
+                if _is_broker_alive(ga, pid):
+                    ga.exec_argv("taskkill.exe", ["/F", "/PID", str(pid)], timeout=5)
             except Exception:
                 pass  # best-effort — broker may already have exited
         shutil.rmtree(session_dir, ignore_errors=True)
@@ -2459,10 +2507,13 @@ def pipe_close(session_id: str) -> str:
     if res is None and broker_pid is not None:
         try:
             _, _, ga = _ensure_vm_ready()
-            kill = ga.exec_argv(
-                "taskkill.exe", ["/F", "/T", "/PID", str(broker_pid)], timeout=10
-            )
-            killed = kill.exitcode == 0
+            if _is_broker_alive(ga, broker_pid):
+                kill = ga.exec_argv(
+                    "taskkill.exe", ["/F", "/T", "/PID", str(broker_pid)], timeout=10
+                )
+                killed = kill.exitcode == 0
+            else:
+                killed = None  # broker already gone, PID possibly recycled
         except Exception:
             killed = False
 
@@ -2482,6 +2533,15 @@ def pipe_close(session_id: str) -> str:
             "acknowledged the close and no broker.pid was recorded, so it "
             "could not be killed. A python.exe may still hold the pipe handle "
             "open in the VM."
+        )
+    if killed is None:
+        # _is_broker_alive returned False — the PID is no longer python.exe.
+        # The broker exited on its own; taskkill was skipped to avoid hitting
+        # an unrelated process that recycled the same PID.
+        return (
+            f"closed session {session_id} — the broker (PID {broker_pid}) "
+            "is already gone (PID no longer belongs to python.exe); "
+            "taskkill skipped to avoid killing an unrelated process."
         )
     return (
         f"closed session {session_id} locally, but the broker (PID "
@@ -3306,6 +3366,7 @@ def kdbg_mem(va: str, length: int = 64, decode: str = "hex") -> str:
             ``utf-8`` / ``utf8`` — UTF-8 (saved file content, etc.)
             ``ascii`` — ASCII (control bytes shown as ``.``)
             ``cstr`` — null-terminated ASCII (truncates at first 0x00)
+            ``qwords`` — array of little-endian 64-bit hex values
 
     Returns:
         JSON ``{va, bytes, decoded?}`` where ``bytes`` is the raw hex
@@ -3337,6 +3398,11 @@ def kdbg_mem(va: str, length: int = 64, decode: str = "hex") -> str:
         elif d == "cstr":
             cut = raw.split(b"\x00", 1)[0]
             result["decoded"] = cut.decode("latin-1", errors="replace")
+        elif d == "qwords":
+            result["decoded"] = [
+                "0x{:016x}".format(int.from_bytes(raw[i:i+8], "little"))
+                for i in range(0, len(raw) - len(raw) % 8, 8)
+            ]
         else:
             result["decoded"] = f"unknown decode mode: {decode!r}"
     return _json.dumps(result, indent=2)
@@ -3388,7 +3454,10 @@ def kdbg_stack(n: int = 16) -> str:
         n: Number of 8-byte qwords to read (1..256).
 
     Returns:
-        JSON ``{rsp, qwords}`` with hex strings.
+        JSON ``{rsp, qwords}`` where each qword is
+        ``{offset, va, value}`` — offset is RSP-relative
+        (``rsp+0x00``), va is the absolute address, value is
+        the little-endian-decoded 64-bit hex.
     """
     cfg = _kdbg_cfg_only()
     try:

@@ -246,6 +246,23 @@ def jobs_kill(ctx: click.Context, job_id: int) -> None:
 
     ensure_running(vm, ga, cfg)
 
+    # ── Check whether the job already exited BEFORE attempting taskkill ──
+    # If the PID was recycled, a blind taskkill would kill an unrelated
+    # process.  Checking first lets us record the real result and bail
+    # without touching whatever now owns this PID number.
+    exited = _exited_status(ga, job.pid)
+    if exited is not None:
+        job.exitcode = exited["exitcode"]
+        job.stdout = exited["stdout"]
+        job.stderr = exited["stderr"]
+        job.status = JobStatus.DONE if job.exitcode == 0 else JobStatus.FAILED
+        store.update(job)
+        console.print(
+            f"[yellow][!][/] Job {job_id} had already exited "
+            f"(code {job.exitcode}) — nothing to kill; output preserved"
+        )
+        return
+
     try:
         # /T kills the whole tree. Without it only the outer cmd.exe died;
         # its children kept the inherited stdout pipe open, so the guest
@@ -259,25 +276,6 @@ def jobs_kill(ctx: click.Context, job_id: int) -> None:
 
     if kill.exitcode != 0:
         # taskkill exits 128 when the PID is gone and 1 on access-denied.
-        # Treating either as success used to print "killed" and then reap
-        # the job's buffered result away, destroying the output of a run
-        # that had in fact completed. Ask the agent what actually happened
-        # before deciding.
-        exited = _exited_status(ga, job.pid)
-        if exited is not None:
-            # The job finished on its own; the status read we just did is
-            # also what frees the agent's slot, so record the real result
-            # rather than fabricating FAILED/-1.
-            job.exitcode = exited["exitcode"]
-            job.stdout = exited["stdout"]
-            job.stderr = exited["stderr"]
-            job.status = JobStatus.DONE if job.exitcode == 0 else JobStatus.FAILED
-            store.update(job)
-            console.print(
-                f"[yellow][!][/] Job {job_id} had already exited "
-                f"(code {job.exitcode}) — nothing to kill; output preserved"
-            )
-            return
         # Still running (or unknowable) and taskkill refused: leave the
         # ledger alone — the job is not dead and its slot is not ours to
         # free. Reaping here would strand a live process's output.

@@ -466,7 +466,9 @@ class TestBackgroundExec:
         # Fired detached — never waited on via the synchronous path.
         ga.exec.assert_not_called()
         cmd = ga.exec_background.call_args[0][0]
-        assert cmd == "python.exe Z:\\.mcp\\jobs\\1\\script.py"
+        # Command is nonce-prefixed: echo __wbx<hex>__&&python.exe ...
+        assert cmd.startswith("echo __wbx")
+        assert "&&python.exe Z:\\.mcp\\jobs\\1\\script.py" in cmd
         # Script materialized in a persistent per-job dir (not the auto-cleaned
         # synchronous one).
         script = cfg.shared_dir / ".mcp" / "jobs" / "1" / "script.py"
@@ -476,11 +478,16 @@ class TestBackgroundExec:
         import json
         from winbox.mcp import powershell
         ga, vm, cfg = mock_mcp
-        ga.exec_powershell_background.return_value = 999
+        ga.exec_background.return_value = 999
 
         out = json.loads(powershell("Start-Sleep 999", background=True))
         assert out == {"background": True, "job_id": 1, "pid": 999}
-        ga.exec_powershell_background.assert_called_once_with("Start-Sleep 999")
+        # Powershell bg now calls exec_background directly (not
+        # exec_powershell_background) so the nonce echo can be prepended.
+        ga.exec_background.assert_called_once()
+        cmd = ga.exec_background.call_args[0][0]
+        assert cmd.startswith("echo __wbx")
+        assert "&&powershell -ExecutionPolicy Bypass -EncodedCommand " in cmd
         ga.exec_powershell.assert_not_called()
         ga.exec.assert_not_called()
 
@@ -492,7 +499,9 @@ class TestBackgroundExec:
 
         out = json.loads(exec_tool("trigger.exe", background=True))
         assert out == {"background": True, "job_id": 1, "pid": 555}
-        ga.exec_background.assert_called_once_with("trigger.exe")
+        cmd = ga.exec_background.call_args[0][0]
+        assert cmd.startswith("echo __wbx")
+        assert "&&trigger.exe" in cmd
         ga.exec.assert_not_called()
 
     def test_exec_background_forwards_alternate_credentials(self, mock_mcp):
@@ -507,11 +516,11 @@ class TestBackgroundExec:
         ))
 
         assert out == {"background": True, "job_id": 1, "pid": 556}
-        ga.exec_background.assert_called_once_with(
-            "whoami",
-            user=r"WINBOX\rpcprobe",
-            password="Cobalt!Raven_2026-47",
-        )
+        call_kwargs = ga.exec_background.call_args[1]
+        assert call_kwargs["user"] == r"WINBOX\rpcprobe"
+        assert call_kwargs["password"] == "Cobalt!Raven_2026-47"
+        cmd = ga.exec_background.call_args[0][0]
+        assert "&&whoami" in cmd
 
     def test_python_background_forwards_alternate_credentials(self, mock_mcp):
         import json
@@ -525,17 +534,17 @@ class TestBackgroundExec:
         ))
 
         assert out == {"background": True, "job_id": 1, "pid": 4332}
-        ga.exec_background.assert_called_once_with(
-            r"python.exe Z:\.mcp\jobs\1\script.py",
-            user="rpcprobe",
-            password="Cobalt!Raven_2026-47",
-        )
+        call_kwargs = ga.exec_background.call_args[1]
+        assert call_kwargs["user"] == "rpcprobe"
+        assert call_kwargs["password"] == "Cobalt!Raven_2026-47"
+        cmd = ga.exec_background.call_args[0][0]
+        assert r"python.exe Z:\.mcp\jobs\1\script.py" in cmd
 
     def test_powershell_background_forwards_alternate_credentials(self, mock_mcp):
         import json
         from winbox.mcp import powershell
         ga, vm, cfg = mock_mcp
-        ga.exec_powershell_background.return_value = 1000
+        ga.exec_background.return_value = 1000
 
         out = json.loads(powershell(
             "whoami", background=True,
@@ -543,9 +552,12 @@ class TestBackgroundExec:
         ))
 
         assert out == {"background": True, "job_id": 1, "pid": 1000}
-        ga.exec_powershell_background.assert_called_once_with(
-            "whoami", user="rpcprobe", password="Cobalt!Raven_2026-47",
-        )
+        call_kwargs = ga.exec_background.call_args[1]
+        assert call_kwargs["user"] == "rpcprobe"
+        assert call_kwargs["password"] == "Cobalt!Raven_2026-47"
+        cmd = ga.exec_background.call_args[0][0]
+        assert cmd.startswith("echo __wbx")
+        assert "&&powershell -ExecutionPolicy Bypass -EncodedCommand " in cmd
 
     def test_exec_sync_runs_and_returns_structured_json(self, mock_mcp):
         import json
@@ -570,14 +582,18 @@ class TestBackgroundExec:
         assert job.pid == 111
         assert job.status is JobStatus.RUNNING
         assert job.mode is JobMode.BUFFERED
+        assert job.nonce.startswith("__wbx") and job.nonce.endswith("__")
 
 
 class TestJobResult:
     def _launch(self, mock_mcp, pid=7):
+        """Launch a background python job and return the stored nonce."""
         from winbox.mcp import python
-        ga = mock_mcp[0]
+        from winbox.jobs import JobStore
+        ga, vm, cfg = mock_mcp
         ga.exec_background.return_value = pid
         python("print(1)", background=True)
+        return JobStore(cfg).get(1).nonce
 
     def test_unknown_job(self, mock_mcp):
         import json
@@ -601,14 +617,16 @@ class TestJobResult:
         import json
         from winbox.mcp import job_result
         ga, vm, cfg = mock_mcp
-        self._launch(mock_mcp, pid=8)
+        nonce = self._launch(mock_mcp, pid=8)
         ga.exec_status.return_value = {
-            "exited": True, "exitcode": 0, "stdout": "42\r\n", "stderr": "",
+            "exited": True, "exitcode": 0,
+            "stdout": f"{nonce}\r\n42\r\n", "stderr": "",
         }
 
         out = json.loads(job_result(1))
         assert out["running"] is False
         assert out["exitcode"] == 0
+        # Nonce prefix is stripped — caller sees clean output only.
         assert out["stdout"] == "42\r\n"
         # The per-job script dir is removed once the process is done with it.
         assert not (cfg.shared_dir / ".mcp" / "jobs" / "1").exists()
@@ -618,11 +636,13 @@ class TestJobResult:
         same as the synchronous powershell path."""
         import json
         from winbox.mcp import powershell, job_result
+        from winbox.jobs import JobStore
         ga, vm, cfg = mock_mcp
-        ga.exec_powershell_background.return_value = 9
+        ga.exec_background.return_value = 9
         powershell("asdf", background=True)
+        nonce = JobStore(cfg).get(1).nonce
         ga.exec_status.return_value = {
-            "exited": True, "exitcode": 1, "stdout": "",
+            "exited": True, "exitcode": 1, "stdout": f"{nonce}\r\n",
             "stderr": (
                 '#< CLIXML\r\n<Objs xmlns="http://schemas.microsoft.com/'
                 'powershell/2004/04"><S S="Error">'
@@ -643,9 +663,10 @@ class TestJobResult:
         import json
         from winbox.mcp import job_result
         ga, vm, cfg = mock_mcp
-        self._launch(mock_mcp, pid=10)
+        nonce = self._launch(mock_mcp, pid=10)
         ga.exec_status.return_value = {
-            "exited": True, "exitcode": 0, "stdout": "done\r\n", "stderr": "",
+            "exited": True, "exitcode": 0,
+            "stdout": f"{nonce}\r\ndone\r\n", "stderr": "",
         }
         job_result(1)
         ga.exec_status.reset_mock()
@@ -653,6 +674,87 @@ class TestJobResult:
         out = json.loads(job_result(1))
         assert out["stdout"] == "done\r\n"
         ga.exec_status.assert_not_called()
+
+    def test_job_result_rejects_stale_output(self, mock_mcp):
+        """When exec_status returns output that doesn't carry the job's nonce,
+        the job is marked LOST — the PID was recycled and the output belongs
+        to an unrelated process."""
+        import json
+        from winbox.mcp import job_result
+        from winbox.jobs import JobStore, JobStatus
+        ga, vm, cfg = mock_mcp
+        self._launch(mock_mcp, pid=42)
+        ga.exec_status.return_value = {
+            "exited": True, "exitcode": 0,
+            "stdout": "someone-elses-output\r\n", "stderr": "",
+        }
+
+        out = json.loads(job_result(1))
+        assert "PID recycled" in out["error"]
+        assert JobStore(cfg).get(1).status is JobStatus.LOST
+
+    def test_job_result_strips_nonce_from_stdout(self, mock_mcp):
+        """The nonce echo line is stripped from the returned stdout."""
+        import json
+        from winbox.mcp import job_result
+        ga, vm, cfg = mock_mcp
+        nonce = self._launch(mock_mcp, pid=50)
+        ga.exec_status.return_value = {
+            "exited": True, "exitcode": 0,
+            "stdout": f"{nonce}\r\nreal output\r\n", "stderr": "",
+        }
+
+        out = json.loads(job_result(1))
+        assert nonce not in out["stdout"]
+        assert out["stdout"] == "real output\r\n"
+
+    def test_job_result_no_nonce_job_passes_through(self, mock_mcp):
+        """LOG mode jobs (nonce='') pass through without nonce verification."""
+        import json
+        from winbox.mcp import job_result
+        from winbox.jobs import Job, JobMode, JobStatus, JobStore
+        ga, vm, cfg = mock_mcp
+
+        # Manually create a LOG-mode job (no nonce) to simulate the
+        # CLI's exec --bg --log path which doesn't go through MCP.
+        store = JobStore(cfg)
+        store.add(Job(
+            id=1, pid=77, command="detached.exe",
+            mode=JobMode.LOG, nonce="",
+        ))
+        ga.exec_status.return_value = {
+            "exited": True, "exitcode": 0,
+            "stdout": "raw output\r\n", "stderr": "",
+        }
+
+        out = json.loads(job_result(1))
+        assert out["stdout"] == "raw output\r\n"
+        assert out["exitcode"] == 0
+        assert JobStore(cfg).get(1).status is JobStatus.DONE
+
+    def test_bg_job_has_nonce(self, mock_mcp):
+        """Background python/exec/powershell launches generate a nonce and
+        store it in the job."""
+        from winbox.mcp import python, exec as exec_tool, powershell
+        from winbox.jobs import JobStore
+        ga, vm, cfg = mock_mcp
+        ga.exec_background.return_value = 100
+
+        python("print(1)", background=True)
+        job = JobStore(cfg).get(1)
+        assert job.nonce.startswith("__wbx") and job.nonce.endswith("__")
+        assert len(job.nonce) == 23  # __wbx(5) + 16 hex + __(2)
+
+        ga.exec_background.return_value = 200
+        exec_tool("dir", background=True)
+        job = JobStore(cfg).get(2)
+        assert job.nonce.startswith("__wbx") and job.nonce.endswith("__")
+        assert job.nonce != JobStore(cfg).get(1).nonce  # unique per job
+
+        ga.exec_background.return_value = 300
+        powershell("Get-Process", background=True)
+        job = JobStore(cfg).get(3)
+        assert job.nonce.startswith("__wbx") and job.nonce.endswith("__")
 
     def test_poll_failure_reports_running_not_lost(self, mock_mcp):
         """A transient GA hiccup must not be reported as a finished/empty job —
@@ -1846,6 +1948,10 @@ class TestPipeSession:
                         sfile.write_text('{"status": "error", "error": "boom"}')
             return {"exitcode": 0, "stdout": "pid:4242\n", "stderr": ""}
 
+        # _is_broker_alive confirms the PID is still python.exe.
+        ga.exec.return_value = ExecResult(
+            exitcode=0, stdout="4242 python.exe", stderr=""
+        )
         ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
         with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
             pipe_open(name="lsass")
@@ -1870,6 +1976,10 @@ class TestPipeSession:
             # Never writes status.json → pipe_open polls until timeout.
             return {"exitcode": 0, "stdout": "pid:7777\n", "stderr": ""}
 
+        # _is_broker_alive confirms the PID is still python.exe.
+        ga.exec.return_value = ExecResult(
+            exitcode=0, stdout="7777 python.exe", stderr=""
+        )
         ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
         with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
             result = pipe_open(name="srvsvc", timeout=0)  # instant timeout
@@ -1902,6 +2012,10 @@ class TestPipeSession:
                     (d / "broker.pid").write_text("9191")
             return {"exitcode": 0, "stdout": "", "stderr": ""}
 
+        # _is_broker_alive confirms the PID is still python.exe.
+        ga.exec.return_value = ExecResult(
+            exitcode=0, stdout="9191 python.exe", stderr=""
+        )
         ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
         with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
             result = pipe_open(name="srvsvc", timeout=0)
@@ -2282,6 +2396,10 @@ class TestPipeCloseDoesNotLeakTheBroker:
         sid = "1eak00000001"
         session_dir = _make_session(cfg, sid)
         (session_dir / "broker.pid").write_text("4242")
+        # _is_broker_alive checks via ga.exec — confirm the PID is still python.exe.
+        ga.exec.return_value = ExecResult(
+            exitcode=0, stdout="4242 python.exe", stderr=""
+        )
         ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
         # No broker thread — the close is never acknowledged.
 
@@ -2316,12 +2434,103 @@ class TestPipeCloseDoesNotLeakTheBroker:
         sid = "1eak00000003"
         session_dir = _make_session(cfg, sid)
         (session_dir / "broker.pid").write_text("4242")
+        # _is_broker_alive says yes (PID is still python.exe), but taskkill fails.
+        ga.exec.return_value = ExecResult(
+            exitcode=0, stdout="4242 python.exe", stderr=""
+        )
         ga.exec_argv.return_value = ExecResult(exitcode=128, stdout="", stderr="no such PID")
 
         result = pipe_close(sid)
 
         assert "4242" in result
         assert "may still hold the pipe handle" in result
+
+
+class TestPipeBrokerOwnershipCheck:
+    """Bug 23: taskkill must verify the PID still belongs to the broker
+    (python.exe) before killing it — otherwise a recycled PID causes an
+    unrelated process to be killed."""
+
+    def test_close_does_not_kill_recycled_pid(self, mock_mcp):
+        """If _is_broker_alive returns False, pipe_close must NOT taskkill."""
+        from unittest.mock import patch
+        from winbox.mcp import pipe_close
+        ga, _, cfg = mock_mcp
+
+        sid = "own_check_001"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "broker.pid").write_text("5555")
+        # No broker thread — close is never acknowledged.
+        # _is_broker_alive returns False (PID recycled to a non-python.exe process).
+        ga.exec.return_value = ExecResult(exitcode=0, stdout="INFO: No tasks", stderr="")
+
+        result = pipe_close(sid)
+
+        taskkill_calls = [
+            c for c in ga.exec_argv.call_args_list
+            if c[0][0] == "taskkill.exe"
+        ]
+        assert taskkill_calls == [], (
+            f"taskkill should NOT be called when the PID is recycled, "
+            f"got {taskkill_calls}"
+        )
+        assert "already gone" in result or "taskkill skipped" in result
+
+    def test_close_kills_live_broker(self, mock_mcp):
+        """If _is_broker_alive returns True and broker doesn't ACK the close,
+        pipe_close must taskkill."""
+        from winbox.mcp import pipe_close
+        ga, _, cfg = mock_mcp
+
+        sid = "own_check_002"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "broker.pid").write_text("6666")
+        # No broker thread — close is never acknowledged.
+        # _is_broker_alive returns True (PID is still python.exe).
+        ga.exec.return_value = ExecResult(
+            exitcode=0, stdout="6666 python.exe", stderr=""
+        )
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+
+        result = pipe_close(sid)
+
+        taskkill_calls = [
+            c for c in ga.exec_argv.call_args_list
+            if c[0][0] == "taskkill.exe" and "6666" in c[0][1]
+        ]
+        assert len(taskkill_calls) == 1, (
+            f"expected taskkill for live broker PID 6666, got {taskkill_calls}"
+        )
+        assert "force-killed" in result
+
+    def test_abort_does_not_kill_recycled_pid(self, mock_mcp):
+        """The _abort closure inside pipe_open must also skip taskkill when the
+        PID no longer belongs to python.exe."""
+        import winbox.mcp as mcp_mod
+        from unittest.mock import patch
+        from winbox.mcp import pipe_open
+        ga, vm, cfg = mock_mcp
+
+        def _fake_exec(code, timeout=300, args=None):
+            # Never writes status.json → pipe_open polls until timeout.
+            return {"exitcode": 0, "stdout": "pid:8888\n", "stderr": ""}
+
+        # _is_broker_alive will use ga.exec — return no python.exe match.
+        ga.exec.return_value = ExecResult(
+            exitcode=0, stdout="INFO: No tasks", stderr=""
+        )
+        ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
+        with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
+            result = pipe_open(name="srvsvc", timeout=0)  # instant timeout
+
+        assert "timeout" in result
+        taskkill_calls = [
+            c for c in ga.exec_argv.call_args_list
+            if c[0][0] == "taskkill.exe"
+        ]
+        assert taskkill_calls == [], (
+            f"_abort should NOT taskkill a recycled PID, got {taskkill_calls}"
+        )
 
 
 # ─── kdbg_start / kdbg_stop / kdbg_status tools ─────────────────────────────
@@ -2979,10 +3188,43 @@ class TestKdbgDaemonTools:
 
     def test_stack_passes_n(self, mock_mcp):
         from winbox.mcp import kdbg_stack
-        client = self._client_with(call_result={"rsp": "0x100", "qwords": []})
+        client = self._client_with(call_result={
+            "rsp": "0x100",
+            "qwords": [{"offset": "rsp+0x00", "va": "0x100", "value": "0x0000000000000001"}],
+        })
         with patch("winbox.mcp._kdbg_client", return_value=client):
             kdbg_stack(n=8)
         client.call.assert_called_once_with("stack", n=8)
+
+    def test_stack_returns_offset_labeled_qwords(self, mock_mcp):
+        from winbox.mcp import kdbg_stack
+        import json as _json
+        qwords = [
+            {"offset": "rsp+0x00", "va": "0x1000", "value": "0x00000000deadbeef"},
+            {"offset": "rsp+0x08", "va": "0x1008", "value": "0x00000000cafebabe"},
+        ]
+        client = self._client_with(call_result={"rsp": "0x1000", "qwords": qwords})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_stack(n=2)
+        parsed = _json.loads(result)
+        assert parsed["rsp"] == "0x1000"
+        assert len(parsed["qwords"]) == 2
+        assert parsed["qwords"][0]["offset"] == "rsp+0x00"
+        assert parsed["qwords"][0]["value"] == "0x00000000deadbeef"
+        assert parsed["qwords"][1]["offset"] == "rsp+0x08"
+
+    def test_mem_decode_qwords(self, mock_mcp):
+        from winbox.mcp import kdbg_mem
+        import json as _json
+        raw_hex = "efbeadde00000000" + "bebafeca00000000"
+        client = self._client_with(call_result={"va": "0x1000", "bytes": raw_hex})
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_mem(va="0x1000", length=16, decode="qwords")
+        parsed = _json.loads(result)
+        assert parsed["decoded"] == [
+            "0x00000000deadbeef",
+            "0x00000000cafebabe",
+        ]
 
     def test_bt_passes_depth(self, mock_mcp):
         from winbox.mcp import kdbg_bt
