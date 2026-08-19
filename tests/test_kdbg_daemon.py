@@ -532,6 +532,120 @@ def test_bp_list_includes_hw_field():
     assert by_target["nt!Bar"]["hw"] is False
 
 
+# ── installed_cr3 (bug #21) ────────────────────────────────────────────
+
+
+def test_bp_add_user_soft_stores_installed_cr3(monkeypatch):
+    """op_bp_add must persist the CR3 that install_user_breakpoint
+    actually used so removal can skip candidate iteration."""
+    from winbox.kdbg.debugger import daemon as _daemon_mod
+    from winbox.kdbg.debugger.install import InstallReport
+
+    rsp = FakeRsp()
+    store = FakeStore({"notepad!NPWndProc": 0x7ff6e289a760})
+    session = _make_session(rsp=rsp, store=store)
+
+    fake_report = InstallReport(
+        user_va=0x7ff6e289a760,
+        target_dtb=0xDEAD,
+        elapsed=0.001,
+    )
+    monkeypatch.setattr(
+        _daemon_mod, "install_user_breakpoint",
+        lambda *a, **kw: fake_report,
+    )
+
+    reply = session.handle_op(
+        "bp_add", {"target": "notepad!NPWndProc", "mode": "soft"},
+    )
+    assert reply["ok"], reply
+    bp_id = reply["result"]["id"]
+    assert session.bps[bp_id].installed_cr3 == 0xDEAD
+
+
+def test_bp_remove_user_soft_uses_installed_cr3():
+    """When installed_cr3 is set, removal must use _cr3_masquerade with
+    that exact CR3 instead of iterating candidates via
+    _cr3_masqueraded_call."""
+    import time as _t
+
+    user_va = 0x7ff6e289a760
+    rsp = FakeRsp()
+    target = TargetInfo(pid=4584, dtb=0x4d6bb000, name="notepad.exe")
+    cr3_writes, remove_cr3 = _track_masquerade(rsp)
+
+    session = _make_session(rsp=rsp, target=target)
+    session.stop = StopState(
+        vcpu="01", rip=0xfffff80600001000, cr3=0x1ae000, signal=5,
+        raw_regs=_blob(cr3=0x1ae000),
+    )
+    session.bps[0] = Breakpoint(
+        bp_id=0, va=user_va, target="notepad!NPWndProc",
+        user_mode=True, hw=False, installed_at=_t.monotonic(),
+        installed_cr3=0xBEEF,
+    )
+    session._bp_by_va[user_va] = 0
+
+    # _cr3_masqueraded_call iterates candidates; we should NOT enter
+    # it. Track whether it was called.
+    masqueraded_call_used = []
+    orig = session._cr3_masqueraded_call
+    def spy(*a, **kw):
+        masqueraded_call_used.append(True)
+        return orig(*a, **kw)
+    session._cr3_masqueraded_call = spy
+
+    reply = session.handle_op("bp_remove", {"id": 0})
+    assert reply["ok"], reply
+
+    # Must have used installed_cr3 (0xBEEF) directly, not the
+    # candidate-iteration path.
+    assert masqueraded_call_used == [], (
+        "_cr3_masqueraded_call should not be called when installed_cr3 is set"
+    )
+    # Swap to 0xBEEF, then restore original 0x1ae000.
+    assert cr3_writes == [0xBEEF, 0x1ae000]
+    assert remove_cr3 == [0xBEEF]
+
+
+def test_bp_remove_user_soft_falls_back_without_installed_cr3():
+    """When installed_cr3 is 0 (not recorded), removal must fall back
+    to _cr3_masqueraded_call which iterates all candidates."""
+    import time as _t
+
+    user_va = 0x7ff6e289a760
+    rsp = FakeRsp()
+    target = TargetInfo(pid=4584, dtb=0x4d6bb000, name="notepad.exe")
+    cr3_writes, _ = _track_masquerade(rsp)
+
+    session = _make_session(rsp=rsp, target=target)
+    session.stop = StopState(
+        vcpu="01", rip=0xfffff80600001000, cr3=0x1ae000, signal=5,
+        raw_regs=_blob(cr3=0x1ae000),
+    )
+    session.bps[0] = Breakpoint(
+        bp_id=0, va=user_va, target="notepad!NPWndProc",
+        user_mode=True, hw=False, installed_at=_t.monotonic(),
+        installed_cr3=0,  # not recorded
+    )
+    session._bp_by_va[user_va] = 0
+
+    masqueraded_call_used = []
+    orig = session._cr3_masqueraded_call
+    def spy(*a, **kw):
+        masqueraded_call_used.append(True)
+        return orig(*a, **kw)
+    session._cr3_masqueraded_call = spy
+
+    reply = session.handle_op("bp_remove", {"id": 0})
+    assert reply["ok"], reply
+
+    # Must have used _cr3_masqueraded_call (candidate iteration).
+    assert masqueraded_call_used == [True]
+    # Candidate iteration uses target.dtb (0x4d6bb000).
+    assert cr3_writes[0] == 0x4d6bb000
+
+
 # ── interrupt / status fast paths ──────────────────────────────────────
 
 
@@ -2083,3 +2197,36 @@ class TestBreakpointFailureExplanations:
         assert "soft boom" in msg
         assert "hw boom" in msg
         assert "tried first" in msg
+
+
+# ── op_stack ────────────────────────────────────────────────────────────
+
+
+def test_op_stack_returns_offset_labeled_qwords():
+    rsp_val = 0xfffff80501234500
+    blob = _blob(rsp=rsp_val, cr3=0x1ae000)
+    stack_bytes = (b"\xef\xbe\xad\xde\x00\x00\x00\x00"
+                   b"\xbe\xba\xfe\xca\x00\x00\x00\x00")
+
+    class StackRsp(FakeRsp):
+        def read_memory(self, va, length):
+            return stack_bytes[:length]
+
+    session = _make_session(rsp=StackRsp(regs_blob=blob))
+    session.stop = StopState(vcpu="01", rip=0x1000, cr3=0x1ae000,
+                             signal=5, raw_regs=blob)
+    result = session.op_stack(n=2)
+    assert result["rsp"] == f"0x{rsp_val:x}"
+    assert len(result["qwords"]) == 2
+    assert result["qwords"][0]["offset"] == "rsp+0x00"
+    assert result["qwords"][0]["va"] == f"0x{rsp_val:x}"
+    assert result["qwords"][0]["value"] == "0x00000000deadbeef"
+    assert result["qwords"][1]["offset"] == "rsp+0x08"
+    assert result["qwords"][1]["va"] == f"0x{rsp_val + 8:x}"
+    assert result["qwords"][1]["value"] == "0x00000000cafebabe"
+
+
+def test_op_stack_requires_halt():
+    session = _make_session()
+    with pytest.raises(RuntimeError, match="not halted"):
+        session.op_stack()

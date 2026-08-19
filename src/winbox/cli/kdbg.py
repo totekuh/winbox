@@ -1008,10 +1008,8 @@ def kdbg_stack(ctx: click.Context, n: int) -> None:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
     console.print(f"[dim]RSP = {result['rsp']}[/]")
-    rsp_val = int(result['rsp'], 16)
-    for i, qw in enumerate(result["qwords"]):
-        offset = i * 8
-        console.print(f"  rsp+0x{offset:02x}: {qw}")
+    for entry in result["qwords"]:
+        console.print(f"  {entry['offset']}: {entry['value']}")
 
 
 @kdbg.command("bt")

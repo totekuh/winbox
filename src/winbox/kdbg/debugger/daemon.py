@@ -117,6 +117,7 @@ class Breakpoint:
     user_mode: bool       # True if VA is in user-half of address space
     hw: bool              # True if installed via Z1 (hardware DR), False if Z0 (software 0xCC)
     installed_at: float   # monotonic timestamp
+    installed_cr3: int = 0   # CR3 used by install_user_breakpoint; 0 = not applicable
     hits: int = 0
     # Conditional-bp state. ``condition`` is the raw user string for
     # display; ``_predicate`` is the parsed AST evaluated on each fire
@@ -519,6 +520,12 @@ class DaemonSession:
 
         bp_id = self._next_bp_id
         self._next_bp_id += 1
+        # For user-mode soft bps, record the CR3 that
+        # install_user_breakpoint actually used so removal can target it
+        # directly instead of re-iterating all candidates (bug #21).
+        _installed_cr3 = 0
+        if is_user and not installed_hw:
+            _installed_cr3 = report.target_dtb  # type: ignore[union-attr]
         bp = Breakpoint(
             bp_id=bp_id,
             va=va,
@@ -526,6 +533,7 @@ class DaemonSession:
             user_mode=is_user,
             hw=installed_hw,
             installed_at=time.monotonic(),
+            installed_cr3=_installed_cr3,
             condition=condition,
             _predicate=predicate_ast,
         )
@@ -589,10 +597,17 @@ class DaemonSession:
             vcpu = self._pick_vcpu()
             self._select_thread(vcpu)
             regs = self.rsp.read_registers()
-            self._cr3_masqueraded_call(
-                vcpu, regs,
-                lambda: self.rsp.remove_breakpoint(bp.va, kind=1, hardware=False),
-            )
+            if bp.installed_cr3:
+                # Use the exact CR3 that install_user_breakpoint placed
+                # the 0xCC under — avoids re-iterating all candidates
+                # and eliminates E22 on removal (bug #21).
+                with self._cr3_masquerade(vcpu, regs, cr3=bp.installed_cr3):
+                    self.rsp.remove_breakpoint(bp.va, kind=1, hardware=False)
+            else:
+                self._cr3_masqueraded_call(
+                    vcpu, regs,
+                    lambda: self.rsp.remove_breakpoint(bp.va, kind=1, hardware=False),
+                )
         else:
             self.rsp.remove_breakpoint(bp.va, kind=1, hardware=bp.hw)
 
@@ -910,19 +925,23 @@ class DaemonSession:
         return {"va": f"0x{va:x}", "length": len(payload)}
 
     def op_stack(self, n: int = 16) -> dict[str, Any]:
-        """N qwords starting at RSP."""
+        """N qwords starting at RSP, with RSP-relative offset labels."""
         if self.stop is None:
             raise RuntimeError("not halted; cont first")
         n = max(1, min(int(n), 256))
         rsp_va = struct.unpack_from("<Q", self.stop.raw_regs, 7 * 8)[0]
-        # Stack lives in target's address space — use the same masquerade-read.
         result = self.op_mem(rsp_va, n * 8)
+        raw = bytes.fromhex(result["bytes"])
         return {
             "rsp": f"0x{rsp_va:x}",
             "qwords": [
-                "0x{:016x}".format(
-                    int.from_bytes(bytes.fromhex(result["bytes"])[i:i+8], "little")
-                )
+                {
+                    "offset": f"rsp+0x{i:02x}",
+                    "va": f"0x{rsp_va + i:x}",
+                    "value": "0x{:016x}".format(
+                        int.from_bytes(raw[i:i+8], "little")
+                    ),
+                }
                 for i in range(0, n * 8, 8)
             ],
         }
