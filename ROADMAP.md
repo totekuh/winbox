@@ -32,32 +32,8 @@ the MCP `kdbg_*` wiring (2026-08-10), not from a specific repro. They're
 ordered by risk × tractability: silent-wrong-result bugs with a known fix
 shape first, pure capability gaps and cross-cutting rewrites last.
 
-Items 20-21 jump that queue: they came out of actually driving a live kdbg
-session on 2026-08-10 to verify item 9's fix, not from static reading, and
-20 in particular is now the highest-confidence hazard in this file — it
-crashed the guest twice in one session, once destructively.
-
-### 20. Calling a guest-agent-dependent tool while a kdbg session holds the VM halted corrupts guest state — reproduced twice, once destructively
-
-`kdbg_attach` halts the VM's vCPUs for the session's duration (standard
-gdbstub all-stop behavior; libvirt reports the domain `paused` while
-attached). Any MCP tool that depends on the in-guest QEMU guest agent (e.g.
-`kdbg_user_symbols_load`, which pulls the target binary via
-VirtIO-FS/guest agent) cannot get a response while the guest's CPUs aren't
-running — the agent process itself needs to execute to answer. Calling one
-of these between `kdbg_attach` and `kdbg_detach` was reproduced twice in one
-session: the first time, it was followed by more calls and an extended
-real-world pause before detach, and the VM came back from that corrupted —
-Windows dropped into WinRE ("It looks like Windows didn't load correctly")
-and needed recovery from a libvirt snapshot. The second time, detaching
-immediately after the failure avoided lasting damage, but `kdbg_regs` on the
-same still-attached session then timed out (`RspError: read timed out`), and
-the gdbstub itself needed a stop/start cycle before a fresh attach worked
-again. Fix: at minimum, document this prominently — no guest-agent-dependent
-tool call between attach and detach; better, have `kdbg_attach` write
-session state that those tools check and refuse to run against with a clear
-error, instead of timing out into the guest agent and leaving the
-session/VM in an unknown state.
+Item 21 jumped that queue: it came out of actually driving a live kdbg
+session on 2026-08-10 to verify item 9's fix, not from static reading.
 
 ### 21. `bp_remove` on a private user-mode soft breakpoint can fail with E22 while the breakpoint is still live
 

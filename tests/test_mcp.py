@@ -119,7 +119,34 @@ class TestEnsureVmReady:
         ga, vm, cfg = mock_mcp
         vm.state.return_value = VMState.PAUSED
 
-        _ensure_vm_ready()
+        with patch("winbox.mcp.DaemonClient", create=True) as dc_cls:
+            dc_cls.return_value.session_alive.return_value = False
+            _ensure_vm_ready()
+        vm.resume.assert_called_once()
+
+    def test_paused_with_kdbg_session_refuses(self, mock_mcp):
+        from winbox.mcp import _ensure_vm_ready
+        ga, vm, cfg = mock_mcp
+        vm.state.return_value = VMState.PAUSED
+
+        with patch(
+            "winbox.kdbg.debugger.client.DaemonClient"
+        ) as dc_cls:
+            dc_cls.return_value.session_alive.return_value = True
+            with pytest.raises(RuntimeError, match="halted by a kdbg debug session"):
+                _ensure_vm_ready()
+        vm.resume.assert_not_called()
+
+    def test_paused_without_kdbg_session_resumes(self, mock_mcp):
+        from winbox.mcp import _ensure_vm_ready
+        ga, vm, cfg = mock_mcp
+        vm.state.return_value = VMState.PAUSED
+
+        with patch(
+            "winbox.kdbg.debugger.client.DaemonClient"
+        ) as dc_cls:
+            dc_cls.return_value.session_alive.return_value = False
+            _ensure_vm_ready()
         vm.resume.assert_called_once()
 
     def test_saved_starts_vm(self, mock_mcp):

@@ -88,6 +88,12 @@ def _ensure_vm_ready() -> tuple[Config, VM, GuestAgent]:
     if state == VMState.SHUTOFF:
         vm.start()
     elif state == VMState.PAUSED:
+        from winbox.kdbg.debugger.client import DaemonClient
+        if DaemonClient(cfg).session_alive():
+            raise RuntimeError(
+                "VM is halted by a kdbg debug session. "
+                "Run kdbg_cont to resume, or kdbg_detach to end the session."
+            )
         vm.resume()
     elif state == VMState.SAVED:
         vm.start()
