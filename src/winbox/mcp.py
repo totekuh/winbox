@@ -2764,7 +2764,10 @@ def kdbg_ps() -> str:
 
     Requires ``kdbg_symbols_load`` to have been run first.
     """
-    cfg, vm, ga = _ensure_vm_ready()
+    cfg, vm, _ = _get_state()
+    state = vm.state()
+    if state not in (VMState.RUNNING, VMState.PAUSED):
+        return f"VM is not running (state: {state.value})"
     store = _kdbg_get_store()
     try:
         procs = _kdbg_list_processes(cfg.vm_name, store)
@@ -2791,7 +2794,10 @@ def kdbg_lm() -> str:
     to locate driver images when you need to resolve addresses inside
     non-nt drivers.
     """
-    cfg, vm, ga = _ensure_vm_ready()
+    cfg, vm, _ = _get_state()
+    state = vm.state()
+    if state not in (VMState.RUNNING, VMState.PAUSED):
+        return f"VM is not running (state: {state.value})"
     store = _kdbg_get_store()
     try:
         mods = _kdbg_list_modules(cfg.vm_name, store)
@@ -2827,7 +2833,10 @@ def kdbg_user_lm(pid: int) -> str:
     Args:
         pid: Target process ID (must be in kdbg_ps output).
     """
-    cfg, vm, ga = _ensure_vm_ready()
+    cfg, vm, _ = _get_state()
+    state = vm.state()
+    if state not in (VMState.RUNNING, VMState.PAUSED):
+        return f"VM is not running (state: {state.value})"
     store = _kdbg_get_store()
     try:
         _kdbg_ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
@@ -2945,7 +2954,10 @@ def kdbg_read_va(pid: int, address: str, length: int) -> str:
         address: Virtual address, hex string (e.g. '0x7ff600001000').
         length: Number of bytes to read (capped at 1MB).
     """
-    cfg, vm, ga = _ensure_vm_ready()
+    cfg, vm, _ = _get_state()
+    state = vm.state()
+    if state not in (VMState.RUNNING, VMState.PAUSED):
+        return f"VM is not running (state: {state.value})"
     if length <= 0:
         return "length must be > 0"
     if length > 1024 * 1024:
@@ -2982,7 +2994,10 @@ def kdbg_base_refresh() -> str:
     reboot the cached symbol map still has the old base — this call
     re-reads the IDT, computes the fresh base, and updates the store.
     """
-    cfg, vm, ga = _ensure_vm_ready()
+    cfg, vm, _ = _get_state()
+    state = vm.state()
+    if state not in (VMState.RUNNING, VMState.PAUSED):
+        return f"VM is not running (state: {state.value})"
     store = _kdbg_get_store()
     try:
         data = store.load("nt")

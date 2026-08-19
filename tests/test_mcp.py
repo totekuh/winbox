@@ -124,6 +124,20 @@ class TestEnsureVmReady:
             _ensure_vm_ready()
         vm.resume.assert_called_once()
 
+    def test_kdbg_walker_tools_work_when_paused(self, mock_mcp):
+        """kdbg_ps/kdbg_lm/kdbg_read_va/kdbg_base_refresh use HMP, not GA.
+        They must not be blocked when the VM is paused by a kdbg session."""
+        ga, vm, cfg = mock_mcp
+        vm.state.return_value = VMState.PAUSED
+
+        from winbox.mcp import kdbg_ps
+        with patch("winbox.mcp._kdbg_get_store") as mock_store, \
+             patch("winbox.mcp._kdbg_list_processes", return_value=[]):
+            mock_store.return_value = MagicMock()
+            result = kdbg_ps()
+        assert "[]" in result
+        vm.resume.assert_not_called()
+
     def test_paused_with_kdbg_session_refuses(self, mock_mcp):
         from winbox.mcp import _ensure_vm_ready
         ga, vm, cfg = mock_mcp
@@ -2795,7 +2809,8 @@ class TestKdbgListTools:
             assert entry["base"].startswith("0x")
             assert entry["size"].startswith("0x")
 
-    def test_kdbg_ps_auto_resumes_paused_vm(self, mock_mcp):
+    def test_kdbg_ps_works_when_paused(self, mock_mcp):
+        """kdbg_ps uses HMP, not GA — must work while paused (no resume)."""
         import json as _json
         from winbox.kdbg.walk import ProcessRecord
         from winbox.mcp import kdbg_ps
@@ -2812,12 +2827,12 @@ class TestKdbgListTools:
              patch("winbox.mcp._kdbg_list_processes", return_value=procs):
             result = kdbg_ps()
 
-        vm.resume.assert_called_once()
-        assert "VM not running" not in result
+        vm.resume.assert_not_called()
         parsed = _json.loads(result)
         assert parsed[0]["pid"] == 4
 
-    def test_kdbg_read_va_auto_resumes_paused_vm(self, mock_mcp):
+    def test_kdbg_read_va_works_when_paused(self, mock_mcp):
+        """kdbg_read_va uses HMP page-walks — must work while paused."""
         from winbox.kdbg.walk import ProcessRecord
         from winbox.mcp import kdbg_read_va
 
@@ -2835,8 +2850,7 @@ class TestKdbgListTools:
              patch("winbox.mcp._kdbg_read_virt_cr3", return_value=payload):
             result = kdbg_read_va(pid=1234, address="0x7ff600001000", length=4)
 
-        vm.resume.assert_called_once()
-        assert "VM not running" not in result
+        vm.resume.assert_not_called()
         assert result == "deadbeef"
 
 
