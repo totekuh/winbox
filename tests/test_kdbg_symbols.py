@@ -346,15 +346,14 @@ class TestEnsureNtBaseCurrent:
 class TestWalkerEntryPointsHealFirst:
     """The repair has to happen before anything resolves a kernel symbol."""
 
-    def test_callers_heal_before_forking_daemon(self):
+    def test_daemon_walks_processes_after_gdbstub_connect(self):
         import inspect
 
-        import winbox.mcp as mcp_mod
+        from winbox.kdbg.debugger import daemon
 
-        src = inspect.getsource(mcp_mod.kdbg_attach)
-        assert "_kdbg_get_store" in src
-        assert "_kdbg_list_processes" in src
-        assert src.index("_kdbg_list_processes") < src.index("_fork_daemon")
+        src = inspect.getsource(daemon.fork_daemon)
+        assert "list_processes" in src
+        assert src.index("RspClient.connect") < src.index("list_processes")
 
     def test_mcp_and_cli_store_accessors_heal(self):
         import inspect

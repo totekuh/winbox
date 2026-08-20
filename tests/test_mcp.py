@@ -2896,55 +2896,23 @@ class TestKdbgDaemonTools:
             user_directory_table_base=user_dtb,
         )
 
-    def test_attach_walks_processes_before_fork(self, mock_mcp):
-        """_kdbg_list_processes must be called AND _fork_daemon must
-        receive a TargetInfo (not a raw int pid)."""
+    def test_attach_passes_pid_to_fork_daemon(self, mock_mcp):
+        """fork_daemon receives the raw PID — the daemon child walks
+        processes after halting the VM for a stable CR3."""
         from winbox.mcp import kdbg_attach
-        from winbox.kdbg.debugger.daemon import TargetInfo
-        proc = self._fake_proc()
         client = self._client_with(alive=False, info={
             "target_pid": 4584, "target_dtb": "0x4d6bb000",
             "target_name": "notepad.exe", "daemon_pid": 1234,
             "gdbstub_port": 1234,
         })
-        fake_store = MagicMock()
         with patch("winbox.mcp._kdbg_client", return_value=client), \
-             patch("winbox.mcp._kdbg_get_store", return_value=fake_store), \
-             patch("winbox.mcp._kdbg_list_processes", return_value=[proc]) as lp, \
              patch("winbox.mcp._fork_daemon", return_value=1234) as ff:
             result = kdbg_attach(4584)
 
-        lp.assert_called_once()
         ff.assert_called_once()
-        # fork_daemon must receive a TargetInfo, not an int
-        call_args = ff.call_args
-        target_arg = call_args[0][1]  # positional: cfg, target
-        assert isinstance(target_arg, TargetInfo)
-        assert target_arg.pid == 4584
-        assert target_arg.dtb == 0x4d6bb000
-        assert target_arg.name == "notepad.exe"
+        assert ff.call_args[0][1] == 4584
         out = _json_mod.loads(result)
         assert out["daemon_pid"] == 1234
-        assert out["target"]["pid"] == 4584
-        assert out["target"]["name"] == "notepad.exe"
-
-    def test_attach_pid_not_found_without_forking(self, mock_mcp):
-        """When the target pid is not in the process list, _fork_daemon
-        must NOT be called and the error should be returned."""
-        from winbox.mcp import kdbg_attach
-        client = self._client_with(alive=False)
-        fake_store = MagicMock()
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
-             patch("winbox.mcp._kdbg_get_store", return_value=fake_store), \
-             patch("winbox.mcp._kdbg_list_processes", return_value=[]) as lp, \
-             patch("winbox.mcp._fork_daemon") as ff:
-            result = kdbg_attach(99999)
-
-        lp.assert_called_once()
-        ff.assert_not_called()
-        assert "error:" in result
-        assert "99999" in result
-        assert "not found" in result
 
     def test_attach_refuses_when_session_already_alive(self, mock_mcp):
         from winbox.mcp import kdbg_attach

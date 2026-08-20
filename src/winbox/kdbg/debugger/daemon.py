@@ -1823,18 +1823,17 @@ def _validate_module_bases(
 
 def fork_daemon(
     cfg: Config,
-    target: TargetInfo,
+    target_pid: int,
     *,
     gdbstub_port: int = 1234,
 ) -> int:
     """Fork off a session daemon. Parent returns the daemon pid; child
     never returns from this function (it enters serve_forever).
 
-    The caller is responsible for walking the process list and
-    constructing the ``TargetInfo`` — the daemon child no longer does
-    its own process walk (it used to silently fail when
-    ``ensure_nt_base_current`` swallowed exceptions in the forked
-    child, making user-launched processes invisible).
+    The child connects the gdbstub first (halting the VM for a stable
+    CR3), then walks the process list to find ``target_pid``. Walking
+    after the halt avoids KPTI CR3 races that truncate the list on a
+    running VM.
 
     The parent waits on a status pipe for the child to either say "OK"
     (everything wired) or "ERR: ..." (and exits with that error).
@@ -1879,15 +1878,28 @@ def fork_daemon(
         rsp.handshake()
         initial_sr = rsp.query_halt_reason()
 
-        # Stale-base check. If the VM rebooted since the symbol store
-        # was last updated, ASLR moved every module's base. The cached
-        # ``base`` field in store entries points nowhere in current
-        # process — Z0 user_va install fails later with cryptic E22.
-        # Catch it now and tell the user exactly what to do.
-        # Only validates store entries that are ACTUALLY loaded in the
-        # target — irrelevant entries (e.g. notepad symbols cached
-        # while now attaching to cyserver) are skipped without complaint.
+        # VM is now halted — CR3 is stable, safe to walk kernel structures.
         store = SymbolStore(cfg.symbols_dir)
+        from winbox.kdbg.symbols import ensure_nt_base_current
+        ensure_nt_base_current(cfg, store)
+        from winbox.kdbg.walk import list_processes
+        procs = list_processes(cfg.vm_name, store)
+        target_rec = next((p for p in procs if p.pid == target_pid), None)
+        if target_rec is None:
+            os.write(pipe_w, f"ERR: pid {target_pid} not found\n".encode())
+            os.close(pipe_w)
+            pipe_signaled = True
+            rsp.cont()
+            rsp.close()
+            os._exit(1)
+        target = TargetInfo(
+            pid=target_rec.pid,
+            dtb=target_rec.directory_table_base,
+            name=target_rec.name,
+            user_dtb=target_rec.user_directory_table_base,
+            eprocess=target_rec.eprocess,
+        )
+
         _validate_module_bases(cfg, rsp, target, store)
 
         listen_sock = _bind_unix_socket(sock_path(cfg))
