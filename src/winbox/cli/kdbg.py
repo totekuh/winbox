@@ -795,6 +795,7 @@ def kdbg_attach(ctx: click.Context, pid: int, port: int) -> None:
         dtb=target_rec.directory_table_base,
         name=target_rec.name,
         user_dtb=target_rec.user_directory_table_base,
+        eprocess=target_rec.eprocess,
     )
     try:
         daemon_pid = fork_daemon(cfg, target, gdbstub_port=port)

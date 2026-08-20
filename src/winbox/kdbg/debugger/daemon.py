@@ -173,6 +173,7 @@ class TargetInfo:
     user_dtb: int = 0  # KPROCESS.UserDirectoryTableBase if present (KVA
                        # Shadow / KPTI builds). 0 means "field absent or
                        # read failed; we only know one CR3".
+    eprocess: int = 0  # VA of the EPROCESS struct (for PEB.Ldr walks)
 
     @property
     def cr3_set(self) -> tuple[int, ...]:
