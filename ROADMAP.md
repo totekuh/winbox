@@ -295,31 +295,59 @@ if something's already attached.
 These are not bugs — they're untested edge cases that could surface real bugs.
 Each needs a live test and, where it breaks, a fix.
 
-**32. Double attach** — `kdbg_attach` while a session is already active. Should
-refuse cleanly (existing `session_alive` check). Verify the error message is
-clear and the existing session is unaffected.
+**32. Tested 2026-08-21 — PASS.** Double attach refused cleanly: "VM is halted
+by a kdbg debug session." Existing session unaffected.
 
-**33. Detach during `kdbg_cont`** — `kdbg_interrupt` + `kdbg_detach` while cont
-is blocked waiting for a breakpoint. Should interrupt cleanly and detach without
-leaving the VM paused or the GA broken.
+**33. Tested 2026-08-21 — PASS.** `kdbg_interrupt` during blocked `kdbg_cont`
+queues correctly, detach works, GA survives, VM resumes. Note: interrupt may
+race with cont timeout (observed `reason: timeout` instead of `reason:
+interrupt` when both expire at the same wall-clock moment — not a bug, timing).
 
-**34. Exhaust all 4 DR slots** — set 5 hw breakpoints. The 5th should fail with
-a clear error naming the DR slot limit. Verify existing 4 are unaffected.
+**34. Tested 2026-08-21 — PASS.** 5th hw breakpoint fails with clear error
+naming DR slot limit. Existing 4 unaffected and tracked correctly.
 
-**35. Attach to a process that exits mid-session** — target exits while
-breakpoints are set. Cont should time out (target gone), detach should clean
-up without crash. Breakpoint removal on a dead process's CR3 — does it error
-or succeed?
+**35. Attach to a process that exits mid-session** — NOT YET TESTED. Target
+exits while breakpoints are set. Cont should time out (target gone), detach
+should clean up without crash.
 
-**36. Breakpoint on nonexistent symbol** — `kdbg_bp nt!FakeFunction`. Should
-fail with "symbol not found" before attempting any gdbstub operation.
+**36. Tested 2026-08-21 — PASS.** `kdbg_bp nt!FakeFunction` fails with "symbol
+not found" before any gdbstub operation.
 
-**37. Memory read at unmapped VA** — `kdbg_mem 0xdeadbeefdeadbeef`. Should
-return a clean error, not crash the daemon or corrupt session state.
+**37. Tested 2026-08-21 — PASS.** `kdbg_mem 0xdeadbeefdeadbeef` returns clean
+`RspError: m failed` error. Session state intact.
 
-**38. Rapid attach/detach cycles** — 5 consecutive attach/detach on the same
-process. GA channel must survive all cycles. If it breaks on cycle N, that's
-a bug to fix (related to item 29).
+**38. Tested 2026-08-21 — PASS.** 5 consecutive attach/detach cycles on same
+process. GA survived all cycles.
+
+### Findings from 2026-08-21 live testing session
+
+**39. PID mismatch between GA `ps` and kernel process walker.** GA-based `ps`
+reports different PIDs than `kdbg_ps` (kernel EPROCESS walk via HMP). Observed
+with lsass.exe: GA reported PID 860, kernel walk reported PID 856. Also seen
+with svchost.exe (GA: 1808, not in kernel walk at all). Root cause is likely
+item 31 (KPTI walker truncation on running VM) — `kdbg_ps` runs on a running
+VM and the user-mode CR3 doesn't map all kernel structures. The `kdbg_attach`
+daemon walks after halting the VM (stable CR3), so it sees the true PIDs. The
+GA `ps` uses `Get-Process` inside the guest, which sees the true PIDs too.
+The mismatch means `kdbg_attach` with a PID from GA `ps` can fail with
+"pid not found." Workaround: use PIDs from `kdbg_ps` for `kdbg_attach`.
+Fix: same as item 31 — use `read_virt_cr3` with a known kernel DTB.
+
+**40. hw bp probe false positive on fresh boot.** The one-time hw bp probe
+(item 30 fix) timed out on a freshly booted VM — `nt!KiPageFault` did not
+fire within 300ms. On a warm VM it fires instantly. 300ms may be too short
+for a quiet fresh-boot state. The false warning is harmless (hw bps actually
+work) but confusing. Fix: increase probe timeout to 500ms or 1s, or pick a
+hotter symbol (e.g., `nt!KeQueryInterruptTimePrecise` which fires on every
+timer interrupt).
+
+**41. `kdbg_cont` is a blocking MCP operation.** The cont tool blocks for up
+to `timeout` seconds. The daemon internally services `interrupt` and `status`
+ops via `_pump_client`, but the MCP client is stuck waiting. A non-blocking
+design — cont returns immediately, `kdbg_status` polls for bp hits — would
+let the operator do other work (read memory, check state) while waiting for a
+rare breakpoint. This is a design gap, not a bug, and would require changes to
+the daemon protocol, MCP handler, and the `_wait_for_stop_serving` loop.
 
 ### Debugger (kdbg) gaps — collected from a live MsMpEng RPC session
 
