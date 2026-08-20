@@ -37,36 +37,27 @@ record. Item 21 (bp_remove E22) was addressed by storing `installed_cr3` in
 the Breakpoint. Items 28-34 below came from the same live debugging session
 that verified those fixes.
 
-### 28. `kdbg_attach` "empty stop reply" — auto-retry needed
+**28. Fixed.** `fork_daemon` now retries up to 3 times on "empty stop reply":
+raw-closes the socket, restarts the gdbstub via HMP, reconnects. After all
+attempts exhausted, raises a clear error naming the recovery. Supersedes old
+item 12. Verified live — first attach reliably hits the bug and auto-recovers
+on attempt 2.
 
-When the gdbstub doesn't return a stop packet on initial connect,
-`kdbg_attach` fails with `RspError: empty stop reply`. Recovery today:
-manual `kdbg_stop` + `kdbg_start` + re-attach. The operator has to know
-this. Fix: bounded auto-retry (stop/start the gdbstub internally) with a
-clear error if all attempts fail. Roadmap item 12 describes the same bug;
-this entry supersedes it with a concrete fix shape.
+**29. Fixed.** PID-not-found path now uses `rsp.cont()` + `time.sleep(0.1)` +
+`rsp._sock.close()` (raw close, no D-packet dance) — same safe pattern as
+`DaemonSession.shutdown()`. The old `rsp.close()` did interrupt+wait+D which
+halted-resumed-halted the VM and corrupted the virtio-serial GA channel.
+After resuming, checks `agent_channel_connected()` and appends a warning if
+the channel dropped. Verified live — GA survives the failed attach.
 
-### 29. GA channel dies after failed `kdbg_attach`
-
-When the daemon child connects the gdbstub (halts VM), walks processes,
-fails to find the target PID, resumes the VM, and exits — the QEMU guest
-agent channel often breaks permanently (`QEMU guest agent is not connected`).
-Every subsequent MCP/CLI command fails until a cold restart (`winbox down
---force && winbox up`). The brief halt/resume cycle corrupts the
-virtio-serial channel state. Fix: ensure the daemon child cleanly resumes
-the VM via the gdbstub (`rsp.cont()`) before disconnecting, and verify the
-GA channel is still alive before reporting the error — if not, attempt
-channel recovery or surface a clear "GA lost, restart needed" message
-instead of letting every subsequent command fail silently.
-
-### 30. No breakpoint-fire verification — hw bp may silently never fire
-
-Hardware breakpoints install with `OK` from QEMU but may never fire if the
-guest hypervisor (HVCI/VBS) intercepts DR writes. The HVCI detection added
-on 2026-08-20 warns at attach time, but other causes exist (nested
-virtualization quirks, QEMU gdbstub bugs). A post-install probe — short
-cont + check hits > 0 on a known-hot function — would catch silent failures
-early instead of leaving the operator waiting for a hit that never comes.
+**30. Fixed (two parts).** Part A: one-time hw bp verification probe on first
+hw bp install. Installs a temp hw bp on `nt!KiPageFault` (or
+`nt!KeQueryPerformanceCounter`), does a 300ms cont, checks for SIGTRAP. If
+the probe times out, returns `hw_probe_warning` in the response. Runs once
+per session. Part B: `op_cont` now includes `unfired_hw_bps` in its response
+listing all hw bps with `hits==0` after a cont that ran longer than 5
+seconds. Verified live — probe fires immediately, unfired warning appears
+correctly when bp fires in non-target CR3.
 
 ### 31. Process walker truncation on KPTI builds (running VM)
 
@@ -352,10 +343,8 @@ hardware path, yet the fallback is only visible as a buried `hw: false` field.
 Either refuse to silently downgrade against sensitive targets, or surface the
 fallback loudly.
 
-**12. `kdbg_attach` "empty stop reply" needs a manual stop+start cycle.** When
-it happens there is no error pointing at the fix; the operator has to know to
-`kdbg_stop` then `kdbg_start`. Add a bounded internal auto-retry and, failing
-that, an error message that names the recovery.
+**12. Fixed.** Superseded by item 28 — `fork_daemon` now auto-retries with
+gdbstub restart via HMP.
 
 **13. `kdbg_detach`'s unit test is not isolated (test hygiene).** Found this
 session: `test_detach_calls_daemon_and_waits_for_release` does not mock

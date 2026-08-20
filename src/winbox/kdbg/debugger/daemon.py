@@ -283,6 +283,11 @@ class DaemonSession:
         # calls in the cont hot path; reset on shutdown / detach.
         self._last_selected_vcpu: str | None = None
 
+        # Item #30: one-time hw breakpoint verification probe.
+        # Set True after the first hw bp in the session triggers a probe
+        # (or after probing is skipped). Prevents repeated probes.
+        self._hw_bp_verified: bool = False
+
         self._serving = False
         self._listen_sock: socket.socket | None = None
 
@@ -547,7 +552,7 @@ class DaemonSession:
         )
         self.bps[bp_id] = bp
         self._bp_by_va[va] = bp_id
-        return {
+        result = {
             "id": bp_id,
             "va": f"0x{va:x}",
             "user_mode": is_user,
@@ -555,6 +560,92 @@ class DaemonSession:
             "condition": condition,
             "elapsed_ms": round(elapsed_ms, 2),
         }
+
+        # Item #30 Part A: one-time hw bp verification probe on first
+        # hw bp installed in this session.
+        if installed_hw and not self._hw_bp_verified:
+            probe_warning = self._probe_hw_breakpoints()
+            if probe_warning:
+                result["hw_probe_warning"] = probe_warning
+
+        return result
+
+    def _probe_hw_breakpoints(self) -> str | None:
+        """One-time probe: verify hardware breakpoints actually fire.
+
+        Installs a temporary hw bp on a known-hot kernel symbol
+        (nt!KiPageFault or nt!KeQueryPerformanceCounter), does a short
+        cont, and checks whether a SIGTRAP arrives. Returns a warning
+        string if the probe timed out (hw bps may not work), or None
+        on success. Sets ``_hw_bp_verified`` either way so the probe
+        runs at most once per session. (Item #30)
+        """
+        self._hw_bp_verified = True  # don't re-probe regardless of outcome
+
+        # Pick a hot kernel symbol from the store.
+        probe_va = None
+        for sym in ("nt!KiPageFault", "nt!KeQueryPerformanceCounter"):
+            try:
+                probe_va = self.store.resolve(sym)
+                break
+            except Exception:
+                continue
+        if probe_va is None:
+            return (
+                "hw bp probe skipped: could not resolve a hot kernel symbol "
+                "from the store; hw bp functionality is unverified"
+            )
+
+        # Install temporary hw bp on the probe symbol.
+        try:
+            self.rsp.insert_breakpoint(probe_va, kind=1, hardware=True)
+        except RspError as e:
+            return f"hw bp probe failed to install: {e}"
+
+        # Short cont — accept any CR3 (kernel code fires in every process).
+        warning = None
+        try:
+            self.rsp.cont()
+            try:
+                sr = self.rsp.wait_for_stop(timeout=0.3)
+                # Check if we got SIGTRAP at the probe address.
+                if sr.signal == 5:
+                    # Read rip to confirm it's at the probe VA.
+                    vcpu = sr.thread or "01"
+                    self._select_thread(vcpu)
+                    regs = self.rsp.read_registers()
+                    rip = struct.unpack_from("<Q", regs, 128)[0]
+                    if rip == probe_va:
+                        pass  # hw bps work — success
+                    else:
+                        # Hit something else; still proves hw bps fire.
+                        pass
+                else:
+                    warning = (
+                        "hw bp probe: stop was not SIGTRAP; "
+                        "hardware breakpoints may not fire on this guest"
+                    )
+            except RspError:
+                # Timeout — no stop arrived in 300ms.
+                # Interrupt to re-halt the VM.
+                self.rsp.interrupt()
+                try:
+                    self.rsp.wait_for_stop(timeout=2.0)
+                except RspError:
+                    pass
+                warning = (
+                    "hw bp probe timed out: no hit on a hot kernel path within "
+                    "300ms. Hardware breakpoints may not fire — common causes: "
+                    "HVCI intercepting DR writes, nested virtualization quirks, "
+                    "or QEMU gdbstub bugs. Consider mode='soft' if your target "
+                    "breakpoints never fire."
+                )
+        finally:
+            # Remove the probe bp regardless of outcome.
+            with suppress(RspError):
+                self.rsp.remove_breakpoint(probe_va, kind=1, hardware=True)
+
+        return warning
 
     def op_bp_list(self) -> dict[str, Any]:
         from winbox.kdbg.demangle import pretty_symbol
@@ -663,7 +754,8 @@ class DaemonSession:
         else falls back to ``(dtb, dtb ^ 0x1000)``.
         """
         accepted_cr3s = self.target.cr3_set
-        deadline = time.monotonic() + max(0.5, float(timeout))
+        _cont_start = time.monotonic()
+        deadline = _cont_start + max(0.5, float(timeout))
         # Drop a flag left over from an interrupt issued while nothing was
         # running — honouring it would make this cont return immediately
         # without ever resuming the guest. An interrupt that arrives *during*
@@ -676,10 +768,14 @@ class DaemonSession:
                 self.rsp.interrupt()
                 sr = self.rsp.wait_for_stop(timeout=2.0)
                 self._capture_stop(sr)
-                return {"reason": "interrupt", **self._stop_summary()}
+                result = {"reason": "interrupt", **self._stop_summary()}
+                result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
+                return result
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return {"reason": "timeout"}
+                result = {"reason": "timeout"}
+                result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
+                return result
 
             self.rsp.cont()
             try:
@@ -695,7 +791,9 @@ class DaemonSession:
                         self._capture_stop(sr)
                     except RspError:
                         pass
-                    return {"reason": "timeout", **self._stop_summary()}
+                    result = {"reason": "timeout", **self._stop_summary()}
+                    result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
+                    return result
                 raise RuntimeError(f"cont/wait failed: {e}") from e
 
             if self._interrupt_pending:
@@ -705,12 +803,16 @@ class DaemonSession:
                 # the stop for what the operator asked for.
                 self._interrupt_pending = False
                 self._capture_stop(sr)
-                return {"reason": "interrupt", **self._stop_summary()}
+                result = {"reason": "interrupt", **self._stop_summary()}
+                result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
+                return result
 
             if sr.signal != 5:
                 # Not a bp — surface anyway, caller decides.
                 self._capture_stop(sr)
-                return {"reason": "signal", **self._stop_summary()}
+                result = {"reason": "signal", **self._stop_summary()}
+                result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
+                return result
 
             # ONE g-packet per fire — extract cr3 + rip from the same
             # blob. The previous shape (select_thread, read_cr3,
@@ -766,7 +868,9 @@ class DaemonSession:
                 bp.hits += 1
             else:
                 self._bump_bp_hits(rip, in_target=True)
-            return {"reason": "bp", **self._stop_summary()}
+            result = {"reason": "bp", **self._stop_summary()}
+            result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
+            return result
 
     def op_step(self) -> dict[str, Any]:
         if self.stop is None:
@@ -1095,6 +1199,29 @@ class DaemonSession:
             return int.from_bytes(data, "little")
 
         return _read
+
+    def _unfired_hw_bp_warnings(self, elapsed: float) -> dict[str, Any]:
+        """Item #30 Part B: passive check for hw bps that never fired.
+
+        After a cont that ran for >5 seconds, any hw bp with hits==0 is
+        suspicious — it may be silently non-functional (HVCI, QEMU bugs,
+        etc.). Returns a dict with an ``unfired_hw_bps`` key listing them,
+        or an empty dict if there's nothing to report.
+        """
+        if elapsed < 5.0:
+            return {}
+        unfired = [
+            {
+                "id": b.bp_id,
+                "va": f"0x{b.va:x}",
+                "target": b.target,
+            }
+            for b in self.bps.values()
+            if b.hw and b.hits == 0
+        ]
+        if not unfired:
+            return {}
+        return {"unfired_hw_bps": unfired}
 
     def _stop_summary(self) -> dict[str, Any]:
         if self.stop is None:
@@ -1874,9 +2001,40 @@ def fork_daemon(
         _detach_to_log(log_path(cfg))
         lock_fd = _acquire_lock_or_die(lock_path(cfg))
 
-        rsp = RspClient.connect("127.0.0.1", gdbstub_port, timeout=5.0)
-        rsp.handshake()
-        initial_sr = rsp.query_halt_reason()
+        # Item #28: Bounded retry on "empty stop reply" — the gdbstub
+        # occasionally returns an empty body to the '?' query after a
+        # fresh start. Instead of forcing the operator to manually cycle
+        # kdbg_stop + kdbg_start, restart the stub via HMP and reconnect.
+        _MAX_ATTACH_ATTEMPTS = 3
+        for _attempt in range(1, _MAX_ATTACH_ATTEMPTS + 1):
+            rsp = RspClient.connect("127.0.0.1", gdbstub_port, timeout=5.0)
+            try:
+                rsp.handshake()
+                initial_sr = rsp.query_halt_reason()
+                break  # success
+            except RspError as _rsp_err:
+                if "empty stop reply" not in str(_rsp_err):
+                    raise  # not the retryable failure — propagate
+                # Close raw socket (no D-packet dance)
+                with suppress(OSError):
+                    rsp._sock.close()
+                rsp = None
+                if _attempt >= _MAX_ATTACH_ATTEMPTS:
+                    raise DaemonError(
+                        f"gdbstub returned empty stop reply on "
+                        f"{_MAX_ATTACH_ATTEMPTS} consecutive attempts. "
+                        f"Recovery: kdbg_stop, kdbg_start, then retry."
+                    ) from _rsp_err
+                # Restart the gdbstub via HMP
+                from winbox.kdbg.hmp import hmp
+                with suppress(Exception):
+                    hmp(cfg.vm_name, "gdbserver none")
+                time.sleep(0.5)
+                hmp(
+                    cfg.vm_name,
+                    f"gdbserver tcp:127.0.0.1:{gdbstub_port}",
+                )
+                time.sleep(0.3)  # let stub settle
 
         # VM is now halted — CR3 is stable, safe to walk kernel structures.
         store = SymbolStore(cfg.symbols_dir)
@@ -1886,11 +2044,28 @@ def fork_daemon(
         procs = list_processes(cfg.vm_name, store)
         target_rec = next((p for p in procs if p.pid == target_pid), None)
         if target_rec is None:
-            os.write(pipe_w, f"ERR: pid {target_pid} not found\n".encode())
+            # Resume VM and close socket using the same safe pattern as
+            # DaemonSession.shutdown(): raw socket close, no D-packet.
+            # rsp.close() does interrupt+wait+D which halts-resumes-halts
+            # the VM and corrupts the virtio-serial GA channel. (Item #29)
+            rsp.cont()
+            time.sleep(0.1)
+            rsp._sock.close()
+            # Check GA health — warn if the channel dropped.
+            ga_warning = ""
+            try:
+                from winbox.vm.lifecycle import agent_channel_connected
+                if not agent_channel_connected(cfg.vm_name):
+                    ga_warning = (
+                        " (warning: guest-agent channel is down; "
+                        "it may need a few seconds to reconnect)"
+                    )
+            except Exception:
+                pass
+            msg = f"ERR: pid {target_pid} not found{ga_warning}\n"
+            os.write(pipe_w, msg.encode())
             os.close(pipe_w)
             pipe_signaled = True
-            rsp.cont()
-            rsp.close()
             os._exit(1)
         target = TargetInfo(
             pid=target_rec.pid,

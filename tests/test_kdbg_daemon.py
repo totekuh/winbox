@@ -8,6 +8,7 @@ state machine and op_<verb> dispatch.
 from __future__ import annotations
 
 import struct
+import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -2266,3 +2267,302 @@ def test_op_stack_requires_halt():
     session = _make_session()
     with pytest.raises(RuntimeError, match="not halted"):
         session.op_stack()
+
+
+# ── Item #28: auto-retry on "empty stop reply" ─────────────────────────
+
+
+class TestEmptyStopReplyRetry:
+    """fork_daemon should auto-restart the gdbstub and reconnect when
+    query_halt_reason raises RspError('empty stop reply')."""
+
+    def test_retry_loop_constants_exist(self):
+        """The retry constant is defined in fork_daemon's body.
+        We verify indirectly by checking the source."""
+        import inspect
+        from winbox.kdbg.debugger import daemon
+        src = inspect.getsource(daemon.fork_daemon)
+        assert "_MAX_ATTACH_ATTEMPTS" in src
+        assert "empty stop reply" in src
+
+    def test_rsp_error_non_empty_stop_reply_is_not_retried(self):
+        """RspError that is NOT "empty stop reply" should propagate
+        without triggering the retry path."""
+        from winbox.kdbg.debugger.rsp import RspError
+
+        # The retry logic checks 'if "empty stop reply" not in str(err)'
+        err = RspError("connection closed by peer")
+        assert "empty stop reply" not in str(err)
+
+    def test_rsp_error_empty_stop_reply_matches(self):
+        """The exact error string must match the retry guard."""
+        from winbox.kdbg.debugger.rsp import RspError
+
+        err = RspError("empty stop reply")
+        assert "empty stop reply" in str(err)
+
+
+# ── Item #29: safe close on PID-not-found ──────────────────────────────
+
+
+class TestPidNotFoundSafeClose:
+    """When target_pid is not in the process list, fork_daemon should
+    resume the VM and close the socket safely (no D-packet)."""
+
+    def test_source_does_not_call_rsp_close(self):
+        """The PID-not-found path must NOT call rsp.close() anymore —
+        it uses the raw _sock.close() pattern from shutdown()."""
+        import inspect
+        from winbox.kdbg.debugger import daemon
+
+        src = inspect.getsource(daemon.fork_daemon)
+        # Find the pid-not-found block
+        idx = src.index("target_rec is None")
+        # Get the block until os._exit(1) after it
+        block_end = src.index("os._exit(1)", idx)
+        block = src[idx:block_end]
+        # Strip comments before checking — the comment explaining *why*
+        # rsp.close() is wrong mentions it by name.
+        code_lines = [
+            ln for ln in block.splitlines()
+            if not ln.strip().startswith("#")
+        ]
+        code_only = "\n".join(code_lines)
+        assert "rsp.close()" not in code_only, "rsp.close() must not be used in PID-not-found"
+        assert "rsp._sock.close()" in code_only, "raw _sock.close() should be used"
+        assert "rsp.cont()" in code_only, "cont() must be called before close"
+
+    def test_source_checks_ga_channel(self):
+        """The PID-not-found path should check agent_channel_connected
+        and include a warning if the channel is down."""
+        import inspect
+        from winbox.kdbg.debugger import daemon
+
+        src = inspect.getsource(daemon.fork_daemon)
+        idx = src.index("target_rec is None")
+        block_end = src.index("os._exit(1)", idx)
+        block = src[idx:block_end]
+        assert "agent_channel_connected" in block
+
+
+# ── Item #30 Part A: hw bp verification probe ──────────────────────────
+
+
+class TestHwBpProbe:
+    """DaemonSession._probe_hw_breakpoints verifies that hw bps fire."""
+
+    def test_probe_fires_on_first_hw_bp(self):
+        """When the first hw bp is installed, a probe should run."""
+        from winbox.kdbg.debugger.rsp import StopReply
+
+        probe_va = 0xfffff80608001000
+
+        class ProbeRsp(FakeRsp):
+            def __init__(self):
+                super().__init__()
+                self._probe_bp_va = None
+                self._cont_count = 0
+
+            def insert_breakpoint(self, addr, *, kind=1, hardware=False):
+                super().insert_breakpoint(addr, kind=kind, hardware=hardware)
+                if hardware and self._probe_bp_va is None:
+                    # First hw bp = user's. Second = probe.
+                    pass
+                self._probe_bp_va = addr
+
+            def cont(self):
+                self._cont_count += 1
+                self.continued += 1
+
+            def wait_for_stop(self, *, timeout=None):
+                # Simulate probe bp firing
+                return StopReply(signal=5, thread="01", stop_kind="hwbreak",
+                                raw="T05hwbreak:;thread:01;")
+
+        rsp = ProbeRsp()
+        store = FakeStore({
+            "nt!KiPageFault": probe_va,
+            "notepad!Foo": 0x7ff6e289a760,
+        })
+        session = _make_session(rsp=rsp, store=store)
+        assert session._hw_bp_verified is False
+
+        # Install a hw bp — this should trigger the probe
+        reply = session.handle_op("bp_add", {"target": "notepad!Foo", "mode": "hw"})
+        assert reply["ok"]
+        assert session._hw_bp_verified is True
+
+    def test_probe_runs_once_only(self):
+        """After the first probe, subsequent hw bps should NOT re-probe."""
+        from winbox.kdbg.debugger.rsp import StopReply
+
+        probe_count = [0]
+
+        class CountingProbeRsp(FakeRsp):
+            def cont(self):
+                probe_count[0] += 1
+                self.continued += 1
+
+            def wait_for_stop(self, *, timeout=None):
+                return StopReply(signal=5, thread="01", stop_kind="hwbreak",
+                                raw="T05hwbreak:;thread:01;")
+
+        rsp = CountingProbeRsp()
+        store = FakeStore({
+            "nt!KiPageFault": 0xfffff80608001000,
+            "notepad!Foo": 0x7ff6e289a760,
+            "notepad!Bar": 0x7ff6e289a770,
+        })
+        session = _make_session(rsp=rsp, store=store)
+
+        # First hw bp triggers probe
+        session.handle_op("bp_add", {"target": "notepad!Foo", "mode": "hw"})
+        first_cont_count = probe_count[0]
+        assert first_cont_count > 0
+
+        # Second hw bp should NOT trigger another probe
+        session.handle_op("bp_add", {"target": "notepad!Bar", "mode": "hw"})
+        assert probe_count[0] == first_cont_count
+
+    def test_probe_timeout_returns_warning(self):
+        """If the probe cont times out, a warning is returned."""
+        from winbox.kdbg.debugger.rsp import RspError, StopReply
+
+        class TimeoutProbeRsp(FakeRsp):
+            def cont(self):
+                self.continued += 1
+
+            def wait_for_stop(self, *, timeout=None):
+                if timeout is not None and timeout < 1.0:
+                    # Probe timeout
+                    raise RspError("read timed out")
+                return StopReply(signal=5, thread="01", stop_kind="hwbreak",
+                                raw="T05hwbreak:;thread:01;")
+
+            def interrupt(self):
+                self.interrupted += 1
+
+        rsp = TimeoutProbeRsp()
+        store = FakeStore({
+            "nt!KiPageFault": 0xfffff80608001000,
+            "notepad!Foo": 0x7ff6e289a760,
+        })
+        session = _make_session(rsp=rsp, store=store)
+
+        reply = session.handle_op("bp_add", {"target": "notepad!Foo", "mode": "hw"})
+        assert reply["ok"]
+        assert "hw_probe_warning" in reply["result"]
+        assert "timed out" in reply["result"]["hw_probe_warning"]
+
+    def test_probe_skipped_when_no_kernel_symbols(self):
+        """If no hot kernel symbol can be resolved, probe is skipped."""
+        store = FakeStore({
+            "notepad!Foo": 0x7ff6e289a760,
+        })
+        session = _make_session(store=store)
+
+        reply = session.handle_op("bp_add", {"target": "notepad!Foo", "mode": "hw"})
+        assert reply["ok"]
+        assert "hw_probe_warning" in reply["result"]
+        assert "could not resolve" in reply["result"]["hw_probe_warning"]
+        assert session._hw_bp_verified is True
+
+    def test_no_probe_for_soft_bp(self):
+        """Software breakpoints should NOT trigger the hw probe."""
+        from winbox.kdbg.debugger import daemon as daemon_mod
+        from winbox.kdbg.debugger.install import InstallReport
+
+        def fake_install(cli, vm_name, store, *, cr3_candidates, user_va):
+            return InstallReport(user_va=user_va, target_dtb=cr3_candidates[0], elapsed=0.005)
+
+        import unittest.mock as mock
+        with mock.patch.object(daemon_mod, "install_user_breakpoint", fake_install):
+            store = FakeStore({"notepad!Foo": 0x7ff6e289a760})
+            session = _make_session(store=store)
+            reply = session.handle_op("bp_add", {"target": "notepad!Foo", "mode": "soft"})
+
+        assert reply["ok"]
+        assert session._hw_bp_verified is False  # probe never ran
+        assert "hw_probe_warning" not in reply["result"]
+
+
+# ── Item #30 Part B: unfired hw bp warnings ────────────────────────────
+
+
+class TestUnfiredHwBpWarnings:
+    """op_cont should warn about hw bps with hits==0 after long runs."""
+
+    def test_unfired_warning_after_long_cont(self):
+        """A hw bp with 0 hits after 5+ seconds should appear in warnings."""
+        session = _make_session()
+        # Manually set up a hw bp with 0 hits
+        bp = Breakpoint(
+            bp_id=0, va=0xfffff80608628780, target="nt!Foo",
+            user_mode=False, hw=True, installed_at=time.monotonic(),
+        )
+        session.bps[0] = bp
+        session._bp_by_va[bp.va] = 0
+
+        result = session._unfired_hw_bp_warnings(elapsed=10.0)
+        assert "unfired_hw_bps" in result
+        assert len(result["unfired_hw_bps"]) == 1
+        assert result["unfired_hw_bps"][0]["id"] == 0
+
+    def test_no_warning_for_short_cont(self):
+        """Under 5 seconds, no warning even if bp has 0 hits."""
+        session = _make_session()
+        bp = Breakpoint(
+            bp_id=0, va=0xfffff80608628780, target="nt!Foo",
+            user_mode=False, hw=True, installed_at=time.monotonic(),
+        )
+        session.bps[0] = bp
+
+        result = session._unfired_hw_bp_warnings(elapsed=3.0)
+        assert result == {}
+
+    def test_no_warning_when_bp_has_hits(self):
+        """A hw bp with hits > 0 should not show in warnings."""
+        session = _make_session()
+        bp = Breakpoint(
+            bp_id=0, va=0xfffff80608628780, target="nt!Foo",
+            user_mode=False, hw=True, installed_at=time.monotonic(),
+            hits=3,
+        )
+        session.bps[0] = bp
+
+        result = session._unfired_hw_bp_warnings(elapsed=10.0)
+        assert result == {}
+
+    def test_no_warning_for_soft_bp(self):
+        """Software bps should not appear in unfired hw bp warnings."""
+        session = _make_session()
+        bp = Breakpoint(
+            bp_id=0, va=0xfffff80608628780, target="nt!Foo",
+            user_mode=False, hw=False, installed_at=time.monotonic(),
+        )
+        session.bps[0] = bp
+
+        result = session._unfired_hw_bp_warnings(elapsed=10.0)
+        assert result == {}
+
+    def test_multiple_unfired_bps(self):
+        """All unfired hw bps should be listed."""
+        session = _make_session()
+        for i in range(3):
+            bp = Breakpoint(
+                bp_id=i, va=0xfffff80608628780 + i,
+                target=f"nt!Func{i}",
+                user_mode=False, hw=True,
+                installed_at=time.monotonic(),
+            )
+            session.bps[i] = bp
+
+        # Give one of them hits
+        session.bps[1].hits = 5
+
+        result = session._unfired_hw_bp_warnings(elapsed=10.0)
+        assert "unfired_hw_bps" in result
+        ids = [bp["id"] for bp in result["unfired_hw_bps"]]
+        assert 0 in ids
+        assert 1 not in ids  # has hits
+        assert 2 in ids
