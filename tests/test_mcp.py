@@ -119,7 +119,9 @@ class TestEnsureVmReady:
         ga, vm, cfg = mock_mcp
         vm.state.return_value = VMState.PAUSED
 
-        with patch("winbox.mcp.DaemonClient", create=True) as dc_cls:
+        with patch(
+            "winbox.kdbg.debugger.client.DaemonClient"
+        ) as dc_cls:
             dc_cls.return_value.session_alive.return_value = False
             _ensure_vm_ready()
         vm.resume.assert_called_once()

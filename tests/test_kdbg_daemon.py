@@ -688,6 +688,42 @@ def test_interrupt_swallows_rsp_failure_without_raising():
     assert session._interrupt_pending is True
 
 
+def test_cont_timeout_captures_halt_state():
+    """After cont timeout, self.stop must reflect the interrupt halt."""
+    from winbox.kdbg.debugger.rsp import RspError, StopReply
+
+    class TimeoutRsp(FakeRsp):
+        def wait_for_stop(self, *, timeout=None):
+            return StopReply(signal=2, thread="01", stop_kind="", raw="T02")
+
+    rsp = TimeoutRsp(regs_blob=_blob())
+    session = _make_session(rsp=rsp)
+    session._wait_for_stop_serving = lambda remaining: (_ for _ in ()).throw(
+        RspError("read timed out"))
+
+    result = session.op_cont(timeout=1.0)
+    assert result["reason"] == "timeout"
+    assert session.stop is not None
+    assert "rip" in result
+
+
+def test_cont_timeout_interrupt_failure_leaves_stop_none():
+    """If the post-timeout interrupt fails, stop stays None (graceful)."""
+    from winbox.kdbg.debugger.rsp import RspError
+
+    class BrokenInterruptRsp(FakeRsp):
+        def interrupt(self):
+            raise RspError("socket dead")
+
+    session = _make_session(rsp=BrokenInterruptRsp())
+    session._wait_for_stop_serving = lambda remaining: (_ for _ in ()).throw(
+        RspError("read timed out"))
+
+    result = session.op_cont(timeout=1.0)
+    assert result["reason"] == "timeout"
+    assert session.stop is None
+
+
 def test_op_step_recovers_from_wait_for_stop_timeout():
     """Regression: a step whose ``wait_for_stop`` timed out left
     ``self.stop`` unchanged and the gdbstub in indeterminate state
