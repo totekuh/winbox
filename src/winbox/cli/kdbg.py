@@ -776,8 +776,28 @@ def kdbg_attach(ctx: click.Context, pid: int, port: int) -> None:
         )
         raise SystemExit(1)
 
+    # Walk the process list in the caller (where ensure_nt_base_current
+    # runs reliably) instead of deferring to the forked daemon child.
+    store = _get_store(cfg)
     try:
-        daemon_pid = fork_daemon(cfg, pid, gdbstub_port=port)
+        procs = list_processes(cfg.vm_name, store)
+    except (SymbolStoreError, HmpError) as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    target_rec = next((p for p in procs if p.pid == pid), None)
+    if target_rec is None:
+        console.print(f"[red][-][/] pid {pid} not found in process list")
+        raise SystemExit(1)
+
+    from winbox.kdbg.debugger.daemon import TargetInfo
+    target = TargetInfo(
+        pid=target_rec.pid,
+        dtb=target_rec.directory_table_base,
+        name=target_rec.name,
+        user_dtb=target_rec.user_directory_table_base,
+    )
+    try:
+        daemon_pid = fork_daemon(cfg, target, gdbstub_port=port)
     except DaemonError as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)

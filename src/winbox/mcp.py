@@ -3072,8 +3072,30 @@ def kdbg_attach(pid: int, port: int = 1234) -> str:
             f"(target {info.get('target_name', '?')}({info.get('target_pid', '?')}), "
             f"daemon_pid={info.get('daemon_pid', '?')}); call kdbg_detach first"
         )
+
+    # Walk the process list in the MCP process (where ensure_nt_base_current
+    # already ran successfully inside _kdbg_get_store) instead of letting the
+    # forked daemon child re-resolve it independently — the child's
+    # ensure_nt_base_current could silently fail, leaving a stale nt base
+    # that makes user-launched processes invisible.
+    store = _kdbg_get_store()
     try:
-        daemon_pid = _fork_daemon(cfg, pid, gdbstub_port=port)
+        procs = _kdbg_list_processes(cfg.vm_name, store)
+    except (_KdbgStoreError, _KdbgHmpError) as e:
+        return f"error: {e}"
+    target_rec = next((p for p in procs if p.pid == pid), None)
+    if target_rec is None:
+        return f"error: pid {pid} not found"
+
+    from winbox.kdbg.debugger.daemon import TargetInfo
+    target = TargetInfo(
+        pid=target_rec.pid,
+        dtb=target_rec.directory_table_base,
+        name=target_rec.name,
+        user_dtb=target_rec.user_directory_table_base,
+    )
+    try:
+        daemon_pid = _fork_daemon(cfg, target, gdbstub_port=port)
     except _DaemonError as e:
         return f"error: {e}"
     info = client.session_info() or {}

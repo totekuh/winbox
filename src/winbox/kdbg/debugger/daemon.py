@@ -74,7 +74,6 @@ from winbox.kdbg.debugger.protocol import (
     reply_ok,
 )
 from winbox.kdbg.debugger.rsp import RspClient, RspError
-from winbox.kdbg.walk import list_processes
 
 
 # ── Filesystem layout ───────────────────────────────────────────────────
@@ -683,10 +682,11 @@ class DaemonSession:
                     # state and return cleanly.
                     try:
                         self.rsp.interrupt()
-                        self.rsp.wait_for_stop(timeout=2.0)
+                        sr = self.rsp.wait_for_stop(timeout=2.0)
+                        self._capture_stop(sr)
                     except RspError:
                         pass
-                    return {"reason": "timeout"}
+                    return {"reason": "timeout", **self._stop_summary()}
                 raise RuntimeError(f"cont/wait failed: {e}") from e
 
             if self._interrupt_pending:
@@ -1814,12 +1814,18 @@ def _validate_module_bases(
 
 def fork_daemon(
     cfg: Config,
-    target_pid: int,
+    target: TargetInfo,
     *,
     gdbstub_port: int = 1234,
 ) -> int:
     """Fork off a session daemon. Parent returns the daemon pid; child
     never returns from this function (it enters serve_forever).
+
+    The caller is responsible for walking the process list and
+    constructing the ``TargetInfo`` — the daemon child no longer does
+    its own process walk (it used to silently fail when
+    ``ensure_nt_base_current`` swallowed exceptions in the forked
+    child, making user-launched processes invisible).
 
     The parent waits on a status pipe for the child to either say "OK"
     (everything wired) or "ERR: ..." (and exits with that error).
@@ -1860,26 +1866,9 @@ def fork_daemon(
         _detach_to_log(log_path(cfg))
         lock_fd = _acquire_lock_or_die(lock_path(cfg))
 
-        # Resolve target now that we're inside the daemon (parent doesn't
-        # need to talk to gdb).
-        store = SymbolStore(cfg.symbols_dir)
-        # Before anything resolves a kernel symbol. list_processes below
-        # reads PsActiveProcessHead off the cached nt base, so a base left
-        # over from a previous boot fails here as "PDPTE not present" —
-        # long before the staleness check further down could say so.
-        from winbox.kdbg.symbols import ensure_nt_base_current
-        ensure_nt_base_current(cfg, store)
-        procs = list_processes(cfg.vm_name, store)
-        target = next((p for p in procs if p.pid == target_pid), None)
-        if target is None:
-            os.write(pipe_w, f"ERR: pid {target_pid} not found\n".encode())
-            os.close(pipe_w)
-            pipe_signaled = True
-            os._exit(1)
-
         rsp = RspClient.connect("127.0.0.1", gdbstub_port, timeout=5.0)
         rsp.handshake()
-        rsp.query_halt_reason()
+        initial_sr = rsp.query_halt_reason()
 
         # Stale-base check. If the VM rebooted since the symbol store
         # was last updated, ASLR moved every module's base. The cached
@@ -1889,24 +1878,20 @@ def fork_daemon(
         # Only validates store entries that are ACTUALLY loaded in the
         # target — irrelevant entries (e.g. notepad symbols cached
         # while now attaching to cyserver) are skipped without complaint.
+        store = SymbolStore(cfg.symbols_dir)
         _validate_module_bases(cfg, rsp, target, store)
 
         listen_sock = _bind_unix_socket(sock_path(cfg))
-        info = TargetInfo(
-            pid=target.pid,
-            dtb=target.directory_table_base,
-            name=target.name,
-            user_dtb=target.user_directory_table_base,
-        )
         _write_session_file(session_path(cfg), {
-            "target_pid": info.pid,
-            "target_dtb": f"0x{info.dtb:x}",
-            "target_name": info.name,
+            "target_pid": target.pid,
+            "target_dtb": f"0x{target.dtb:x}",
+            "target_name": target.name,
             "daemon_pid": os.getpid(),
             "gdbstub_port": gdbstub_port,
             "attach_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
         })
-        session = DaemonSession(cfg=cfg, rsp=rsp, target=info, store=store)
+        session = DaemonSession(cfg=cfg, rsp=rsp, target=target, store=store)
+        session._capture_stop(initial_sr)
         _install_signal_handlers(session)
 
         os.write(pipe_w, b"OK\n")
@@ -1914,7 +1899,7 @@ def fork_daemon(
         pipe_signaled = True
 
         sys.stderr.write(f"[kdbg-daemon pid={os.getpid()}] attached to "
-                         f"{info.name}({info.pid}) dtb=0x{info.dtb:x}\n")
+                         f"{target.name}({target.pid}) dtb=0x{target.dtb:x}\n")
         sys.stderr.flush()
 
         try:
