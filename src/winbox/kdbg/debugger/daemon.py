@@ -202,6 +202,14 @@ class TargetInfo:
         return (self.dtb, self.dtb ^ 0x1000)
 
     @property
+    def directory_table_base(self) -> int:
+        return self.dtb
+
+    @property
+    def user_directory_table_base(self) -> int:
+        return self.user_dtb
+
+    @property
     def masquerade_candidates(self) -> tuple[int, ...]:
         """CR3 values safe to *write* into a vCPU for masquerade reads/writes.
 
