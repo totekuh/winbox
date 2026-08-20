@@ -813,6 +813,18 @@ def kdbg_attach(ctx: click.Context, pid: int, port: int) -> None:
     )
     console.print(f"    [dim]bp / cont / regs / mem / stack / bt / detach[/]")
 
+    # Warn if HVCI is on — kernel breakpoints will not fire.
+    try:
+        from winbox import hvci as _hvci
+        ga = GuestAgent(cfg)
+        if _hvci.status(ga).hvci_enabled:
+            console.print(
+                "[yellow][!][/] HVCI is enabled — kernel breakpoints will not work. "
+                "Run [bold]winbox hvci disable[/] first."
+            )
+    except Exception:
+        pass  # Best-effort; GA might be busy after gdbstub connected
+
 
 @kdbg.command("session")
 @click.pass_context

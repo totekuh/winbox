@@ -103,6 +103,10 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "av status": (LIVE, ""),
     "av enable": (LIVE, ""),
     "av disable": (LIVE, "reboots the guest"),
+    "hvci": (GROUP, ""),
+    "hvci status": (LIVE, ""),
+    "hvci disable": (LIVE, "reboots the guest"),
+    "hvci enable": (LIVE, "reboots the guest"),
 
     # Malware Analysis
     "capture start": (LIVE, "via dumpcap, which Kali's Wireshark package "
@@ -192,6 +196,11 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "av_enable": (LIVE, ""),
     "av_disable": (EXCLUDED, "reboots the guest mid-suite; the CLI path "
                              "`av disable` covers the same shared code"),
+    "hvci_status": (LIVE, ""),
+    "hvci_disable": (EXCLUDED, "reboots the guest mid-suite; the CLI path "
+                               "`hvci disable` covers the same shared code"),
+    "hvci_enable": (EXCLUDED, "reboots the guest mid-suite; the CLI path "
+                              "`hvci enable` covers the same shared code"),
     "net_isolate": (LIVE, ""),
     "net_connect": (LIVE, ""),
     "net_unplug": (LIVE, ""),
@@ -273,6 +282,8 @@ CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
 
 MCP_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "av_disable": "tests/test_mcp.py",
+    "hvci_disable": "tests/test_hvci.py",
+    "hvci_enable": "tests/test_hvci.py",
     "kdbg_write_mem": "tests/test_kdbg_rsp.py",
     "kdbg_cont": "tests/test_mcp.py",
     "kdbg_step": "tests/test_mcp.py",

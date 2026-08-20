@@ -44,7 +44,7 @@ PS C:\Windows\system32>
 - **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
 - **Malware detonation lab** — `winbox capture` (host-side pcap on the bridge — prefers `dumpcap`, which Kali's Wireshark package lets the `wireshark` group run without root, falling back to `tcpdump` otherwise), `winbox sinkhole` (zero-dependency DNS sinkhole that answers every C2 lookup with the bridge IP and logs the domain, plus optional INETSim fake services), and `winbox detonate check` (read-only preflight that refuses to go green unless the guest genuinely can't reach the internet). See [docs/malware-detonation.md](docs/malware-detonation.md)
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
-- **MCP server** — 57 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including credentialed or background exec/Python/PowerShell, Defender enable/disable/status, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
+- **MCP server** — 60 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including credentialed or background exec/Python/PowerShell, Defender enable/disable/status, HVCI/VBS detection and toggle, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
 - **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`; `--mode auto` falls back to software 0xCC where the 4 DR slots run out, but note HVCI blocks software breakpoints on the 24H2 kernel — Windows 11 and Server 2025), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
 - **VNC display** via virt-manager (`winbox vnc`) — plain VGA, no clipboard/resize
 - **x64dbg in the guest** — bundled in setup, extracted to `C:\Tools\x64dbg`, both x32 and x64 on PATH
@@ -340,7 +340,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (57):**
+**Available tools (60):**
 
 User-mode primitives:
 
@@ -373,6 +373,14 @@ Defender:
 | `av_status(timeout?)` | Report Defender/AMSI protection state (Get-MpComputerStatus + Get-MpPreference) |
 | `av_enable()` | Re-enable Defender real-time protection, AMSI, and behavior monitoring |
 | `av_disable(confirm)` | Disable Defender completely — sets GP registry keys then reboots the VM. `confirm=True` required. |
+
+HVCI / Virtualization Based Security:
+
+| Tool | Description |
+|------|-------------|
+| `hvci_status(timeout?)` | Report HVCI/VBS state (DeviceGuard registry keys + bcdedit hypervisorlaunchtype) |
+| `hvci_disable(confirm)` | Disable HVCI and VBS — sets registry keys + bcdedit then reboots the VM. `confirm=True` required. |
+| `hvci_enable(confirm)` | Re-enable HVCI and VBS. Reboots the VM. `confirm=True` required. |
 
 Named pipes:
 

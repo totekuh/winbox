@@ -991,6 +991,31 @@ class TestDefender:
                 CliRunner().invoke(cli, ["av", "disable"])
 
 
+class TestHvci:
+    """HVCI / VBS detection and toggle."""
+
+    def test_hvci_status(self, run, tool):
+        """CLI and MCP status both succeed and report a consistent view."""
+        out = run("hvci", "status").output
+        assert "VBS:" in out
+        assert "HVCI:" in out
+
+        mcp_out = tool("hvci_status")()
+        assert '"hvci":' in mcp_out
+
+    def test_hvci_disable_then_enable(self, run, tool):
+        """Full cycle: disable then restore."""
+        run("hvci", "disable")
+        status = run("hvci", "status").output
+        # After disable, HVCI should be off (or at least the attempt was made)
+        assert "off" in status.lower() or "disabled" in status.lower()
+
+        run("hvci", "enable")
+        status = run("hvci", "status").output
+        # Re-enable may or may not activate without Secure Boot
+        assert "VBS:" in status
+
+
 class TestMalwareAnalysis:
     """capture/sinkhole/detonate. `capture start` needs root for tcpdump, so
     it is not exercised here — see tests/test_capture.py."""

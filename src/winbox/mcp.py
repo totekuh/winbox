@@ -1596,6 +1596,142 @@ def av_disable(confirm: bool = False) -> str:
     )
 
 
+# ─── Tool 8c: hvci_status / hvci_disable / hvci_enable ─────────────────────
+# Thin frontends over winbox.hvci — the same operations the `winbox hvci`
+# CLI group calls, so the two never drift.
+
+@mcp.tool()
+def hvci_status(timeout: int = 15) -> str:
+    """Report HVCI / Virtualization Based Security state in the VM.
+
+    Queries the DeviceGuard registry keys and bcdedit hypervisorlaunchtype
+    to determine whether VBS and HVCI are enabled. Read-only — safe to call
+    any time.
+
+    Args:
+        timeout: Execution timeout in seconds (default 15).
+    """
+    from winbox import hvci
+
+    cfg, vm, ga = _ensure_vm_ready()
+    s = hvci.status(ga)
+    return _json.dumps({
+        "vbs": "on" if s.vbs_enabled else "off",
+        "hvci": "on" if s.hvci_enabled else "off",
+        "hypervisor_off": s.hypervisor_off,
+        "note": ("kernel breakpoints will not work while HVCI is on"
+                 if s.hvci_enabled else None),
+    }, indent=2)
+
+
+@mcp.tool()
+def hvci_disable(confirm: bool = False) -> str:
+    """Disable HVCI and VBS — sets registry keys + bcdedit then REBOOTS the VM.
+
+    HVCI (Hypervisor-enforced Code Integrity) blocks unsigned kernel code and
+    prevents hardware breakpoints from working. This tool disables both VBS
+    and HVCI, then reboots the VM for the changes to take effect.
+
+    Because of the reboot, ``confirm`` must be True or the call is a no-op.
+    Undo with hvci_enable.
+
+    Args:
+        confirm: Must be True to actually run (guards the reboot).
+    """
+    from winbox import hvci
+
+    if not confirm:
+        return (
+            "pass confirm=true to disable HVCI/VBS (will reboot the VM)"
+        )
+
+    cfg, vm, ga = _ensure_vm_ready()
+    s = hvci.status(ga)
+    if not s.hvci_enabled and not s.vbs_enabled:
+        return "HVCI/VBS already disabled"
+
+    hvci.disable(ga)
+
+    try:
+        ga.exec("shutdown /r /t 0", timeout=10)
+    except GuestAgentError:
+        # Expected: the VM dies before the GA can ACK.
+        pass
+
+    import time as _time
+    _time.sleep(10)
+    try:
+        ga.wait(timeout=120)
+    except GuestAgentError:
+        return (
+            "HVCI registry keys set and reboot issued, but the guest agent "
+            "did not come back within 120s. Check with: virsh console "
+            + cfg.vm_name
+        )
+
+    s = hvci.status(ga)
+    if not s.hvci_enabled:
+        return "HVCI disabled successfully"
+    return (
+        "HVCI registry set but still reporting enabled — may need a "
+        "second reboot or Secure Boot change"
+    )
+
+
+@mcp.tool()
+def hvci_enable(confirm: bool = False) -> str:
+    """Re-enable HVCI and VBS. Reboots the VM.
+
+    Sets the DeviceGuard registry keys and bcdedit hypervisorlaunchtype
+    to re-enable VBS and HVCI. Note that HVCI requires Secure Boot in
+    the VM's UEFI firmware to actually activate.
+
+    Because of the reboot, ``confirm`` must be True or the call is a no-op.
+    Undo with hvci_disable.
+
+    Args:
+        confirm: Must be True to actually run (guards the reboot).
+    """
+    from winbox import hvci
+
+    if not confirm:
+        return (
+            "pass confirm=true to enable HVCI/VBS (will reboot the VM)"
+        )
+
+    cfg, vm, ga = _ensure_vm_ready()
+    s = hvci.status(ga)
+    if s.hvci_enabled and s.vbs_enabled:
+        return "HVCI/VBS already enabled"
+
+    hvci.enable(ga)
+
+    try:
+        ga.exec("shutdown /r /t 0", timeout=10)
+    except GuestAgentError:
+        # Expected: the VM dies before the GA can ACK.
+        pass
+
+    import time as _time
+    _time.sleep(10)
+    try:
+        ga.wait(timeout=120)
+    except GuestAgentError:
+        return (
+            "HVCI registry keys set and reboot issued, but the guest agent "
+            "did not come back within 120s. Check with: virsh console "
+            + cfg.vm_name
+        )
+
+    s = hvci.status(ga)
+    if s.hvci_enabled:
+        return "HVCI enabled successfully"
+    return (
+        "HVCI registry set but not active — may need Secure Boot "
+        "enabled in UEFI"
+    )
+
+
 # ─── Tool 9: net_isolate / net_unplug / net_connect ─────────────────────────
 
 @mcp.tool()
@@ -3100,7 +3236,7 @@ def kdbg_attach(pid: int, port: int = 1234) -> str:
     except _DaemonError as e:
         return f"error: {e}"
     info = client.session_info() or {}
-    return _json.dumps({
+    result = {
         "daemon_pid": daemon_pid,
         "target": {
             "pid": info.get("target_pid", pid),
@@ -3108,7 +3244,21 @@ def kdbg_attach(pid: int, port: int = 1234) -> str:
             "name": info.get("target_name", "?"),
         },
         "gdbstub_port": info.get("gdbstub_port", port),
-    }, indent=2)
+    }
+
+    # Warn if HVCI is on — kernel breakpoints will not fire.
+    try:
+        from winbox import hvci as _hvci
+        hvci_state = _hvci.status(ga)
+        if hvci_state.hvci_enabled:
+            result["warning"] = (
+                "HVCI is enabled — kernel breakpoints will not work. "
+                "Run hvci_disable(confirm=true) first."
+            )
+    except Exception:
+        pass  # GA might be unresponsive after gdbstub connected
+
+    return _json.dumps(result, indent=2)
 
 
 @mcp.tool()

@@ -2970,6 +2970,47 @@ class TestKdbgDaemonTools:
             result = kdbg_attach(99999)
         assert "error: gdbstub refused" in result
 
+    def test_attach_warns_when_hvci_on(self, mock_mcp):
+        from winbox.mcp import kdbg_attach
+        from winbox.hvci import HvciStatus
+        proc = self._fake_proc()
+        client = self._client_with(alive=False, info={
+            "target_pid": 4584, "target_dtb": "0x4d6bb000",
+            "target_name": "notepad.exe", "daemon_pid": 1234,
+            "gdbstub_port": 1234,
+        })
+        fake_store = MagicMock()
+        hvci_on = HvciStatus(vbs_enabled=True, hvci_enabled=True, hypervisor_off=False)
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.mcp._kdbg_get_store", return_value=fake_store), \
+             patch("winbox.mcp._kdbg_list_processes", return_value=[proc]), \
+             patch("winbox.mcp._fork_daemon", return_value=1234), \
+             patch("winbox.hvci.status", return_value=hvci_on):
+            result = kdbg_attach(4584)
+        out = _json_mod.loads(result)
+        assert "warning" in out
+        assert "HVCI" in out["warning"]
+
+    def test_attach_no_warning_when_hvci_off(self, mock_mcp):
+        from winbox.mcp import kdbg_attach
+        from winbox.hvci import HvciStatus
+        proc = self._fake_proc()
+        client = self._client_with(alive=False, info={
+            "target_pid": 4584, "target_dtb": "0x4d6bb000",
+            "target_name": "notepad.exe", "daemon_pid": 1234,
+            "gdbstub_port": 1234,
+        })
+        fake_store = MagicMock()
+        hvci_off = HvciStatus(vbs_enabled=False, hvci_enabled=False, hypervisor_off=True)
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.mcp._kdbg_get_store", return_value=fake_store), \
+             patch("winbox.mcp._kdbg_list_processes", return_value=[proc]), \
+             patch("winbox.mcp._fork_daemon", return_value=1234), \
+             patch("winbox.hvci.status", return_value=hvci_off):
+            result = kdbg_attach(4584)
+        out = _json_mod.loads(result)
+        assert "warning" not in out
+
     # ── kdbg_session ────────────────────────────────────────────────────
 
     def test_session_when_not_attached(self, mock_mcp):
