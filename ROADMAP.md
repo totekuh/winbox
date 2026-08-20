@@ -32,8 +32,53 @@ the MCP `kdbg_*` wiring (2026-08-10), not from a specific repro. They're
 ordered by risk × tractability: silent-wrong-result bugs with a known fix
 shape first, pure capability gaps and cross-cutting rewrites last.
 
-Item 21 jumped that queue: it came out of actually driving a live kdbg
-session on 2026-08-10 to verify item 9's fix, not from static reading.
+Items 9, 10, 20, 21, 22, 23 were fixed on 2026-08-19/20 — `git log` is the
+record. Item 21 (bp_remove E22) was addressed by storing `installed_cr3` in
+the Breakpoint. Items 28-34 below came from the same live debugging session
+that verified those fixes.
+
+### 28. `kdbg_attach` "empty stop reply" — auto-retry needed
+
+When the gdbstub doesn't return a stop packet on initial connect,
+`kdbg_attach` fails with `RspError: empty stop reply`. Recovery today:
+manual `kdbg_stop` + `kdbg_start` + re-attach. The operator has to know
+this. Fix: bounded auto-retry (stop/start the gdbstub internally) with a
+clear error if all attempts fail. Roadmap item 12 describes the same bug;
+this entry supersedes it with a concrete fix shape.
+
+### 29. GA channel dies after failed `kdbg_attach`
+
+When the daemon child connects the gdbstub (halts VM), walks processes,
+fails to find the target PID, resumes the VM, and exits — the QEMU guest
+agent channel often breaks permanently (`QEMU guest agent is not connected`).
+Every subsequent MCP/CLI command fails until a cold restart (`winbox down
+--force && winbox up`). The brief halt/resume cycle corrupts the
+virtio-serial channel state. Fix: ensure the daemon child cleanly resumes
+the VM via the gdbstub (`rsp.cont()`) before disconnecting, and verify the
+GA channel is still alive before reporting the error — if not, attempt
+channel recovery or surface a clear "GA lost, restart needed" message
+instead of letting every subsequent command fail silently.
+
+### 30. No breakpoint-fire verification — hw bp may silently never fire
+
+Hardware breakpoints install with `OK` from QEMU but may never fire if the
+guest hypervisor (HVCI/VBS) intercepts DR writes. The HVCI detection added
+on 2026-08-20 warns at attach time, but other causes exist (nested
+virtualization quirks, QEMU gdbstub bugs). A post-install probe — short
+cont + check hits > 0 on a known-hot function — would catch silent failures
+early instead of leaving the operator waiting for a hit that never comes.
+
+### 31. Process walker truncation on KPTI builds (running VM)
+
+`list_processes` reads kernel structures via HMP `x` through the current
+CPU's CR3. On KPTI builds, if the CPU is in user mode, the user CR3 doesn't
+map most kernel VAs — the walk truncates or fails. A CR3 bit-12 flip retry
+was added (2026-08-20) which helps for `kdbg_ps` on a running VM, but
+mid-walk truncation from page-table races remains. The daemon child walks
+after halting the VM (stable CR3), so `kdbg_attach` is not affected. Only
+`kdbg_ps`/`kdbg_lm`/`kdbg_read_va` called without a debug session are
+impacted. Deeper fix: use `read_virt_cr3` with a known kernel DTB (e.g.
+System's `0x1ae000`) instead of `read_virt_current`.
 
 ### 21. `bp_remove` on a private user-mode soft breakpoint can fail with E22 while the breakpoint is still live
 
@@ -254,6 +299,37 @@ the risk of a human `gdb` already attached to the same port, but
 `kdbg_attach` doesn't check for or warn about it. Fix: probe the port or
 track attach state before forking the daemon, and fail with a clear message
 if something's already attached.
+### Edge cases to harden (2026-08-20)
+
+These are not bugs — they're untested edge cases that could surface real bugs.
+Each needs a live test and, where it breaks, a fix.
+
+**32. Double attach** — `kdbg_attach` while a session is already active. Should
+refuse cleanly (existing `session_alive` check). Verify the error message is
+clear and the existing session is unaffected.
+
+**33. Detach during `kdbg_cont`** — `kdbg_interrupt` + `kdbg_detach` while cont
+is blocked waiting for a breakpoint. Should interrupt cleanly and detach without
+leaving the VM paused or the GA broken.
+
+**34. Exhaust all 4 DR slots** — set 5 hw breakpoints. The 5th should fail with
+a clear error naming the DR slot limit. Verify existing 4 are unaffected.
+
+**35. Attach to a process that exits mid-session** — target exits while
+breakpoints are set. Cont should time out (target gone), detach should clean
+up without crash. Breakpoint removal on a dead process's CR3 — does it error
+or succeed?
+
+**36. Breakpoint on nonexistent symbol** — `kdbg_bp nt!FakeFunction`. Should
+fail with "symbol not found" before attempting any gdbstub operation.
+
+**37. Memory read at unmapped VA** — `kdbg_mem 0xdeadbeefdeadbeef`. Should
+return a clean error, not crash the daemon or corrupt session state.
+
+**38. Rapid attach/detach cycles** — 5 consecutive attach/detach on the same
+process. GA channel must survive all cycles. If it breaks on cycle N, that's
+a bug to fix (related to item 29).
+
 ### Debugger (kdbg) gaps — collected from a live MsMpEng RPC session
 
 Found while single-stepping a user-mode RPC call inside `MsMpEng.exe`. Ranked
@@ -263,20 +339,12 @@ running" the moment a triggered call halts the guest) is **already closed** —
 `exec`/`python`/`powershell` now take `background=True` and return a job handle,
 retrieved with `job_result`. The rest below are open.
 
-**9. `kdbg_cont`'s `reason` and `kdbg_session`'s `halted` are not trustworthy.**
-Twice in one session both reported `timeout`/`false` while `kdbg_regs` read
-`rip` sitting exactly on the breakpoint address. This is a daemon state-tracking
-bug, not a UX nit: the tool disagrees with its own register read, which is
-ground truth. Highest priority — it makes every other kdbg result suspect. Fix
-involves reconciling the daemon's halt bookkeeping with the actual stop-reply /
-`rip` after a continue.
+**9. Fixed.** `kdbg_cont` timeout now captures the interrupt's stop reply via
+`_capture_stop(sr)`. Initial attach also captures halt state from
+`query_halt_reason()`. `halted` is now trustworthy. See commit `a2373bc`.
 
-**10. No structured stack / memory dump.** `kdbg_mem` returns raw hex only, so
-reading a stack means round-tripping the bytes through a separate script just to
-byte-swap and label offsets. Add a `decode='qwords'` mode (or a dedicated
-`kdbg_stack(count, base='rsp'|'rbp')`) that returns pre-endian-corrected 64-bit
-values with `rsp`/`rbp`-relative offset labels. Straightforward and removes an
-entire manual step.
+**10. Fixed.** `kdbg_stack` returns `{offset, va, value}` per qword.
+`kdbg_mem` gained `decode='qwords'`. See commit `9009a49`.
 
 **11. `kdbg_bp mode='auto'` downgrades to software silently.** Against a
 PPL-protected target the `0xCC` software patch is materially riskier than the
