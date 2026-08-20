@@ -165,7 +165,15 @@ def list_processes(
     user_dtb_off = kproc_fields.get("UserDirectoryTableBase", {}).get("off")
 
     # Flink of PsActiveProcessHead points at the first EPROCESS.ActiveProcessLinks.
-    flink = _read_u64(vm_name, cr3, head, cache)
+    # On KPTI builds the CPU may be in user mode — its CR3 maps only a
+    # kernel stub, not the full kernel address space. If the first read
+    # fails, retry with CR3 ^ 0x1000 (the kernel-mode KPTI half).
+    try:
+        flink = _read_u64(vm_name, cr3, head, cache)
+    except (PageWalkError, HmpError):
+        cr3 ^= 0x1000
+        cache = WalkCache()
+        flink = _read_u64(vm_name, cr3, head, cache)
     results: list[ProcessRecord] = []
     seen: set[int] = set()
     while flink != head and flink != 0 and len(results) < MAX_PROCESSES:
