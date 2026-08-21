@@ -275,15 +275,18 @@ socket, restarts gdbstub via HMP, reconnects.
 **29.** PID-not-found path uses safe socket close pattern (no D-packet dance).
 GA channel survives failed attach.
 
-**30.** Part A: one-time hw bp probe on first hw bp install (1s timeout,
-`nt!KeQueryInterruptTimePrecise` as primary symbol). Part B: `op_cont` reports
-`unfired_hw_bps` for hw bps with `hits==0` after 5s+ cont.
+**30.** Active probe removed (false-positived on fresh boot — no kernel
+symbol reliably fires within 1s on quiet VM). Replaced with passive
+verification: `_hw_bp_verified` set when any hw bp fires during `op_cont`
+(any CR3). `unfired_hw_bps` warning in cont response covers the case where
+hw bps genuinely never fire.
 
 **31.** `list_processes` switches to System's DTB after first EPROCESS read,
 eliminating mid-walk KPTI CR3 races. `list_modules` gained KPTI retry.
 
-**40.** Probe timeout increased from 300ms to 1s. Added
-`nt!KeQueryInterruptTimePrecise` as primary probe symbol.
+**40.** Active probe removed entirely — superseded by passive verification
+in item 30. The probe false-positived because no kernel symbol fires
+reliably within any timeout on a quiet freshly-booted VM.
 
 **11 (pdb).** `parse_types` raises `ValueError` on zero-field structs instead
 of returning useless empty layouts. Catches `llvm-pdbutil` format drift.
