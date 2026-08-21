@@ -152,23 +152,14 @@ VA (returns 0, counts on bp) from transport failure (raises). Operator sees
 `predicate_read_errors` in `bp_list` instead of wondering why the bp never
 fires.
 
-### 11. `pdb.py` silently drops structs its regex parser can't match
+**11 (pdb). Fixed.** `parse_types` raises on zero-field structs and warns on
+suspiciously sparse structs (sizeof >= 64, < 3 fields). Catches regex drift
+at parse time instead of as a confusing downstream error.
 
-`parse_types` swallows any struct it fails to fully match (`missing = ...;
-pass`); `parse_publics` raises on the equivalent failure. An `llvm-pdbutil`
-output-format drift would silently degrade struct data, surfacing later as
-an unrelated-looking error ("field not found") several calls downstream in
-a walker, far from the real cause. Fix: make `parse_types` raise (or at
-least warn loudly) the same way `parse_publics` does.
-
-### 12. WoW64 module list is silently incomplete
-
-`list_user_modules` (`walk.py`) doesn't walk `PEB.Wow64Process`'s 32-bit
-loader. Against a 32-bit-on-64-bit process, `kdbg_user_lm` /
-`kdbg_user_symbols_load` quietly return only the 64-bit `ntdll`/`wow64.dll`
-and none of the process's real 32-bit DLLs, with no flag that the result is
-partial. Minimum fix: detect WoW64 and return a warning in the result even
-before implementing the 32-bit walk; full fix adds the `Wow64Process` walk.
+**12. Partially fixed.** `is_wow64()` detects WoW64 via `PEB.Wow64Process`.
+`kdbg_user_lm` adds a warning when WoW64 detected ("only 64-bit modules
+listed"). The 32-bit module walk itself is not implemented yet — that's
+the full fix. Detection is the minimum useful step.
 
 ### 14. No watchpoints
 
@@ -214,12 +205,9 @@ cross-cutting, not a local patch — hence listed near last.
 at attach time. Catches QEMU register-XML drift before it silently corrupts
 CR3 filters and bp targeting.
 
-### 19. `kdbg_attach` doesn't detect a concurrent interactive `gdb` session
-
-QEMU's gdbstub accepts only one client. `kdbg_attach` doesn't check for or
-warn about a human `gdb` already attached to the same port. Fix: probe the
-port or track attach state before forking the daemon, and fail with a clear
-message if something's already attached.
+**19. Fixed.** `gdbstub_has_client()` reads `/proc/net/tcp` for ESTABLISHED
+connections to the gdbstub port. `kdbg_attach` refuses if another client is
+already connected. Verified live — raw TCP connect blocked subsequent attach.
 
 ### 41. `kdbg_cont` is a blocking MCP operation
 
