@@ -550,91 +550,7 @@ class DaemonSession:
             "condition": condition,
             "elapsed_ms": round(elapsed_ms, 2),
         }
-        # Item #30 Part A: one-time hw bp verification probe on first
-        # hw bp installed in this session.
-        if installed_hw and not self._hw_bp_verified:
-            probe_warning = self._probe_hw_breakpoints()
-            if probe_warning:
-                result["hw_probe_warning"] = probe_warning
-
         return result
-
-    def _probe_hw_breakpoints(self) -> str | None:
-        """One-time probe: verify hardware breakpoints actually fire.
-
-        Installs a temporary hw bp on a known-hot kernel symbol
-        (nt!KiPageFault or nt!KeQueryPerformanceCounter), does a short
-        cont, and checks whether a SIGTRAP arrives. Returns a warning
-        string if the probe timed out (hw bps may not work), or None
-        on success. Sets ``_hw_bp_verified`` either way so the probe
-        runs at most once per session. (Item #30)
-        """
-        self._hw_bp_verified = True  # don't re-probe regardless of outcome
-
-        # Pick a hot kernel symbol from the store.
-        probe_va = None
-        for sym in ("nt!KeQueryInterruptTimePrecise", "nt!KiPageFault", "nt!KeQueryPerformanceCounter"):
-            try:
-                probe_va = self.store.resolve(sym)
-                break
-            except Exception:
-                continue
-        if probe_va is None:
-            return (
-                "hw bp probe skipped: could not resolve a hot kernel symbol "
-                "from the store; hw bp functionality is unverified"
-            )
-
-        # Install temporary hw bp on the probe symbol.
-        try:
-            self.rsp.insert_breakpoint(probe_va, kind=1, hardware=True)
-        except RspError as e:
-            return f"hw bp probe failed to install: {e}"
-
-        # Short cont — accept any CR3 (kernel code fires in every process).
-        warning = None
-        try:
-            self.rsp.cont()
-            try:
-                sr = self.rsp.wait_for_stop(timeout=1.0)
-                # Check if we got SIGTRAP at the probe address.
-                if sr.signal == 5:
-                    # Read rip to confirm it's at the probe VA.
-                    vcpu = sr.thread or "01"
-                    self._select_thread(vcpu)
-                    regs = self.rsp.read_registers()
-                    rip = struct.unpack_from("<Q", regs, 128)[0]
-                    if rip == probe_va:
-                        pass  # hw bps work — success
-                    else:
-                        # Hit something else; still proves hw bps fire.
-                        pass
-                else:
-                    warning = (
-                        "hw bp probe: stop was not SIGTRAP; "
-                        "hardware breakpoints may not fire on this guest"
-                    )
-            except RspError:
-                # Timeout — no stop arrived in 1s.
-                # Interrupt to re-halt the VM.
-                self.rsp.interrupt()
-                try:
-                    self.rsp.wait_for_stop(timeout=2.0)
-                except RspError:
-                    pass
-                warning = (
-                    "hw bp probe timed out: no hit on a hot kernel path within "
-                    "1s. Hardware breakpoints may not fire — common causes: "
-                    "HVCI intercepting DR writes, nested virtualization quirks, "
-                    "or QEMU gdbstub bugs. Consider mode='soft' if your target "
-                    "breakpoints never fire."
-                )
-        finally:
-            # Remove the probe bp regardless of outcome.
-            with suppress(RspError):
-                self.rsp.remove_breakpoint(probe_va, kind=1, hardware=True)
-
-        return warning
 
     def op_bp_list(self) -> dict[str, Any]:
         from winbox.kdbg.demangle import pretty_symbol
@@ -823,8 +739,11 @@ class DaemonSession:
             rip = struct.unpack_from("<Q", regs, 128)[0]
 
             if cr3 not in accepted_cr3s:
-                # silent-continue — bump bp hit counter best-effort
                 self._bump_bp_hits(rip, in_target=False)
+                if not self._hw_bp_verified:
+                    hit_bp = self.bps.get(self._bp_by_va.get(rip, -1))
+                    if hit_bp is not None and hit_bp.hw:
+                        self._hw_bp_verified = True
                 continue
 
             # Predicate gate. Reuse the regs blob we already read so
@@ -855,6 +774,8 @@ class DaemonSession:
             self._capture_stop_with_regs(sr, regs)
             if bp is not None:
                 bp.hits += 1
+                if bp.hw and not self._hw_bp_verified:
+                    self._hw_bp_verified = True
             else:
                 self._bump_bp_hits(rip, in_target=True)
             result = {"reason": "bp", **self._stop_summary()}

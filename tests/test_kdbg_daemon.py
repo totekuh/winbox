@@ -2525,141 +2525,82 @@ class TestPidNotFoundSafeClose:
 # ── Item #30 Part A: hw bp verification probe ──────────────────────────
 
 
-class TestHwBpProbe:
-    """DaemonSession._probe_hw_breakpoints verifies that hw bps fire."""
+class TestHwBpPassiveVerification:
+    """hw bp verification is now passive — set _hw_bp_verified when any
+    hw bp fires during op_cont, regardless of CR3."""
 
-    def test_probe_fires_on_first_hw_bp(self):
-        """When the first hw bp is installed, a probe should run."""
+    def test_hw_bp_verified_on_non_target_fire(self):
+        """A hw bp fire in wrong CR3 should still set _hw_bp_verified."""
         from winbox.kdbg.debugger.rsp import StopReply
 
-        probe_va = 0xfffff80608001000
+        bp_va = 0xfffff80608628780
+        wrong_cr3 = 0xAAAAA000
 
-        class ProbeRsp(FakeRsp):
+        class WrongCR3Rsp(FakeRsp):
             def __init__(self):
-                super().__init__()
-                self._probe_bp_va = None
-                self._cont_count = 0
-
-            def insert_breakpoint(self, addr, *, kind=1, hardware=False):
-                super().insert_breakpoint(addr, kind=kind, hardware=hardware)
-                if hardware and self._probe_bp_va is None:
-                    # First hw bp = user's. Second = probe.
-                    pass
-                self._probe_bp_va = addr
-
-            def cont(self):
-                self._cont_count += 1
-                self.continued += 1
+                super().__init__(regs_blob=_blob(rip=bp_va, cr3=wrong_cr3))
 
             def wait_for_stop(self, *, timeout=None):
-                # Simulate probe bp firing
-                return StopReply(signal=5, thread="01", stop_kind="hwbreak",
-                                raw="T05hwbreak:;thread:01;")
+                return StopReply(signal=5, thread="01",
+                                stop_kind="hwbreak", raw="T05")
 
-        rsp = ProbeRsp()
-        store = FakeStore({
-            "nt!KiPageFault": probe_va,
-            "notepad!Foo": 0x7ff6e289a760,
-        })
+            def read_registers(self):
+                return _blob(rip=bp_va, cr3=wrong_cr3)
+
+        rsp = WrongCR3Rsp()
+        store = FakeStore({"nt!Foo": bp_va})
         session = _make_session(rsp=rsp, store=store)
+        session._hw_bp_verified = False
+
+        session.handle_op("bp_add", {"target": "nt!Foo", "mode": "hw"})
+        assert session._hw_bp_verified is False  # not verified yet
+
+        session.stop = StopState(vcpu="01", rip=0x1000, cr3=0x4d6bb000,
+                                 signal=5, raw_regs=_blob(cr3=0x4d6bb000))
+        session.handle_op("cont", {"timeout": 1})
+
+        assert session._hw_bp_verified is True
+
+    def test_hw_bp_not_verified_for_soft_bp(self):
+        """A soft bp fire should NOT set _hw_bp_verified."""
+        from winbox.kdbg.debugger.rsp import StopReply
+
+        bp_va = 0xfffff80608628780
+        target_cr3 = 0x4d6bb000
+
+        class TargetRsp(FakeRsp):
+            def __init__(self):
+                super().__init__(regs_blob=_blob(rip=bp_va, cr3=target_cr3))
+
+            def wait_for_stop(self, *, timeout=None):
+                return StopReply(signal=5, thread="01",
+                                stop_kind="swbreak", raw="T05")
+
+            def read_registers(self):
+                return _blob(rip=bp_va, cr3=target_cr3)
+
+        rsp = TargetRsp()
+        store = FakeStore({"nt!Foo": bp_va})
+        session = _make_session(rsp=rsp, store=store)
+        session._hw_bp_verified = False
+
+        session.handle_op("bp_add", {"target": "nt!Foo", "mode": "hw"})
+
+        session.stop = StopState(vcpu="01", rip=0x1000, cr3=target_cr3,
+                                 signal=5, raw_regs=_blob(cr3=target_cr3))
+
+        # Manually set the bp as soft for this test
+        session.bps[0].hw = False
+
+        session.handle_op("cont", {"timeout": 1})
         assert session._hw_bp_verified is False
 
-        # Install a hw bp — this should trigger the probe
-        reply = session.handle_op("bp_add", {"target": "notepad!Foo", "mode": "hw"})
-        assert reply["ok"]
-        assert session._hw_bp_verified is True
-
-    def test_probe_runs_once_only(self):
-        """After the first probe, subsequent hw bps should NOT re-probe."""
-        from winbox.kdbg.debugger.rsp import StopReply
-
-        probe_count = [0]
-
-        class CountingProbeRsp(FakeRsp):
-            def cont(self):
-                probe_count[0] += 1
-                self.continued += 1
-
-            def wait_for_stop(self, *, timeout=None):
-                return StopReply(signal=5, thread="01", stop_kind="hwbreak",
-                                raw="T05hwbreak:;thread:01;")
-
-        rsp = CountingProbeRsp()
-        store = FakeStore({
-            "nt!KiPageFault": 0xfffff80608001000,
-            "notepad!Foo": 0x7ff6e289a760,
-            "notepad!Bar": 0x7ff6e289a770,
-        })
-        session = _make_session(rsp=rsp, store=store)
-
-        # First hw bp triggers probe
-        session.handle_op("bp_add", {"target": "notepad!Foo", "mode": "hw"})
-        first_cont_count = probe_count[0]
-        assert first_cont_count > 0
-
-        # Second hw bp should NOT trigger another probe
-        session.handle_op("bp_add", {"target": "notepad!Bar", "mode": "hw"})
-        assert probe_count[0] == first_cont_count
-
-    def test_probe_timeout_returns_warning(self):
-        """If the probe cont times out, a warning is returned."""
-        from winbox.kdbg.debugger.rsp import RspError, StopReply
-
-        class TimeoutProbeRsp(FakeRsp):
-            def cont(self):
-                self.continued += 1
-
-            def wait_for_stop(self, *, timeout=None):
-                if timeout is not None and timeout <= 1.0:
-                    # Probe timeout (probe uses 1.0s)
-                    raise RspError("read timed out")
-                return StopReply(signal=5, thread="01", stop_kind="hwbreak",
-                                raw="T05hwbreak:;thread:01;")
-
-            def interrupt(self):
-                self.interrupted += 1
-
-        rsp = TimeoutProbeRsp()
-        store = FakeStore({
-            "nt!KiPageFault": 0xfffff80608001000,
-            "notepad!Foo": 0x7ff6e289a760,
-        })
-        session = _make_session(rsp=rsp, store=store)
-
-        reply = session.handle_op("bp_add", {"target": "notepad!Foo", "mode": "hw"})
-        assert reply["ok"]
-        assert "hw_probe_warning" in reply["result"]
-        assert "timed out" in reply["result"]["hw_probe_warning"]
-
-    def test_probe_skipped_when_no_kernel_symbols(self):
-        """If no hot kernel symbol can be resolved, probe is skipped."""
-        store = FakeStore({
-            "notepad!Foo": 0x7ff6e289a760,
-        })
+    def test_no_probe_warning_on_bp_add(self):
+        """bp_add should NOT include hw_probe_warning anymore."""
+        store = FakeStore({"nt!Foo": 0xfffff80608000000})
         session = _make_session(store=store)
-
-        reply = session.handle_op("bp_add", {"target": "notepad!Foo", "mode": "hw"})
+        reply = session.handle_op("bp_add", {"target": "nt!Foo", "mode": "hw"})
         assert reply["ok"]
-        assert "hw_probe_warning" in reply["result"]
-        assert "could not resolve" in reply["result"]["hw_probe_warning"]
-        assert session._hw_bp_verified is True
-
-    def test_no_probe_for_soft_bp(self):
-        """Software breakpoints should NOT trigger the hw probe."""
-        from winbox.kdbg.debugger import daemon as daemon_mod
-        from winbox.kdbg.debugger.install import InstallReport
-
-        def fake_install(cli, vm_name, store, *, cr3_candidates, user_va):
-            return InstallReport(user_va=user_va, target_dtb=cr3_candidates[0], elapsed=0.005)
-
-        import unittest.mock as mock
-        with mock.patch.object(daemon_mod, "install_user_breakpoint", fake_install):
-            store = FakeStore({"notepad!Foo": 0x7ff6e289a760})
-            session = _make_session(store=store)
-            reply = session.handle_op("bp_add", {"target": "notepad!Foo", "mode": "soft"})
-
-        assert reply["ok"]
-        assert session._hw_bp_verified is False  # probe never ran
         assert "hw_probe_warning" not in reply["result"]
 
 
