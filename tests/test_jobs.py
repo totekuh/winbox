@@ -738,3 +738,82 @@ class TestJobsOutputEdge:
         result = runner.invoke(cli, ["jobs", "output", "1"])
         assert result.exit_code == 0
         assert "still running" in result.output
+
+
+# ─── Nonce verification (item 22) ────────────────────────────────────────────
+
+
+class TestNonceVerification:
+    def test_bg_buffered_stores_nonce(self, runner, cfg, mock_env):
+        mock_env.exec_background.return_value = 4532
+        runner.invoke(cli, ["exec", "--bg", "SharpHound.exe"])
+        job = JobStore(cfg).get(1)
+        assert job.nonce.startswith("__wbx")
+
+    def test_bg_log_has_no_nonce(self, runner, cfg, mock_env):
+        mock_env._vm.state.return_value = MagicMock(value="running")
+        mock_env.exec_detached.return_value = 4533
+        runner.invoke(cli, ["exec", "--bg", "--log", "x.exe"])
+        job = JobStore(cfg).get(1)
+        assert job.nonce == ""
+
+    def test_bg_command_tagged_with_nonce(self, runner, cfg, mock_env):
+        mock_env.exec_background.return_value = 100
+        runner.invoke(cli, ["exec", "--bg", "x.exe"])
+        call_args = mock_env.exec_background.call_args
+        cmd = call_args[0][0]
+        assert cmd.startswith("echo __wbx")
+        assert "&&" in cmd
+
+    def test_jobs_list_detects_nonce_mismatch(self, runner, cfg, mock_env):
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING, nonce="__wbxABCD1234ABCD1234__"))
+        mock_env.exec_status.return_value = {
+            "exited": True, "exitcode": 0,
+            "stdout": "wrong output from recycled PID", "stderr": "",
+        }
+        runner.invoke(cli, ["jobs", "list"])
+        reloaded = JobStore(cfg).get(1)
+        assert reloaded.status == JobStatus.LOST
+
+    def test_jobs_list_accepts_matching_nonce(self, runner, cfg, mock_env):
+        nonce = "__wbxABCD1234ABCD1234__"
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING, nonce=nonce))
+        mock_env.exec_status.return_value = {
+            "exited": True, "exitcode": 0,
+            "stdout": f"{nonce}\r\nreal output", "stderr": "",
+        }
+        runner.invoke(cli, ["jobs", "list"])
+        reloaded = JobStore(cfg).get(1)
+        assert reloaded.status == JobStatus.DONE
+        assert reloaded.stdout == "real output"
+
+    def test_jobs_output_detects_nonce_mismatch(self, runner, cfg, mock_env):
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING, nonce="__wbxNONCE__"))
+        mock_env.exec_status.return_value = {
+            "exited": True, "exitcode": 0,
+            "stdout": "foreign output", "stderr": "",
+        }
+        result = runner.invoke(cli, ["jobs", "output", "1"])
+        assert result.exit_code == 1
+        assert "recycled" in result.output
+        reloaded = JobStore(cfg).get(1)
+        assert reloaded.status == JobStatus.LOST
+
+    def test_jobs_kill_detects_nonce_mismatch_on_exited(self, runner, cfg, mock_env):
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING, nonce="__wbxNONCE__"))
+        mock_env.exec_status.return_value = {
+            "exited": True, "exitcode": 0,
+            "stdout": "foreign output", "stderr": "",
+        }
+        result = runner.invoke(cli, ["jobs", "kill", "1"])
+        assert "recycled" in result.output
+        reloaded = JobStore(cfg).get(1)
+        assert reloaded.status == JobStatus.LOST

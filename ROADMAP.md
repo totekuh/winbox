@@ -219,10 +219,12 @@ separate setsid process. `session_alive()` checks the fcntl lock, not
 in-process state. Verified: fresh Python process connects to running daemon
 and gets full status. No code change needed — the architecture solved it.
 
-**47. Scriptable breakpoint actions.** On bp fire, auto-run a sequence:
-read N fields, log to file, cont. Turns kdbg into a lightweight tracing
-framework — "log every IOCTL code through this dispatcher" without manual
-cont loops. Needs a mini-DSL or Python callback registration.
+**47. Fixed.** `kdbg_bp` accepts `actions` — a list of expression strings
+(same grammar as conditions). On each in-target fire, expressions are
+evaluated and results appended to a JSONL trace file. The bp auto-continues
+instead of halting. `kdbg_bp_trace(bp_id)` reads the trace. Turns kdbg into
+a lightweight tracer: "log every IOCTL code through this dispatcher" is now
+`kdbg_bp(target, actions=["[rsp+0x18]"])` + `kdbg_bp_trace(id)`.
 
 ---
 

@@ -130,6 +130,10 @@ class Breakpoint:
     predicate_skips: int = 0
     predicate_errors: int = 0
     predicate_read_errors: int = 0
+    actions: list = field(default_factory=list)
+    _action_asts: list = field(default_factory=list, repr=False)
+    trace_count: int = 0
+    trace_path: str = ""
 
 
 @dataclass
@@ -447,11 +451,18 @@ class DaemonSession:
         condition: str | None = None,
         wp_type: str | None = None,
         wp_size: int = 1,
+        actions: list | None = None,
     ) -> dict[str, Any]:
         """Install a breakpoint or watchpoint at sym/VA.
 
         ``mode`` selects the execution-bp mechanism (``"hw"`` or
         ``"soft"``). Ignored when ``wp_type`` is set.
+
+        ``actions`` is a list of expression strings (same grammar as
+        ``condition``). On each in-target fire that passes the predicate,
+        every expression is evaluated and the results are appended to a
+        trace file. The bp auto-continues instead of halting — turning it
+        into a lightweight tracer. Use ``bp_trace`` to read the log.
 
         ``wp_type`` installs a watchpoint instead of an execution bp:
         ``"write"`` (Z2), ``"read"`` (Z3), ``"access"`` (Z4). Uses a
@@ -485,6 +496,14 @@ class DaemonSession:
             except PredicateSyntaxError as e:
                 raise RuntimeError(f"bad condition: {e}") from e
 
+        action_list = actions or []
+        action_asts = []
+        for i, expr in enumerate(action_list):
+            try:
+                action_asts.append(parse_predicate(expr))
+            except PredicateSyntaxError as e:
+                raise RuntimeError(f"bad action[{i}]: {e}") from e
+
         va = self._resolve_target(target)
         is_user = (va >> 47) != 0x1FFFF
 
@@ -501,6 +520,9 @@ class DaemonSession:
 
             bp_id = self._next_bp_id
             self._next_bp_id += 1
+            _trace = ""
+            if action_list:
+                _trace = str(_runtime_dir(self.cfg) / f"bp{bp_id}.trace.jsonl")
             bp = Breakpoint(
                 bp_id=bp_id,
                 va=va,
@@ -512,10 +534,13 @@ class DaemonSession:
                 wp_size=wp_size,
                 condition=condition,
                 _predicate=predicate_ast,
+                actions=action_list,
+                _action_asts=action_asts,
+                trace_path=_trace,
             )
             self.bps[bp_id] = bp
             self._bp_by_va[va] = bp_id
-            return {
+            result = {
                 "id": bp_id,
                 "va": f"0x{va:x}",
                 "user_mode": is_user,
@@ -525,6 +550,10 @@ class DaemonSession:
                 "condition": condition,
                 "elapsed_ms": round(elapsed_ms, 2),
             }
+            if action_list:
+                result["actions"] = action_list
+                result["trace_path"] = _trace
+            return result
 
         # ── Execution breakpoint path (unchanged) ─────────────────────
         if mode not in ("hw", "soft"):
@@ -569,6 +598,9 @@ class DaemonSession:
         _installed_cr3 = 0
         if is_user and not installed_hw:
             _installed_cr3 = report.target_dtb  # type: ignore[union-attr]
+        _trace = ""
+        if action_list:
+            _trace = str(_runtime_dir(self.cfg) / f"bp{bp_id}.trace.jsonl")
         bp = Breakpoint(
             bp_id=bp_id,
             va=va,
@@ -579,10 +611,13 @@ class DaemonSession:
             installed_cr3=_installed_cr3,
             condition=condition,
             _predicate=predicate_ast,
+            actions=action_list,
+            _action_asts=action_asts,
+            trace_path=_trace,
         )
         self.bps[bp_id] = bp
         self._bp_by_va[va] = bp_id
-        return {
+        result = {
             "id": bp_id,
             "va": f"0x{va:x}",
             "user_mode": is_user,
@@ -590,6 +625,10 @@ class DaemonSession:
             "condition": condition,
             "elapsed_ms": round(elapsed_ms, 2),
         }
+        if action_list:
+            result["actions"] = action_list
+            result["trace_path"] = _trace
+        return result
 
     def op_bp_list(self) -> dict[str, Any]:
         from winbox.kdbg.demangle import pretty_symbol
@@ -613,8 +652,32 @@ class DaemonSession:
             if b.wp_type is not None:
                 entry["wp_type"] = b.wp_type
                 entry["wp_size"] = b.wp_size
+            if b.actions:
+                entry["actions"] = b.actions
+                entry["trace_count"] = b.trace_count
+                entry["trace_path"] = b.trace_path
             entries.append(entry)
         return {"bps": entries}
+
+    def op_bp_trace(self, id: int, tail: int = 20) -> dict[str, Any]:  # noqa: A002
+        """Read the last ``tail`` trace entries for a bp with actions."""
+        bp = self.bps.get(id)
+        if bp is None:
+            raise ValueError(f"no bp with id {id}")
+        if not bp.trace_path:
+            return {"id": id, "entries": [], "total": 0}
+        import json as _json
+        try:
+            lines = Path(bp.trace_path).read_text().splitlines()
+        except OSError:
+            return {"id": id, "entries": [], "total": 0}
+        entries = []
+        for line in lines[-tail:]:
+            try:
+                entries.append(_json.loads(line))
+            except _json.JSONDecodeError:
+                continue
+        return {"id": id, "entries": entries, "total": len(lines)}
 
     def _remove_bp_via_stub(self, bp: Breakpoint) -> None:
         """Send the z-packet that clears ``bp`` from the gdbstub.
@@ -821,6 +884,11 @@ class DaemonSession:
                     self._hw_bp_verified = True
             else:
                 self._bump_bp_hits(rip, in_target=True)
+
+            if bp is not None and bp._action_asts:
+                self._execute_actions(bp, regs)
+                continue
+
             result = {"reason": "bp", **self._stop_summary()}
             result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
             return result
@@ -1276,10 +1344,30 @@ class DaemonSession:
                 b.hits += 1
                 return
 
-    # Fallback span when a module has no recorded SizeOfImage (legacy
-    # store entries from before that field was tracked). 16 MiB is
-    # bigger than any single Windows image in practice, but small
-    # enough that it won't match VAs in unrelated modules.
+    def _execute_actions(self, bp: Breakpoint, regs: bytes) -> None:
+        """Evaluate action expressions and append results to trace file."""
+        import json as _json
+        mem = self._mem_qword_reader(regs, bp=bp)
+        rip = struct.unpack_from("<Q", regs, 128)[0]
+        entry = {
+            "hit": bp.trace_count,
+            "rip": f"0x{rip:x}",
+            "values": {},
+        }
+        for expr_str, ast in zip(bp.actions, bp._action_asts):
+            try:
+                val = ast.eval(regs, mem)
+                entry["values"][expr_str] = f"0x{val:x}"
+            except Exception as e:
+                entry["values"][expr_str] = f"error: {e}"
+        bp.trace_count += 1
+        if bp.trace_path:
+            try:
+                with open(bp.trace_path, "a") as f:
+                    f.write(_json.dumps(entry) + "\n")
+            except OSError:
+                pass
+
     def _best_symbol_for_va(self, va: int) -> str | None:
         from winbox.kdbg.format import symbolicate_va
         return symbolicate_va(self.store, va)

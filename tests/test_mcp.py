@@ -2263,7 +2263,9 @@ class TestPipeSessionDoesNotDesync:
                 json.dumps({**answer, "seq": seq})
             )
 
-        # 4. a fresh recv, answered properly, must get its own answer.
+        # 4. a fresh recv recovers the orphaned read data first.
+        assert pipe_recv(sid, 16) == "cafe"
+        # 5. the next recv gets a fresh answer from the broker.
         _broker_thread(session_dir, {"ok": True, "data_hex": "beef"})
         assert pipe_recv(sid, 16) == "beef"
 
@@ -2398,6 +2400,64 @@ class TestPipeSessionDoesNotDesync:
 
         assert len(results) == len(set(results)), f"seq collision: {sorted(results)}"
         assert sorted(results) == list(range(1, 51))
+
+
+class TestPipeRecvOrphanRecovery:
+    """Item 24: a timed-out pipe_recv leaves orphaned bytes — the broker
+    already dequeued them from the pipe but the host never read the result
+    file. The next pipe_recv must reclaim them before issuing a new read."""
+
+    def test_recovers_orphaned_read_data(self, mock_mcp):
+        import json
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "orphan000001"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "result.1.json").write_text(
+            json.dumps({"ok": True, "data_hex": "deadbeef", "seq": 1})
+        )
+        assert pipe_recv(sid, 16) == "deadbeef"
+        assert not (session_dir / "result.1.json").exists()
+
+    def test_skips_write_results(self, mock_mcp):
+        import json
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "orphan000002"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "result.1.json").write_text(
+            json.dumps({"ok": True, "written": 4, "seq": 1})
+        )
+        result = pipe_recv(sid, 16, timeout=0)
+        assert "timeout" in result
+        assert (session_dir / "result.1.json").exists()
+
+    def test_recovers_oldest_first(self, mock_mcp):
+        import json
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "orphan000003"
+        session_dir = _make_session(cfg, sid)
+        (session_dir / "result.5.json").write_text(
+            json.dumps({"ok": True, "data_hex": "second", "seq": 5})
+        )
+        (session_dir / "result.2.json").write_text(
+            json.dumps({"ok": True, "data_hex": "first", "seq": 2})
+        )
+        assert pipe_recv(sid, 16) == "first"
+        assert pipe_recv(sid, 16) == "second"
+
+    def test_no_orphans_issues_fresh_read(self, mock_mcp):
+        from winbox.mcp import pipe_recv
+        _, _, cfg = mock_mcp
+
+        sid = "orphan000004"
+        _make_session(cfg, sid)
+        result = pipe_recv(sid, 16, timeout=0)
+        assert "timeout" in result
 
 
 class TestPipeCloseDoesNotLeakTheBroker:

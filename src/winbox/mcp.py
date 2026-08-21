@@ -2572,6 +2572,40 @@ def pipe_send(session_id: str, data_hex: str, timeout: int = 10) -> str:
     return f"error: {res.get('error')}"
 
 
+def _recover_orphaned_read(session_dir: Path) -> str | None:
+    """Reclaim data from a previous read that the host timed out on.
+
+    If a prior pipe_recv timed out after the broker already dequeued bytes
+    from the pipe, the result file is orphaned — the bytes are gone from the
+    pipe and the next pipe_recv would skip them. Scan for the oldest such
+    file and return its data, consuming the file so it's not returned twice.
+    """
+    best_seq = None
+    best_path = None
+    try:
+        for name in session_dir.iterdir():
+            if name.name.startswith("result.") and name.name.endswith(".json"):
+                try:
+                    seq = int(name.name[7:-5])
+                except ValueError:
+                    continue
+                if best_seq is None or seq < best_seq:
+                    best_seq = seq
+                    best_path = name
+    except OSError:
+        return None
+    if best_path is None:
+        return None
+    try:
+        data = _json.loads(best_path.read_text())
+    except (OSError, _json.JSONDecodeError):
+        return None
+    if data.get("ok") and data.get("data_hex"):
+        best_path.unlink(missing_ok=True)
+        return data["data_hex"]
+    return None
+
+
 @mcp.tool()
 def pipe_recv(session_id: str, size: int, timeout: int = 10) -> str:
     """Read bytes from an open pipe session.
@@ -2588,13 +2622,12 @@ def pipe_recv(session_id: str, size: int, timeout: int = 10) -> str:
         return f"session not found: {session_id}"
 
     if size < 0:
-        # A negative size would make the in-guest broker call
-        # create_string_buffer(-1), which raises and kills the broker.
         return f"error: size must be >= 0, got {size}"
 
-    # Give the broker a slightly shorter budget than our own, so a quiet pipe
-    # comes back as a clean "no data" answer rather than as a host-side
-    # timeout with the read still pending in the guest.
+    recovered = _recover_orphaned_read(session_dir)
+    if recovered is not None:
+        return recovered
+
     wait_ms = max(500, int((timeout - 1) * 1000))
     res = _broker_cmd(
         session_dir, {"cmd": "read", "size": size, "wait_ms": wait_ms}, timeout
@@ -2602,8 +2635,6 @@ def pipe_recv(session_id: str, size: int, timeout: int = 10) -> str:
     if res is None:
         return "timeout waiting for read result"
     if res.get("ok"):
-        # .get, not [...]: an unexpected result shape must surface as an error
-        # string, never as a KeyError out of the tool call.
         data_hex = res.get("data_hex")
         if data_hex is None:
             return f"error: broker returned no data for a read: {res}"
@@ -3281,6 +3312,7 @@ def kdbg_bp(
     condition: str | None = None,
     wp_type: str | None = None,
     wp_size: int = 1,
+    actions: list | None = None,
 ) -> str:
     """Install a breakpoint or watchpoint at TARGET in the attached process.
 
@@ -3336,10 +3368,17 @@ def kdbg_bp(
             4-slot DR0..3 pool with hw execution breakpoints.
         wp_size: Watched region size in bytes (1, 2, 4, or 8).
             Only meaningful when ``wp_type`` is set. Default 1.
+        actions: List of expression strings to evaluate on each
+            in-target fire. Same grammar as ``condition``. When set,
+            the bp auto-continues instead of halting — results are
+            appended to a JSONL trace file. Read with ``kdbg_bp_trace``.
+            Example: ``["rcx", "[rsp+0x18]", "poi(rdx+0x10)"]``
+            logs register and memory values on each fire.
 
     Returns:
         JSON ``{id, va, user_mode, hw, condition, elapsed_ms}``. For
-        watchpoints, also includes ``wp_type`` and ``wp_size``. The
+        watchpoints, also includes ``wp_type`` and ``wp_size``. For
+        action bps, includes ``actions`` and ``trace_path``. The
         ``predicate_*_count`` fields appear in ``kdbg_bps`` output.
     """
     cfg = _kdbg_cfg_only()
@@ -3351,6 +3390,8 @@ def kdbg_bp(
     if wp_type is not None:
         kwargs["wp_type"] = wp_type
         kwargs["wp_size"] = int(wp_size)
+    if actions:
+        kwargs["actions"] = list(actions)
     try:
         return _json.dumps(
             _kdbg_client(cfg).call("bp_add", **kwargs),
@@ -3375,6 +3416,31 @@ def kdbg_bps() -> str:
     cfg = _kdbg_cfg_only()
     try:
         return _json.dumps(_kdbg_client(cfg).call("bp_list"), indent=2)
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_bp_trace(bp_id: int, tail: int = 20) -> str:
+    """Read the trace log for a breakpoint with actions.
+
+    Action breakpoints auto-continue and log expression values to a
+    JSONL trace file on each fire. This tool reads the last ``tail``
+    entries from that log.
+
+    Args:
+        bp_id: Breakpoint id (from ``kdbg_bp`` / ``kdbg_bps``).
+        tail: Number of most recent entries to return (default 20).
+
+    Returns:
+        JSON ``{id, entries: [{hit, rip, values: {expr: value}}], total}``.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        return _json.dumps(
+            _kdbg_client(cfg).call("bp_trace", id=bp_id, tail=int(tail)),
+            indent=2,
+        )
     except _ClientError as e:
         return f"error: {e}"
 

@@ -44,7 +44,7 @@ PS C:\Windows\system32>
 - **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
 - **Malware detonation lab** — `winbox capture` (host-side pcap on the bridge — prefers `dumpcap`, which Kali's Wireshark package lets the `wireshark` group run without root, falling back to `tcpdump` otherwise), `winbox sinkhole` (zero-dependency DNS sinkhole that answers every C2 lookup with the bridge IP and logs the domain, plus optional INETSim fake services), and `winbox detonate check` (read-only preflight that refuses to go green unless the guest genuinely can't reach the internet). See [docs/malware-detonation.md](docs/malware-detonation.md)
 - **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
-- **MCP server** — 60 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including credentialed or background exec/Python/PowerShell, Defender enable/disable/status, HVCI/VBS detection and toggle, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
+- **MCP server** — 61 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including credentialed or background exec/Python/PowerShell, Defender enable/disable/status, HVCI/VBS detection and toggle, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
 - **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`; `--mode auto` falls back to software 0xCC where the 4 DR slots run out, but note HVCI blocks software breakpoints on the 24H2 kernel — Windows 11 and Server 2025), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
 - **VNC display** via virt-manager (`winbox vnc`) — plain VGA, no clipboard/resize
 - **x64dbg in the guest** — bundled in setup, extracted to `C:\Tools\x64dbg`, both x32 and x64 on PATH
@@ -340,7 +340,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (60):**
+**Available tools (61):**
 
 User-mode primitives:
 
@@ -422,6 +422,7 @@ Hypervisor-level kernel debug (via QEMU gdbstub + HMP, EDR-invisible):
 | `kdbg_session()` | Show current daemon state (target pid, attach time, bp count, halted vs running) |
 | `kdbg_bp(target, mode?, condition?)` | Install a bp. `mode="hw"` (default; Z1/DR — invisible to PatchGuard + `GetThreadContext`, 4 slots/vCPU), `mode="soft"` (0xCC patch — unlimited but PG-visible), or `mode="auto"` (hw first, soft on slot exhaustion). **On the 24H2 kernel (Windows 11, Server 2025) use `hw`/`auto`: HVCI blocks the software 0xCC patch.** Optional `condition` is a server-side predicate evaluated on each fire (regs, `[reg+off]` qword reads, `==/!=/</<=/>/>=`, `&&`/`||`) |
 | `kdbg_bps()` | List installed bps with hit/skip/error counters |
+| `kdbg_bp_trace(bp_id, tail?)` | Read the JSONL trace log for an action bp |
 | `kdbg_rm(bp_id)` | Remove an installed bp |
 | `kdbg_cont(timeout?)` | Resume; block until next stop in target's CR3 set (KPTI-aware: kernel + user PML4) |
 | `kdbg_step()` | Single-instruction step on the firing vCPU |

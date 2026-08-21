@@ -2888,3 +2888,88 @@ class TestWatchpointList:
         bps = reply["result"]["bps"]
         assert "wp_type" not in bps[0]
         assert "wp_size" not in bps[0]
+
+
+# ── Scriptable breakpoint actions (item 47) ───────────────────────────
+
+
+class TestBpActions:
+    def test_bp_add_with_actions(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        reply = session.handle_op(
+            "bp_add", {"target": "nt!X", "actions": ["rcx", "rdx"]},
+        )
+        assert reply["ok"]
+        r = reply["result"]
+        assert r["actions"] == ["rcx", "rdx"]
+        assert "trace_path" in r
+
+    def test_bp_add_invalid_action_rejected(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        reply = session.handle_op(
+            "bp_add", {"target": "nt!X", "actions": ["rcx", "garbage **"]},
+        )
+        assert not reply["ok"]
+        assert "action[1]" in reply["error"]
+
+    def test_bp_list_includes_action_info(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        session.handle_op(
+            "bp_add", {"target": "nt!X", "actions": ["rax"]},
+        )
+        reply = session.handle_op("bp_list", {})
+        bp = reply["result"]["bps"][0]
+        assert bp["actions"] == ["rax"]
+        assert bp["trace_count"] == 0
+
+    def test_execute_actions_logs_and_continues(self, tmp_path):
+        cfg = FakeCfg()
+        cfg.root_dir = tmp_path
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        session.cfg = cfg
+        session.handle_op(
+            "bp_add", {"target": "nt!X", "actions": ["rax"]},
+        )
+        bp = list(session.bps.values())[0]
+        regs = _blob(rax=0x42, rip=_KERNEL_VA_WP, cr3=0x1ae000)
+        session._execute_actions(bp, regs)
+        assert bp.trace_count == 1
+        import json
+        trace = json.loads(open(bp.trace_path).readline())
+        assert trace["values"]["rax"] == "0x42"
+
+    def test_bp_trace_returns_entries(self, tmp_path):
+        cfg = FakeCfg()
+        cfg.root_dir = tmp_path
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        session.cfg = cfg
+        session.handle_op(
+            "bp_add", {"target": "nt!X", "actions": ["rcx"]},
+        )
+        bp = list(session.bps.values())[0]
+        regs = _blob(rcx=0xDEAD, rip=_KERNEL_VA_WP, cr3=0x1ae000)
+        session._execute_actions(bp, regs)
+        session._execute_actions(bp, regs)
+        trace_reply = session.handle_op("bp_trace", {"id": bp.bp_id})
+        assert trace_reply["ok"]
+        assert trace_reply["result"]["total"] == 2
+        assert len(trace_reply["result"]["entries"]) == 2
+
+    def test_bp_no_actions_halts_normally(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        session.handle_op("bp_add", {"target": "nt!X"})
+        bp = list(session.bps.values())[0]
+        assert bp.actions == []
+        assert bp._action_asts == []

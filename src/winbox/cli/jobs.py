@@ -30,6 +30,18 @@ def _poll_job_status(ga: GuestAgent, pid: int, *, attempts: int = 3) -> dict:
     raise AssertionError("unreachable")
 
 
+def _strip_nonce(stdout: str, nonce: str) -> str:
+    idx = stdout.find(nonce)
+    if idx == -1:
+        return stdout
+    rest = stdout[idx + len(nonce):]
+    if rest.startswith("\r\n"):
+        return rest[2:]
+    if rest.startswith("\n"):
+        return rest[1:]
+    return rest
+
+
 def _pid_image_name(ga: GuestAgent, pid: int) -> str | None:
     """Return the image name for ``pid``, or None if unreachable."""
     try:
@@ -108,8 +120,15 @@ def jobs_list(ctx: click.Context) -> None:
         try:
             status = _poll_job_status(ga, job.pid)
             if status["exited"]:
+                stdout = status["stdout"]
+                if job.nonce and job.nonce not in stdout:
+                    job.status = JobStatus.LOST
+                    mutated.append(job)
+                    continue
+                if job.nonce:
+                    stdout = _strip_nonce(stdout, job.nonce)
                 job.exitcode = status["exitcode"]
-                job.stdout = status["stdout"]
+                job.stdout = stdout
                 job.stderr = status["stderr"]
                 job.status = JobStatus.DONE if job.exitcode == 0 else JobStatus.FAILED
                 mutated.append(job)
@@ -218,18 +237,31 @@ def jobs_output(ctx: click.Context, job_id: int) -> None:
         console.print(f"[red][-][/] Cannot fetch output: {e}")
         raise SystemExit(1)
 
+    stdout = status["stdout"]
+    stderr = status["stderr"]
+
     if status["exited"]:
+        if job.nonce and job.nonce not in stdout:
+            job.status = JobStatus.LOST
+            store.update(job)
+            console.print(
+                f"[red][-][/] PID {job.pid} recycled — output belongs to "
+                "an unrelated process. Job marked LOST."
+            )
+            raise SystemExit(1)
+        if job.nonce:
+            stdout = _strip_nonce(stdout, job.nonce)
         job.exitcode = status["exitcode"]
-        job.stdout = status["stdout"]
-        job.stderr = status["stderr"]
+        job.stdout = stdout
+        job.stderr = stderr
         job.status = JobStatus.DONE if job.exitcode == 0 else JobStatus.FAILED
         store.update(job)
 
-    if status["stdout"]:
-        console.print(status["stdout"], end="", markup=False, highlight=False)
-    if status["stderr"]:
-        console.print(status["stderr"], end="", markup=False, style="red", highlight=False)
-    if not status["stdout"] and not status["stderr"]:
+    if stdout:
+        console.print(stdout, end="", markup=False, highlight=False)
+    if stderr:
+        console.print(stderr, end="", markup=False, style="red", highlight=False)
+    if not stdout and not stderr:
         if status["exited"]:
             console.print("[yellow][!][/] Job finished with no output")
         else:
@@ -266,8 +298,19 @@ def jobs_kill(ctx: click.Context, job_id: int) -> None:
     # without touching whatever now owns this PID number.
     exited = _exited_status(ga, job.pid)
     if exited is not None:
+        stdout = exited["stdout"]
+        if job.nonce and job.nonce not in stdout:
+            job.status = JobStatus.LOST
+            store.update(job)
+            console.print(
+                f"[red][-][/] PID {job.pid} recycled — exited output belongs "
+                "to an unrelated process. Job marked LOST."
+            )
+            return
+        if job.nonce:
+            stdout = _strip_nonce(stdout, job.nonce)
         job.exitcode = exited["exitcode"]
-        job.stdout = exited["stdout"]
+        job.stdout = stdout
         job.stderr = exited["stderr"]
         job.status = JobStatus.DONE if job.exitcode == 0 else JobStatus.FAILED
         store.update(job)

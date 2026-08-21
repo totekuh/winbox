@@ -35,6 +35,7 @@ OPS: frozenset[str] = frozenset({
     "bp_add",       # install bp at sym/VA
     "bp_list",      # enumerate installed bps
     "bp_remove",    # remove bp by id
+    "bp_trace",     # read trace log for a bp with actions
     "cont",         # resume; blocks daemon-side until next stop in target
     "step",         # single-step the firing vCPU once
     "step_over",    # step over call/syscall — temp bp at next insn + cont

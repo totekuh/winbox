@@ -152,7 +152,10 @@ def run_command_bg(
     if quoted_args:
         full_cmd += f" {quoted_args}"
 
+    import uuid
+
     store = JobStore(cfg)
+    nonce = f"__wbx{uuid.uuid4().hex[:16]}__"
 
     def _spawn(job_id: int) -> Job:
         if log:
@@ -165,18 +168,21 @@ def run_command_bg(
             else:
                 pid = ga.exec_detached(wrapped, user=user, password=password)
             mode = JobMode.LOG
+            job_nonce = ""
         else:
+            tagged = f"echo {nonce}&&{full_cmd}"
             if user is None and password is None:
-                pid = ga.exec_background(full_cmd)
+                pid = ga.exec_background(tagged)
             else:
                 pid = ga.exec_background(
-                    full_cmd, user=user, password=password,
+                    tagged, user=user, password=password,
                 )
             mode = JobMode.BUFFERED
+            job_nonce = nonce
         return Job(
             id=job_id, pid=pid,
             command=f"{resolved} {args_str}".strip(),
-            mode=mode,
+            mode=mode, nonce=job_nonce,
         )
 
     return store.claim(_spawn)
