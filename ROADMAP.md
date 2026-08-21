@@ -244,9 +244,9 @@ and the `_wait_for_stop_serving` loop.
 
 ### Edge cases to harden (2026-08-20)
 
-**35. Attach to a process that exits mid-session** — NOT YET TESTED. Target
-exits while breakpoints are set. Cont should time out (target gone), detach
-should clean up without crash.
+**35. Tested 2026-08-21 — PASS.** Target killed mid-session (scheduled
+`Stop-Process` fires while cont running). Cont timed out (target gone),
+detach cleaned up without crash, GA survived.
 
 ---
 
@@ -284,6 +284,18 @@ eliminating mid-walk KPTI CR3 races. `list_modules` gained KPTI retry.
 
 **40.** Probe timeout increased from 300ms to 1s. Added
 `nt!KeQueryInterruptTimePrecise` as primary probe symbol.
+
+**11 (pdb).** `parse_types` raises `ValueError` on zero-field structs instead
+of returning useless empty layouts. Catches `llvm-pdbutil` format drift.
+
+**16.** Step-over: `kdbg_step(over=True)` steps over `call`/`syscall`/`sysenter`
+by planting a temp hw bp at the next instruction and continuing. Falls back to
+regular step for non-call instructions. Verified live — stepped over a
+`call rel32` inside `nt!NtClose`, landed at the correct return point.
+
+**18.** Register layout validation at attach time: `_validate_register_layout`
+checks RIP (canonical), CS (recognized selector), CR3 (non-zero, <52-bit cap).
+Catches QEMU register-XML drift before it silently corrupts everything.
 
 ### Edge cases tested (2026-08-21)
 
