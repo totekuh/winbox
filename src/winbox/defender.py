@@ -316,24 +316,32 @@ _DEFENDER_DEFAULT_START = {
 }
 
 
-def _system_services_reg(start_values: dict[str, int]) -> str:
-    """Render a .reg document setting Services\\<name>\\Start in SYSTEM."""
+def _system_services_reg(
+    start_values: dict[str, int],
+    control_set: int = 1,
+) -> str:
+    """Render a .reg document setting Services\\<name>\\Start in SYSTEM.
+
+    ``control_set`` selects which ControlSet to target (1, 2, ...).
+    The active set is determined by ``SYSTEM\\Select\\Current`` — use
+    :func:`read_current_control_set` to get it from the offline hive.
+    """
+    cs = f"ControlSet{control_set:03d}"
     lines = ["Windows Registry Editor Version 5.00", ""]
     for name, start in start_values.items():
         lines.append(
-            f"[HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\{name}]"
+            f"[HKEY_LOCAL_MACHINE\\SYSTEM\\{cs}\\Services\\{name}]"
         )
         lines.append(f'"Start"=dword:{start:08x}')
         lines.append("")
-    # Drop the trailing blank so the rendered document is byte-identical to
-    # the hand-written payload this replaced — the build path is proven with
-    # exactly those bytes.
     return "\r\n".join(lines).rstrip("\r\n") + "\r\n"
 
 
 # Start=4 is "disabled". A WinDefend that never starts never arms Tamper
 # Protection, so Defender stays fully inert and cannot quarantine winbox's
 # tools. This is what `winbox setup` applies before the guest's first boot.
+# Module-level constants use ControlSet001 — the default on fresh images.
+# Runtime callers (disable_offline/enable_offline) read the active set first.
 DEFENDER_OFF_SYSTEM_REG = _system_services_reg(
     {name: 4 for name in _DEFENDER_SERVICES}
 )
@@ -410,13 +418,19 @@ def disable_offline(cfg, *, progress: ProgressFn = _noop) -> None:
     """
     from winbox import offlinereg
 
-    progress("Disabling Defender services in the offline SYSTEM hive...")
+    win_part = offlinereg.windows_partition(cfg)
+    progress("Reading active ControlSet from SYSTEM hive...")
+    cs = offlinereg.read_current_control_set(cfg.disk_path, win_part)
+    reg_body = _system_services_reg(
+        {name: 4 for name in _DEFENDER_SERVICES}, control_set=cs,
+    )
+    progress(f"Disabling Defender services in ControlSet{cs:03d}...")
     offlinereg.merge_hive(
         cfg.disk_path,
         hive=offlinereg.SYSTEM_HIVE,
         prefix="HKEY_LOCAL_MACHINE\\SYSTEM",
-        reg_body=DEFENDER_OFF_SYSTEM_REG,
-        win_part=offlinereg.windows_partition(cfg),
+        reg_body=reg_body,
+        win_part=win_part,
     )
 
 
@@ -431,13 +445,17 @@ def enable_offline(cfg, *, progress: ProgressFn = _noop) -> None:
     """
     from winbox import offlinereg
 
-    progress("Restoring Defender service start types in the offline SYSTEM hive...")
+    win_part = offlinereg.windows_partition(cfg)
+    progress("Reading active ControlSet from SYSTEM hive...")
+    cs = offlinereg.read_current_control_set(cfg.disk_path, win_part)
+    reg_body = _system_services_reg(_DEFENDER_DEFAULT_START, control_set=cs)
+    progress(f"Restoring Defender service start types in ControlSet{cs:03d}...")
     offlinereg.merge_hive(
         cfg.disk_path,
         hive=offlinereg.SYSTEM_HIVE,
         prefix="HKEY_LOCAL_MACHINE\\SYSTEM",
-        reg_body=DEFENDER_ON_SYSTEM_REG,
-        win_part=offlinereg.windows_partition(cfg),
+        reg_body=reg_body,
+        win_part=win_part,
     )
 
 

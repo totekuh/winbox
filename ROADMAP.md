@@ -59,25 +59,17 @@ bigger change than the foreground path took. Not yet reproduced;
 audit-derived from the same PID-recycle mechanism `git log` already fixed for
 the foreground path.
 
-The same raw-PID weakness has a second consequence on the *write* side:
-`winbox jobs kill <id>` runs `taskkill /PID <job.pid> /T /F`, so a job that
-finished and had its PID recycled onto an unrelated guest process gets that
-innocent process's whole tree force-killed. Both consequences (wrong output
-read, wrong process killed) are the same missing-identity-token root and want
-the same fix.
+The *kill* side is now guarded: `jobs kill` queries `tasklist` for the PID's
+image name before `taskkill`. If the PID is no longer `cmd.exe`/`runex.exe`
+(the expected process), kill is refused and the job is marked LOST. The
+*result-identity* side (wrong output read) still has no nonce guard — the
+full fix needs a job-scoped nonce echoed at spawn and checked at status-read.
 
-### 23. The named-pipe broker is killed by raw PID with no ownership check
-
-`pipe_open`'s `_abort` and `pipe_close` run `taskkill /F /PID <broker_pid>`
-against the stored broker PID with no verification that the PID still belongs
-to the broker. A broker that crashes right after spawn and has its Windows PID
-recycled onto an unrelated process gets that process force-killed instead. This
-is the pipe-subsystem twin of item 22's kill side (same PID-recycle root). The
-broker now self-writes its `broker.pid` at startup (2026-08-10), which fixed
-the *unkillable-leak* half — the host can always find the PID — but not this
-*wrong-PID-kill* half, which needs an identity token (e.g. verify the target is
-the `python.exe` we launched, or tag the broker and check the tag before
-killing). PLAUSIBLE, audit-derived, not reproduced.
+**23. Fixed.** `pipe_close` and `_abort` already verify the PID is still
+`python.exe` via `_is_broker_alive()` before `taskkill`. If the PID was
+recycled to a different process, taskkill is skipped. The guard was added
+during the broker self-write fix (2026-08-10) and covers both `_abort`
+and `pipe_close` paths.
 
 ### 24. `pipe_recv` can silently lose bytes when the host times out after the broker already read them
 
@@ -95,32 +87,18 @@ ACKs) or a bounded sweep that reclaims a still-unread result for the *same*
 logical read before issuing the next — a broker-protocol change. CONFIRMED,
 audit-derived.
 
-### 25. `JobStore.claim` spawns the guest process before it persists the Job
+**25. Fixed.** `claim()` now persists a placeholder Job (pid=0,
+command="(spawning)") *before* calling `build()`. If `build()` fails, the
+placeholder is cleaned up. If `_save()` after spawn fails, the placeholder
+still exists — the job is visible in `jobs list` even though it has pid=0.
+No more orphan processes invisible to the ledger.
 
-`claim()` runs `build(job_id)` — which launches the VM-side process via
-`exec_background`/`exec_detached` — and only then calls `_save()`. If `_save()`
-raises (disk full, tmpfile/rename error), the process is already running but
-has no ledger entry, so `winbox jobs list`/`kill` never see it and it holds its
-exec slot / log handles until the VM reboots. Low-probability (needs a disk-
-level `_save` failure). The clean fix is persist-placeholder → spawn → update,
-which also removes the deliberately-accepted flock-held-across-spawn window
-(documented in `claim`'s docstring — a `jobs list` blocks for the spawn
-duration), but it restructures the `claim(build)` API and the `run_command_bg`
-caller, so it is logged rather than rushed. CONFIRMED, audit-derived.
-
-### 27. Offline Defender disable hardcodes ControlSet001
-
-`defender._system_services_reg` writes `Services\*\Start` under a literal
-`HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001`. On a freshly-installed guest the
-current control set *is* 001, but if `HKLM\SYSTEM\Select\Current` is 2 (e.g.
-after a Last-Known-Good rollback), the offline edit lands in an inactive
-control set while the operation prints its green success line, and Windows
-boots from ControlSet002 with Defender fully armed — the user believes it is
-off while it quarantines winbox's tools. The correct fix reads `Select\Current`
-out of the SYSTEM hive first (an extra guestfish/hivex read before rendering
-the `.reg`) and targets `ControlSet00<N>`. Deferred because it needs hive
-introspection the current render-static-`.reg` path doesn't do, and the common
-fresh-VM case (ControlSet001) works. PLAUSIBLE, audit-derived (2026-08-10).
+**27. Fixed.** `disable_offline`/`enable_offline` now read
+`SYSTEM\Select\Current` via `hivexregedit --export` before rendering the
+`.reg`, and target the active ControlSet (001, 002, etc.) instead of
+hardcoding 001. `_system_services_reg` accepts a `control_set` parameter.
+Module-level constants still default to 001 for the build-time path (fresh
+images). `read_current_control_set` added to `offlinereg.py`.
 
 ### 26. kdbg read-surface residuals from the 2026-08-10 audit (accepted / minor)
 

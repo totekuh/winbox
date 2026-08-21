@@ -120,6 +120,41 @@ class TestJobStore:
         # Failed claim must not leave any junk in the store.
         assert store.all() == []
 
+    def test_claim_persists_placeholder_before_build(self, cfg):
+        """A placeholder must exist on disk before build() runs, so a
+        crash during spawn never leaves an orphan with no ledger entry."""
+        seen_on_disk = []
+        def build(jid):
+            disk = JobStore(cfg)
+            on_disk = disk.get(jid)
+            seen_on_disk.append(on_disk)
+            return Job(id=jid, pid=42, command="x", mode=JobMode.BUFFERED)
+        store = JobStore(cfg)
+        store.claim(build)
+        assert seen_on_disk[0] is not None
+        assert seen_on_disk[0].pid == 0
+        assert seen_on_disk[0].command == "(spawning)"
+
+    def test_claim_cleans_up_placeholder_on_build_failure(self, cfg):
+        """If build() raises, the placeholder is removed."""
+        store = JobStore(cfg)
+        with pytest.raises(RuntimeError, match="boom"):
+            store.claim(lambda jid: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert store.all() == []
+        reloaded = JobStore(cfg)
+        assert reloaded.all() == []
+
+    def test_claim_updates_placeholder_with_real_job(self, cfg):
+        """After build, the placeholder is replaced by the real Job."""
+        store = JobStore(cfg)
+        job = store.claim(
+            lambda jid: Job(id=jid, pid=999, command="real.exe", mode=JobMode.LOG)
+        )
+        assert job.pid == 999
+        assert job.command == "real.exe"
+        reloaded = JobStore(cfg).get(job.id)
+        assert reloaded.pid == 999
+
 
 # ─── Job dataclass ────────────────────────────────────────────────────────────
 
@@ -442,6 +477,67 @@ class TestJobsKill:
         result = runner.invoke(cli, ["jobs", "kill", "1"])
         assert result.exit_code == 1
         assert "Kill failed" in result.output
+
+    def test_kill_refuses_when_pid_recycled(self, runner, cfg, mock_env):
+        """If the PID now belongs to a different process, refuse to kill."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="sharphound", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING))
+        mock_env.exec_status.return_value = {
+            "exited": False, "exitcode": -1, "stdout": "", "stderr": "",
+        }
+        mock_env.exec.return_value = ExecResult(
+            exitcode=0,
+            stdout='"svchost.exe","100","Services","0","12,345 K"\r\n',
+            stderr="",
+        )
+        result = runner.invoke(cli, ["jobs", "kill", "1"])
+        assert result.exit_code == 1
+        assert "recycled" in result.output
+        reloaded = JobStore(cfg).get(1)
+        assert reloaded.status == JobStatus.LOST
+
+    def test_kill_proceeds_when_image_is_cmd(self, runner, cfg, mock_env):
+        """PID still cmd.exe — safe to kill."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING))
+        mock_env.exec_status.return_value = {
+            "exited": False, "exitcode": -1, "stdout": "", "stderr": "",
+        }
+        call_count = [0]
+        def exec_side_effect(cmd, timeout=15):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return ExecResult(
+                    exitcode=0,
+                    stdout='"cmd.exe","100","Console","1","3,456 K"\r\n',
+                    stderr="",
+                )
+            return ExecResult(exitcode=0, stdout="", stderr="")
+        mock_env.exec.side_effect = exec_side_effect
+        result = runner.invoke(cli, ["jobs", "kill", "1"])
+        assert result.exit_code == 0
+        assert "killed" in result.output.lower()
+
+    def test_kill_proceeds_when_image_check_fails(self, runner, cfg, mock_env):
+        """If tasklist fails, proceed with kill (can't determine, don't block)."""
+        store = JobStore(cfg)
+        store.add(Job(id=1, pid=100, command="x", mode=JobMode.BUFFERED,
+                       status=JobStatus.RUNNING))
+        mock_env.exec_status.return_value = {
+            "exited": False, "exitcode": -1, "stdout": "", "stderr": "",
+        }
+        call_count = [0]
+        def exec_side_effect(cmd, timeout=15):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return ExecResult(exitcode=1, stdout="", stderr="error")
+            return ExecResult(exitcode=0, stdout="", stderr="")
+        mock_env.exec.side_effect = exec_side_effect
+        result = runner.invoke(cli, ["jobs", "kill", "1"])
+        assert result.exit_code == 0
+        assert "killed" in result.output.lower()
 
 
 # ─── jobs list edge cases ────────────────────────────────────────────────────

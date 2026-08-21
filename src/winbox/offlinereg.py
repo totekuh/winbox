@@ -166,6 +166,45 @@ def _require_valid_hive(path: Path, stage: str) -> None:
         )
 
 
+def read_current_control_set(disk_path: Path, win_part: str) -> int:
+    """Read ``SYSTEM\\Select\\Current`` from the offline SYSTEM hive.
+
+    Returns the active ControlSet number (1, 2, ...). The offline Defender
+    disable must target this set — hardcoding ControlSet001 silently fails
+    after a Last-Known-Good rollback selects ControlSet002.
+
+    Uses ``hivexregedit --export`` on a downloaded copy of the SYSTEM hive.
+    """
+    missing = tools_available()
+    if missing is not None:
+        raise OfflineRegistryError(f"{missing} not found — install libguestfs-tools")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        local_hive = Path(tmp) / "SYSTEM"
+        guestfish(disk_path, [
+            f"mount {win_part} /",
+            f"download {SYSTEM_HIVE} {local_hive}",
+        ])
+        result = subprocess.run(
+            ["hivexregedit", "--export",
+             "--prefix", "HKEY_LOCAL_MACHINE\\SYSTEM",
+             str(local_hive), "Select"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            raise OfflineRegistryError(
+                f"hivexregedit export Select failed: "
+                f"{result.stderr.strip() or 'unknown error'}"
+            )
+        import re
+        match = re.search(r'"Current"=dword:([0-9a-fA-F]+)', result.stdout)
+        if not match:
+            raise OfflineRegistryError(
+                "Select\\Current not found in SYSTEM hive export"
+            )
+        return int(match.group(1), 16)
+
+
 def windows_partition(cfg) -> str:
     """The guest's Windows partition device, per the active OS profile.
 

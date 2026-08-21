@@ -30,6 +30,20 @@ def _poll_job_status(ga: GuestAgent, pid: int, *, attempts: int = 3) -> dict:
     raise AssertionError("unreachable")
 
 
+def _pid_image_name(ga: GuestAgent, pid: int) -> str | None:
+    """Return the image name for ``pid``, or None if unreachable."""
+    try:
+        r = ga.exec(f'tasklist /FI "PID eq {pid}" /NH /FO CSV', timeout=5)
+        if r.exitcode != 0:
+            return None
+        for line in r.stdout.strip().splitlines():
+            if line.startswith('"'):
+                return line.split('"')[1].lower()
+    except GuestAgentError:
+        pass
+    return None
+
+
 def _exited_status(ga: GuestAgent, pid: int) -> dict | None:
     """Return the agent's finished-result dict for ``pid``, else None.
 
@@ -263,12 +277,17 @@ def jobs_kill(ctx: click.Context, job_id: int) -> None:
         )
         return
 
+    image = _pid_image_name(ga, job.pid)
+    if image is not None and image not in ("cmd.exe", "runex.exe"):
+        console.print(
+            f"[red][-][/] PID {job.pid} is now {image!r}, not cmd.exe — "
+            f"the job's PID was recycled. Refusing to kill an unrelated process."
+        )
+        job.status = JobStatus.LOST
+        store.update(job)
+        raise SystemExit(1)
+
     try:
-        # /T kills the whole tree. Without it only the outer cmd.exe died;
-        # its children kept the inherited stdout pipe open, so the guest
-        # agent went on buffering their output into a result slot nobody
-        # would ever read — the orphan that later collided with a recycled
-        # PID and surfaced as another command's output.
         kill = ga.exec(f"taskkill /PID {job.pid} /T /F", timeout=15)
     except GuestAgentError as e:
         console.print(f"[red][-][/] Kill failed: {e}")

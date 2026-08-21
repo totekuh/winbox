@@ -259,3 +259,63 @@ class TestRegistryPayloads:
         from winbox.setup.installer import _DEFENDER_OFF_SYSTEM_REG
 
         assert DEFENDER_OFF_SYSTEM_REG == _DEFENDER_OFF_SYSTEM_REG
+
+    def test_control_set_parameter_changes_target(self):
+        from winbox.defender import _system_services_reg
+        reg = _system_services_reg({"WinDefend": 4}, control_set=2)
+        assert "ControlSet002" in reg
+        assert "ControlSet001" not in reg
+
+    def test_control_set_default_is_001(self):
+        from winbox.defender import _system_services_reg
+        reg = _system_services_reg({"WinDefend": 4})
+        assert "ControlSet001" in reg
+
+    def test_control_set_3_digit_padding(self):
+        from winbox.defender import _system_services_reg
+        reg = _system_services_reg({"WinDefend": 4}, control_set=10)
+        assert "ControlSet010" in reg
+
+
+class TestReadCurrentControlSet:
+    def test_parses_select_current_from_export(self):
+        export_output = (
+            'Windows Registry Editor Version 5.00\r\n\r\n'
+            '[HKEY_LOCAL_MACHINE\\SYSTEM\\Select]\r\n'
+            '"Current"=dword:00000001\r\n'
+            '"Default"=dword:00000001\r\n'
+        )
+        with patch("winbox.offlinereg.tools_available", return_value=None), \
+             patch("winbox.offlinereg.guestfish"), \
+             patch("winbox.offlinereg.subprocess.run",
+                   return_value=_proc(stdout=export_output)):
+            cs = offlinereg.read_current_control_set(Path("/d.qcow2"), "/dev/sda3")
+        assert cs == 1
+
+    def test_returns_2_when_select_says_2(self):
+        export_output = (
+            '[HKEY_LOCAL_MACHINE\\SYSTEM\\Select]\r\n'
+            '"Current"=dword:00000002\r\n'
+        )
+        with patch("winbox.offlinereg.tools_available", return_value=None), \
+             patch("winbox.offlinereg.guestfish"), \
+             patch("winbox.offlinereg.subprocess.run",
+                   return_value=_proc(stdout=export_output)):
+            cs = offlinereg.read_current_control_set(Path("/d.qcow2"), "/dev/sda3")
+        assert cs == 2
+
+    def test_raises_when_current_not_found(self):
+        with patch("winbox.offlinereg.tools_available", return_value=None), \
+             patch("winbox.offlinereg.guestfish"), \
+             patch("winbox.offlinereg.subprocess.run",
+                   return_value=_proc(stdout="[Select]\r\n")):
+            with pytest.raises(OfflineRegistryError, match="Current not found"):
+                offlinereg.read_current_control_set(Path("/d.qcow2"), "/dev/sda3")
+
+    def test_raises_on_export_failure(self):
+        with patch("winbox.offlinereg.tools_available", return_value=None), \
+             patch("winbox.offlinereg.guestfish"), \
+             patch("winbox.offlinereg.subprocess.run",
+                   return_value=_proc(returncode=1, stderr="bad hive")):
+            with pytest.raises(OfflineRegistryError, match="export Select failed"):
+                offlinereg.read_current_control_set(Path("/d.qcow2"), "/dev/sda3")

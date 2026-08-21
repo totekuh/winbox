@@ -159,12 +159,31 @@ class JobStore:
         allocated value. Holding the lock during spawn serializes
         concurrent background launches — for a single-user dev tool that's
         the desired trade-off vs losing a job to an ID collision.
+
+        A placeholder Job is persisted *before* ``build()`` runs so that
+        a failure in ``build`` or ``_save`` after spawn never leaves an
+        orphan process with no ledger entry. The placeholder is updated
+        with the real Job (PID, command, etc.) once ``build`` returns.
         """
         with self._exclusive():
             self._load()
             job_id = max(self._jobs, default=0) + 1
-            job = build(job_id)
+            placeholder = Job(
+                id=job_id, pid=0, command="(spawning)",
+                mode=JobMode.BUFFERED, status=JobStatus.RUNNING,
+            )
+            self._jobs[job_id] = placeholder
+            self._save()
+
+            try:
+                job = build(job_id)
+            except Exception:
+                del self._jobs[job_id]
+                self._save()
+                raise
             if job.id != job_id:
+                del self._jobs[job_id]
+                self._save()
                 raise ValueError(
                     f"build() must return Job with id={job_id}, got {job.id}"
                 )
