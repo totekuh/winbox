@@ -2395,6 +2395,87 @@ class TestStepOver:
             session.op_step_over()
 
 
+# ── step_out ───────────────────────────────────────────────────────────
+
+
+class TestStepOut:
+
+    def _halted_session(self, rsp=None, rip=0xfffff80608628780,
+                        rsp_val=0xfffff80501234500):
+        session = _make_session(rsp=rsp or FakeRsp())
+        blob = _blob(rip=rip, rsp=rsp_val, cr3=0x1ae000)
+        session.stop = StopState(
+            vcpu="01", rip=rip, cr3=0x1ae000, signal=5, raw_regs=blob,
+        )
+        return session
+
+    def test_step_out_plants_bp_at_return_address(self):
+        from winbox.kdbg.debugger.rsp import StopReply
+
+        rsp_val = 0xfffff80501234500
+        ret_addr = 0xfffff80608628800
+
+        class StepOutRsp(FakeRsp):
+            def read_memory(self, va, length):
+                if va == rsp_val:
+                    return struct.pack("<Q", ret_addr)
+                return b"\x90" * length
+
+            def insert_breakpoint(self, addr, *, kind=1, hardware=False):
+                self.bps_inserted.append(addr)
+
+            def remove_breakpoint(self, addr, *, kind=1, hardware=False):
+                self.bps_removed.append(addr)
+
+            def cont(self):
+                self.continued += 1
+
+            def wait_for_stop(self, *, timeout=None):
+                return StopReply(signal=5, thread="01",
+                                stop_kind="hwbreak", raw="T05")
+
+            def read_registers(self):
+                return _blob(rip=ret_addr, cr3=0x1ae000)
+
+        rsp = StepOutRsp()
+        session = self._halted_session(rsp=rsp, rsp_val=rsp_val)
+        result = session.op_step_out()
+
+        assert result["reason"] == "step_out"
+        assert ret_addr in rsp.bps_inserted
+        assert ret_addr in rsp.bps_removed
+
+    def test_step_out_requires_halt(self):
+        session = _make_session()
+        with pytest.raises(RuntimeError, match="not halted"):
+            session.op_step_out()
+
+    def test_step_out_zero_return_address_rejected(self):
+        class ZeroRetRsp(FakeRsp):
+            def read_memory(self, va, length):
+                return b"\x00" * length
+
+        rsp = ZeroRetRsp()
+        session = self._halted_session(rsp=rsp)
+        with pytest.raises(RuntimeError, match="return address.*is 0"):
+            session.op_step_out()
+
+    def test_step_out_dr_slot_exhaustion(self):
+        from winbox.kdbg.debugger.rsp import RspError
+
+        class NoSlotsRetRsp(FakeRsp):
+            def read_memory(self, va, length):
+                return struct.pack("<Q", 0xfffff80608628800)
+
+            def insert_breakpoint(self, addr, *, kind=1, hardware=False):
+                raise RspError("E22")
+
+        rsp = NoSlotsRetRsp()
+        session = self._halted_session(rsp=rsp)
+        with pytest.raises(RuntimeError, match="Free a DR slot"):
+            session.op_step_out()
+
+
 # ── Item #18: register layout validation ───────────────────────────────
 
 

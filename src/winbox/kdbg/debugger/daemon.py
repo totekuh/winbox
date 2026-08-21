@@ -127,6 +127,7 @@ class Breakpoint:
     predicate_hits: int = 0
     predicate_skips: int = 0
     predicate_errors: int = 0
+    predicate_read_errors: int = 0
 
 
 @dataclass
@@ -568,6 +569,7 @@ class DaemonSession:
                     "predicate_hit_count": b.predicate_hits,
                     "predicate_skip_count": b.predicate_skips,
                     "predicate_error_count": b.predicate_errors,
+                    "predicate_read_error_count": b.predicate_read_errors,
                     "age_s": round(time.monotonic() - b.installed_at, 2),
                 }
                 for b in self.bps.values()
@@ -754,7 +756,7 @@ class DaemonSession:
             if bp is not None and bp._predicate is not None:
                 try:
                     truthy = bool(bp._predicate.eval(
-                        regs, self._mem_qword_reader(regs)
+                        regs, self._mem_qword_reader(regs, bp=bp)
                     ))
                 except PredicateRuntimeError as e:
                     bp.predicate_errors += 1
@@ -823,6 +825,52 @@ class DaemonSession:
 
     _STEP_OVER_MNEMONICS = frozenset({"call", "syscall", "sysenter"})
 
+    def _run_to(self, target_rip: int, *, timeout: float, reason: str,
+                label: str) -> dict[str, Any]:
+        """Plant temp hw bp at target_rip, cont until hit, remove."""
+        try:
+            self.rsp.insert_breakpoint(target_rip, kind=1, hardware=True)
+        except RspError as e:
+            raise RuntimeError(
+                f"{reason} needs a temp hw bp at 0x{target_rip:x} but "
+                f"install failed: {e}. Free a DR slot with bp_remove."
+            ) from e
+
+        try:
+            deadline = time.monotonic() + max(1.0, float(timeout))
+            self.rsp.cont()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.rsp.interrupt()
+                    try:
+                        sr = self.rsp.wait_for_stop(timeout=2.0)
+                        self._capture_stop(sr)
+                    except RspError:
+                        pass
+                    raise RuntimeError(
+                        f"{reason} timed out ({timeout}s) waiting to reach "
+                        f"0x{target_rip:x}; VM re-halted"
+                    )
+                try:
+                    sr = self.rsp.wait_for_stop(timeout=remaining)
+                except RspError as e:
+                    if "timed out" in str(e).lower():
+                        continue
+                    raise
+                regs = self.rsp.read_registers()
+                hit_rip = struct.unpack_from("<Q", regs, 128)[0]
+                if hit_rip == target_rip:
+                    self._capture_stop(sr)
+                    break
+                self.rsp.cont()
+        finally:
+            with suppress(RspError):
+                self.rsp.remove_breakpoint(target_rip, kind=1, hardware=True)
+
+        return {"reason": reason, **({label: True} if label else {}),
+                **self._stop_summary()}
+
     def op_step_over(self, timeout: float = 10) -> dict[str, Any]:
         """Step over a call/syscall: temp bp at next instruction, cont, remove.
 
@@ -850,50 +898,26 @@ class DaemonSession:
             return self.op_step()
 
         next_rip = rip + insn.size
+        result = self._run_to(next_rip, timeout=timeout,
+                              reason="step_over", label="")
+        result["stepped_over"] = insn.mnemonic
+        return result
 
-        try:
-            self.rsp.insert_breakpoint(next_rip, kind=1, hardware=True)
-        except RspError as e:
-            raise RuntimeError(
-                f"step_over needs a temp hw bp at 0x{next_rip:x} but install "
-                f"failed: {e}. Free a DR slot with bp_remove."
-            ) from e
+    def op_step_out(self, timeout: float = 10) -> dict[str, Any]:
+        """Step out of the current function: temp bp at return address, cont.
 
-        try:
-            vcpu = self.stop.vcpu
-            deadline = time.monotonic() + max(1.0, float(timeout))
-            self.rsp.cont()
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self.rsp.interrupt()
-                    try:
-                        sr = self.rsp.wait_for_stop(timeout=2.0)
-                        self._capture_stop(sr)
-                    except RspError:
-                        pass
-                    raise RuntimeError(
-                        f"step_over timed out ({timeout}s) waiting for return "
-                        f"from {insn.mnemonic} at 0x{rip:x}; VM re-halted"
-                    )
-                try:
-                    sr = self.rsp.wait_for_stop(timeout=remaining)
-                except RspError as e:
-                    if "timed out" in str(e).lower():
-                        continue
-                    raise
-                regs = self.rsp.read_registers()
-                hit_rip = struct.unpack_from("<Q", regs, 128)[0]
-                if hit_rip == next_rip:
-                    self._capture_stop(sr)
-                    break
-                self.rsp.cont()
-        finally:
-            with suppress(RspError):
-                self.rsp.remove_breakpoint(next_rip, kind=1, hardware=True)
-
-        return {"reason": "step_over", "stepped_over": insn.mnemonic,
-                **self._stop_summary()}
+        Reads [rsp] to get the return address, plants a temp hw bp there,
+        and continues until it fires. Requires a free DR slot.
+        """
+        if self.stop is None:
+            raise RuntimeError("not halted; cont first")
+        rsp_va = struct.unpack_from("<Q", self.stop.raw_regs, 7 * 8)[0]
+        ret_bytes = self.rsp.read_memory(rsp_va, 8)
+        ret_addr = struct.unpack("<Q", ret_bytes)[0]
+        if ret_addr == 0:
+            raise RuntimeError("return address at [rsp] is 0 — stack may be corrupt")
+        return self._run_to(ret_addr, timeout=timeout,
+                            reason="step_out", label="")
 
     def op_interrupt(self) -> dict[str, Any]:
         """Halt a running VM via raw ``\\x03`` on the RSP socket, in
@@ -1120,59 +1144,37 @@ class DaemonSession:
             raw_regs=regs,
         )
 
-    def _mem_qword_reader(self, fired_regs: bytes):
+    def _mem_qword_reader(self, fired_regs: bytes, bp: "Breakpoint | None" = None):
         """Build a closure that reads a qword from target's address space.
 
-        Uses ``_cr3_masqueraded_call`` (same dance as op_mem / op_write_mem),
-        so on a build with a verified ``user_dtb`` a read that's unmapped
-        under the primary CR3 gets retried against the other half before
-        giving up. Per-call cost is 3 RSP packets per candidate tried
-        (G-swap, m, G-restore). The firing vCPU must still be selected
-        when the closure runs — caller's responsibility to invoke before
-        yielding control.
-
-        Failure modes:
-          * Read rejected under every candidate CR3 (unmapped VA, gdbstub
-            error) → return 0. The documented predicate semantic is that
-            unmapped derefs read as zero so a check like
-            ``[rcx+0x10] != 0`` composes with dangling-pointer cases
-            without the operator pre-validating the deref. The cost: a
-            real transport hiccup looks the same as an unmapped read
-            inside the predicate. Acceptable because the surrounding
-            session would also be visibly broken (next op fails for
-            other reasons).
-          * G-swap rejected → ``PredicateRuntimeError`` (op_cont converts
-            to ``reason="predicate_error"`` and stays halted; this is a
-            session-level failure, not a data-level miss).
-          * G-restore failed → ``CR3RestoreError`` propagates up (the
-            session is poisoned at this point; cont will tear down).
-          * Short read with no error → ``PredicateRuntimeError`` — the
-            chunked-read path post-1.3.0 should never produce this; if
-            it does, surface loudly rather than silently returning 0.
+        Unmapped VA reads return 0 (predicate composes with dangling-pointer
+        cases). Transport/session errors raise PredicateRuntimeError so the
+        operator knows the condition failed for infrastructure reasons, not
+        because the target value is actually 0. Read errors are counted on
+        the bp's ``predicate_read_errors`` field for diagnostics.
         """
         rsp = self.rsp
         session = self
-        # Snapshot vcpu hint at construction time; if the daemon hasn't
-        # captured a stop yet we trust the firing vCPU is still selected.
         vcpu_hint = self.stop.vcpu if self.stop is not None else "01"
+        _UNMAPPED_SIGNS = (b"E14", b"E0E", b"E08", b"failed")
 
         def _read(addr: int) -> int:
             try:
                 data = session._cr3_masqueraded_call(
                     vcpu_hint, fired_regs, lambda: rsp.read_memory(addr, 8)
                 )
-            except RspError:
-                # Unmapped (or rejected) under every candidate CR3 —
-                # predicate sees 0.
-                return 0
+            except RspError as e:
+                err_str = str(e).encode()
+                if any(sign in err_str for sign in _UNMAPPED_SIGNS):
+                    if bp is not None:
+                        bp.predicate_read_errors += 1
+                    return 0
+                raise PredicateRuntimeError(
+                    f"predicate read at 0x{addr:x} failed (transport): {e}"
+                ) from e
             except CR3RestoreError:
-                # Don't dress this up as a predicate failure — the
-                # session is dead and the operator needs to know.
                 raise
             except RuntimeError as e:
-                # G-swap rejected (in-context, before yield). Convert
-                # to a predicate-level failure so op_cont reports it
-                # cleanly without poisoning the session.
                 if "G-packet" in str(e):
                     raise PredicateRuntimeError(str(e)) from e
                 raise

@@ -38,6 +38,7 @@ OPS: frozenset[str] = frozenset({
     "cont",         # resume; blocks daemon-side until next stop in target
     "step",         # single-step the firing vCPU once
     "step_over",    # step over call/syscall — temp bp at next insn + cont
+    "step_out",     # step out of function — temp bp at [rsp] return addr + cont
     "interrupt",    # async halt (for breaking out of cont)
     "regs",         # current register state at last halt
     "mem",          # read memory in target's CR3

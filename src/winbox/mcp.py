@@ -3386,25 +3386,28 @@ def kdbg_cont(timeout: float = 30.0) -> str:
 
 
 @mcp.tool()
-def kdbg_step(over: bool = False) -> str:
-    """Single-step the firing vCPU once.
+def kdbg_step(over: bool = False, out: bool = False) -> str:
+    """Single-step the firing vCPU.
 
     Only valid after a stop (call ``kdbg_cont`` first or attach to a
-    halted state). Advances RIP by one instruction (1-15 bytes for
-    x86-64).
+    halted state).
 
     Args:
-        over: If True, step OVER call/syscall instructions instead of
-            into them. Plants a temp hw breakpoint at the next instruction
-            and continues until it fires. Falls back to a regular step if
-            the current instruction is not a call/syscall. Requires a
-            free DR slot (4 max per vCPU).
+        over: Step OVER call/syscall — temp hw bp at next instruction,
+            cont until it fires. Falls back to regular step for non-call.
+        out: Step OUT of current function — temp hw bp at return address
+            ([rsp]), cont until it fires.
 
     Returns:
         JSON with stop info at the new RIP.
     """
     cfg = _kdbg_cfg_only()
-    op = "step_over" if over else "step"
+    if out:
+        op = "step_out"
+    elif over:
+        op = "step_over"
+    else:
+        op = "step"
     try:
         return _json.dumps(_kdbg_client(cfg).call(op), indent=2)
     except _ClientError as e:
