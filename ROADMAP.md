@@ -13,8 +13,6 @@ a roadmap whose top item nobody can start.
 ## Open
 
 Items 1-8 have all been worked — `git log` is the record. Item 8 is addressed
-at its source (below) but stays listed as *Watching* because it is
-intermittent by nature.
 at its source (below) but stays listed as *Watching* because it is intermittent
 by nature.
 
@@ -23,48 +21,11 @@ future kdbg change: **neither breakpoint mechanism installs on both images.**
 Windows 11 runs HVCI by default, which exists precisely to stop the `0xCC`
 patch a software breakpoint writes into a kernel code page, so `--mode soft`
 cannot work there. Server 2022 has instead been seen exhausting the four
-per-vCPU DR0..3 slots, which is the hardware path's ceiling. `--mode auto`
-tries hardware first and falls back, so it works on both, and the failure
-messages now name the wall you actually hit instead of guessing at one.
+per-vCPU DR0..3 slots, which is the hardware path's ceiling. There is no
+`--mode auto` — breakpoints must carry their type explicitly. The failure
+messages name the wall you actually hit instead of guessing at one.
 
-Items 10-19 below all came out of one audit pass over `src/winbox/kdbg` and
-the MCP `kdbg_*` wiring (2026-08-10), not from a specific repro. They're
-ordered by risk × tractability: silent-wrong-result bugs with a known fix
-shape first, pure capability gaps and cross-cutting rewrites last.
-
-Items 9, 10, 20, 21, 22, 23 were fixed on 2026-08-19/20 — `git log` is the
-record. Item 21 (bp_remove E22) was addressed by storing `installed_cr3` in
-the Breakpoint. Items 28-34 below came from the same live debugging session
-that verified those fixes.
-
-**28. Fixed.** `fork_daemon` now retries up to 3 times on "empty stop reply":
-raw-closes the socket, restarts the gdbstub via HMP, reconnects. After all
-attempts exhausted, raises a clear error naming the recovery. Supersedes old
-item 12. Verified live — first attach reliably hits the bug and auto-recovers
-on attempt 2.
-
-**29. Fixed.** PID-not-found path now uses `rsp.cont()` + `time.sleep(0.1)` +
-`rsp._sock.close()` (raw close, no D-packet dance) — same safe pattern as
-`DaemonSession.shutdown()`. The old `rsp.close()` did interrupt+wait+D which
-halted-resumed-halted the VM and corrupted the virtio-serial GA channel.
-After resuming, checks `agent_channel_connected()` and appends a warning if
-the channel dropped. Verified live — GA survives the failed attach.
-
-**30. Fixed (two parts).** Part A: one-time hw bp verification probe on first
-hw bp install. Installs a temp hw bp on `nt!KiPageFault` (or
-`nt!KeQueryPerformanceCounter`), does a 300ms cont, checks for SIGTRAP. If
-the probe times out, returns `hw_probe_warning` in the response. Runs once
-per session. Part B: `op_cont` now includes `unfired_hw_bps` in its response
-listing all hw bps with `hits==0` after a cont that ran longer than 5
-seconds. Verified live — probe fires immediately, unfired warning appears
-correctly when bp fires in non-target CR3.
-
-**31. Fixed.** `list_processes` now switches to System's DTB (PID 4's
-`DirectoryTableBase`) after reading the first EPROCESS, eliminating mid-walk
-KPTI CR3 races on a running VM. `list_modules` also gained the initial KPTI
-retry. Verified live — 60 processes returned consistently on a running VM.
-
-### 21. `bp_remove` on a private user-mode soft breakpoint can fail with E22 while the breakpoint is still live
+### 21. `bp_remove` on a private user-mode soft breakpoint can fail with E22
 
 Removing a soft breakpoint just installed via `kdbg_bp(mode="soft")` on a
 private (non-shared) user VA (`ntdll!NtClose` in a freshly attached process)
@@ -105,7 +66,7 @@ innocent process's whole tree force-killed. Both consequences (wrong output
 read, wrong process killed) are the same missing-identity-token root and want
 the same fix.
 
-### 23. The named-pipe broker is killed by raw PID with no ownership check — recycle → collateral kill
+### 23. The named-pipe broker is killed by raw PID with no ownership check
 
 `pipe_open`'s `_abort` and `pipe_close` run `taskkill /F /PID <broker_pid>`
 against the stored broker PID with no verification that the PID still belongs
@@ -147,7 +108,7 @@ which also removes the deliberately-accepted flock-held-across-spawn window
 duration), but it restructures the `claim(build)` API and the `run_command_bg`
 caller, so it is logged rather than rushed. CONFIRMED, audit-derived.
 
-### 27. Offline Defender disable hardcodes ControlSet001 instead of resolving the active control set
+### 27. Offline Defender disable hardcodes ControlSet001
 
 `defender._system_services_reg` writes `Services\*\Start` under a literal
 `HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001`. On a freshly-installed guest the
@@ -188,14 +149,14 @@ Three findings from the read-surface audit were left as-is, deliberately:
 
 ### 10. Conditional breakpoints fail closed and indistinguishably from a real null
 
-`_mem_qword_reader` (`daemon.py:883-941`) returns `0` both when a VA is
-genuinely unmapped and when the RSP read itself fails (session flakiness). A
-predicate like `[rcx+0x10] != 0` can silently never fire for the wrong
-reason, with nothing telling the operator the condition — not the target —
-is why nothing happened. This is a documented tradeoff, not an oversight,
-but it's indistinguishable from "the bug just didn't repro." Fix: propagate
-a distinct sentinel/exception for read failure vs. unmapped VA through
-predicate evaluation instead of coercing both to 0.
+`_mem_qword_reader` (`daemon.py`) returns `0` both when a VA is genuinely
+unmapped and when the RSP read itself fails (session flakiness). A predicate
+like `[rcx+0x10] != 0` can silently never fire for the wrong reason, with
+nothing telling the operator the condition — not the target — is why nothing
+happened. This is a documented tradeoff, not an oversight, but it's
+indistinguishable from "the bug just didn't repro." Fix: propagate a distinct
+sentinel/exception for read failure vs. unmapped VA through predicate
+evaluation instead of coercing both to 0.
 
 ### 11. `pdb.py` silently drops structs its regex parser can't match
 
@@ -208,169 +169,138 @@ least warn loudly) the same way `parse_publics` does.
 
 ### 12. WoW64 module list is silently incomplete
 
-`list_user_modules` (`walk.py:294-315`) doesn't walk `PEB.Wow64Process`'s
-32-bit loader. Against a 32-bit-on-64-bit process, `kdbg_user_lm` /
+`list_user_modules` (`walk.py`) doesn't walk `PEB.Wow64Process`'s 32-bit
+loader. Against a 32-bit-on-64-bit process, `kdbg_user_lm` /
 `kdbg_user_symbols_load` quietly return only the 64-bit `ntdll`/`wow64.dll`
 and none of the process's real 32-bit DLLs, with no flag that the result is
 partial. Minimum fix: detect WoW64 and return a warning in the result even
 before implementing the 32-bit walk; full fix adds the `Wow64Process` walk.
 
-### 13. Two RSP clients, one dead but indistinguishable from live
-
-`gdbstub.py`'s `GdbStubClient` raises `NotImplementedError` on
-`read_registers`/`single_step`/`cont`/`set_hw_breakpoint`, and nothing in
-`mcp.py` or `cli/kdbg.py` calls it — `debugger/rsp.py`'s `RspClient` is the
-real, working implementation and reimplements the same RSP framing
-independently. `gdbstub.py` still has its own passing test suite
-(`test_kdbg_gdbstub.py`), so it reads as live code to anyone searching the
-repo. Fix: delete `gdbstub.py` and its tests, or fold anything still useful
-into `rsp.py`, so there's one RSP client, not two.
-
 ### 14. No watchpoints
 
-`RspClient.insert_breakpoint`/`remove_breakpoint` (`rsp.py:529-554`) only
-ever send `Z0`/`Z1` (software/hardware execution breakpoint). QEMU's
-gdbstub supports `Z2`/`Z3`/`Z4` (write/read/access watchpoints) but nothing
-here emits them — no equivalent of WinDbg's `ba`, no way to break on a
-struct-field write, which matters for the hooking/instrumentation research
-this tool targets. Fix: extend the existing `Z0`/`Z1` path to accept
-watchpoint types and thread them through the `kdbg_bp` MCP surface.
+`RspClient.insert_breakpoint`/`remove_breakpoint` only ever send `Z0`/`Z1`
+(software/hardware execution breakpoint). QEMU's gdbstub supports
+`Z2`/`Z3`/`Z4` (write/read/access watchpoints) but nothing here emits them —
+no equivalent of WinDbg's `ba`, no way to break on a struct-field write,
+which matters for the hooking/instrumentation research this tool targets.
+Fix: extend the existing `Z0`/`Z1` path to accept watchpoint types and
+thread them through the `kdbg_bp` MCP surface.
 
 ### 15. `kdbg_bt` is a stack-scan heuristic, not a real unwinder
 
-`op_bt` (`daemon.py:806-833`) walks RSP-relative stack qwords and treats
-anything that looks like a canonical code address as a return address
-(`_looks_like_code_va`). There's no `.pdata`/`RUNTIME_FUNCTION` parsing
-anywhere in the codebase, and x64 Windows release binaries are
-frame-pointer-omitted almost everywhere non-leaf — so against real targets
-(AV/EDR components, optimized code) this backtrace will systematically drop
-or fabricate frames. Already flagged as best-effort in the function's own
-docstring. Largest capability gap versus a WinDbg-class debugger, and the
-least tractable item here — a real fix means parsing `.pdata` and doing
-table-based unwind, not a local patch.
+`op_bt` walks RSP-relative stack qwords and treats anything that looks like
+a canonical code address as a return address (`_looks_like_code_va`). There's
+no `.pdata`/`RUNTIME_FUNCTION` parsing anywhere in the codebase, and x64
+Windows release binaries are frame-pointer-omitted almost everywhere non-leaf
+— so against real targets (AV/EDR components, optimized code) this backtrace
+will systematically drop or fabricate frames. Already flagged as best-effort
+in the function's own docstring. Largest capability gap versus a WinDbg-class
+debugger, and the least tractable item here — a real fix means parsing
+`.pdata` and doing table-based unwind, not a local patch.
 
 ### 16. No step-over/step-out
 
 `kdbg_step`/`op_step` only single-instruction trace-into. Stepping over a
-`call` (to avoid diving into a syscall stub or a hot loop) currently
-requires disassembling by hand, computing the return address, and planting
-a temporary breakpoint manually. Fix: add a step-over mode that disassembles
-the current instruction and, if it's a `call`, plants a temp breakpoint at
-the next instruction and continues instead of stepping in.
+`call` (to avoid diving into a syscall stub or a hot loop) currently requires
+disassembling by hand, computing the return address, and planting a temporary
+breakpoint manually. Fix: add a step-over mode that disassembles the current
+instruction and, if it's a `call`, plants a temp breakpoint at the next
+instruction and continues instead of stepping in.
 
 ### 17. SMP is tuned for `-smp 1`, not a first-class case
 
 `_last_selected_vcpu` caching and the `sr.thread or "01"` default throughout
 `daemon.py` assume a single vCPU. `list_threads`/`select_thread` exist, but
-nothing scopes a breakpoint's fire-tracking to a specific core or
-distributes hardware breakpoints per-vCPU. Low tractability relative to
-impact — this is cross-cutting, not a local patch — hence listed near last.
+nothing scopes a breakpoint's fire-tracking to a specific core or distributes
+hardware breakpoints per-vCPU. Low tractability relative to impact — this is
+cross-cutting, not a local patch — hence listed near last.
 
 ### 18. Hardcoded register/CR3 offsets have no runtime sanity check
 
-`RspClient._CR3_OFFSET = 204` and the g-packet field offsets in
-`_decode_regs` are hardcoded, "verified against QEMU 8.x/9.x," with no
-cross-check at runtime — unlike `resolve_nt_base`, which sanity-checks its
-result (page-aligned, canonical). A future QEMU register-XML change would
-misdecode CR3/RIP silently instead of erroring. Fix: add the same kind of
-plausibility check `resolve_nt_base` already does, and raise instead of
-proceeding on a value that fails it.
+`RspClient._CR3_OFFSET = 204` and the g-packet field offsets in `_decode_regs`
+are hardcoded, "verified against QEMU 8.x/9.x," with no cross-check at
+runtime — unlike `resolve_nt_base`, which sanity-checks its result
+(page-aligned, canonical). A future QEMU register-XML change would misdecode
+CR3/RIP silently instead of erroring. Fix: add the same kind of plausibility
+check `resolve_nt_base` already does, and raise instead of proceeding on a
+value that fails it.
 
 ### 19. `kdbg_attach` doesn't detect a concurrent interactive `gdb` session
 
-QEMU's gdbstub accepts only one client. `gdbstub.py`'s own docstring flags
-the risk of a human `gdb` already attached to the same port, but
-`kdbg_attach` doesn't check for or warn about it. Fix: probe the port or
-track attach state before forking the daemon, and fail with a clear message
-if something's already attached.
+QEMU's gdbstub accepts only one client. `kdbg_attach` doesn't check for or
+warn about a human `gdb` already attached to the same port. Fix: probe the
+port or track attach state before forking the daemon, and fail with a clear
+message if something's already attached.
+
+### 41. `kdbg_cont` is a blocking MCP operation
+
+The cont tool blocks for up to `timeout` seconds. The daemon internally
+services `interrupt` and `status` ops via `_pump_client`, but the MCP client
+is stuck waiting. A non-blocking design — cont returns immediately,
+`kdbg_status` polls for bp hits — would let the operator do other work (read
+memory, check state) while waiting for a rare breakpoint. This is a design
+gap, not a bug, and would require changes to the daemon protocol, MCP handler,
+and the `_wait_for_stop_serving` loop.
+
 ### Edge cases to harden (2026-08-20)
-
-These are not bugs — they're untested edge cases that could surface real bugs.
-Each needs a live test and, where it breaks, a fix.
-
-**32. Tested 2026-08-21 — PASS.** Double attach refused cleanly: "VM is halted
-by a kdbg debug session." Existing session unaffected.
-
-**33. Tested 2026-08-21 — PASS.** `kdbg_interrupt` during blocked `kdbg_cont`
-queues correctly, detach works, GA survives, VM resumes. Note: interrupt may
-race with cont timeout (observed `reason: timeout` instead of `reason:
-interrupt` when both expire at the same wall-clock moment — not a bug, timing).
-
-**34. Tested 2026-08-21 — PASS.** 5th hw breakpoint fails with clear error
-naming DR slot limit. Existing 4 unaffected and tracked correctly.
 
 **35. Attach to a process that exits mid-session** — NOT YET TESTED. Target
 exits while breakpoints are set. Cont should time out (target gone), detach
 should clean up without crash.
 
-**36. Tested 2026-08-21 — PASS.** `kdbg_bp nt!FakeFunction` fails with "symbol
-not found" before any gdbstub operation.
+---
 
-**37. Tested 2026-08-21 — PASS.** `kdbg_mem 0xdeadbeefdeadbeef` returns clean
-`RspError: m failed` error. Session state intact.
+## Fixed
 
-**38. Tested 2026-08-21 — PASS.** 5 consecutive attach/detach cycles on same
-process. GA survived all cycles.
+*`git log` is the authoritative record. This section exists so the roadmap
+is self-contained — readers don't have to search git for "was this done?"*
 
-### Findings from 2026-08-21 live testing session
+**9.** `kdbg_cont` timeout / halt state tracking. See commit `a2373bc`.
 
-**39. PID mismatch between GA `ps` and kernel process walker.** GA-based `ps`
-reports different PIDs than `kdbg_ps` (kernel EPROCESS walk via HMP). Observed
-with lsass.exe: GA reported PID 860, kernel walk reported PID 856. Also seen
-with svchost.exe (GA: 1808, not in kernel walk at all). Root cause is likely
-item 31 (KPTI walker truncation on running VM) — `kdbg_ps` runs on a running
-VM and the user-mode CR3 doesn't map all kernel structures. The `kdbg_attach`
-daemon walks after halting the VM (stable CR3), so it sees the true PIDs. The
-GA `ps` uses `Get-Process` inside the guest, which sees the true PIDs too.
-The mismatch means `kdbg_attach` with a PID from GA `ps` can fail with
-"pid not found." Workaround: use PIDs from `kdbg_ps` for `kdbg_attach`.
-Fix: same as item 31 — now fixed (walker uses System DTB).
+**10.** `kdbg_stack` returns `{offset, va, value}` per qword. `kdbg_mem`
+gained `decode='qwords'`. See commit `9009a49`.
 
-**40. Fixed.** Probe timeout increased from 300ms to 1s, added
-`nt!KeQueryInterruptTimePrecise` (fires on every timer interrupt) as first
-probe symbol. Verified live — no false positive on fresh-booted VM.
+**11 (auto mode).** `mode='auto'` removed entirely. Breakpoints must carry
+their type explicitly — only `mode='hw'` and `mode='soft'` accepted.
 
-**41. `kdbg_cont` is a blocking MCP operation.** The cont tool blocks for up
-to `timeout` seconds. The daemon internally services `interrupt` and `status`
-ops via `_pump_client`, but the MCP client is stuck waiting. A non-blocking
-design — cont returns immediately, `kdbg_status` polls for bp hits — would
-let the operator do other work (read memory, check state) while waiting for a
-rare breakpoint. This is a design gap, not a bug, and would require changes to
-the daemon protocol, MCP handler, and the `_wait_for_stop_serving` loop.
+**12.** Superseded by item 28 — `fork_daemon` auto-retries with gdbstub
+restart via HMP.
 
-### Debugger (kdbg) gaps — collected from a live MsMpEng RPC session
+**13.** Dead `gdbstub.py` + tests deleted. `kdbg_detach` test mocks
+`ensure_not_paused` — no longer touches the real VM.
 
-Found while single-stepping a user-mode RPC call inside `MsMpEng.exe`. Ranked
-risk × tractability. The fire-and-forget gap that surfaced in the same session
-(synchronous `python`/`powershell` blocking and throwing "domain is not
-running" the moment a triggered call halts the guest) is **already closed** —
-`exec`/`python`/`powershell` now take `background=True` and return a job handle,
-retrieved with `job_result`. The rest below are open.
+**28.** `fork_daemon` retries up to 3 times on "empty stop reply": raw-closes
+socket, restarts gdbstub via HMP, reconnects.
 
-**9. Fixed.** `kdbg_cont` timeout now captures the interrupt's stop reply via
-`_capture_stop(sr)`. Initial attach also captures halt state from
-`query_halt_reason()`. `halted` is now trustworthy. See commit `a2373bc`.
+**29.** PID-not-found path uses safe socket close pattern (no D-packet dance).
+GA channel survives failed attach.
 
-**10. Fixed.** `kdbg_stack` returns `{offset, va, value}` per qword.
-`kdbg_mem` gained `decode='qwords'`. See commit `9009a49`.
+**30.** Part A: one-time hw bp probe on first hw bp install (1s timeout,
+`nt!KeQueryInterruptTimePrecise` as primary symbol). Part B: `op_cont` reports
+`unfired_hw_bps` for hw bps with `hits==0` after 5s+ cont.
 
-**11. Fixed.** `mode='auto'` removed entirely. Breakpoints must carry their
-type explicitly — only `mode='hw'` and `mode='soft'` accepted. Passing
-`mode='auto'` now raises a clear error. No silent fallbacks.
+**31.** `list_processes` switches to System's DTB after first EPROCESS read,
+eliminating mid-walk KPTI CR3 races. `list_modules` gained KPTI retry.
 
-**12. Fixed.** Superseded by item 28 — `fork_daemon` now auto-retries with
-gdbstub restart via HMP.
+**40.** Probe timeout increased from 300ms to 1s. Added
+`nt!KeQueryInterruptTimePrecise` as primary probe symbol.
 
-**13. Fixed (two parts).** Dead `gdbstub.py` + tests deleted — it was an
-unused RSP client with `NotImplementedError` stubs alongside the real
-`rsp.py`. `kdbg_detach` test now mocks `ensure_not_paused` so it no longer
-touches the real VM.
+### Edge cases tested (2026-08-21)
 
-*Workflow note (not a tool defect):* prefer live `kdbg_disasm` against the
-running process over tracking a module's ASLR base and cross-referencing a
-static off-VM copy with `objdump`. The live path is faster and removes any
-"is this the right build" doubt. `kdbg_disasm` and `kdbg_user_symbols_load`
-already exist and went unused.
+**32.** Double attach — PASS. Clean refusal, existing session unaffected.
+
+**33.** Interrupt during cont — PASS. Interrupt+detach works, GA survives.
+
+**34.** DR slot exhaustion — PASS. 5th hw bp fails with clear error.
+
+**36.** Nonexistent symbol — PASS. Fails before any gdbstub operation.
+
+**37.** Unmapped VA read — PASS. Clean error, session intact.
+
+**38.** Rapid attach/detach x5 — PASS. GA survived all cycles.
+
+**39.** PID mismatch between GA `ps` and kernel walker — root cause was
+item 31 (KPTI truncation). Fixed by walker using System DTB.
 
 ---
 
@@ -421,3 +351,9 @@ connected at that moment.
   this constraint (e.g. a system-wide `pip install mcp` from before this fix)
   — reinstall it (`pip install 'mcp>=1.0,<2'`) rather than chasing the
   symptom per-test.
+
+*Workflow note (not a tool defect):* prefer live `kdbg_disasm` against the
+running process over tracking a module's ASLR base and cross-referencing a
+static off-VM copy with `objdump`. The live path is faster and removes any
+"is this the right build" doubt. `kdbg_disasm` and `kdbg_user_symbols_load`
+already exist and went unused.
