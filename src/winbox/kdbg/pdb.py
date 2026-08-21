@@ -345,6 +345,19 @@ def parse_types(text: str, wanted: Iterable[str]) -> dict[str, StructLayout]:
             f"llvm-pdbutil --types output."
         )
 
+    sparse = [
+        f"{name} (sizeof={layout.size}, {len(layout.fields)} fields)"
+        for name, layout in layouts.items()
+        if layout.size >= 64 and len(layout.fields) < 3
+    ]
+    if sparse:
+        _log.warning(
+            "parse_types: %d type(s) have suspiciously few fields for their "
+            "size (%s) — field-line regex may have partially failed; check "
+            "_MEMBER_RE against current llvm-pdbutil output",
+            len(sparse), "; ".join(sparse),
+        )
+
     return layouts
 
 

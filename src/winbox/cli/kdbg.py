@@ -943,16 +943,24 @@ def kdbg_cont(ctx: click.Context, timeout: float) -> None:
 
 
 @kdbg.command("step")
+@click.option("--over", is_flag=True, default=False,
+              help="Step OVER call/syscall — temp hw bp at next instruction.")
+@click.option("--out", is_flag=True, default=False,
+              help="Step OUT of current function — temp hw bp at [rsp] return address.")
 @click.pass_context
-def kdbg_step(ctx: click.Context) -> None:
-    """Single-step the firing vCPU once."""
+def kdbg_step(ctx: click.Context, over: bool, out: bool) -> None:
+    """Single-step the firing vCPU."""
+    if over and out:
+        console.print("[red][-][/] --over and --out are mutually exclusive")
+        raise SystemExit(1)
     cfg: Config = ctx.obj["cfg"]
+    op = "step_out" if out else ("step_over" if over else "step")
     try:
-        result = _client(cfg).call("step")
+        result = _client(cfg).call(op)
     except ClientError as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
-    _print_stop(result.get("reason", "step"), result)
+    _print_stop(result.get("reason", op), result)
 
 
 @kdbg.command("interrupt")

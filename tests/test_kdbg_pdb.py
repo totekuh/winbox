@@ -229,3 +229,34 @@ def test_parse_types_raises_on_empty_fields():
 """
     with pytest.raises(ValueError, match="zero fields"):
         parse_types(fixture, ["_BROKEN_STRUCT"])
+
+
+def test_parse_types_warns_on_sparse_fields(caplog):
+    """A struct with sizeof >= 64 but < 3 fields is suspicious."""
+    import logging
+    fixture = """
+   0x3000 | LF_FIELDLIST [size = 32]
+              - LF_MEMBER [name = `SomeField`, Type = 0x0023 (unsigned __int64), offset = 0, attrs = public]
+   0x3001 | LF_STRUCTURE [size = 48] `_SPARSE_STRUCT`
+            vtable: <no type>, base list: <no type>, field list: 0x3000
+            options: has unique name, sizeof 128
+"""
+    with caplog.at_level(logging.WARNING):
+        result = parse_types(fixture, ["_SPARSE_STRUCT"])
+    assert "_SPARSE_STRUCT" in result
+    assert len(result["_SPARSE_STRUCT"].fields) == 1
+    assert "suspiciously few fields" in caplog.text
+
+
+def test_parse_types_no_warning_for_small_struct():
+    """A small struct (sizeof < 64) with few fields is normal."""
+    fixture = """
+   0x4000 | LF_FIELDLIST [size = 32]
+              - LF_MEMBER [name = `Value`, Type = 0x0023 (unsigned __int64), offset = 0, attrs = public]
+   0x4001 | LF_STRUCTURE [size = 48] `_SMALL_STRUCT`
+            vtable: <no type>, base list: <no type>, field list: 0x4000
+            options: has unique name, sizeof 16
+"""
+    result = parse_types(fixture, ["_SMALL_STRUCT"])
+    assert "_SMALL_STRUCT" in result
+    assert len(result["_SMALL_STRUCT"].fields) == 1

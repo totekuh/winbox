@@ -2925,6 +2925,27 @@ class TestKdbgDaemonTools:
         assert "another session" in result
         assert "kdbg_detach" in result
 
+    def test_attach_refuses_when_gdb_client_connected(self, mock_mcp):
+        from winbox.mcp import kdbg_attach
+        client = self._client_with(alive=False)
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=True), \
+             patch("winbox.mcp._fork_daemon") as ff:
+            result = kdbg_attach(4584)
+        ff.assert_not_called()
+        assert "another gdb client" in result
+
+    def test_attach_proceeds_when_no_gdb_client(self, mock_mcp):
+        from winbox.mcp import kdbg_attach
+        client = self._client_with(alive=False)
+        client.session_info.return_value = {"target_pid": 4584, "target_name": "test.exe",
+                                            "target_dtb": "0x1ae000", "gdbstub_port": 1234}
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
+             patch("winbox.mcp._fork_daemon", return_value=12345):
+            result = kdbg_attach(4584)
+        assert "daemon_pid" in result
+
     def test_attach_surfaces_daemon_error(self, mock_mcp):
         from winbox.mcp import kdbg_attach
         from winbox.kdbg.debugger.daemon import DaemonError

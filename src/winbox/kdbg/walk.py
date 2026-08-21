@@ -329,6 +329,38 @@ def list_modules(
 # ── User-mode module list (PEB.Ldr walker) ──────────────────────────────
 
 
+def is_wow64(
+    vm_name: str,
+    store: SymbolStore,
+    target: ProcessRecord,
+    *,
+    cache: WalkCache | None = None,
+) -> bool:
+    """True if ``target`` is a WoW64 (32-bit-on-64-bit) process.
+
+    Reads ``PEB.Wow64Process`` — non-zero means WoW64. Returns False
+    if the field doesn't exist in the struct map (pre-Win10) or can't
+    be read.
+    """
+    if cache is None:
+        cache = WalkCache()
+    target_cr3 = target.directory_table_base
+    try:
+        eproc_fields = store.struct("_EPROCESS")["fields"]
+        peb_off = eproc_fields["Peb"]["off"]
+        peb_va = _read_u64(vm_name, target_cr3, target.eprocess + peb_off, cache)
+        if peb_va == 0:
+            return False
+        peb_fields = store.struct("_PEB")["fields"]
+        wow64_off = peb_fields.get("Wow64Process", {}).get("off")
+        if wow64_off is None:
+            return False
+        wow64_ptr = _read_u64(vm_name, target_cr3, peb_va + wow64_off, cache)
+        return wow64_ptr != 0
+    except (HmpError, PageWalkError, SymbolStoreError):
+        return False
+
+
 def list_user_modules(
     vm_name: str,
     store: SymbolStore,

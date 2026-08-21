@@ -110,6 +110,36 @@ def _listening_sockets() -> set[tuple[str | None, int]] | None:
     return sockets if found_any else None
 
 
+def gdbstub_has_client(port: int) -> bool:
+    """True if an ESTABLISHED TCP connection exists to the gdbstub port.
+
+    QEMU's gdbstub accepts only one client. If one is already connected,
+    a second connect will either drop the first or produce undefined
+    behavior. This check reads /proc/net/tcp passively (no connect).
+    """
+    established = "01"
+    for proc_file, is_v4 in (("/proc/net/tcp", True), ("/proc/net/tcp6", False)):
+        try:
+            with open(proc_file, "r") as fh:
+                lines = fh.readlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 4 or fields[3] != established:
+                continue
+            local = fields[1]
+            if ":" not in local:
+                continue
+            _, _, port_hex = local.rpartition(":")
+            try:
+                if int(port_hex, 16) == port:
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
 def probe_port(host: str, port: int, timeout: float = 0.5) -> bool:
     """True if something is listening on host:port.
 

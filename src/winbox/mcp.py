@@ -2797,7 +2797,7 @@ from winbox.kdbg.hmp import HmpError as _KdbgHmpError
 from winbox.kdbg.pe import PeError as _KdbgPeError
 from winbox.kdbg.walk import list_modules as _kdbg_list_modules
 from winbox.kdbg.walk import list_processes as _kdbg_list_processes
-from winbox.kdbg.walk import list_user_modules as _kdbg_list_user_modules
+from winbox.kdbg.walk import list_user_modules as _kdbg_list_user_modules, is_wow64 as _kdbg_is_wow64
 
 
 def _kdbg_get_store() -> _KdbgStore:
@@ -3001,7 +3001,16 @@ def kdbg_user_lm(pid: int) -> str:
         }
         for m in mods
     ]
-    return _json.dumps(out, indent=2)
+    result: dict = {"modules": out}
+    try:
+        if _kdbg_is_wow64(cfg.vm_name, store, target, cache=cache):
+            result["warning"] = (
+                "WoW64 process — only 64-bit modules listed. "
+                "The 32-bit module list (PEB.Wow64Process) is not walked yet."
+            )
+    except Exception:
+        pass
+    return _json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -3207,6 +3216,13 @@ def kdbg_attach(pid: int, port: int = 1234) -> str:
             f"error: another session is active "
             f"(target {info.get('target_name', '?')}({info.get('target_pid', '?')}), "
             f"daemon_pid={info.get('daemon_pid', '?')}); call kdbg_detach first"
+        )
+
+    from winbox.kdbg.hmp import gdbstub_has_client
+    if gdbstub_has_client(port):
+        return (
+            f"error: another gdb client is already connected to port {port}. "
+            f"Disconnect it first — QEMU's gdbstub accepts only one client."
         )
 
     try:

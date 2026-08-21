@@ -16,6 +16,7 @@ from winbox.kdbg import walk
 from winbox.kdbg.walk import (
     ProcessRecord,
     UserModuleRecord,
+    is_wow64,
     list_user_modules,
 )
 
@@ -471,3 +472,99 @@ def test_list_processes_no_switch_when_system_dtb_matches(monkeypatch):
     assert len(procs) == 1
     # All reads should use the same CR3
     assert all(c == DTB for c in cr3s_used)
+
+
+# ── WoW64 detection ───────────────────────────────────────────────────
+
+
+_WOW64_TYPES = {
+    **_PROC_TYPES,
+    "_PEB": {
+        "size": 0x7C8,
+        "fields": {
+            "Ldr": {"off": 0x18, "type": ""},
+            "Wow64Process": {"off": 0x2C0, "type": ""},
+        },
+    },
+}
+
+
+def test_is_wow64_true(monkeypatch):
+    """Non-zero PEB.Wow64Process means WoW64."""
+    target = ProcessRecord(
+        pid=1234, name="wow32.exe", eprocess=0xFFFFE000_00100000,
+        directory_table_base=0x12345000, user_directory_table_base=0,
+    )
+    PEB_OFF = 0x550
+    PEB_VA = 0x7FFE_0000_0000
+    WOW64_OFF = 0x2C0
+
+    qwords = {
+        target.eprocess + PEB_OFF: PEB_VA,
+        PEB_VA + WOW64_OFF: 0x7FFE_0001_0000,  # non-zero = WoW64
+    }
+
+    monkeypatch.setattr("winbox.kdbg.walk._read_u64",
+                        lambda vm, cr3, va, cache: qwords.get(va, 0))
+
+    class S:
+        def struct(self, t, field=None, *, module="nt"):
+            types = {**_WOW64_TYPES}
+            types["_EPROCESS"] = {
+                "size": 0xB80,
+                "fields": {**_PROC_TYPES["_EPROCESS"]["fields"], "Peb": {"off": PEB_OFF, "type": ""}},
+            }
+            return types[t]
+
+    assert is_wow64("vm", S(), target) is True
+
+
+def test_is_wow64_false(monkeypatch):
+    """Zero PEB.Wow64Process means native 64-bit."""
+    target = ProcessRecord(
+        pid=1234, name="native64.exe", eprocess=0xFFFFE000_00100000,
+        directory_table_base=0x12345000, user_directory_table_base=0,
+    )
+    PEB_OFF = 0x550
+    PEB_VA = 0x7FFE_0000_0000
+
+    qwords = {
+        target.eprocess + PEB_OFF: PEB_VA,
+    }
+
+    monkeypatch.setattr("winbox.kdbg.walk._read_u64",
+                        lambda vm, cr3, va, cache: qwords.get(va, 0))
+
+    class S:
+        def struct(self, t, field=None, *, module="nt"):
+            types = {**_WOW64_TYPES}
+            types["_EPROCESS"] = {
+                "size": 0xB80,
+                "fields": {**_PROC_TYPES["_EPROCESS"]["fields"], "Peb": {"off": PEB_OFF, "type": ""}},
+            }
+            return types[t]
+
+    assert is_wow64("vm", S(), target) is False
+
+
+def test_is_wow64_no_field(monkeypatch):
+    """If _PEB has no Wow64Process field, return False (old Windows build)."""
+    target = ProcessRecord(
+        pid=1234, name="old.exe", eprocess=0xFFFFE000_00100000,
+        directory_table_base=0x12345000, user_directory_table_base=0,
+    )
+
+    monkeypatch.setattr("winbox.kdbg.walk._read_u64",
+                        lambda vm, cr3, va, cache: 0x7FFE_0000_0000)
+
+    class S:
+        def struct(self, t, field=None, *, module="nt"):
+            types = {**_PROC_TYPES}
+            types["_EPROCESS"] = {
+                "size": 0xB80,
+                "fields": {**_PROC_TYPES["_EPROCESS"]["fields"], "Peb": {"off": 0x550, "type": ""}},
+            }
+            types["_PEB"] = {"size": 0x100, "fields": {"Ldr": {"off": 0x18, "type": ""}}}
+            return types[t]
+
+    assert is_wow64("vm", S(), target) is False
