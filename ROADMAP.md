@@ -354,9 +354,9 @@ retrieved with `job_result`. The rest below are open.
 **10. Fixed.** `kdbg_stack` returns `{offset, va, value}` per qword.
 `kdbg_mem` gained `decode='qwords'`. See commit `9009a49`.
 
-**11. Fixed.** `mode='auto'` now returns `downgrade_warning` in the response
-when falling back from hw to soft, explaining the reason and noting that
-software breakpoints are PatchGuard-visible and hash-detectable.
+**11. Fixed.** `mode='auto'` removed entirely. Breakpoints must carry their
+type explicitly — only `mode='hw'` and `mode='soft'` accepted. Passing
+`mode='auto'` now raises a clear error. No silent fallbacks.
 
 **12. Fixed.** Superseded by item 28 — `fork_daemon` now auto-retries with
 gdbstub restart via HMP.
