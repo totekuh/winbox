@@ -8,7 +8,7 @@ them cheap to pin down exactly.
 
 from __future__ import annotations
 
-from winbox.kdbg.format import format_struct, format_sym
+from winbox.kdbg.format import format_struct, format_sym, symbolicate_va
 
 
 class FakeStore:
@@ -158,3 +158,81 @@ class TestFormatStructLayout:
         out = format_struct(store, "_S")
         assert "  +0x0002  Small  b" in out
         assert "  +0x1234  Big  q" in out
+
+
+# ── symbolicate_va ─────────────────────────────────────────────────────
+
+
+class SymStoreForVA:
+    """SymbolStore stand-in for symbolicate_va tests."""
+
+    def __init__(self, modules: dict):
+        self._modules = modules
+
+    def list_modules(self):
+        return list(self._modules.keys())
+
+    def load(self, name):
+        return self._modules[name]
+
+
+class TestSymbolicateVa:
+    def test_resolves_kernel_va(self):
+        store = SymStoreForVA({
+            "nt": {
+                "base": 0xfffff80608000000,
+                "size_of_image": 0x1000000,
+                "symbols": {"NtCreateFile": 0x80000, "NtClose": 0x80100},
+            },
+        })
+        result = symbolicate_va(store, 0xfffff80608080050)
+        assert result == "nt!NtCreateFile+0x50"
+        result2 = symbolicate_va(store, 0xfffff80608080100)
+        assert result2 == "nt!NtClose+0x0"
+
+    def test_resolves_user_mode_va(self):
+        store = SymStoreForVA({
+            "nt": {
+                "base": 0xfffff80608000000,
+                "size_of_image": 0x1000000,
+                "symbols": {"NtCreateFile": 0x80000},
+            },
+            "ntdll": {
+                "base": 0x7ffa12340000,
+                "size_of_image": 0x200000,
+                "symbols": {"NtClose": 0x1000, "RtlInitUnicodeString": 0x2000},
+            },
+        })
+        result = symbolicate_va(store, 0x7ffa12341500)
+        assert result == "ntdll!NtClose+0x500"
+
+    def test_returns_none_for_unmatched_va(self):
+        store = SymStoreForVA({
+            "nt": {
+                "base": 0xfffff80608000000,
+                "size_of_image": 0x1000000,
+                "symbols": {"NtCreateFile": 0x80000},
+            },
+        })
+        assert symbolicate_va(store, 0x12345678) is None
+
+    def test_skips_module_with_no_base(self):
+        store = SymStoreForVA({
+            "nt": {"base": None, "size_of_image": 0x1000, "symbols": {"X": 0x10}},
+        })
+        assert symbolicate_va(store, 0x10) is None
+
+    def test_empty_store(self):
+        store = SymStoreForVA({})
+        assert symbolicate_va(store, 0xfffff80608080000) is None
+
+    def test_picks_closest_symbol(self):
+        store = SymStoreForVA({
+            "mod": {
+                "base": 0x1000,
+                "size_of_image": 0x5000,
+                "symbols": {"A": 0x100, "B": 0x200, "C": 0x300},
+            },
+        })
+        result = symbolicate_va(store, 0x1250)
+        assert result == "mod!B+0x50"

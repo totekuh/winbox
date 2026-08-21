@@ -14,8 +14,49 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from winbox.kdbg.demangle import pretty_symbol
+
 if TYPE_CHECKING:
     from winbox.kdbg.store import SymbolStore
+
+_LEGACY_SIZE_FALLBACK = 16 * 1024 * 1024
+
+
+def symbolicate_va(store: "SymbolStore", va: int) -> str | None:
+    """Resolve a VA to ``module!symbol+0xoffset`` using all loaded modules.
+
+    Returns None when no loaded module's address range contains ``va``.
+    """
+    try:
+        modules = store.list_modules()
+    except Exception:
+        return None
+    best: tuple[str, str, int] | None = None
+    for module in modules:
+        try:
+            data = store.load(module)
+        except Exception:
+            continue
+        base = data.get("base") or 0
+        if not base:
+            continue
+        size = data.get("size_of_image") or _LEGACY_SIZE_FALLBACK
+        if not (base <= va < base + size):
+            continue
+        symbols = data.get("symbols", {})
+        local_best: tuple[str, int] | None = None
+        for name, rva in symbols.items():
+            target = base + rva
+            if target <= va and (local_best is None or target > local_best[1]):
+                local_best = (name, target)
+        if local_best is None:
+            continue
+        if best is None or local_best[1] > best[2]:
+            best = (module, local_best[0], local_best[1])
+    if best is None:
+        return None
+    module, name, addr = best
+    return f"{pretty_symbol(f'{module}!{name}')}+0x{va - addr:x}"
 
 
 def format_sym(

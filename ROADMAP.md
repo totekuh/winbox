@@ -161,15 +161,13 @@ at parse time instead of as a confusing downstream error.
 listed"). The 32-bit module walk itself is not implemented yet — that's
 the full fix. Detection is the minimum useful step.
 
-### 14. No watchpoints
-
-`RspClient.insert_breakpoint`/`remove_breakpoint` only ever send `Z0`/`Z1`
-(software/hardware execution breakpoint). QEMU's gdbstub supports
-`Z2`/`Z3`/`Z4` (write/read/access watchpoints) but nothing here emits them —
-no equivalent of WinDbg's `ba`, no way to break on a struct-field write,
-which matters for the hooking/instrumentation research this tool targets.
-Fix: extend the existing `Z0`/`Z1` path to accept watchpoint types and
-thread them through the `kdbg_bp` MCP surface.
+**14. Fixed.** `kdbg_bp` now accepts `wp_type` ("write"/"read"/"access") and
+`wp_size` (1/2/4/8) parameters. `insert_breakpoint`/`remove_breakpoint`
+route to Z2/Z3/Z4 packets. Watchpoints share the DR0..3 pool with hw exec
+bps. Z3 (read-only) is unsupported by QEMU on x86-64 — hardware DR registers
+only support write (Z2) and access (Z4). Verified live — write and access
+watchpoints install/remove/list correctly; invalid type/size rejected at add
+time; 5th DR slot correctly refused.
 
 ### 15. `kdbg_bt` is a stack-scan heuristic, not a real unwinder
 
@@ -230,11 +228,11 @@ detach cleaned up without crash, GA survived.
 **42. Fixed.** `kdbg_step(out=True)` reads `[rsp]`, plants temp hw bp at
 return address, conts until hit. Shares `_run_to` helper with step-over.
 
-**43. User-mode symbol resolution in bt/disasm.** `kdbg_bt` and
-`kdbg_disasm` only resolve nt symbols. Loading target module + ntdll PDBs
-(via existing `kdbg_user_symbols_load`) and integrating into bt/disasm
-output would make backtraces useful for the AV/EDR user-mode components
-kdbg targets. The plumbing exists, just not wired.
+**43. Fixed.** `kdbg_bt` already resolved all loaded modules (including
+user-mode) via `_best_symbol_for_va`. `kdbg_disasm` now annotates call/jmp
+targets with a `"sym"` field via `symbolicate_va` (extracted to `format.py`
+for reuse). Verified live — `call 0x7fff7f324940` renders as
+`ntdll!LdrpLogInternal+0x0`.
 
 **44. Fixed.** `_mem_qword_reader` now distinguishes unmapped VA (return 0,
 count `predicate_read_errors` on bp) from transport failure (raise

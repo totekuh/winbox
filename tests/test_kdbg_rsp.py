@@ -178,6 +178,36 @@ def test_breakpoint_install_raises_on_error_response():
         cli.insert_breakpoint(0xDEADBEEF)
 
 
+def test_insert_watchpoint_write_emits_z2():
+    cli, sock = _client([b"+", _frame(b"OK")])
+    cli.insert_breakpoint(0x401000, kind=4, wp_type="write")
+    assert b"$Z2,401000,4#" in bytes(sock.sent)
+
+
+def test_insert_watchpoint_read_emits_z3():
+    cli, sock = _client([b"+", _frame(b"OK")])
+    cli.insert_breakpoint(0x401000, kind=8, wp_type="read")
+    assert b"$Z3,401000,8#" in bytes(sock.sent)
+
+
+def test_insert_watchpoint_access_emits_z4():
+    cli, sock = _client([b"+", _frame(b"OK")])
+    cli.insert_breakpoint(0x401000, kind=2, wp_type="access")
+    assert b"$Z4,401000,2#" in bytes(sock.sent)
+
+
+def test_remove_watchpoint_emits_lowercase():
+    cli, sock = _client([b"+", _frame(b"OK")])
+    cli.remove_breakpoint(0x401000, kind=4, wp_type="write")
+    assert b"$z2,401000,4#" in bytes(sock.sent)
+
+
+def test_insert_watchpoint_unknown_type_raises():
+    cli, _ = _client([])
+    with pytest.raises(RspError, match="unknown watchpoint"):
+        cli.insert_breakpoint(0x401000, wp_type="execute")
+
+
 # ── memory ops ──────────────────────────────────────────────────────────
 
 

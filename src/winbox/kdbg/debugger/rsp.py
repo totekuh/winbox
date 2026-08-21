@@ -601,29 +601,51 @@ class RspClient:
                 raise RspError(f"M failed at 0x{cur:x}: {resp!r}")
             offset += len(chunk)
 
-    def insert_breakpoint(self, addr: int, *, kind: int = 1, hardware: bool = False) -> None:
-        """``Z0,addr,kind`` (sw) or ``Z1,addr,kind`` (hw exec).
+    _WP_Z = {"write": b"Z2", "read": b"Z3", "access": b"Z4"}
+    _WP_z = {"write": b"z2", "read": b"z3", "access": b"z4"}
 
-        ``kind`` is the bp size (1 byte for x86 software int3). For hw
-        exec bps, kind is the size of the matched instruction; on x86 we
-        pass 1 to mean "first byte" — QEMU honours it.
+    def insert_breakpoint(
+        self,
+        addr: int,
+        *,
+        kind: int = 1,
+        hardware: bool = False,
+        wp_type: str | None = None,
+    ) -> None:
+        """Insert a breakpoint or watchpoint.
 
-        SOFTWARE bps patch a 0xCC into the instruction stream at the
-        physical page backing ``addr`` in the currently-selected vCPU's
-        CR3. The 0xCC is visible to in-process self-hashing; for that
-        case use ``hardware=True``, but DR0..3 are per-vCPU and Windows
-        save/restores them across context switches.
+        Execution breakpoints: ``Z0`` (software, 0xCC patch) or ``Z1``
+        (hardware, debug register).
 
-        HARDWARE bps go via ``Z1`` — limited to 4 active across the
-        whole CPU.
+        Watchpoints (``wp_type``): ``Z2`` (write), ``Z3`` (read),
+        ``Z4`` (access). ``kind`` is the watched region size in bytes
+        (1/2/4/8 on x86-64). Uses a debug register — shares the 4-slot
+        DR0..3 pool with hw execution breakpoints.
         """
-        z = b"Z1" if hardware else b"Z0"
+        if wp_type is not None:
+            z = self._WP_Z.get(wp_type)
+            if z is None:
+                raise RspError(f"unknown watchpoint type: {wp_type!r}")
+        else:
+            z = b"Z1" if hardware else b"Z0"
         resp = self._exchange(b"%b,%x,%x" % (z, addr, kind))
         if resp != b"OK":
             raise RspError(f"{z.decode()} insert at 0x{addr:x} failed: {resp!r}")
 
-    def remove_breakpoint(self, addr: int, *, kind: int = 1, hardware: bool = False) -> None:
-        z = b"z1" if hardware else b"z0"
+    def remove_breakpoint(
+        self,
+        addr: int,
+        *,
+        kind: int = 1,
+        hardware: bool = False,
+        wp_type: str | None = None,
+    ) -> None:
+        if wp_type is not None:
+            z = self._WP_z.get(wp_type)
+            if z is None:
+                raise RspError(f"unknown watchpoint type: {wp_type!r}")
+        else:
+            z = b"z1" if hardware else b"z0"
         resp = self._exchange(b"%b,%x,%x" % (z, addr, kind))
         if resp != b"OK":
             raise RspError(f"{z.decode()} remove at 0x{addr:x} failed: {resp!r}")

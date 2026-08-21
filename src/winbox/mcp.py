@@ -3275,8 +3275,14 @@ def kdbg_session() -> str:
 
 
 @mcp.tool()
-def kdbg_bp(target: str, mode: str = "hw", condition: str | None = None) -> str:
-    """Install a breakpoint at TARGET in the attached process.
+def kdbg_bp(
+    target: str,
+    mode: str = "hw",
+    condition: str | None = None,
+    wp_type: str | None = None,
+    wp_size: int = 1,
+) -> str:
+    """Install a breakpoint or watchpoint at TARGET in the attached process.
 
     Defaults to **hardware breakpoint** (CPU debug register, Z1
     packet) — invisible to PatchGuard (no code modification) AND
@@ -3287,7 +3293,7 @@ def kdbg_bp(target: str, mode: str = "hw", condition: str | None = None) -> str:
 
     Args:
         target: Symbol (``module!sym``) or hex VA.
-        mode: Breakpoint mechanism:
+        mode: Breakpoint mechanism (ignored when ``wp_type`` is set):
             ``"hw"`` (default) — hardware bp via Z1. PG-safe and
                 anti-debug-invisible. Limit 4 per vCPU.
             ``"soft"`` — software 0xCC patch via Z0. Unlimited
@@ -3316,19 +3322,35 @@ def kdbg_bp(target: str, mode: str = "hw", condition: str | None = None) -> str:
 
             For string compares, encode the bytes as a little-endian
             qword literal yourself (e.g. ``"w00t"`` -> ``0x74303077``).
+        wp_type: Set to install a **watchpoint** instead of an execution
+            breakpoint. Values:
+            ``"write"`` — break on write (Z2). The WinDbg ``ba w``
+                equivalent.
+            ``"read"`` — break on read (Z3).
+            ``"access"`` — break on read or write (Z4). The WinDbg
+                ``ba r`` equivalent.
+            Watchpoints use a hardware debug register and share the
+            4-slot DR0..3 pool with hw execution breakpoints.
+        wp_size: Watched region size in bytes (1, 2, 4, or 8).
+            Only meaningful when ``wp_type`` is set. Default 1.
 
     Returns:
-        JSON ``{id, va, user_mode, hw, condition, elapsed_ms}``. The
+        JSON ``{id, va, user_mode, hw, condition, elapsed_ms}``. For
+        watchpoints, also includes ``wp_type`` and ``wp_size``. The
         ``predicate_*_count`` fields appear in ``kdbg_bps`` output.
     """
     cfg = _kdbg_cfg_only()
     if condition is not None and not condition.strip():
         condition = None
+    if wp_type is not None and not wp_type.strip():
+        wp_type = None
+    kwargs = {"target": target, "mode": mode, "condition": condition}
+    if wp_type is not None:
+        kwargs["wp_type"] = wp_type
+        kwargs["wp_size"] = int(wp_size)
     try:
         return _json.dumps(
-            _kdbg_client(cfg).call(
-                "bp_add", target=target, mode=mode, condition=condition,
-            ),
+            _kdbg_client(cfg).call("bp_add", **kwargs),
             indent=2,
         )
     except _ClientError as e:
@@ -3486,14 +3508,30 @@ def kdbg_disasm(addr: str = "", count: int = 8) -> str:
         return f"error: malformed mem result"
 
     md = _cs.Cs(_cs.CS_ARCH_X86, _cs.CS_MODE_64)
+    md.detail = True
+
+    store = _kdbg_get_store()
+    from winbox.kdbg.format import symbolicate_va
+    _CALL = _cs.CS_GRP_CALL
+    _JUMP = _cs.CS_GRP_JUMP
+    _IMM = _cs.x86.X86_OP_IMM
+
     insns = []
     for ins in md.disasm(raw, addr_int):
-        insns.append({
+        entry = {
             "addr": f"0x{ins.address:x}",
             "bytes": ins.bytes.hex(),
             "mnemonic": ins.mnemonic,
             "op_str": ins.op_str,
-        })
+        }
+        if any(g in (_CALL, _JUMP) for g in ins.groups):
+            for op in ins.operands:
+                if op.type == _IMM:
+                    sym = symbolicate_va(store, op.imm)
+                    if sym:
+                        entry["sym"] = sym
+                    break
+        insns.append(entry)
         if len(insns) >= n:
             break
 

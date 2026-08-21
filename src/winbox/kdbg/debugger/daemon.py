@@ -122,6 +122,8 @@ class Breakpoint:
     # display; ``_predicate`` is the parsed AST evaluated on each fire
     # (None means unconditional — original behaviour). Counters track
     # how the predicate decided each in-target fire.
+    wp_type: str | None = None  # None = exec bp; "write"/"read"/"access" = watchpoint
+    wp_size: int = 0            # watched region size (1/2/4/8); 0 for exec bps
     condition: str | None = None
     _predicate: Any = field(default=None, repr=False)
     predicate_hits: int = 0
@@ -435,46 +437,47 @@ class DaemonSession:
             "daemon_pid": os.getpid(),
         }
 
+    _VALID_WP_TYPES = frozenset({"write", "read", "access"})
+    _VALID_WP_SIZES = frozenset({1, 2, 4, 8})
+
     def op_bp_add(
         self,
         target: str,
         mode: str = "hw",
         condition: str | None = None,
+        wp_type: str | None = None,
+        wp_size: int = 1,
     ) -> dict[str, Any]:
-        """Install a bp at sym/VA.
+        """Install a breakpoint or watchpoint at sym/VA.
 
-        ``mode`` selects the bp mechanism:
+        ``mode`` selects the execution-bp mechanism (``"hw"`` or
+        ``"soft"``). Ignored when ``wp_type`` is set.
 
-        * ``"hw"`` (default) — hardware bp via gdbstub ``Z1`` packet.
-          Sets a CPU debug register (DR0..3). Invisible to PatchGuard
-          (no code modification) and invisible to in-guest GetThread\
-          Context (KVM virtualizes DR access). For user-mode VAs no
-          CR3 masquerade is needed — Z1 doesn't translate the VA, it
-          just configures a register match. Limit: 4 active per vCPU.
-        * ``"soft"`` — software bp via gdbstub ``Z0`` (0xCC patch).
-          Visible to code self-hashing and PatchGuard. Unlimited count.
-          For user-mode VAs goes through ``install_user_breakpoint``
-          (CR3 masquerade dance).
-        * ``"auto"`` — try hw first; on slot exhaustion fall back to
-          soft. Surfaces neither the hw success nor the fallback in
-          a special way; the resulting bp's ``hw`` field tells which
-          you got.
+        ``wp_type`` installs a watchpoint instead of an execution bp:
+        ``"write"`` (Z2), ``"read"`` (Z3), ``"access"`` (Z4). Uses a
+        hardware debug register — shares the 4-slot DR0..3 pool with
+        hw execution breakpoints.
 
-        ``condition`` is an optional predicate evaluated server-side on
-        each in-target fire. False predicate -> silent-cont (no halt
-        surfaced to client). True predicate -> halt as today. Parse
-        errors raise immediately, before any RSP packet is sent, so a
-        bad predicate never installs a bp. See ``predicate.py`` for the
-        grammar (regs, ``[reg+offset]`` qword reads, ``== != < <= > >=``,
-        ``&``, ``&&``, ``||``).
+        ``wp_size`` is the watched region in bytes (1/2/4/8). Only
+        meaningful for watchpoints; ignored for execution bps.
         """
-        # Treat empty string the same as None — convenient for callers
-        # that always pass the arg through.
         if isinstance(condition, str) and not condition.strip():
             condition = None
+        if isinstance(wp_type, str) and not wp_type.strip():
+            wp_type = None
 
-        # Parse predicate FIRST. We don't want a bp installed in the
-        # gdbstub if the predicate is malformed.
+        if wp_type is not None:
+            if wp_type not in self._VALID_WP_TYPES:
+                raise ValueError(
+                    f"wp_type must be 'write', 'read', or 'access'; "
+                    f"got {wp_type!r}"
+                )
+            wp_size = int(wp_size)
+            if wp_size not in self._VALID_WP_SIZES:
+                raise ValueError(
+                    f"wp_size must be 1, 2, 4, or 8; got {wp_size}"
+                )
+
         predicate_ast = None
         if condition is not None:
             try:
@@ -483,8 +486,47 @@ class DaemonSession:
                 raise RuntimeError(f"bad condition: {e}") from e
 
         va = self._resolve_target(target)
-        is_user = (va >> 47) != 0x1FFFF  # canonical-high == kernel half
+        is_user = (va >> 47) != 0x1FFFF
 
+        # ── Watchpoint path ────────────────────────────────────────────
+        if wp_type is not None:
+            t0 = time.monotonic()
+            try:
+                self.rsp.insert_breakpoint(
+                    va, kind=wp_size, wp_type=wp_type,
+                )
+            except RspError as e:
+                raise RuntimeError(_hw_bp_failure(e)) from e
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+
+            bp_id = self._next_bp_id
+            self._next_bp_id += 1
+            bp = Breakpoint(
+                bp_id=bp_id,
+                va=va,
+                target=target,
+                user_mode=is_user,
+                hw=True,
+                installed_at=time.monotonic(),
+                wp_type=wp_type,
+                wp_size=wp_size,
+                condition=condition,
+                _predicate=predicate_ast,
+            )
+            self.bps[bp_id] = bp
+            self._bp_by_va[va] = bp_id
+            return {
+                "id": bp_id,
+                "va": f"0x{va:x}",
+                "user_mode": is_user,
+                "hw": True,
+                "wp_type": wp_type,
+                "wp_size": wp_size,
+                "condition": condition,
+                "elapsed_ms": round(elapsed_ms, 2),
+            }
+
+        # ── Execution breakpoint path (unchanged) ─────────────────────
         if mode not in ("hw", "soft"):
             raise ValueError(
                 f"mode must be 'hw' or 'soft'; got {mode!r}. "
@@ -524,9 +566,6 @@ class DaemonSession:
 
         bp_id = self._next_bp_id
         self._next_bp_id += 1
-        # For user-mode soft bps, record the CR3 that
-        # install_user_breakpoint actually used so removal can target it
-        # directly instead of re-iterating all candidates (bug #21).
         _installed_cr3 = 0
         if is_user and not installed_hw:
             _installed_cr3 = report.target_dtb  # type: ignore[union-attr]
@@ -543,7 +582,7 @@ class DaemonSession:
         )
         self.bps[bp_id] = bp
         self._bp_by_va[va] = bp_id
-        result = {
+        return {
             "id": bp_id,
             "va": f"0x{va:x}",
             "user_mode": is_user,
@@ -551,30 +590,31 @@ class DaemonSession:
             "condition": condition,
             "elapsed_ms": round(elapsed_ms, 2),
         }
-        return result
 
     def op_bp_list(self) -> dict[str, Any]:
         from winbox.kdbg.demangle import pretty_symbol
-        return {
-            "bps": [
-                {
-                    "id": b.bp_id,
-                    "va": f"0x{b.va:x}",
-                    "target": b.target,
-                    "target_pretty": pretty_symbol(b.target),
-                    "user_mode": b.user_mode,
-                    "hw": b.hw,
-                    "hits": b.hits,
-                    "condition": b.condition,
-                    "predicate_hit_count": b.predicate_hits,
-                    "predicate_skip_count": b.predicate_skips,
-                    "predicate_error_count": b.predicate_errors,
-                    "predicate_read_error_count": b.predicate_read_errors,
-                    "age_s": round(time.monotonic() - b.installed_at, 2),
-                }
-                for b in self.bps.values()
-            ]
-        }
+        entries = []
+        for b in self.bps.values():
+            entry = {
+                "id": b.bp_id,
+                "va": f"0x{b.va:x}",
+                "target": b.target,
+                "target_pretty": pretty_symbol(b.target),
+                "user_mode": b.user_mode,
+                "hw": b.hw,
+                "hits": b.hits,
+                "condition": b.condition,
+                "predicate_hit_count": b.predicate_hits,
+                "predicate_skip_count": b.predicate_skips,
+                "predicate_error_count": b.predicate_errors,
+                "predicate_read_error_count": b.predicate_read_errors,
+                "age_s": round(time.monotonic() - b.installed_at, 2),
+            }
+            if b.wp_type is not None:
+                entry["wp_type"] = b.wp_type
+                entry["wp_size"] = b.wp_size
+            entries.append(entry)
+        return {"bps": entries}
 
     def _remove_bp_via_stub(self, bp: Breakpoint) -> None:
         """Send the z-packet that clears ``bp`` from the gdbstub.
@@ -599,14 +639,15 @@ class DaemonSession:
         or ``CR3RestoreError`` (restore failed, session poisoned) — same
         contract as the memory-op masquerade path.
         """
-        if bp.user_mode and not bp.hw:
+        if bp.wp_type is not None:
+            self.rsp.remove_breakpoint(
+                bp.va, kind=bp.wp_size, wp_type=bp.wp_type,
+            )
+        elif bp.user_mode and not bp.hw:
             vcpu = self._pick_vcpu()
             self._select_thread(vcpu)
             regs = self.rsp.read_registers()
             if bp.installed_cr3:
-                # Use the exact CR3 that install_user_breakpoint placed
-                # the 0xCC under — avoids re-iterating all candidates
-                # and eliminates E22 on removal (bug #21).
                 with self._cr3_masquerade(vcpu, regs, cr3=bp.installed_cr3):
                     self.rsp.remove_breakpoint(bp.va, kind=1, hardware=False)
             else:
@@ -1239,61 +1280,9 @@ class DaemonSession:
     # store entries from before that field was tracked). 16 MiB is
     # bigger than any single Windows image in practice, but small
     # enough that it won't match VAs in unrelated modules.
-    _LEGACY_SIZE_FALLBACK = 16 * 1024 * 1024
-
     def _best_symbol_for_va(self, va: int) -> str | None:
-        """Find the symbol whose owning module actually contains ``va``.
-
-        Old behaviour was "closest <= symbol from any module" — which
-        produced nonsense like ``ntdll!__guard...+0x3a6e9a376`` for
-        VAs in user32 (just the closest known symbol overall, regardless
-        of which module the VA was in).
-
-        Fix: only consider modules whose ``[base, base+size)`` range
-        contains ``va``. If no module covers it, return None rather
-        than report a wrong-module guess. If a module has no recorded
-        size (legacy store entry), use ``_LEGACY_SIZE_FALLBACK`` as a
-        coarse upper bound.
-
-        Symbol display goes through ``demangle.pretty_symbol`` so
-        mangled C++ names render as readable signatures.
-        """
-        from winbox.kdbg.demangle import pretty_symbol
-        try:
-            modules = self.store.list_modules()
-        except Exception:
-            return None
-        best: tuple[str, str, int] | None = None
-        for module in modules:
-            try:
-                data = self.store.load(module)
-            except Exception:
-                continue
-            base = data.get("base") or 0
-            if not base:
-                continue
-            size = data.get("size_of_image") or self._LEGACY_SIZE_FALLBACK
-            # Filter: this module actually contains the VA?
-            if not (base <= va < base + size):
-                continue
-            symbols = data.get("symbols", {})
-            local_best: tuple[str, int] | None = None
-            for name, rva in symbols.items():
-                target = base + rva
-                if target <= va and (local_best is None or target > local_best[1]):
-                    local_best = (name, target)
-            if local_best is None:
-                continue
-            # Among modules that contain the VA, pick the one with the
-            # closest symbol. (In practice the VA is in exactly one
-            # module's range; this only matters for overlapping ranges
-            # which shouldn't happen but cheap to handle.)
-            if best is None or local_best[1] > best[2]:
-                best = (module, local_best[0], local_best[1])
-        if best is None:
-            return None
-        module, name, addr = best
-        return f"{pretty_symbol(f'{module}!{name}')}+0x{va - addr:x}"
+        from winbox.kdbg.format import symbolicate_va
+        return symbolicate_va(self.store, va)
 
     # ── serve loop ──────────────────────────────────────────────────────
 

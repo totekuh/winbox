@@ -61,8 +61,8 @@ class FakeRsp:
     def __init__(self, regs_blob=None, threads=("01",)) -> None:
         self.regs_blob = regs_blob or _blob()
         self._threads = list(threads)
-        self.bps_inserted: list[int] = []
-        self.bps_removed: list[int] = []
+        self.bps_inserted: list = []
+        self.bps_removed: list = []
         self.continued = 0
         self.stepped = 0
         self.interrupted = 0
@@ -80,11 +80,13 @@ class FakeRsp:
     def read_cr3(self) -> int:
         return struct.unpack_from("<Q", self.regs_blob, _CR3_OFFSET)[0]
 
-    def insert_breakpoint(self, addr: int, *, kind: int = 1, hardware: bool = False) -> None:
-        self.bps_inserted.append(addr)
+    def insert_breakpoint(self, addr: int, *, kind: int = 1,
+                          hardware: bool = False, wp_type: str | None = None) -> None:
+        self.bps_inserted.append((addr, kind, hardware, wp_type))
 
-    def remove_breakpoint(self, addr: int, *, kind: int = 1, hardware: bool = False) -> None:
-        self.bps_removed.append(addr)
+    def remove_breakpoint(self, addr: int, *, kind: int = 1,
+                          hardware: bool = False, wp_type: str | None = None) -> None:
+        self.bps_removed.append((addr, kind, hardware, wp_type))
 
     def cont(self) -> None:
         self.continued += 1
@@ -197,7 +199,7 @@ def test_bp_add_kernel_va_uses_plain_z0():
     reply = session.handle_op("bp_add", {"target": "nt!SwapContext"})
     assert reply["ok"]
     assert reply["result"]["user_mode"] is False
-    assert rsp.bps_inserted == [0xfffff80608628520]
+    assert rsp.bps_inserted == [(0xfffff80608628520, 1, True, None)]
 
 
 # ── op_bp_add (user) — uses real install_user_breakpoint internally ────
@@ -389,7 +391,7 @@ def test_bp_remove_drops_from_registry_and_calls_z0():
     bp_id = add_reply["result"]["id"]
     rm_reply = session.handle_op("bp_remove", {"id": bp_id})
     assert rm_reply["ok"]
-    assert rsp.bps_removed == [0xfffff80608000000]
+    assert rsp.bps_removed == [(0xfffff80608000000, 1, True, None)]
     # registry empty
     list_reply = session.handle_op("bp_list", {})
     assert list_reply["result"]["bps"] == []
@@ -407,9 +409,9 @@ def test_bp_remove_routes_to_correct_packet():
     rsp = FakeRsp()
     rm_calls: list[bool] = []
     real_remove = rsp.remove_breakpoint
-    def tracking_remove(addr, *, kind=1, hardware=False):
+    def tracking_remove(addr, *, kind=1, hardware=False, wp_type=None):
         rm_calls.append(hardware)
-        real_remove(addr, kind=kind, hardware=hardware)
+        real_remove(addr, kind=kind, hardware=hardware, wp_type=wp_type)
     rsp.remove_breakpoint = tracking_remove
 
     store = FakeStore({"nt!Foo": 0xfffff80608000000})
@@ -444,9 +446,9 @@ def _track_masquerade(rsp):
 
     orig_remove = rsp.remove_breakpoint
 
-    def tracking_remove(addr, *, kind=1, hardware=False):
+    def tracking_remove(addr, *, kind=1, hardware=False, wp_type=None):
         remove_cr3.append(struct.unpack_from("<Q", rsp.regs_blob, _CR3_OFFSET)[0])
-        orig_remove(addr, kind=kind, hardware=hardware)
+        orig_remove(addr, kind=kind, hardware=hardware, wp_type=wp_type)
 
     rsp.remove_breakpoint = tracking_remove
     return cr3_writes, remove_cr3
@@ -482,7 +484,7 @@ def test_bp_remove_user_soft_masquerades_cr3():
     assert cr3_writes == [0x4d6bb000, 0x1ae000]
     # The z0 removal happened while masqueraded as target.dtb.
     assert remove_cr3 == [0x4d6bb000]
-    assert rsp.bps_removed == [user_va]
+    assert rsp.bps_removed == [(user_va, 1, False, None)]
 
 
 def test_shutdown_user_soft_bp_removed_under_masquerade():
@@ -2765,3 +2767,124 @@ class TestUnfiredHwBpWarnings:
         assert 0 in ids
         assert 1 not in ids  # has hits
         assert 2 in ids
+
+
+# ── Watchpoint tests (item 14) ────────────────────────────────────────
+
+_KERNEL_VA_WP = 0xfffff80608628780
+
+
+class TestWatchpointAdd:
+    def test_write_watchpoint_sends_z2(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!SomeVar": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        reply = session.handle_op(
+            "bp_add", {"target": "nt!SomeVar", "wp_type": "write", "wp_size": 4},
+        )
+        assert reply["ok"]
+        r = reply["result"]
+        assert r["wp_type"] == "write"
+        assert r["wp_size"] == 4
+        assert r["hw"] is True
+        assert rsp.bps_inserted == [(_KERNEL_VA_WP, 4, False, "write")]
+
+    def test_read_watchpoint_sends_z3(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!SomeVar": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        reply = session.handle_op(
+            "bp_add", {"target": "nt!SomeVar", "wp_type": "read", "wp_size": 8},
+        )
+        assert reply["ok"]
+        assert rsp.bps_inserted == [(_KERNEL_VA_WP, 8, False, "read")]
+
+    def test_access_watchpoint_sends_z4(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!SomeVar": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        reply = session.handle_op(
+            "bp_add", {"target": "nt!SomeVar", "wp_type": "access", "wp_size": 2},
+        )
+        assert reply["ok"]
+        assert rsp.bps_inserted == [(_KERNEL_VA_WP, 2, False, "access")]
+
+    def test_invalid_wp_type_rejected(self):
+        session = _make_session(store=FakeStore({"nt!X": _KERNEL_VA_WP}))
+        reply = session.handle_op(
+            "bp_add", {"target": "nt!X", "wp_type": "execute"},
+        )
+        assert reply["ok"] is False
+        assert "wp_type" in reply["error"]
+
+    def test_invalid_wp_size_rejected(self):
+        session = _make_session(store=FakeStore({"nt!X": _KERNEL_VA_WP}))
+        reply = session.handle_op(
+            "bp_add", {"target": "nt!X", "wp_type": "write", "wp_size": 3},
+        )
+        assert reply["ok"] is False
+        assert "wp_size" in reply["error"]
+
+    def test_watchpoint_with_condition(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        reply = session.handle_op(
+            "bp_add", {
+                "target": "nt!X", "wp_type": "write", "wp_size": 4,
+                "condition": "rax == 0x42",
+            },
+        )
+        assert reply["ok"]
+        assert reply["result"]["condition"] == "rax == 0x42"
+
+
+class TestWatchpointRemove:
+    def test_remove_sends_correct_z_packet(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        add_reply = session.handle_op(
+            "bp_add", {"target": "nt!X", "wp_type": "write", "wp_size": 4},
+        )
+        bp_id = add_reply["result"]["id"]
+        rm_reply = session.handle_op("bp_remove", {"id": bp_id})
+        assert rm_reply["ok"]
+        assert rsp.bps_removed == [(_KERNEL_VA_WP, 4, False, "write")]
+
+    def test_remove_clears_registry(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        add_reply = session.handle_op(
+            "bp_add", {"target": "nt!X", "wp_type": "access", "wp_size": 8},
+        )
+        bp_id = add_reply["result"]["id"]
+        session.handle_op("bp_remove", {"id": bp_id})
+        assert session.bps == {}
+
+
+class TestWatchpointList:
+    def test_list_includes_wp_fields(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        session.handle_op(
+            "bp_add", {"target": "nt!X", "wp_type": "write", "wp_size": 4},
+        )
+        reply = session.handle_op("bp_list", {})
+        assert reply["ok"]
+        bps = reply["result"]["bps"]
+        assert len(bps) == 1
+        assert bps[0]["wp_type"] == "write"
+        assert bps[0]["wp_size"] == 4
+
+    def test_exec_bp_has_no_wp_fields(self):
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        session.handle_op("bp_add", {"target": "nt!X", "mode": "hw"})
+        reply = session.handle_op("bp_list", {})
+        bps = reply["result"]["bps"]
+        assert "wp_type" not in bps[0]
+        assert "wp_size" not in bps[0]
