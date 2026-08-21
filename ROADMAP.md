@@ -147,16 +147,10 @@ Three findings from the read-surface audit were left as-is, deliberately:
   sharply once `SymbolStore.load` was memoized (2026-08-10), so this is a low
   priority.
 
-### 10. Conditional breakpoints fail closed and indistinguishably from a real null
-
-`_mem_qword_reader` (`daemon.py`) returns `0` both when a VA is genuinely
-unmapped and when the RSP read itself fails (session flakiness). A predicate
-like `[rcx+0x10] != 0` can silently never fire for the wrong reason, with
-nothing telling the operator the condition — not the target — is why nothing
-happened. This is a documented tradeoff, not an oversight, but it's
-indistinguishable from "the bug just didn't repro." Fix: propagate a distinct
-sentinel/exception for read failure vs. unmapped VA through predicate
-evaluation instead of coercing both to 0.
+**10. Fixed.** See item 44 — `_mem_qword_reader` now distinguishes unmapped
+VA (returns 0, counts on bp) from transport failure (raises). Operator sees
+`predicate_read_errors` in `bp_list` instead of wondering why the bp never
+fires.
 
 ### 11. `pdb.py` silently drops structs its regex parser can't match
 
@@ -245,8 +239,8 @@ detach cleaned up without crash, GA survived.
 
 ### Capability roadmap (2026-08-21)
 
-**42. Step-out.** Plant temp hw bp at return address (read `[rsp]`), cont
-until it fires, remove. Same pattern as step-over. Trivial implementation.
+**42. Fixed.** `kdbg_step(out=True)` reads `[rsp]`, plants temp hw bp at
+return address, conts until hit. Shares `_run_to` helper with step-over.
 
 **43. User-mode symbol resolution in bt/disasm.** `kdbg_bt` and
 `kdbg_disasm` only resolve nt symbols. Loading target module + ntdll PDBs
@@ -254,10 +248,9 @@ until it fires, remove. Same pattern as step-over. Trivial implementation.
 output would make backtraces useful for the AV/EDR user-mode components
 kdbg targets. The plumbing exists, just not wired.
 
-**44. Conditional bp memory predicates with meaningful errors.** Item 10's
-fix: propagate distinct sentinel for read failure vs. unmapped VA through
-predicate evaluation. Surface "read at 0x... failed" instead of silently
-treating as 0. Prevents hours of "why isn't my conditional bp firing."
+**44. Fixed.** `_mem_qword_reader` now distinguishes unmapped VA (return 0,
+count `predicate_read_errors` on bp) from transport failure (raise
+`PredicateRuntimeError`). `bp_list` surfaces the read error count.
 
 **45. Expression evaluator: chained dereferences.** Current predicates are
 `[reg+off] op value`. Adding `poi(poi(rcx+0x10)+0x8) == 0x1234` (chained
