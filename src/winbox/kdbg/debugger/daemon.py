@@ -560,6 +560,13 @@ class DaemonSession:
             "condition": condition,
             "elapsed_ms": round(elapsed_ms, 2),
         }
+        if mode == "auto" and hw_error is not None and not installed_hw:
+            result["downgrade_warning"] = (
+                f"mode='auto' fell back to software breakpoint "
+                f"(hw failed: {hw_error}). Software breakpoints patch 0xCC "
+                f"into the code page — PatchGuard-visible and "
+                f"hash-detectable on kernel addresses."
+            )
 
         # Item #30 Part A: one-time hw bp verification probe on first
         # hw bp installed in this session.
@@ -584,7 +591,7 @@ class DaemonSession:
 
         # Pick a hot kernel symbol from the store.
         probe_va = None
-        for sym in ("nt!KiPageFault", "nt!KeQueryPerformanceCounter"):
+        for sym in ("nt!KeQueryInterruptTimePrecise", "nt!KiPageFault", "nt!KeQueryPerformanceCounter"):
             try:
                 probe_va = self.store.resolve(sym)
                 break
@@ -607,7 +614,7 @@ class DaemonSession:
         try:
             self.rsp.cont()
             try:
-                sr = self.rsp.wait_for_stop(timeout=0.3)
+                sr = self.rsp.wait_for_stop(timeout=1.0)
                 # Check if we got SIGTRAP at the probe address.
                 if sr.signal == 5:
                     # Read rip to confirm it's at the probe VA.
@@ -626,7 +633,7 @@ class DaemonSession:
                         "hardware breakpoints may not fire on this guest"
                     )
             except RspError:
-                # Timeout — no stop arrived in 300ms.
+                # Timeout — no stop arrived in 1s.
                 # Interrupt to re-halt the VM.
                 self.rsp.interrupt()
                 try:
@@ -635,7 +642,7 @@ class DaemonSession:
                     pass
                 warning = (
                     "hw bp probe timed out: no hit on a hot kernel path within "
-                    "300ms. Hardware breakpoints may not fire — common causes: "
+                    "1s. Hardware breakpoints may not fire — common causes: "
                     "HVCI intercepting DR writes, nested virtualization quirks, "
                     "or QEMU gdbstub bugs. Consider mode='soft' if your target "
                     "breakpoints never fire."

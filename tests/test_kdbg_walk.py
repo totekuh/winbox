@@ -361,3 +361,113 @@ def test_find_process_matches_name_longer_than_15_chars(monkeypatch):
     assert find_process("winbox", None, name="SecurityHealthService.exe") is rec
     # A different long name that truncates differently must NOT match.
     assert find_process("winbox", None, name="NotepadPlusPlusReally.exe") is None
+
+
+# ── KPTI stabilization ────────────────────────────────────────────────
+
+
+def test_list_processes_switches_to_system_dtb(monkeypatch):
+    """After reading System (PID 4), the walker should switch to its DTB
+    for subsequent reads — stabilizes the walk against KPTI CR3 races."""
+    from winbox.kdbg.walk import list_processes
+
+    HEAD = 0xFFFFF800_00C26340
+    SYSTEM = 0xFFFFE000_00100000
+    PROC2 = 0xFFFFE000_00200000
+    SYS_DTB = 0x1ae000
+    CPU_CR3 = 0x999000  # different from SYS_DTB
+
+    apl_off = _PROC_TYPES["_EPROCESS"]["fields"]["ActiveProcessLinks"]["off"]
+    pid_off = _PROC_TYPES["_EPROCESS"]["fields"]["UniqueProcessId"]["off"]
+    img_off = _PROC_TYPES["_EPROCESS"]["fields"]["ImageFileName"]["off"]
+    dtb_off = _PROC_TYPES["_KPROCESS"]["fields"]["DirectoryTableBase"]["off"]
+    user_off = _PROC_TYPES["_KPROCESS"]["fields"]["UserDirectoryTableBase"]["off"]
+
+    sys_flink = SYSTEM + apl_off
+    p2_flink = PROC2 + apl_off
+    qwords = {
+        HEAD: sys_flink,
+        sys_flink: p2_flink,
+        SYSTEM + pid_off: 4,
+        SYSTEM + dtb_off: SYS_DTB,
+        SYSTEM + user_off: 0,
+        p2_flink: HEAD,
+        PROC2 + pid_off: 1234,
+        PROC2 + dtb_off: 0x5678000,
+        PROC2 + user_off: 0,
+    }
+
+    cr3s_used = []
+
+    def tracking_read_u64(vm, cr3, va, cache):
+        cr3s_used.append(cr3)
+        return qwords[va]
+
+    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3", lambda vm: CPU_CR3)
+    monkeypatch.setattr("winbox.kdbg.walk._read_u64", tracking_read_u64)
+    monkeypatch.setattr("winbox.kdbg.walk._read_cstr",
+                        lambda vm, cr3, va, n, cache: "System" if va == SYSTEM + img_off else "proc2.exe")
+
+    class S:
+        def resolve(self, name):
+            return HEAD
+        def struct(self, t, field=None, *, module="nt"):
+            return _PROC_TYPES[t]
+
+    procs = list_processes("vm", S())
+    assert len(procs) == 2
+    assert procs[0].pid == 4
+    assert procs[1].pid == 1234
+
+    # First reads use CPU_CR3, reads after System should use SYS_DTB
+    first_read_cr3 = cr3s_used[0]
+    assert first_read_cr3 == CPU_CR3
+    # After System is read, subsequent reads must use SYS_DTB
+    last_read_cr3 = cr3s_used[-1]
+    assert last_read_cr3 == SYS_DTB
+
+
+def test_list_processes_no_switch_when_system_dtb_matches(monkeypatch):
+    """If System's DTB matches the current CR3, no switch needed."""
+    from winbox.kdbg.walk import list_processes
+
+    HEAD = 0xFFFFF800_00C26340
+    SYSTEM = 0xFFFFE000_00100000
+    DTB = 0x1ae000
+
+    apl_off = _PROC_TYPES["_EPROCESS"]["fields"]["ActiveProcessLinks"]["off"]
+    pid_off = _PROC_TYPES["_EPROCESS"]["fields"]["UniqueProcessId"]["off"]
+    dtb_off = _PROC_TYPES["_KPROCESS"]["fields"]["DirectoryTableBase"]["off"]
+    user_off = _PROC_TYPES["_KPROCESS"]["fields"]["UserDirectoryTableBase"]["off"]
+    img_off = _PROC_TYPES["_EPROCESS"]["fields"]["ImageFileName"]["off"]
+
+    sys_flink = SYSTEM + apl_off
+    qwords = {
+        HEAD: sys_flink,
+        sys_flink: HEAD,
+        SYSTEM + pid_off: 4,
+        SYSTEM + dtb_off: DTB,
+        SYSTEM + user_off: 0,
+    }
+
+    cr3s_used = []
+
+    def tracking_read_u64(vm, cr3, va, cache):
+        cr3s_used.append(cr3)
+        return qwords[va]
+
+    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3", lambda vm: DTB)
+    monkeypatch.setattr("winbox.kdbg.walk._read_u64", tracking_read_u64)
+    monkeypatch.setattr("winbox.kdbg.walk._read_cstr",
+                        lambda vm, cr3, va, n, cache: "System")
+
+    class S:
+        def resolve(self, name):
+            return HEAD
+        def struct(self, t, field=None, *, module="nt"):
+            return _PROC_TYPES[t]
+
+    procs = list_processes("vm", S())
+    assert len(procs) == 1
+    # All reads should use the same CR3
+    assert all(c == DTB for c in cr3s_used)

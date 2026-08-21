@@ -327,6 +327,20 @@ def test_bp_add_auto_falls_back_to_soft_on_no_slots(monkeypatch):
     assert reply["ok"]
     assert reply["result"]["hw"] is False
     assert soft_installed == [0xfffff80608000000]
+    assert "downgrade_warning" in reply["result"]
+    assert "PatchGuard" in reply["result"]["downgrade_warning"]
+
+
+def test_bp_add_auto_no_warning_when_hw_succeeds():
+    """mode=auto: Z1 succeeds -> no downgrade warning."""
+    rsp = FakeRsp()
+    store = FakeStore({"nt!Foo": 0xfffff80608000000})
+    session = _make_session(rsp=rsp, store=store)
+    session._hw_bp_verified = True  # skip probe
+    reply = session.handle_op("bp_add", {"target": "nt!Foo", "mode": "auto"})
+    assert reply["ok"]
+    assert reply["result"]["hw"] is True
+    assert "downgrade_warning" not in reply["result"]
 
 
 def test_bp_add_invalid_mode_errors():
@@ -2433,8 +2447,8 @@ class TestHwBpProbe:
                 self.continued += 1
 
             def wait_for_stop(self, *, timeout=None):
-                if timeout is not None and timeout < 1.0:
-                    # Probe timeout
+                if timeout is not None and timeout <= 1.0:
+                    # Probe timeout (probe uses 1.0s)
                     raise RspError("read timed out")
                 return StopReply(signal=5, thread="01", stop_kind="hwbreak",
                                 raw="T05hwbreak:;thread:01;")

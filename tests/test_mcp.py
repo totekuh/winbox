@@ -3321,7 +3321,8 @@ class TestKdbgDaemonTools:
         client = MagicMock()
         client.session_alive.side_effect = [True, False]
         client.call.return_value = {"shutting_down": True}
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.kdbg.hmp.ensure_not_paused", return_value=None):
             result = kdbg_detach()
         client.call.assert_called_once_with("detach")
         assert result == "detached"

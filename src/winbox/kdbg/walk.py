@@ -225,6 +225,12 @@ def list_processes(
             pid=pid, name=name, eprocess=eproc, directory_table_base=dtb,
             user_directory_table_base=user_dtb,
         ))
+        # KPTI stabilization: System (first EPROCESS, PID 4) always has
+        # a valid kernel CR3. Switch to it for the rest of the walk to
+        # avoid mid-walk KPTI CR3 races on a running VM.
+        if len(results) == 1 and pid == 4 and dtb != cr3:
+            cr3 = dtb
+            cache = WalkCache()
         flink = _read_u64(vm_name, cr3, flink, cache)
     if len(results) >= MAX_PROCESSES:
         logger.warning(
@@ -284,7 +290,15 @@ def list_modules(
     size_off = ldr_fields["SizeOfImage"]["off"]
     base_name_off = ldr_fields["BaseDllName"]["off"]
 
-    flink = _read_u64(vm_name, cr3, head, cache)
+    # On KPTI builds the CPU may be in user mode — its CR3 maps only a
+    # kernel stub. If the first read fails, retry with CR3 ^ 0x1000
+    # (the kernel-mode KPTI half), same as list_processes.
+    try:
+        flink = _read_u64(vm_name, cr3, head, cache)
+    except (PageWalkError, HmpError):
+        cr3 ^= 0x1000
+        cache = WalkCache()
+        flink = _read_u64(vm_name, cr3, head, cache)
     results: list[ModuleRecord] = []
     seen: set[int] = set()
     while flink != head and flink != 0 and len(results) < MAX_MODULES:
