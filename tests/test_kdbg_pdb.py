@@ -216,3 +216,16 @@ def test_parse_types_skips_forward_refs_with_missing_fields():
 """
     types = parse_types(fixture, ["_ONLY_FWD"])
     assert types == {}
+
+
+def test_parse_types_raises_on_empty_fields():
+    """If a struct is found but has zero fields, the regex drifted —
+    raise instead of returning a useless empty layout."""
+    fixture = """
+   0x2000 | LF_FIELDLIST [size = 16]
+   0x2001 | LF_STRUCTURE [size = 48] `_BROKEN_STRUCT`
+            vtable: <no type>, base list: <no type>, field list: 0x2000
+            options: has unique name, sizeof 256
+"""
+    with pytest.raises(ValueError, match="zero fields"):
+        parse_types(fixture, ["_BROKEN_STRUCT"])

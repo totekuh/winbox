@@ -329,17 +329,20 @@ def parse_types(text: str, wanted: Iterable[str]) -> dict[str, StructLayout]:
 
     missing = wanted_set - layouts.keys()
     if missing:
-        # Warn loudly instead of the previous silent `pass`: a missing wanted
-        # type otherwise surfaces only as a confusing "type not found" deep in
-        # a later walk. Truncation by timeout / non-zero exit is already caught
-        # upstream in _run_dump (it raises), and a wanted type can legitimately
-        # be forward-ref-only or absent, so this stays a warning — not a hard
-        # failure that would reject those valid partial loads. The daemon log
-        # captures it so an incomplete struct map is diagnosable.
         _log.warning(
             "parse_types: %d/%d wanted type(s) not found (%s) — struct map is "
             "incomplete; llvm-pdbutil output may be truncated",
             len(missing), len(wanted_set), ", ".join(sorted(missing)),
+        )
+
+    empty = [name for name, layout in layouts.items() if not layout.fields]
+    if empty:
+        raise ValueError(
+            f"parse_types: {len(empty)} type(s) have zero fields after "
+            f"parsing ({', '.join(sorted(empty))}). This usually means "
+            f"llvm-pdbutil output format drifted and the field-line regex "
+            f"no longer matches. Check _MEMBER_RE against current "
+            f"llvm-pdbutil --types output."
         )
 
     return layouts
