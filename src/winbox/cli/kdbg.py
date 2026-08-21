@@ -830,13 +830,12 @@ def kdbg_session(ctx: click.Context) -> None:
 @kdbg.command("bp")
 @click.argument("target", metavar="VA_OR_SYMBOL")
 @click.option(
-    "--mode", type=click.Choice(["hw", "soft", "auto"], case_sensitive=False),
+    "--mode", type=click.Choice(["hw", "soft"], case_sensitive=False),
     default="hw", show_default=True,
     help=(
         "Breakpoint mechanism. 'hw' uses CPU debug registers (Z1) — "
         "PG-safe and anti-debug-invisible, limit 4 per vCPU. "
-        "'soft' uses 0xCC patches (Z0) — unlimited but PG/hash visible. "
-        "'auto' tries hw first, falls back to soft on slot exhaustion."
+        "'soft' uses 0xCC patches (Z0) — unlimited but PG/hash visible."
     ),
 )
 @click.option(

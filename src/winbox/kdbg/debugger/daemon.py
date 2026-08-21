@@ -484,31 +484,25 @@ class DaemonSession:
         va = self._resolve_target(target)
         is_user = (va >> 47) != 0x1FFFF  # canonical-high == kernel half
 
-        if mode not in ("hw", "soft", "auto"):
-            raise ValueError(f"mode must be 'hw', 'soft', or 'auto'; got {mode!r}")
+        if mode not in ("hw", "soft"):
+            raise ValueError(
+                f"mode must be 'hw' or 'soft'; got {mode!r}. "
+                f"Breakpoints must carry their type explicitly — "
+                f"no silent fallback."
+            )
 
-        # Track how the bp got installed for the registry + reply.
         installed_hw = False
         elapsed_ms = 0.0
 
-        hw_error: Exception | None = None
-        if mode in ("hw", "auto"):
-            # Try hw first: DR-register breakpoints are PatchGuard-safe and
-            # invisible to in-guest anti-debug, so they are always preferred.
+        if mode == "hw":
             t0 = time.monotonic()
             try:
                 self.rsp.insert_breakpoint(va, kind=1, hardware=True)
                 installed_hw = True
                 elapsed_ms = (time.monotonic() - t0) * 1000.0
             except RspError as e:
-                hw_error = e
-                if mode == "hw":
-                    raise RuntimeError(_hw_bp_failure(e)) from e
-                # mode == "auto" — fall through to soft path
-
-        if not installed_hw:
-            # Software path. Kernel VAs get plain Z0 (kernel pages are
-            # in every CR3); user VAs need the CR3-masquerade dance.
+                raise RuntimeError(_hw_bp_failure(e)) from e
+        else:
             t0 = time.monotonic()
             try:
                 if is_user:
@@ -518,17 +512,13 @@ class DaemonSession:
                         user_va=va,
                     )
                     elapsed_ms = report.elapsed * 1000.0
-                    # install_user_breakpoint issues its own Hg (threads[0])
-                    # via code we don't own — invalidate the cache so the
-                    # next op_cont re-selects rather than trusting a stale
-                    # _last_selected_vcpu.
                     self._last_selected_vcpu = None
                 else:
                     self.rsp.insert_breakpoint(va, kind=1)
                     elapsed_ms = (time.monotonic() - t0) * 1000.0
             except (RspError, InstallError) as e:
                 raise RuntimeError(
-                    _soft_bp_failure(e, is_user=is_user, hw_error=hw_error)
+                    _soft_bp_failure(e, is_user=is_user)
                 ) from e
 
         bp_id = self._next_bp_id
@@ -560,14 +550,6 @@ class DaemonSession:
             "condition": condition,
             "elapsed_ms": round(elapsed_ms, 2),
         }
-        if mode == "auto" and hw_error is not None and not installed_hw:
-            result["downgrade_warning"] = (
-                f"mode='auto' fell back to software breakpoint "
-                f"(hw failed: {hw_error}). Software breakpoints patch 0xCC "
-                f"into the code page — PatchGuard-visible and "
-                f"hash-detectable on kernel addresses."
-            )
-
         # Item #30 Part A: one-time hw bp verification probe on first
         # hw bp installed in this session.
         if installed_hw and not self._hw_bp_verified:
@@ -1750,7 +1732,7 @@ def _hw_bp_failure(err: Exception) -> str:
             f"hw bp install timed out: {err}. The stub stopped answering "
             f"rather than refusing — the guest may be busy, or all four "
             f"DR0..3 slots (per-vCPU) may already be taken. Check `kdbg bps`, "
-            f"and try mode='auto' to fall back to a software breakpoint."
+            f"Use mode='soft' for a software breakpoint instead."
         )
     return (
         f"hw bp install failed: {err}. The 4-slot DR0..3 budget is the usual "
@@ -1759,9 +1741,7 @@ def _hw_bp_failure(err: Exception) -> str:
     )
 
 
-def _soft_bp_failure(
-    err: Exception, *, is_user: bool, hw_error: Exception | None
-) -> str:
+def _soft_bp_failure(err: Exception, *, is_user: bool) -> str:
     """Explain a failed software breakpoint.
 
     A software breakpoint writes 0xCC into the code page. Windows 11 enables
@@ -1777,8 +1757,6 @@ def _soft_bp_failure(
             "Windows 11. If this guest is a client SKU, hardware breakpoints "
             "(mode='hw') are the only ones that will install."
         )
-    if hw_error is not None:
-        parts.append(f"The hardware path was tried first and also failed: {hw_error}")
     return " ".join(parts)
 
 

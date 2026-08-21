@@ -3276,11 +3276,7 @@ def kdbg_bp(target: str, mode: str = "hw", condition: str | None = None) -> str:
                 anti-debug-invisible. Limit 4 per vCPU.
             ``"soft"`` — software 0xCC patch via Z0. Unlimited
                 count but visible to code self-hashing and
-                PatchGuard. Use when >4 hw bps needed or for
-                bp on data ranges (future).
-            ``"auto"`` — try hw first, fall back to soft on slot
-                exhaustion. Inspect the returned ``hw`` field to
-                see which path you got.
+                PatchGuard. Use when >4 hw bps needed.
         condition: Optional predicate evaluated server-side on every
             in-target fire. False predicate -> silent-cont (no halt
             surfaced). True predicate -> halt as today. Use this to

@@ -310,37 +310,13 @@ def test_bp_add_hw_no_slots_clear_error():
     assert "slot" in reply["error"].lower() or "budget" in reply["error"].lower()
 
 
-def test_bp_add_auto_falls_back_to_soft_on_no_slots(monkeypatch):
-    """mode=auto: Z1 fails -> Z0 path runs -> result has hw=False."""
-    from winbox.kdbg.debugger.rsp import RspError
-    rsp = FakeRsp()
-    soft_installed: list[int] = []
-    def half_reject(addr, *, kind=1, hardware=False):
-        if hardware:
-            raise RspError(f"Z1 insert at 0x{addr:x} failed: b'E22'")
-        soft_installed.append(addr)
-    rsp.insert_breakpoint = half_reject
-
+def test_bp_add_auto_mode_rejected():
+    """mode='auto' is no longer accepted — breakpoints must carry type explicitly."""
     store = FakeStore({"nt!Foo": 0xfffff80608000000})
-    session = _make_session(rsp=rsp, store=store)
+    session = _make_session(store=store)
     reply = session.handle_op("bp_add", {"target": "nt!Foo", "mode": "auto"})
-    assert reply["ok"]
-    assert reply["result"]["hw"] is False
-    assert soft_installed == [0xfffff80608000000]
-    assert "downgrade_warning" in reply["result"]
-    assert "PatchGuard" in reply["result"]["downgrade_warning"]
-
-
-def test_bp_add_auto_no_warning_when_hw_succeeds():
-    """mode=auto: Z1 succeeds -> no downgrade warning."""
-    rsp = FakeRsp()
-    store = FakeStore({"nt!Foo": 0xfffff80608000000})
-    session = _make_session(rsp=rsp, store=store)
-    session._hw_bp_verified = True  # skip probe
-    reply = session.handle_op("bp_add", {"target": "nt!Foo", "mode": "auto"})
-    assert reply["ok"]
-    assert reply["result"]["hw"] is True
-    assert "downgrade_warning" not in reply["result"]
+    assert reply["ok"] is False
+    assert "explicitly" in reply["error"]
 
 
 def test_bp_add_invalid_mode_errors():
@@ -438,8 +414,7 @@ def test_bp_remove_routes_to_correct_packet():
     store = FakeStore({"nt!Foo": 0xfffff80608000000})
     session = _make_session(rsp=rsp, store=store)
 
-    # Install one hw, one soft (using auto path won't work since FakeRsp
-    # always succeeds — explicit modes).
+    # Install one hw, one soft.
     hw_id = session.handle_op("bp_add", {"target": "nt!Foo", "mode": "hw"})["result"]["id"]
     soft_id = session.handle_op("bp_add", {"target": "nt!Foo", "mode": "soft"})["result"]["id"]
 
@@ -2202,7 +2177,7 @@ class TestBreakpointFailureExplanations:
         assert "stopped answering" in msg
         # Slots are still a possibility, just not asserted as the cause.
         assert "may" in msg
-        assert "auto" in msg
+        assert "soft" in msg
 
     def test_hw_refusal_points_at_the_slot_budget(self):
         from winbox.kdbg.debugger.daemon import _hw_bp_failure
@@ -2219,7 +2194,7 @@ class TestBreakpointFailureExplanations:
         from winbox.kdbg.debugger.daemon import _soft_bp_failure
         from winbox.kdbg.debugger.rsp import RspError
 
-        msg = _soft_bp_failure(RspError("read timed out"), is_user=False, hw_error=None)
+        msg = _soft_bp_failure(RspError("read timed out"), is_user=False)
 
         assert "HVCI" in msg
         assert "0xCC" in msg
@@ -2231,23 +2206,9 @@ class TestBreakpointFailureExplanations:
         from winbox.kdbg.debugger.daemon import _soft_bp_failure
         from winbox.kdbg.debugger.rsp import RspError
 
-        msg = _soft_bp_failure(RspError("read timed out"), is_user=True, hw_error=None)
+        msg = _soft_bp_failure(RspError("read timed out"), is_user=True)
 
         assert "HVCI" not in msg
-
-    def test_auto_reports_both_failures(self):
-        """In auto mode the hw attempt already happened; hiding it makes the
-        soft error look like the only thing that was tried."""
-        from winbox.kdbg.debugger.daemon import _soft_bp_failure
-        from winbox.kdbg.debugger.rsp import RspError
-
-        msg = _soft_bp_failure(
-            RspError("soft boom"), is_user=False, hw_error=RspError("hw boom")
-        )
-
-        assert "soft boom" in msg
-        assert "hw boom" in msg
-        assert "tried first" in msg
 
 
 # ── op_stack ────────────────────────────────────────────────────────────
