@@ -215,15 +215,10 @@ nothing scopes a breakpoint's fire-tracking to a specific core or distributes
 hardware breakpoints per-vCPU. Low tractability relative to impact — this is
 cross-cutting, not a local patch — hence listed near last.
 
-### 18. Hardcoded register/CR3 offsets have no runtime sanity check
-
-`RspClient._CR3_OFFSET = 204` and the g-packet field offsets in `_decode_regs`
-are hardcoded, "verified against QEMU 8.x/9.x," with no cross-check at
-runtime — unlike `resolve_nt_base`, which sanity-checks its result
-(page-aligned, canonical). A future QEMU register-XML change would misdecode
-CR3/RIP silently instead of erroring. Fix: add the same kind of plausibility
-check `resolve_nt_base` already does, and raise instead of proceeding on a
-value that fails it.
+**18. Fixed.** `_validate_register_layout` checks RIP (canonical), CS
+(recognized selector), CR3 (non-zero, <52-bit cap) from the first g-packet
+at attach time. Catches QEMU register-XML drift before it silently corrupts
+CR3 filters and bp targeting.
 
 ### 19. `kdbg_attach` doesn't detect a concurrent interactive `gdb` session
 
@@ -247,6 +242,37 @@ and the `_wait_for_stop_serving` loop.
 **35. Tested 2026-08-21 — PASS.** Target killed mid-session (scheduled
 `Stop-Process` fires while cont running). Cont timed out (target gone),
 detach cleaned up without crash, GA survived.
+
+### Capability roadmap (2026-08-21)
+
+**42. Step-out.** Plant temp hw bp at return address (read `[rsp]`), cont
+until it fires, remove. Same pattern as step-over. Trivial implementation.
+
+**43. User-mode symbol resolution in bt/disasm.** `kdbg_bt` and
+`kdbg_disasm` only resolve nt symbols. Loading target module + ntdll PDBs
+(via existing `kdbg_user_symbols_load`) and integrating into bt/disasm
+output would make backtraces useful for the AV/EDR user-mode components
+kdbg targets. The plumbing exists, just not wired.
+
+**44. Conditional bp memory predicates with meaningful errors.** Item 10's
+fix: propagate distinct sentinel for read failure vs. unmapped VA through
+predicate evaluation. Surface "read at 0x... failed" instead of silently
+treating as 0. Prevents hours of "why isn't my conditional bp firing."
+
+**45. Expression evaluator: chained dereferences.** Current predicates are
+`[reg+off] op value`. Adding `poi(poi(rcx+0x10)+0x8) == 0x1234` (chained
+pointer chases) would cover most real filtering needs without a full
+scripting language.
+
+**46. Session persistence across MCP restarts.** The daemon survives but
+the MCP server loses its client object on reconnect. Recovery: re-read
+`session.json`, reconnect to daemon Unix socket. Eliminates the "restart
+MCP, lose debug session" friction.
+
+**47. Scriptable breakpoint actions.** On bp fire, auto-run a sequence:
+read N fields, log to file, cont. Turns kdbg into a lightweight tracing
+framework — "log every IOCTL code through this dispatcher" without manual
+cont loops. Needs a mini-DSL or Python callback registration.
 
 ---
 
