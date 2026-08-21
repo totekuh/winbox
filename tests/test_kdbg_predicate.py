@@ -13,6 +13,7 @@ from winbox.kdbg.debugger.predicate import (
     IntLit,
     MemRead,
     Or,
+    Poi,
     PredicateRuntimeError,
     PredicateSyntaxError,
     RegRef,
@@ -466,4 +467,110 @@ def test_parse_unicode_digit_after_first_digit_rejected():
     with pytest.raises(PredicateSyntaxError):
         # '1²' looks like one literal; the inner loop must not accept '²'.
         parse('1² == 1')
+
+
+# ── poi() chained dereferences ─────────────────────────────────────────
+
+
+def test_parse_poi_simple():
+    ast = parse("poi(rcx) == 0x42")
+    assert isinstance(ast, Cmp)
+    assert isinstance(ast.left, Poi)
+    assert isinstance(ast.left.inner, RegRef)
+    assert ast.left.inner.name == "rcx"
+    assert ast.left.offset == 0
+
+
+def test_parse_poi_with_offset():
+    ast = parse("poi(rcx+0x10) == 0")
+    assert isinstance(ast.left, Poi)
+    assert ast.left.offset == 0x10
+
+
+def test_parse_poi_with_negative_offset():
+    ast = parse("poi(rax-0x8) != 0")
+    assert isinstance(ast.left, Poi)
+    assert ast.left.offset == -0x8
+
+
+def test_parse_poi_nested():
+    ast = parse("poi(poi(rcx+0x10)+0x8) == 0x1234")
+    assert isinstance(ast, Cmp)
+    outer = ast.left
+    assert isinstance(outer, Poi)
+    assert outer.offset == 0x8
+    inner = outer.inner
+    assert isinstance(inner, Poi)
+    assert isinstance(inner.inner, RegRef) and inner.inner.name == "rcx"
+    assert inner.offset == 0x10
+
+
+def test_parse_poi_triple_nested():
+    ast = parse("poi(poi(poi(rcx))) == 0")
+    outer = ast.left
+    assert isinstance(outer, Poi)
+    mid = outer.inner
+    assert isinstance(mid, Poi)
+    inner = mid.inner
+    assert isinstance(inner, Poi)
+    assert isinstance(inner.inner, RegRef)
+
+
+def test_eval_poi_simple():
+    blob = _blob(rcx=0x1000)
+    mem = _mem_from({0x1000: 0xDEADBEEF})
+    ast = parse("poi(rcx) == 0xDEADBEEF")
+    assert ast.eval(blob, mem) == 1
+
+
+def test_eval_poi_with_offset():
+    blob = _blob(rcx=0x1000)
+    mem = _mem_from({0x1010: 0x42})
+    ast = parse("poi(rcx+0x10) == 0x42")
+    assert ast.eval(blob, mem) == 1
+
+
+def test_eval_poi_nested():
+    blob = _blob(rcx=0x1000)
+    mem = _mem_from({
+        0x1010: 0x2000,   # poi(rcx+0x10) = 0x2000
+        0x2008: 0x1234,   # poi(0x2000+0x8) = 0x1234
+    })
+    ast = parse("poi(poi(rcx+0x10)+0x8) == 0x1234")
+    assert ast.eval(blob, mem) == 1
+
+
+def test_eval_poi_nested_mismatch():
+    blob = _blob(rcx=0x1000)
+    mem = _mem_from({
+        0x1010: 0x2000,
+        0x2008: 0x9999,
+    })
+    ast = parse("poi(poi(rcx+0x10)+0x8) == 0x1234")
+    assert ast.eval(blob, mem) == 0
+
+
+def test_eval_poi_unmapped_raises():
+    blob = _blob(rcx=0x1000)
+    mem = _mem_from({})
+    ast = parse("poi(rcx)")
+    with pytest.raises(PredicateRuntimeError):
+        ast.eval(blob, mem)
+
+
+def test_eval_poi_in_boolean_combo():
+    blob = _blob(rcx=0x1000, rax=0x42)
+    mem = _mem_from({0x1000: 0xFF})
+    ast = parse("rax == 0x42 && poi(rcx) == 0xFF")
+    assert ast.eval(blob, mem) == 1
+
+
+def test_parse_poi_missing_paren():
+    with pytest.raises(PredicateSyntaxError):
+        parse("poi rcx == 0")
+
+
+def test_parse_poi_empty():
+    with pytest.raises(PredicateSyntaxError):
+        parse("poi() == 0")
 

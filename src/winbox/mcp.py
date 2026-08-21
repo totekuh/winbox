@@ -3310,6 +3310,8 @@ def kdbg_bp(
               regs    = rax rbx rcx rdx rsi rdi rbp rsp r8..r15 rip eflags
               memory  = ``[reg]``, ``[reg+0xN]``, ``[reg-0xN]``, ``[0xABS]``
                         (qword little-endian read in target's CR3)
+              deref   = ``poi(atom)`` or ``poi(atom+0xN)`` — chained
+                        qword read; ``poi()`` nests for pointer chases
               ops     = ``== != < <= > >=``, ``&`` (bitwise AND),
                         ``&& ||`` (short-circuit), parens
               literal = ``0x...`` or decimal
@@ -3319,6 +3321,7 @@ def kdbg_bp(
               ``[rsp+0x18] == 0x226048``
               ``(rax & 0x80000000) != 0``
               ``rcx == 0x4 && [rdx] != 0``
+              ``poi(poi(rcx+0x10)+0x8) == 0x1234``
 
             For string compares, encode the bytes as a little-endian
             qword literal yourself (e.g. ``"w00t"`` -> ``0x74303077``).

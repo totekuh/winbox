@@ -11,15 +11,17 @@ Grammar::
     and     := cmp ('&&' cmp)*
     cmp     := bitand (CMP bitand)?
     bitand  := atom ('&' atom)*
-    atom    := INT | REG | MEM | '(' or ')'
+    atom    := INT | REG | MEM | POI | '(' or ')'
     MEM     := '[' (REG | INT) (('+' | '-') INT)? ']'   # qword little-endian
+    POI     := 'poi' '(' atom (('+' | '-') INT)? ')'    # chained qword deref
     REG     := rax|rbx|rcx|rdx|rsi|rdi|rbp|rsp|r8..r15|rip|eflags
     INT     := 0x[0-9a-fA-F]+ | [0-9]+
     CMP     := == | != | < | <= | > | >=
 
 All values are 64-bit unsigned. Comparisons return 0/1. ``&&``/``||``
-short-circuit. There is no arithmetic outside the ``+`` / ``-`` offset
-inside ``[...]``.
+short-circuit. ``poi(expr)`` reads a qword at the address ``expr``
+evaluates to, enabling chained pointer chases:
+``poi(poi(rcx+0x10)+0x8) == 0x1234``.
 """
 
 from __future__ import annotations
@@ -115,6 +117,26 @@ class MemRead:
             # PredicateRuntimeError, so re-raise as one.
             raise PredicateRuntimeError(
                 f"mem read at 0x{addr:x} failed: {type(e).__name__}: {e}"
+            ) from e
+        return value & 0xFFFFFFFFFFFFFFFF
+
+
+@dataclass(frozen=True)
+class Poi:
+    """Chained qword deref: evaluate inner, add offset, read qword."""
+    inner: object
+    offset: int
+
+    def eval(self, regs: bytes, mem: Callable[[int], int]) -> int:
+        inner_val = self.inner.eval(regs, mem)
+        addr = (inner_val + self.offset) & 0xFFFFFFFFFFFFFFFF
+        try:
+            value = mem(addr)
+        except PredicateRuntimeError:
+            raise
+        except Exception as e:
+            raise PredicateRuntimeError(
+                f"poi read at 0x{addr:x} failed: {type(e).__name__}: {e}"
             ) from e
         return value & 0xFFFFFFFFFFFFFFFF
 
@@ -248,12 +270,15 @@ def _tokenize(src: str) -> list[tuple]:
             while j < n and (src[j].isalnum() or src[j] == "_"):
                 j += 1
             ident = src[i:j].lower()
-            if ident not in _REG_OFFSETS:
+            if ident == "poi":
+                out.append(("POI",))
+            elif ident not in _REG_OFFSETS:
                 raise PredicateSyntaxError(
                     f"unknown identifier {ident!r} at offset {i} "
-                    f"(allowed: {sorted(_REG_OFFSETS)})"
+                    f"(allowed: poi, {sorted(_REG_OFFSETS)})"
                 )
-            out.append(("REG", ident))
+            else:
+                out.append(("REG", ident))
             i = j
             continue
         raise PredicateSyntaxError(f"unexpected character {c!r} at offset {i}")
@@ -371,6 +396,16 @@ class _Parser:
                 return self._mem()
             finally:
                 self.depth -= 1
+        if t[0] == "POI":
+            self.depth += 1
+            if self.depth > _MAX_PAREN_DEPTH:
+                raise PredicateSyntaxError(
+                    f"expression too deep (max nesting {_MAX_PAREN_DEPTH})"
+                )
+            try:
+                return self._poi()
+            finally:
+                self.depth -= 1
         raise PredicateSyntaxError(f"unexpected token {t!r}")
 
     def _mem(self):
@@ -398,6 +433,25 @@ class _Parser:
             offset = sign * it[1]
         self._expect("RB")
         return MemRead(base, offset)
+
+    def _poi(self):
+        self._expect("POI")
+        self._expect("LP")
+        inner = self._atom()
+        offset = 0
+        nxt = self._peek()
+        if nxt is not None and nxt[0] in ("PLUS", "MINUS"):
+            sign = 1 if nxt[0] == "PLUS" else -1
+            self._eat()
+            it = self._peek()
+            if it is None or it[0] != "INT":
+                raise PredicateSyntaxError(
+                    f"expected INT after +/- inside poi(), got {it!r}"
+                )
+            self._eat()
+            offset = sign * it[1]
+        self._expect("RP")
+        return Poi(inner, offset)
 
 
 # ── Public API ─────────────────────────────────────────────────────────

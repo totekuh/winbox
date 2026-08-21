@@ -181,15 +181,6 @@ in the function's own docstring. Largest capability gap versus a WinDbg-class
 debugger, and the least tractable item here — a real fix means parsing
 `.pdata` and doing table-based unwind, not a local patch.
 
-### 16. No step-over/step-out
-
-`kdbg_step`/`op_step` only single-instruction trace-into. Stepping over a
-`call` (to avoid diving into a syscall stub or a hot loop) currently requires
-disassembling by hand, computing the return address, and planting a temporary
-breakpoint manually. Fix: add a step-over mode that disassembles the current
-instruction and, if it's a `call`, plants a temp breakpoint at the next
-instruction and continues instead of stepping in.
-
 ### 17. SMP is tuned for `-smp 1`, not a first-class case
 
 `_last_selected_vcpu` caching and the `sr.thread or "01"` default throughout
@@ -238,15 +229,17 @@ for reuse). Verified live — `call 0x7fff7f324940` renders as
 count `predicate_read_errors` on bp) from transport failure (raise
 `PredicateRuntimeError`). `bp_list` surfaces the read error count.
 
-**45. Expression evaluator: chained dereferences.** Current predicates are
-`[reg+off] op value`. Adding `poi(poi(rcx+0x10)+0x8) == 0x1234` (chained
-pointer chases) would cover most real filtering needs without a full
-scripting language.
+**45. Fixed.** `poi()` function added to predicate grammar. Evaluates inner
+expression, reads qword at result. Nests: `poi(poi(rcx+0x10)+0x8) == 0x1234`
+chases two pointers. Offset arithmetic inside: `poi(rax+0x10)`,
+`poi(rax-0x8)`. 13 unit tests (parse + eval + nesting + errors). Verified
+live — conditional bp with poi() installs and evaluates; bad syntax rejected.
 
-**46. Session persistence across MCP restarts.** The daemon survives but
-the MCP server loses its client object on reconnect. Recovery: re-read
-`session.json`, reconnect to daemon Unix socket. Eliminates the "restart
-MCP, lose debug session" friction.
+**46. Already works.** `DaemonClient` is stateless — each MCP tool call
+opens a fresh Unix socket to the daemon, which survives MCP restarts as a
+separate setsid process. `session_alive()` checks the fcntl lock, not
+in-process state. Verified: fresh Python process connects to running daemon
+and gets full status. No code change needed — the architecture solved it.
 
 **47. Scriptable breakpoint actions.** On bp fire, auto-run a sequence:
 read N fields, log to file, cont. Turns kdbg into a lightweight tracing
