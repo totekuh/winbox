@@ -900,6 +900,80 @@ class DaemonSession:
         self._capture_stop(sr)
         return {"reason": "step", **self._stop_summary()}
 
+    _STEP_OVER_MNEMONICS = frozenset({"call", "syscall", "sysenter"})
+
+    def op_step_over(self, timeout: float = 10) -> dict[str, Any]:
+        """Step over a call/syscall: temp bp at next instruction, cont, remove.
+
+        If the current instruction is not a call/syscall, falls back to a
+        regular single-step. Uses a hardware breakpoint for the temp bp
+        (PatchGuard-safe); fails if all 4 DR slots are taken.
+        """
+        if self.stop is None:
+            raise RuntimeError("not halted; cont first")
+
+        rip = self.stop.rip
+        raw = self.rsp.read_memory(rip, 15)
+
+        try:
+            import capstone
+            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+            insn = next(md.disasm(raw, rip), None)
+        except ImportError:
+            raise RuntimeError("capstone not installed; step_over needs it for disasm")
+
+        if insn is None:
+            raise RuntimeError(f"could not decode instruction at 0x{rip:x}")
+
+        if insn.mnemonic not in self._STEP_OVER_MNEMONICS:
+            return self.op_step()
+
+        next_rip = rip + insn.size
+
+        try:
+            self.rsp.insert_breakpoint(next_rip, kind=1, hardware=True)
+        except RspError as e:
+            raise RuntimeError(
+                f"step_over needs a temp hw bp at 0x{next_rip:x} but install "
+                f"failed: {e}. Free a DR slot with bp_remove."
+            ) from e
+
+        try:
+            vcpu = self.stop.vcpu
+            deadline = time.monotonic() + max(1.0, float(timeout))
+            self.rsp.cont()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.rsp.interrupt()
+                    try:
+                        sr = self.rsp.wait_for_stop(timeout=2.0)
+                        self._capture_stop(sr)
+                    except RspError:
+                        pass
+                    raise RuntimeError(
+                        f"step_over timed out ({timeout}s) waiting for return "
+                        f"from {insn.mnemonic} at 0x{rip:x}; VM re-halted"
+                    )
+                try:
+                    sr = self.rsp.wait_for_stop(timeout=remaining)
+                except RspError as e:
+                    if "timed out" in str(e).lower():
+                        continue
+                    raise
+                regs = self.rsp.read_registers()
+                hit_rip = struct.unpack_from("<Q", regs, 128)[0]
+                if hit_rip == next_rip:
+                    self._capture_stop(sr)
+                    break
+                self.rsp.cont()
+        finally:
+            with suppress(RspError):
+                self.rsp.remove_breakpoint(next_rip, kind=1, hardware=True)
+
+        return {"reason": "step_over", "stepped_over": insn.mnemonic,
+                **self._stop_summary()}
+
     def op_interrupt(self) -> dict[str, Any]:
         """Halt a running VM via raw ``\\x03`` on the RSP socket, in
         addition to setting the cooperative interrupt-pending flag.

@@ -2244,6 +2244,156 @@ def test_op_stack_requires_halt():
         session.op_stack()
 
 
+# ── step_over ──────────────────────────────────────────────────────────
+
+
+class TestStepOver:
+
+    def _halted_session(self, rsp=None, rip=0xfffff80608628780):
+        session = _make_session(rsp=rsp or FakeRsp())
+        blob = _blob(rip=rip, cr3=0x1ae000)
+        session.stop = StopState(
+            vcpu="01", rip=rip, cr3=0x1ae000, signal=5, raw_regs=blob,
+        )
+        session._hw_bp_verified = True
+        return session
+
+    def test_step_over_call_plants_temp_bp(self):
+        """call rel32 (E8 xx xx xx xx) should plant temp bp at RIP+5."""
+        from winbox.kdbg.debugger.rsp import StopReply
+
+        call_rip = 0xfffff80608628780
+        next_rip = call_rip + 5  # E8 + 4-byte rel32
+
+        class CallRsp(FakeRsp):
+            def __init__(self):
+                super().__init__()
+                self._temp_bp_va = None
+                self._returned = False
+
+            def read_memory(self, va, length):
+                if va == call_rip:
+                    # E8 00 10 00 00 = call rel32 (offset 0x1000)
+                    return b"\xe8\x00\x10\x00\x00" + b"\x90" * 10
+                return b"\x90" * length
+
+            def insert_breakpoint(self, addr, *, kind=1, hardware=False):
+                self.bps_inserted.append(addr)
+                if hardware and addr == next_rip:
+                    self._temp_bp_va = addr
+
+            def remove_breakpoint(self, addr, *, kind=1, hardware=False):
+                self.bps_removed.append(addr)
+
+            def cont(self):
+                self.continued += 1
+
+            def wait_for_stop(self, *, timeout=None):
+                return StopReply(signal=5, thread="01",
+                                stop_kind="hwbreak", raw="T05")
+
+            def read_registers(self):
+                return _blob(rip=next_rip, cr3=0x1ae000)
+
+        rsp = CallRsp()
+        session = self._halted_session(rsp=rsp, rip=call_rip)
+        result = session.op_step_over()
+
+        assert result["reason"] == "step_over"
+        assert result["stepped_over"] == "call"
+        assert next_rip in rsp.bps_inserted
+        assert next_rip in rsp.bps_removed
+
+    def test_step_over_non_call_falls_back_to_step(self):
+        """Non-call instruction (e.g., nop) falls back to regular step."""
+        from winbox.kdbg.debugger.rsp import StopReply
+
+        nop_rip = 0xfffff80608628780
+
+        class NopRsp(FakeRsp):
+            def read_memory(self, va, length):
+                if va == nop_rip:
+                    return b"\x90" * 15  # nop sled
+                return b"\x90" * length
+
+            def step(self, t=None):
+                self.stepped += 1
+
+            def wait_for_stop(self, *, timeout=None):
+                return StopReply(signal=5, thread="01",
+                                stop_kind="hwbreak", raw="T05")
+
+        rsp = NopRsp()
+        session = self._halted_session(rsp=rsp, rip=nop_rip)
+        result = session.op_step_over()
+
+        assert result["reason"] == "step"
+        assert rsp.stepped > 0
+
+    def test_step_over_requires_halt(self):
+        session = _make_session()
+        with pytest.raises(RuntimeError, match="not halted"):
+            session.op_step_over()
+
+    def test_step_over_syscall(self):
+        """syscall (0F 05) should be stepped over too."""
+        from winbox.kdbg.debugger.rsp import StopReply
+
+        sc_rip = 0xfffff80608628780
+        next_rip = sc_rip + 2  # 0F 05 = 2 bytes
+
+        class SyscallRsp(FakeRsp):
+            def read_memory(self, va, length):
+                if va == sc_rip:
+                    return b"\x0f\x05" + b"\x90" * 13
+                return b"\x90" * length
+
+            def insert_breakpoint(self, addr, *, kind=1, hardware=False):
+                self.bps_inserted.append(addr)
+
+            def remove_breakpoint(self, addr, *, kind=1, hardware=False):
+                self.bps_removed.append(addr)
+
+            def cont(self):
+                self.continued += 1
+
+            def wait_for_stop(self, *, timeout=None):
+                return StopReply(signal=5, thread="01",
+                                stop_kind="hwbreak", raw="T05")
+
+            def read_registers(self):
+                return _blob(rip=next_rip, cr3=0x1ae000)
+
+        rsp = SyscallRsp()
+        session = self._halted_session(rsp=rsp, rip=sc_rip)
+        result = session.op_step_over()
+
+        assert result["reason"] == "step_over"
+        assert result["stepped_over"] == "syscall"
+        assert next_rip in rsp.bps_inserted
+        assert next_rip in rsp.bps_removed
+
+    def test_step_over_dr_slot_exhaustion(self):
+        """Temp bp install failure gives clear error about DR slots."""
+        from winbox.kdbg.debugger.rsp import RspError
+
+        call_rip = 0xfffff80608628780
+
+        class NoSlotsRsp(FakeRsp):
+            def read_memory(self, va, length):
+                if va == call_rip:
+                    return b"\xe8\x00\x10\x00\x00" + b"\x90" * 10
+                return b"\x90" * length
+
+            def insert_breakpoint(self, addr, *, kind=1, hardware=False):
+                raise RspError("E22")
+
+        rsp = NoSlotsRsp()
+        session = self._halted_session(rsp=rsp, rip=call_rip)
+        with pytest.raises(RuntimeError, match="Free a DR slot"):
+            session.op_step_over()
+
+
 # ── Item #28: auto-retry on "empty stop reply" ─────────────────────────
 
 

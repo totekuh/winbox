@@ -3386,19 +3386,27 @@ def kdbg_cont(timeout: float = 30.0) -> str:
 
 
 @mcp.tool()
-def kdbg_step() -> str:
+def kdbg_step(over: bool = False) -> str:
     """Single-step the firing vCPU once.
 
     Only valid after a stop (call ``kdbg_cont`` first or attach to a
     halted state). Advances RIP by one instruction (1-15 bytes for
     x86-64).
 
+    Args:
+        over: If True, step OVER call/syscall instructions instead of
+            into them. Plants a temp hw breakpoint at the next instruction
+            and continues until it fires. Falls back to a regular step if
+            the current instruction is not a call/syscall. Requires a
+            free DR slot (4 max per vCPU).
+
     Returns:
         JSON with stop info at the new RIP.
     """
     cfg = _kdbg_cfg_only()
+    op = "step_over" if over else "step"
     try:
-        return _json.dumps(_kdbg_client(cfg).call("step"), indent=2)
+        return _json.dumps(_kdbg_client(cfg).call(op), indent=2)
     except _ClientError as e:
         return f"error: {e}"
 

@@ -37,6 +37,7 @@ OPS: frozenset[str] = frozenset({
     "bp_remove",    # remove bp by id
     "cont",         # resume; blocks daemon-side until next stop in target
     "step",         # single-step the firing vCPU once
+    "step_over",    # step over call/syscall — temp bp at next insn + cont
     "interrupt",    # async halt (for breaking out of cont)
     "regs",         # current register state at last halt
     "mem",          # read memory in target's CR3
