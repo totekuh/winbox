@@ -1626,6 +1626,43 @@ _GPR_NAMES = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
               "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
 
 
+def _validate_register_layout(blob: bytes) -> None:
+    """Sanity-check the g-packet register layout at connect time.
+
+    If QEMU changes the register XML (different offsets for RIP, CR3, CS),
+    every read, bp fire, and CR3 filter silently misdecodes. Checking once
+    at attach is cheap and catches the problem before it causes damage.
+    """
+    if len(blob) < 220:
+        raise DaemonError(
+            f"g-packet too short ({len(blob)} bytes, need >=220); "
+            "register layout may be incompatible"
+        )
+    rip = struct.unpack_from("<Q", blob, 128)[0]
+    cs = struct.unpack_from("<I", blob, 140)[0]
+    cr3 = struct.unpack_from("<Q", blob, _CR3_OFFSET_IN_G)[0]
+
+    # RIP must be canonical x86-64 (bits 48..63 = bit 47 sign-extended)
+    high = rip >> 47
+    if high not in (0, 0x1FFFF):
+        raise DaemonError(
+            f"RIP 0x{rip:x} from g-packet offset 128 is not canonical — "
+            "register layout may be wrong for this QEMU build"
+        )
+    # CS must be a plausible x86-64 segment selector (low 2 bits = RPL)
+    if cs not in (0x10, 0x33, 0x08, 0x23, 0x2b, 0x1b):
+        raise DaemonError(
+            f"CS 0x{cs:x} from g-packet offset 140 is not a recognized "
+            "x86-64 selector — register layout may be wrong"
+        )
+    # CR3 non-zero with a valid physical frame
+    if cr3 == 0 or cr3 >= (1 << 52):
+        raise DaemonError(
+            f"CR3 0x{cr3:x} from g-packet offset {_CR3_OFFSET_IN_G} is "
+            "implausible — register layout may be wrong"
+        )
+
+
 def _decode_regs(blob: bytes) -> dict[str, str]:
     """Format a g-packet blob as a flat string-keyed dict.
 
@@ -2147,6 +2184,7 @@ def fork_daemon(
         })
         session = DaemonSession(cfg=cfg, rsp=rsp, target=target, store=store)
         session._capture_stop(initial_sr)
+        _validate_register_layout(session.stop.raw_regs)
         _install_signal_handlers(session)
 
         os.write(pipe_w, b"OK\n")

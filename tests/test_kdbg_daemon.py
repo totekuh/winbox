@@ -30,7 +30,7 @@ _BLOB_LEN = 608
 
 
 def _blob(*, rip=0xfffff80608628780, rsp=0xfffff80501234500,
-          rcx=0xdeadbeef, cr3=0x1ae000,
+          rcx=0xdeadbeef, cr3=0x1ae000, cs=0x10,
           rax=0, rbx=0, rdx=0, rsi=0, rdi=0, rbp=0,
           r8=0, r9=0, r10=0, r11=0, r12=0, r13=0, r14=0, r15=0) -> bytes:
     b = bytearray(_BLOB_LEN)
@@ -52,6 +52,7 @@ def _blob(*, rip=0xfffff80608628780, rsp=0xfffff80501234500,
     struct.pack_into("<Q", b, 112, r14)
     struct.pack_into("<Q", b, 120, r15)
     struct.pack_into("<Q", b, 128, rip)
+    struct.pack_into("<I", b, 140, cs)
     struct.pack_into("<Q", b, _CR3_OFFSET, cr3)
     return bytes(b)
 
@@ -2392,6 +2393,57 @@ class TestStepOver:
         session = self._halted_session(rsp=rsp, rip=call_rip)
         with pytest.raises(RuntimeError, match="Free a DR slot"):
             session.op_step_over()
+
+
+# ── Item #18: register layout validation ───────────────────────────────
+
+
+class TestRegisterLayoutValidation:
+
+    def test_valid_blob_passes(self):
+        from winbox.kdbg.debugger.daemon import _validate_register_layout
+        blob = _blob(rip=0xfffff80608628780, cr3=0x1ae000)
+        _validate_register_layout(blob)  # should not raise
+
+    def test_short_blob_rejected(self):
+        from winbox.kdbg.debugger.daemon import _validate_register_layout, DaemonError
+        with pytest.raises(DaemonError, match="too short"):
+            _validate_register_layout(b"\x00" * 100)
+
+    def test_non_canonical_rip_rejected(self):
+        from winbox.kdbg.debugger.daemon import _validate_register_layout, DaemonError
+        blob = _blob(rip=0x8000000000001000)  # bit 47 set but not sign-extended
+        with pytest.raises(DaemonError, match="not canonical"):
+            _validate_register_layout(blob)
+
+    def test_zero_cr3_rejected(self):
+        from winbox.kdbg.debugger.daemon import _validate_register_layout, DaemonError
+        blob = _blob(cr3=0)
+        with pytest.raises(DaemonError, match="implausible"):
+            _validate_register_layout(blob)
+
+    def test_cr3_above_phys_cap_rejected(self):
+        from winbox.kdbg.debugger.daemon import _validate_register_layout, DaemonError
+        blob = _blob(cr3=(1 << 52))
+        with pytest.raises(DaemonError, match="implausible"):
+            _validate_register_layout(blob)
+
+    def test_bad_cs_rejected(self):
+        from winbox.kdbg.debugger.daemon import _validate_register_layout, DaemonError
+        blob = bytearray(_blob())
+        struct.pack_into("<I", blob, 140, 0xFF)  # bogus CS
+        with pytest.raises(DaemonError, match="not a recognized"):
+            _validate_register_layout(bytes(blob))
+
+    def test_kernel_rip_passes(self):
+        from winbox.kdbg.debugger.daemon import _validate_register_layout
+        blob = _blob(rip=0xFFFFF80608628780)  # canonical-high
+        _validate_register_layout(blob)
+
+    def test_user_rip_passes(self):
+        from winbox.kdbg.debugger.daemon import _validate_register_layout
+        blob = _blob(rip=0x7FF6E289EABC)  # canonical-low
+        _validate_register_layout(blob)
 
 
 # ── Item #28: auto-retry on "empty stop reply" ─────────────────────────
