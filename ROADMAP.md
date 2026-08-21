@@ -59,17 +59,10 @@ listing all hw bps with `hits==0` after a cont that ran longer than 5
 seconds. Verified live — probe fires immediately, unfired warning appears
 correctly when bp fires in non-target CR3.
 
-### 31. Process walker truncation on KPTI builds (running VM)
-
-`list_processes` reads kernel structures via HMP `x` through the current
-CPU's CR3. On KPTI builds, if the CPU is in user mode, the user CR3 doesn't
-map most kernel VAs — the walk truncates or fails. A CR3 bit-12 flip retry
-was added (2026-08-20) which helps for `kdbg_ps` on a running VM, but
-mid-walk truncation from page-table races remains. The daemon child walks
-after halting the VM (stable CR3), so `kdbg_attach` is not affected. Only
-`kdbg_ps`/`kdbg_lm`/`kdbg_read_va` called without a debug session are
-impacted. Deeper fix: use `read_virt_cr3` with a known kernel DTB (e.g.
-System's `0x1ae000`) instead of `read_virt_current`.
+**31. Fixed.** `list_processes` now switches to System's DTB (PID 4's
+`DirectoryTableBase`) after reading the first EPROCESS, eliminating mid-walk
+KPTI CR3 races on a running VM. `list_modules` also gained the initial KPTI
+retry. Verified live — 60 processes returned consistently on a running VM.
 
 ### 21. `bp_remove` on a private user-mode soft breakpoint can fail with E22 while the breakpoint is still live
 
@@ -331,15 +324,11 @@ daemon walks after halting the VM (stable CR3), so it sees the true PIDs. The
 GA `ps` uses `Get-Process` inside the guest, which sees the true PIDs too.
 The mismatch means `kdbg_attach` with a PID from GA `ps` can fail with
 "pid not found." Workaround: use PIDs from `kdbg_ps` for `kdbg_attach`.
-Fix: same as item 31 — use `read_virt_cr3` with a known kernel DTB.
+Fix: same as item 31 — now fixed (walker uses System DTB).
 
-**40. hw bp probe false positive on fresh boot.** The one-time hw bp probe
-(item 30 fix) timed out on a freshly booted VM — `nt!KiPageFault` did not
-fire within 300ms. On a warm VM it fires instantly. 300ms may be too short
-for a quiet fresh-boot state. The false warning is harmless (hw bps actually
-work) but confusing. Fix: increase probe timeout to 500ms or 1s, or pick a
-hotter symbol (e.g., `nt!KeQueryInterruptTimePrecise` which fires on every
-timer interrupt).
+**40. Fixed.** Probe timeout increased from 300ms to 1s, added
+`nt!KeQueryInterruptTimePrecise` (fires on every timer interrupt) as first
+probe symbol. Verified live — no false positive on fresh-booted VM.
 
 **41. `kdbg_cont` is a blocking MCP operation.** The cont tool blocks for up
 to `timeout` seconds. The daemon internally services `interrupt` and `status`
@@ -365,20 +354,17 @@ retrieved with `job_result`. The rest below are open.
 **10. Fixed.** `kdbg_stack` returns `{offset, va, value}` per qword.
 `kdbg_mem` gained `decode='qwords'`. See commit `9009a49`.
 
-**11. `kdbg_bp mode='auto'` downgrades to software silently.** Against a
-PPL-protected target the `0xCC` software patch is materially riskier than the
-hardware path, yet the fallback is only visible as a buried `hw: false` field.
-Either refuse to silently downgrade against sensitive targets, or surface the
-fallback loudly.
+**11. Fixed.** `mode='auto'` now returns `downgrade_warning` in the response
+when falling back from hw to soft, explaining the reason and noting that
+software breakpoints are PatchGuard-visible and hash-detectable.
 
 **12. Fixed.** Superseded by item 28 — `fork_daemon` now auto-retries with
 gdbstub restart via HMP.
 
-**13. `kdbg_detach`'s unit test is not isolated (test hygiene).** Found this
-session: `test_detach_calls_daemon_and_waits_for_release` does not mock
-`ensure_not_paused`, so when the real VM happens to be paused (e.g. a live debug
-session) the test calls virsh against the actual box and the assertion flips.
-A unit test must never touch a running VM — patch `ensure_not_paused`.
+**13. Fixed (two parts).** Dead `gdbstub.py` + tests deleted — it was an
+unused RSP client with `NotImplementedError` stubs alongside the real
+`rsp.py`. `kdbg_detach` test now mocks `ensure_not_paused` so it no longer
+touches the real VM.
 
 *Workflow note (not a tool defect):* prefer live `kdbg_disasm` against the
 running process over tracking a module's ASLR base and cross-referencing a
