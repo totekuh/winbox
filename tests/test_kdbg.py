@@ -221,6 +221,7 @@ class TestKdbgCetSafety:
             "winbox.cli.kdbg.query_cet_status",
             return_value=SimpleNamespace(
                 safe_for_debug=True, user_shadow_stack="OFF", strict_mode="OFF",
+                enabled_processes=(), unqueryable_processes=(),
             ),
         ):
             result = runner.invoke(cli, ["kdbg", "cet-status"])

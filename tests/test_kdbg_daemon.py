@@ -1641,6 +1641,21 @@ def _install_kernel_bp(session, *, condition=None) -> int:
     return reply["result"]["id"]
 
 
+def _record_g_cr3s(rsp) -> list[int]:
+    """Return a list populated with every CR3 written by a G packet."""
+    writes: list[int] = []
+    original = rsp._exchange
+
+    def tracking_exchange(body, *, timeout=None):
+        if body.startswith(b"G"):
+            blob = bytes.fromhex(body[1:].decode("ascii"))
+            writes.append(struct.unpack_from("<Q", blob, _CR3_OFFSET)[0])
+        return original(body, timeout=timeout)
+
+    rsp._exchange = tracking_exchange
+    return writes
+
+
 def test_bp_add_bad_condition_rejected_before_install():
     rsp = FakeRsp()
     session = _make_session(rsp=rsp)
@@ -1768,6 +1783,7 @@ def test_op_cont_predicate_boolean_combo():
         _blob(rip=_KERNEL_VA, rcx=0x4, rdx=0x3000, cr3=_TARGET_DTB),
     ]
     rsp = _ScriptedRsp(blobs)
+    cr3_writes = _record_g_cr3s(rsp)
     session = _make_session(rsp=rsp)
     _install_kernel_bp(session, condition="rcx == 0x4 && [rdx] != 0")
 
@@ -1790,6 +1806,44 @@ def test_op_cont_predicate_boolean_combo():
     assert bp.predicate_hits == 1
     # short-circuit: read_memory not called for the rcx-mismatch fire.
     assert fire_idx["n"] == 2
+    # Only the two fires that actually reached [rdx] masqueraded.  The
+    # runtime-short-circuited first fire kept the zero-G-packet fast path.
+    assert len(cr3_writes) == 4
+
+
+def test_op_cont_batches_independent_and_nested_predicate_reads():
+    """Independent derefs and a dependent poi() chain share one swap."""
+    regs = _blob(
+        rip=_KERNEL_VA, rcx=0x1000, rdx=0x3000, cr3=_TARGET_DTB,
+    )
+    rsp = _ScriptedRsp([regs])
+    cr3_writes = _record_g_cr3s(rsp)
+    session = _make_session(rsp=rsp)
+    _install_kernel_bp(
+        session,
+        condition="poi(poi(rcx)+0x8) == 0x1234 && [rdx] == 0x55",
+    )
+
+    memory = {
+        0x1000: 0x2000,
+        0x2008: 0x1234,
+        0x3000: 0x55,
+    }
+    reads: list[int] = []
+
+    def read_memory(va, length):
+        reads.append(va)
+        return memory[va].to_bytes(length, "little")
+
+    rsp.read_memory = read_memory
+    out = session.handle_op("cont", {"timeout": 1.0})
+
+    assert out["ok"], out
+    assert out["result"]["reason"] == "bp"
+    assert reads == [0x1000, 0x2008, 0x3000]
+    # One swap and one restore for all three data-dependent reads.  The old
+    # path emitted six G packets (swap+restore around each read).
+    assert cr3_writes == [_TARGET_DTB, _TARGET_DTB]
 
 
 def test_op_cont_predicate_unmapped_va_reads_as_zero():
@@ -1828,6 +1882,7 @@ def test_op_cont_predicate_mem_deref_retries_second_cr3_when_user_dtb_known():
     rsp = _ScriptedRsp([_blob(rip=_KERNEL_VA, rsp=0x2000, cr3=_TARGET_DTB)])
     target = TargetInfo(pid=4584, dtb=_TARGET_DTB, name="notepad.exe", user_dtb=user_dtb)
     session = _make_session(rsp=rsp, target=target)
+    cr3_writes = _record_g_cr3s(rsp)
     _install_kernel_bp(session, condition="[rsp+0x18] == 0x226048")
 
     from winbox.kdbg.debugger.rsp import RspError
@@ -1850,6 +1905,46 @@ def test_op_cont_predicate_mem_deref_retries_second_cr3_when_user_dtb_known():
     # positive from the unmapped-reads-as-zero fallback.
     assert bp.predicate_hits == 1
     assert bp.predicate_errors == 0
+    # Primary attempt + restore, then verified user-DTB attempt + restore.
+    assert cr3_writes == [_TARGET_DTB, _TARGET_DTB, user_dtb, _TARGET_DTB]
+
+
+def test_batched_predicate_falls_back_for_mixed_cr3_mappings():
+    """A mixed kernel/user expression may require a different CR3 per read.
+
+    Neither candidate can evaluate the whole expression alone.  The batch
+    attempts must therefore fall back to the old per-read selection and still
+    produce the correct truth value.
+    """
+    user_dtb = 0x4d6bc000
+    regs = _blob(
+        rip=_KERNEL_VA, rcx=0xfffff80000100000,
+        rdx=0x0000000000200000, cr3=_TARGET_DTB,
+    )
+    rsp = _ScriptedRsp([regs])
+    target = TargetInfo(
+        pid=4584, dtb=_TARGET_DTB, name="notepad.exe", user_dtb=user_dtb,
+    )
+    session = _make_session(rsp=rsp, target=target)
+    _install_kernel_bp(session, condition="[rcx] == 0xaa && [rdx] == 0xbb")
+
+    def read_memory(va, length):
+        current_cr3 = struct.unpack_from("<Q", rsp.regs_blob, _CR3_OFFSET)[0]
+        if va == 0xfffff80000100000 and current_cr3 == _TARGET_DTB:
+            return (0xaa).to_bytes(length, "little")
+        if va == 0x200000 and current_cr3 == user_dtb:
+            return (0xbb).to_bytes(length, "little")
+        from winbox.kdbg.debugger.rsp import RspError
+        raise RspError("E14")
+
+    rsp.read_memory = read_memory
+    out = session.handle_op("cont", {"timeout": 1.0})
+
+    assert out["ok"], out
+    assert out["result"]["reason"] == "bp"
+    bp = next(iter(session.bps.values()))
+    assert bp.predicate_hits == 1
+    assert bp.predicate_read_errors == 0
 
 
 def test_op_cont_predicate_oserror_does_not_crash_daemon():
@@ -1968,6 +2063,29 @@ def test_op_write_mem_failed_restore_also_poisons():
     reply = session.handle_op("write_mem", {"va": "0x1000", "data": "deadbeef"})
     assert reply["ok"] is False
     assert session._cr3_corrupted is True
+
+
+def test_batched_predicate_failed_restore_poisons_without_retrying():
+    """A failed batch restore is fatal, never a reason to try another CR3."""
+    user_dtb = 0x4d6bc000
+    rsp = _FailingRestoreRsp(
+        regs_blob=_blob(
+            rip=_KERNEL_VA, rcx=0x1000, rdx=0x2000, cr3=_TARGET_DTB,
+        )
+    )
+    target = TargetInfo(
+        pid=4584, dtb=_TARGET_DTB, name="notepad.exe", user_dtb=user_dtb,
+    )
+    session = _make_session(rsp=rsp, target=target)
+    _install_kernel_bp(session, condition="[rcx] == 0x90 && [rdx] == 0x90")
+
+    reply = session.handle_op("cont", {"timeout": 1.0})
+
+    assert reply["ok"] is False
+    assert session._cr3_corrupted is True
+    # Exactly swap + failed restore.  The verified second candidate must not
+    # be attempted after a poisoning restore failure.
+    assert rsp._g_count == 2
 
 
 # ── Bug fix #2: shutdown removes hw bps via z1 ──────────────────────────
@@ -2894,10 +3012,11 @@ class TestWatchpointList:
 
 
 class TestBpActions:
-    def test_bp_add_with_actions(self):
+    def test_bp_add_with_actions(self, tmp_path):
         rsp = FakeRsp()
         store = FakeStore({"nt!X": _KERNEL_VA_WP})
         session = _make_session(rsp=rsp, store=store)
+        session.cfg.root_dir = tmp_path
         reply = session.handle_op(
             "bp_add", {"target": "nt!X", "actions": ["rcx", "rdx"]},
         )
@@ -2905,6 +3024,56 @@ class TestBpActions:
         r = reply["result"]
         assert r["actions"] == ["rcx", "rdx"]
         assert "trace_path" in r
+
+    def test_bp_add_truncates_trace_from_previous_daemon_session(self, tmp_path):
+        """bp ids restart at zero, but their runtime files outlive daemons."""
+        stale = tmp_path / "bp0.trace.jsonl"
+        stale.write_text('{"hit": 999, "values": {"stale": "yes"}}\n')
+        cfg = FakeCfg()
+        cfg.root_dir = tmp_path
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        session.cfg = cfg
+
+        reply = session.handle_op(
+            "bp_add", {"target": "nt!X", "actions": ["rax"]},
+        )
+
+        assert reply["ok"], reply
+        assert stale.read_text() == ""
+        bp = list(session.bps.values())[0]
+        session._execute_actions(
+            bp, _blob(rax=0x42, rip=_KERNEL_VA_WP, cr3=0x1ae000),
+        )
+        trace = session.handle_op("bp_trace", {"id": bp.bp_id})["result"]
+        assert trace["total"] == bp.trace_count == 1
+        assert trace["entries"][0]["hit"] == 0
+
+    def test_trace_initialisation_failure_happens_before_bp_install(
+        self, tmp_path, monkeypatch,
+    ):
+        from pathlib import Path
+
+        cfg = FakeCfg()
+        cfg.root_dir = tmp_path
+        rsp = FakeRsp()
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        session.cfg = cfg
+
+        def fail_write(self, *args, **kwargs):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(Path, "write_text", fail_write)
+        reply = session.handle_op(
+            "bp_add", {"target": "nt!X", "actions": ["rax"]},
+        )
+
+        assert not reply["ok"]
+        assert "initialise action trace" in reply["error"]
+        assert rsp.bps_inserted == []
+        assert session.bps == {}
 
     def test_bp_add_invalid_action_rejected(self):
         rsp = FakeRsp()
@@ -2916,10 +3085,11 @@ class TestBpActions:
         assert not reply["ok"]
         assert "action[1]" in reply["error"]
 
-    def test_bp_list_includes_action_info(self):
+    def test_bp_list_includes_action_info(self, tmp_path):
         rsp = FakeRsp()
         store = FakeStore({"nt!X": _KERNEL_VA_WP})
         session = _make_session(rsp=rsp, store=store)
+        session.cfg.root_dir = tmp_path
         session.handle_op(
             "bp_add", {"target": "nt!X", "actions": ["rax"]},
         )
@@ -2945,6 +3115,134 @@ class TestBpActions:
         import json
         trace = json.loads(open(bp.trace_path).readline())
         assert trace["values"]["rax"] == "0x42"
+
+    def test_multiple_memory_actions_share_one_masquerade(self, tmp_path):
+        """All independent actions and nested poi reads use one G pair."""
+        cfg = FakeCfg()
+        cfg.root_dir = tmp_path
+        rsp = FakeRsp()
+        cr3_writes = _record_g_cr3s(rsp)
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        session.cfg = cfg
+        session.handle_op(
+            "bp_add",
+            {
+                "target": "nt!X",
+                "actions": ["[rcx]", "poi(poi(rdx)+0x8)", "[r8]"],
+            },
+        )
+        bp = list(session.bps.values())[0]
+        regs = _blob(
+            rcx=0x1000, rdx=0x2000, r8=0x3000,
+            rip=_KERNEL_VA_WP, cr3=0x1ae000,
+        )
+        memory = {
+            0x1000: 0x11,
+            0x2000: 0x2800,
+            0x2808: 0x22,
+            0x3000: 0x33,
+        }
+        rsp.read_memory = lambda va, n: memory[va].to_bytes(n, "little")
+
+        session._execute_actions(bp, regs)
+
+        import json
+        trace = json.loads(open(bp.trace_path).readline())
+        assert trace["values"] == {
+            "[rcx]": "0x11",
+            "poi(poi(rdx)+0x8)": "0x22",
+            "[r8]": "0x33",
+        }
+        assert cr3_writes == [session.target.dtb, 0x1ae000]
+
+    def test_condition_and_actions_share_one_masquerade(self, tmp_path):
+        """The hot path batches a matching predicate with all its actions."""
+        cfg = FakeCfg()
+        cfg.root_dir = tmp_path
+        rsp = FakeRsp()
+        cr3_writes = _record_g_cr3s(rsp)
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        session.cfg = cfg
+        session.handle_op(
+            "bp_add",
+            {
+                "target": "nt!X",
+                "condition": "[rcx] == 0x11",
+                "actions": ["[rdx]", "poi(r8)"],
+            },
+        )
+        bp = list(session.bps.values())[0]
+        regs = _blob(
+            rcx=0x1000, rdx=0x2000, r8=0x3000,
+            rip=_KERNEL_VA_WP, cr3=0x1ae000,
+        )
+        memory = {0x1000: 0x11, 0x2000: 0x22, 0x3000: 0x33}
+        rsp.read_memory = lambda va, n: memory[va].to_bytes(n, "little")
+
+        truthy, values = session._evaluate_breakpoint_expressions(
+            bp, regs, vcpu="01",
+        )
+
+        assert truthy is True
+        assert values == {"[rdx]": "0x22", "poi(r8)": "0x33"}
+        assert cr3_writes == [session.target.dtb, 0x1ae000]
+
+    def test_candidate_retry_does_not_duplicate_trace_entry(self, tmp_path):
+        cfg = FakeCfg()
+        cfg.root_dir = tmp_path
+        user_dtb = 0x4d6bc000
+        rsp = FakeRsp()
+        target = TargetInfo(
+            pid=4584, dtb=_TARGET_DTB, name="notepad.exe", user_dtb=user_dtb,
+        )
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store, target=target)
+        session.cfg = cfg
+        session.handle_op(
+            "bp_add", {"target": "nt!X", "actions": ["[rcx]"]},
+        )
+        bp = list(session.bps.values())[0]
+        regs = _blob(rcx=0x1000, rip=_KERNEL_VA_WP, cr3=0x1ae000)
+
+        def read_memory(va, n):
+            current_cr3 = struct.unpack_from("<Q", rsp.regs_blob, _CR3_OFFSET)[0]
+            if current_cr3 != user_dtb:
+                from winbox.kdbg.debugger.rsp import RspError
+                raise RspError("E14")
+            return (0x44).to_bytes(n, "little")
+
+        rsp.read_memory = read_memory
+        session._execute_actions(bp, regs)
+
+        assert bp.trace_count == 1
+        assert len(open(bp.trace_path).readlines()) == 1
+
+    def test_false_condition_skips_memory_actions_without_any_swap(self, tmp_path):
+        cfg = FakeCfg()
+        cfg.root_dir = tmp_path
+        rsp = FakeRsp()
+        cr3_writes = _record_g_cr3s(rsp)
+        store = FakeStore({"nt!X": _KERNEL_VA_WP})
+        session = _make_session(rsp=rsp, store=store)
+        session.cfg = cfg
+        session.handle_op(
+            "bp_add",
+            {
+                "target": "nt!X",
+                "condition": "rcx == 1",
+                "actions": ["[rdx]"],
+            },
+        )
+        bp = list(session.bps.values())[0]
+        truthy, values = session._evaluate_breakpoint_expressions(
+            bp, _blob(rcx=0, rdx=0x2000), vcpu="01",
+        )
+
+        assert truthy is False
+        assert values is None
+        assert cr3_writes == []
 
     def test_bp_trace_returns_entries(self, tmp_path):
         cfg = FakeCfg()

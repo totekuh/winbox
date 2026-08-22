@@ -50,6 +50,7 @@ from winbox.kdbg.debugger import (
 from winbox.kdbg.debugger.reader import debug_snapshot, reader_info, stop_reader
 from winbox.kdbg.cet import (
     CetSafetyError,
+    format_status as format_cet_status,
     prepare as prepare_cet,
     query_status as query_cet_status,
     restore as restore_cet_policy,
@@ -227,25 +228,24 @@ def kdbg_cet_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     except CetSafetyError as exc:
         console.print(f"[red][-][/] {exc}")
         raise SystemExit(1)
-    state = "SAFE" if status.safe_for_debug else "UNSAFE"
     colour = "green" if status.safe_for_debug else "red"
-    console.print(
-        f"[{colour}]{state}[/]: UserShadowStack={status.user_shadow_stack}, "
-        f"StrictMode={status.strict_mode}"
-    )
+    rendered = format_cet_status(status)
+    state, rest = rendered.split(": ", 1)
+    console.print(f"[{colour}]{state}[/]: {rest}")
 
 
 @kdbg.command("prepare")
 @click.option(
     "--confirm", is_flag=True,
-    help="Confirm disabling Windows user shadow stacks system-wide.",
+    help="Confirm disabling Windows shadow stacks and the VM cet-ss CPU feature.",
 )
 @needs_vm()
 def kdbg_prepare(cfg: Config, vm: VM, ga: GuestAgent, confirm: bool) -> None:
     """Prepare the VM for stable QEMU debugging; requires a reboot."""
     if not confirm:
         console.print(
-            "[yellow][!][/] This disables Windows CET user shadow stacks. "
+            "[yellow][!][/] This disables Windows CET user shadow stacks and "
+            "hides the VM cet-ss CPU feature. "
             "Re-run with --confirm, then reboot the VM."
         )
         raise SystemExit(1)
@@ -256,7 +256,7 @@ def kdbg_prepare(cfg: Config, vm: VM, ga: GuestAgent, confirm: bool) -> None:
         console.print(f"[red][-][/] {exc}")
         raise SystemExit(1)
     if backup is None:
-        console.print("[green][+][/] CET UserShadowStack is already OFF; debugger is safe")
+        console.print("[green][+][/] CET is disabled for every running process; debugger is safe")
     else:
         console.print(f"[green][+][/] CET policy staged; original saved at {backup}")
         console.print("[yellow][!][/] Reboot the VM before using kdbg")

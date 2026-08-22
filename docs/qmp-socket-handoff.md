@@ -133,12 +133,19 @@ The final transport split is therefore:
   virtual/physical memory, process/module walks, and kernel-base discovery.
 
 Before either the broker or interactive daemon opens GDB, winbox queries the
-guest and requires `UserShadowStack=OFF`. `winbox kdbg prepare --confirm` (or
-MCP `kdbg_prepare(confirm=true)`) saves the original raw mitigation registry
-values on the host and disables user shadow stacks; the VM must then reboot.
-`restore-cet`/`kdbg_restore_cet` restores the exact saved policy. This explicit
-safety gate is required because disabling CET is the only configuration that
-survived the stop/resume stress test on the affected stack.
+effective user-shadow-stack policy of every process through
+`GetProcessMitigationPolicy(PROCESS_QUERY_LIMITED_INFORMATION)`. It requires
+the system default to be OFF, zero active processes, and zero still-live
+unqueryable processes. System OFF alone is not enough: Windows binaries can
+opt in, which live validation observed in 34 processes.
+
+`winbox kdbg prepare --confirm` (or MCP `kdbg_prepare(confirm=true)`) saves the
+original raw mitigation registry values and exact libvirt CPU XML on the host,
+sets the Windows default OFF, and persistently hides the VM's `cet-ss` CPU
+feature; the VM must then reboot. `restore-cet`/`kdbg_restore_cet` restores both
+layers exactly. This explicit safety gate is required because disabling CET is
+the only configuration that survived the stop/resume stress test on the
+affected stack.
 
 The broker owns QEMU's single GDB client across CLI and MCP processes. One
 Unix client connection represents one coherent read transaction. It saves the

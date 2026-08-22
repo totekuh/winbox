@@ -164,28 +164,6 @@ memory, check state) while waiting for a rare breakpoint. This is a design
 gap, not a bug, and would require changes to the daemon protocol, MCP handler,
 and the `_wait_for_stop_serving` loop.
 
-### Performance roadmap (2026-08-21)
-
-**49. CR3 masquerade overhead: 3 RSP round-trips per read in daemon path**
-
-Every in-session memory read (`op_mem`, `_mem_qword_reader` in predicates)
-does: G-packet write (swap CR3) → `m` read → G-packet write (restore CR3).
-That's 3 socket round-trips for 1 logical read. A `poi(poi(rcx+0x10)+0x8)`
-predicate does 6 round-trips for 2 reads.
-
-Fix: batch multiple reads under one masquerade. `_cr3_masqueraded_call`
-already takes a `fn` callable — callers could pass a multi-read lambda.
-For predicates: evaluate the full expression tree, collect all addresses
-that need reading, do them all under one masquerade, then resolve.
-Complication: `poi()` chains are data-dependent (second address depends on
-first read), so only independent reads can batch. Still helps `op_stack`
-(already batched) and action-list evaluation (multiple independent
-expressions per bp fire).
-
-Expected gain: ~30-50% faster predicate evaluation for multi-expression
-action breakpoints. Moderate complexity — predicate evaluator needs a
-two-pass design for the non-dependent case.
-
 ### Edge cases to harden (2026-08-20)
 
 **35. Tested 2026-08-21 — PASS.** Target killed mid-session (scheduled
@@ -280,6 +258,41 @@ correct; four concurrent debugger requests completed through broker
 serialization; and the System log contained zero event ID 1001 bugchecks
 since boot. See `docs/v1.5.20-final-check-handoff.md` for the full checklist
 and stress evidence.
+
+The later item 49 live pass found that the original CET check was incomplete:
+the system default reported OFF while 34 running processes had effective user
+shadow stacks enabled, and a zero-breakpoint-hit session reproduced the known
+`WRUSSQ` bugcheck. The gate now queries every process through
+`GetProcessMitigationPolicy` with limited handles (including protected
+processes), fails closed on any active/unqueryable process, and refuses before
+opening GDB. Preparation also hides libvirt's `cet-ss` CPU feature so a new
+process cannot opt in after the one-time scan; the exact original CPU XML and
+Windows mitigation values are restored from a mode-0600 backup.
+
+**49.** Breakpoint conditions and action lists now evaluate as one pure batch
+inside a single CR3 masquerade, including data-dependent nested `poi()` chains.
+Register-only and runtime-short-circuited paths perform no CR3 swap. Candidate
+retry reruns the side-effect-free evaluation under the alternate verified KPTI
+CR3; mixed mappings and fully unmapped reads retain the established per-read
+fallback, exact counters, and zero semantics. Restore failure poisons the
+daemon and never retries. The firing vCPU is explicit rather than inherited
+from possibly stale stop state.
+
+Action trace files are also truncated when a new session reuses a breakpoint
+id, before anything is installed in QEMU, so old entries cannot contaminate
+`total` or survive an initialization failure. Unit coverage checks exact
+G-packet counts (three reads and nested dereferences use one swap/restore),
+candidate retry, mixed mappings, short reads, unmapped values, poison behavior,
+short-circuit zero-swap behavior, trace-once semantics, and trace lifecycle. A
+real Unix-socket daemon/RSP integration test covers the public protocol.
+
+Final live validation on 2026-08-22 used a CET-free boot and a warmed
+PowerShell target at `ntdll!NtClose`: 70/70 predicate hits produced 70 trace
+records with coherent independent/nested reads; the short-circuit edge made 45
+skips with zero reads/traces; the unmapped edge made 39 hits, 39 read-error
+counters, and 39 zero-valued records. Cleanup removed every breakpoint and
+target, stopped the gdbstub, retained zero active/unqueryable CET processes,
+and left System events 1001/41/6008 empty since boot.
 
 **21.** Private user-mode software breakpoint removal now records the exact
 CR3 used by `install_user_breakpoint` and re-enters that CR3 before sending

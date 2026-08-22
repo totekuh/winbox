@@ -243,6 +243,24 @@ class CR3RestoreError(RuntimeError):
     """
 
 
+class _MemoryReadNeeded(BaseException):
+    """Internal probe signal: expression evaluation reached its first read.
+
+    This deliberately derives from ``BaseException`` so the predicate AST and
+    per-action error isolation (both of which catch ``Exception``) cannot turn
+    the signal into a user-visible predicate/action error.  The batched
+    evaluator catches it immediately and re-runs the pure expression while a
+    CR3 masquerade is active.
+    """
+
+
+class _CandidateReadFailed(BaseException):
+    """Internal signal that one CR3 candidate could not map a read."""
+
+    def __init__(self, error: RspError) -> None:
+        self.error = error
+
+
 class DaemonSession:
     """Long-lived debugger session. One target, one gdb connection."""
 
@@ -507,6 +525,23 @@ class DaemonSession:
         va = self._resolve_target(target)
         is_user = (va >> 47) != 0x1FFFF
 
+        # Breakpoint ids restart at zero with every daemon session, while the
+        # runtime directory persists.  Reusing bp0.trace.jsonl without
+        # truncating it mixes old-session entries into the new trace and makes
+        # ``total`` disagree with ``trace_count``.  Initialise the file before
+        # touching the gdbstub: a permissions/disk error then cannot leave an
+        # installed breakpoint that was never added to ``self.bps``.
+        _trace = ""
+        if action_list:
+            trace_path = _runtime_dir(self.cfg) / (
+                f"bp{self._next_bp_id}.trace.jsonl"
+            )
+            try:
+                trace_path.write_text("", encoding="utf-8")
+            except OSError as e:
+                raise RuntimeError(f"could not initialise action trace: {e}") from e
+            _trace = str(trace_path)
+
         # ── Watchpoint path ────────────────────────────────────────────
         if wp_type is not None:
             t0 = time.monotonic()
@@ -520,9 +555,6 @@ class DaemonSession:
 
             bp_id = self._next_bp_id
             self._next_bp_id += 1
-            _trace = ""
-            if action_list:
-                _trace = str(_runtime_dir(self.cfg) / f"bp{bp_id}.trace.jsonl")
             bp = Breakpoint(
                 bp_id=bp_id,
                 va=va,
@@ -598,9 +630,6 @@ class DaemonSession:
         _installed_cr3 = 0
         if is_user and not installed_hw:
             _installed_cr3 = report.target_dtb  # type: ignore[union-attr]
-        _trace = ""
-        if action_list:
-            _trace = str(_runtime_dir(self.cfg) / f"bp{bp_id}.trace.jsonl")
         bp = Breakpoint(
             bp_id=bp_id,
             va=va,
@@ -857,11 +886,12 @@ class DaemonSession:
             # derefs the predicate explicitly triggers.
             bp = self.bps.get(self._bp_by_va.get(rip, -1))
 
-            if bp is not None and bp._predicate is not None:
+            action_values: dict[str, str] | None = None
+            if bp is not None and (bp._predicate is not None or bp._action_asts):
                 try:
-                    truthy = bool(bp._predicate.eval(
-                        regs, self._mem_qword_reader(regs, bp=bp)
-                    ))
+                    truthy, action_values = self._evaluate_breakpoint_expressions(
+                        bp, regs, vcpu=firing_vcpu,
+                    )
                 except PredicateRuntimeError as e:
                     bp.predicate_errors += 1
                     bp.hits += 1
@@ -871,11 +901,12 @@ class DaemonSession:
                         "error": str(e),
                         **self._stop_summary(),
                     }
-                if not truthy:
+                if bp._predicate is not None and not truthy:
                     bp.predicate_skips += 1
                     bp.hits += 1
                     continue
-                bp.predicate_hits += 1
+                if bp._predicate is not None:
+                    bp.predicate_hits += 1
 
             self._capture_stop_with_regs(sr, regs)
             if bp is not None:
@@ -886,7 +917,7 @@ class DaemonSession:
                 self._bump_bp_hits(rip, in_target=True)
 
             if bp is not None and bp._action_asts:
-                self._execute_actions(bp, regs)
+                self._append_action_trace(bp, regs, action_values or {})
                 continue
 
             result = {"reason": "bp", **self._stop_summary()}
@@ -1253,7 +1284,13 @@ class DaemonSession:
             raw_regs=regs,
         )
 
-    def _mem_qword_reader(self, fired_regs: bytes, bp: "Breakpoint | None" = None):
+    def _mem_qword_reader(
+        self,
+        fired_regs: bytes,
+        bp: "Breakpoint | None" = None,
+        *,
+        vcpu: str | None = None,
+    ):
         """Build a closure that reads a qword from target's address space.
 
         Unmapped VA reads return 0 (predicate composes with dangling-pointer
@@ -1264,7 +1301,7 @@ class DaemonSession:
         """
         rsp = self.rsp
         session = self
-        vcpu_hint = self.stop.vcpu if self.stop is not None else "01"
+        vcpu_hint = vcpu or (self.stop.vcpu if self.stop is not None else "01")
         _UNMAPPED_SIGNS = (b"E14", b"E0E", b"E08", b"failed")
 
         def _read(addr: int) -> int:
@@ -1294,6 +1331,96 @@ class DaemonSession:
             return int.from_bytes(data, "little")
 
         return _read
+
+    def _evaluate_with_batched_reads(
+        self,
+        fired_regs: bytes,
+        evaluate,
+        *,
+        bp: "Breakpoint | None" = None,
+        vcpu: str | None = None,
+    ):
+        """Evaluate expressions with all successful reads under one CR3 swap.
+
+        ``evaluate`` receives a qword-reader callback and must keep externally
+        visible side effects until after it returns.  We first run it with a
+        probe reader.  Register-only expressions and runtime-short-circuited
+        memory branches therefore retain the zero-RSP-round-trip fast path.
+
+        Once a read is actually needed, the *entire* evaluation is re-run
+        inside one masquerade candidate.  This naturally batches independent
+        actions and dependent ``poi(poi(...))`` chains alike.  If no single
+        KPTI CR3 candidate maps every address, fall back to the established
+        per-read candidate selection.  That preserves correctness for mixed
+        user/kernel expressions and the documented unmapped-read-as-zero
+        behavior; only this exceptional path pays the old round-trip cost.
+        """
+        def _probe_read(_addr: int) -> int:
+            raise _MemoryReadNeeded()
+
+        try:
+            return evaluate(_probe_read)
+        except _MemoryReadNeeded:
+            pass
+
+        vcpu_hint = vcpu or (self.stop.vcpu if self.stop is not None else "01")
+        rsp = self.rsp
+
+        def _direct_read(addr: int) -> int:
+            try:
+                data = rsp.read_memory(addr, 8)
+            except RspError as e:
+                # Let the outer candidate loop restart the complete, pure
+                # evaluation under the other verified KPTI CR3 half.
+                raise _CandidateReadFailed(e)
+            if len(data) != 8:
+                raise PredicateRuntimeError(
+                    f"short mem read at 0x{addr:x}: got {len(data)} bytes"
+                )
+            return int.from_bytes(data, "little")
+
+        for candidate in self.target.masquerade_candidates:
+            try:
+                with self._cr3_masquerade(vcpu_hint, fired_regs, cr3=candidate):
+                    return evaluate(_direct_read)
+            except _CandidateReadFailed:
+                continue
+
+        # No one CR3 mapped the complete expression.  Re-evaluate with the
+        # proven per-read path: each dereference may select a different CR3,
+        # and a read unmapped under every candidate becomes zero.
+        return evaluate(self._mem_qword_reader(fired_regs, bp=bp, vcpu=vcpu_hint))
+
+    @staticmethod
+    def _evaluate_action_values(bp: Breakpoint, regs: bytes, mem) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for expr_str, ast in zip(bp.actions, bp._action_asts):
+            try:
+                val = ast.eval(regs, mem)
+                values[expr_str] = f"0x{val:x}"
+            except Exception as e:
+                values[expr_str] = f"error: {e}"
+        return values
+
+    def _evaluate_breakpoint_expressions(
+        self,
+        bp: Breakpoint,
+        regs: bytes,
+        *,
+        vcpu: str,
+    ) -> tuple[bool, dict[str, str] | None]:
+        """Evaluate a fire's predicate and actions as one coherent batch."""
+        def _evaluate(mem):
+            truthy = True
+            if bp._predicate is not None:
+                truthy = bool(bp._predicate.eval(regs, mem))
+            if not truthy or not bp._action_asts:
+                return truthy, None
+            return truthy, self._evaluate_action_values(bp, regs, mem)
+
+        return self._evaluate_with_batched_reads(
+            regs, _evaluate, bp=bp, vcpu=vcpu,
+        )
 
     def _unfired_hw_bp_warnings(self, elapsed: float) -> dict[str, Any]:
         """Item #30 Part B: passive check for hw bps that never fired.
@@ -1344,22 +1471,20 @@ class DaemonSession:
                 b.hits += 1
                 return
 
-    def _execute_actions(self, bp: Breakpoint, regs: bytes) -> None:
-        """Evaluate action expressions and append results to trace file."""
+    def _append_action_trace(
+        self,
+        bp: Breakpoint,
+        regs: bytes,
+        values: dict[str, str],
+    ) -> None:
+        """Append one already-evaluated action result to the trace."""
         import json as _json
-        mem = self._mem_qword_reader(regs, bp=bp)
         rip = struct.unpack_from("<Q", regs, 128)[0]
         entry = {
             "hit": bp.trace_count,
             "rip": f"0x{rip:x}",
-            "values": {},
+            "values": values,
         }
-        for expr_str, ast in zip(bp.actions, bp._action_asts):
-            try:
-                val = ast.eval(regs, mem)
-                entry["values"][expr_str] = f"0x{val:x}"
-            except Exception as e:
-                entry["values"][expr_str] = f"error: {e}"
         bp.trace_count += 1
         if bp.trace_path:
             try:
@@ -1367,6 +1492,27 @@ class DaemonSession:
                     f.write(_json.dumps(entry) + "\n")
             except OSError:
                 pass
+
+    def _execute_actions(
+        self,
+        bp: Breakpoint,
+        regs: bytes,
+        *,
+        vcpu: str | None = None,
+    ) -> None:
+        """Evaluate actions as one batch and append their trace entry.
+
+        Kept as a standalone helper for direct callers/tests.  The cont hot
+        path evaluates predicate + actions together via
+        ``_evaluate_breakpoint_expressions`` so both share one masquerade.
+        """
+        values = self._evaluate_with_batched_reads(
+            regs,
+            lambda mem: self._evaluate_action_values(bp, regs, mem),
+            bp=bp,
+            vcpu=vcpu,
+        )
+        self._append_action_trace(bp, regs, values)
 
     def _best_symbol_for_va(self, va: int) -> str | None:
         from winbox.kdbg.format import symbolicate_va

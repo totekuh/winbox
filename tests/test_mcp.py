@@ -2832,10 +2832,31 @@ class TestKdbgCetTools:
 
         status = SimpleNamespace(
             safe_for_debug=True, user_shadow_stack="OFF", strict_mode="OFF",
+            enabled_processes=(), unqueryable_processes=(),
         )
         with patch("winbox.mcp._kdbg_query_cet_status", return_value=status):
             result = kdbg_cet_status()
-        assert result == "SAFE: UserShadowStack=OFF, StrictMode=OFF"
+        assert result == (
+            "SAFE: UserShadowStack=OFF, StrictMode=OFF, active_processes=0, "
+            "unqueryable_processes=0"
+        )
+
+    def test_status_reports_active_processes_as_unsafe(self, mock_mcp):
+        from winbox.mcp import kdbg_cet_status
+
+        status = SimpleNamespace(
+            safe_for_debug=False,
+            user_shadow_stack="OFF",
+            strict_mode="OFF",
+            enabled_processes=("svchost[404]",),
+            unqueryable_processes=(),
+        )
+        with patch("winbox.mcp._kdbg_query_cet_status", return_value=status):
+            result = kdbg_cet_status()
+        assert result.startswith(
+            "UNSAFE: UserShadowStack=OFF, StrictMode=OFF, active_processes=1"
+        )
+        assert "active_sample=svchost[404]" in result
 
     def test_prepare_refuses_without_confirmation(self, mock_mcp):
         from winbox.mcp import kdbg_prepare

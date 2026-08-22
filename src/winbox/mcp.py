@@ -2849,6 +2849,7 @@ from winbox.kdbg.debugger.reader import (
 )
 from winbox.kdbg.cet import (
     CetSafetyError as _KdbgCetSafetyError,
+    format_status as _kdbg_format_cet_status,
     prepare as _kdbg_prepare_cet,
     query_status as _kdbg_query_cet_status,
     restore as _kdbg_restore_cet_policy,
@@ -2873,24 +2874,21 @@ def kdbg_cet_status() -> str:
         status = _kdbg_query_cet_status(ga)
     except _KdbgCetSafetyError as exc:
         return f"error: {exc}"
-    state = "SAFE" if status.safe_for_debug else "UNSAFE"
-    return (
-        f"{state}: UserShadowStack={status.user_shadow_stack}, "
-        f"StrictMode={status.strict_mode}"
-    )
+    return _kdbg_format_cet_status(status)
 
 
 @mcp.tool()
 def kdbg_prepare(confirm: bool = False) -> str:
-    """Disable CET user shadow stacks for stable kdbg use; reboot required.
+    """Hide CET-SS from the VM for stable kdbg use; reboot required.
 
     This weakens a Windows exploit mitigation, so ``confirm`` must be true.
-    The original raw policy is backed up on the host and can be restored with
-    ``kdbg_restore_cet``.
+    The original raw Windows policy and libvirt CPU XML are backed up on the
+    host and can be restored with ``kdbg_restore_cet``.
     """
     if not confirm:
         return (
-            "refused: this disables Windows CET UserShadowStack system-wide; "
+            "refused: this disables Windows CET UserShadowStack and hides "
+            "the VM cet-ss CPU feature; "
             "call again with confirm=true, then reboot the VM"
         )
     cfg, _, ga = _ensure_vm_ready()
@@ -2900,7 +2898,7 @@ def kdbg_prepare(confirm: bool = False) -> str:
     except _KdbgCetSafetyError as exc:
         return f"error: {exc}"
     if backup is None:
-        return "CET UserShadowStack is already OFF; debugger is safe"
+        return "CET is disabled for every running process; debugger is safe"
     return f"CET policy staged; original saved at {backup}; reboot required"
 
 
