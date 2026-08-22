@@ -152,9 +152,33 @@ def test_socket_protocol_batches_condition_and_actions_into_one_g_pair(tmp_path)
         assert rsp.g_cr3s == [_TARGET_DTB, _TARGET_DTB]
         assert rsp.continued == 2
         assert json.loads(open(added["result"]["trace_path"]).readline()) == entries[0]
+
+        # The enhanced query crosses the real JSON-line socket protocol and
+        # composes pagination, numeric filtering, projection, and summary.
+        query_reply = _call(
+            sock_path,
+            "bp_trace",
+            id=added["result"]["id"],
+            from_hit=0,
+            limit=1,
+            expression="[rdx]",
+            value="34",  # numeric match for the recorded hex value 0x22
+            summary=True,
+            top=1,
+        )
+        assert query_reply["ok"], query_reply
+        query = query_reply["result"]
+        assert query["entries"] == [{
+            "hit": 0,
+            "rip": f"0x{_BP_VA:x}",
+            "values": {"[rdx]": "0x22"},
+        }]
+        assert query["matched"] == 1
+        aggregate = query["summary"]["expressions"][0]
+        assert aggregate["expression"] == "[rdx]"
+        assert aggregate["top_values"][0]["count"] == 1
     finally:
         session._shutdown_requested = True
         server.join(timeout=2)
         listen.close()
         rsp.close()
-

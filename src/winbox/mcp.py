@@ -3504,24 +3504,69 @@ def kdbg_bps() -> str:
 
 
 @mcp.tool()
-def kdbg_bp_trace(bp_id: int, tail: int = 20) -> str:
-    """Read the trace log for a breakpoint with actions.
+def kdbg_bp_trace(
+    bp_id: int,
+    tail: int = 20,
+    from_hit: int | None = None,
+    limit: int = 20,
+    expression: str | None = None,
+    value: str | None = None,
+    errors_only: bool = False,
+    summary: bool = False,
+    top: int = 10,
+) -> str:
+    """Query the trace log for a breakpoint with actions.
 
     Action breakpoints auto-continue and log expression values to a
-    JSONL trace file on each fire. This tool reads the last ``tail``
-    entries from that log.
+    JSONL trace file on each fire. The default returns the newest 20
+    records without loading the whole file. Use ``from_hit`` for forward
+    pagination, filters to isolate interesting records, and ``summary``
+    for compact per-expression distributions. Every page and summary is
+    bounded and reports truncation explicitly.
 
     Args:
         bp_id: Breakpoint id (from ``kdbg_bp`` / ``kdbg_bps``).
-        tail: Number of most recent entries to return (default 20).
+        tail: Newest matching entries to return when ``from_hit`` is unset
+            (1-200, default 20).
+        from_hit: Inclusive hit-id cursor for forward pagination. When set,
+            ``limit`` is used and ``tail`` is ignored.
+        limit: Maximum entries in a forward page (1-200, default 20).
+        expression: Exact action expression to filter and project, such as
+            ``"[rsp+0x18]"``. Omit to retain all expressions.
+        value: Exact value filter. Decimal and hexadecimal integers compare
+            numerically, so ``34`` matches ``0x22``. With no expression,
+            any action value may match.
+        errors_only: Return only hits containing an ``"error: ..."`` value
+            (within ``expression`` when supplied).
+        summary: Aggregate every matching record into bounded per-expression
+            counts, errors, distinct values, top values, min/max, and
+            representative hit ids. Returned entries remain independently
+            capped by ``tail``/``limit``.
+        top: Top values per expression in summary output (1-20, default 10).
 
     Returns:
-        JSON ``{id, entries: [{hit, rip, values: {expr: value}}], total}``.
+        JSON containing ``id``, ``entries``, ``total``, ``returned``,
+        ``truncated``, scan/malformed metadata, optional ``next_hit``, and
+        optional ``summary``.
     """
     cfg = _kdbg_cfg_only()
+    kwargs = {
+        "id": bp_id,
+        "tail": int(tail),
+        "limit": int(limit),
+        "errors_only": errors_only,
+        "summary": summary,
+        "top": int(top),
+    }
+    if from_hit is not None:
+        kwargs["from_hit"] = int(from_hit)
+    if expression is not None:
+        kwargs["expression"] = expression
+    if value is not None:
+        kwargs["value"] = value
     try:
         return _json.dumps(
-            _kdbg_client(cfg).call("bp_trace", id=bp_id, tail=int(tail)),
+            _kdbg_client(cfg).call("bp_trace", **kwargs),
             indent=2,
         )
     except _ClientError as e:

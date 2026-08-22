@@ -74,6 +74,11 @@ from winbox.kdbg.debugger.protocol import (
     reply_ok,
 )
 from winbox.kdbg.debugger.rsp import RspClient, RspError
+from winbox.kdbg.debugger.trace import (
+    MAX_SUMMARY_TOP,
+    MAX_TRACE_RESULTS,
+    query_trace,
+)
 
 
 # ── Filesystem layout ───────────────────────────────────────────────────
@@ -688,25 +693,89 @@ class DaemonSession:
             entries.append(entry)
         return {"bps": entries}
 
-    def op_bp_trace(self, id: int, tail: int = 20) -> dict[str, Any]:  # noqa: A002
-        """Read the last ``tail`` trace entries for a bp with actions."""
+    def op_bp_trace(  # noqa: A002
+        self,
+        id: int,
+        tail: int = 20,
+        from_hit: int | None = None,
+        limit: int = 20,
+        expression: str | None = None,
+        value: str | int | None = None,
+        errors_only: bool = False,
+        summary: bool = False,
+        top: int = 10,
+    ) -> dict[str, Any]:
+        """Run a bounded query over an action breakpoint's JSONL trace."""
         bp = self.bps.get(id)
         if bp is None:
             raise ValueError(f"no bp with id {id}")
-        if not bp.trace_path:
-            return {"id": id, "entries": [], "total": 0}
-        import json as _json
-        try:
-            lines = Path(bp.trace_path).read_text().splitlines()
-        except OSError:
-            return {"id": id, "entries": [], "total": 0}
-        entries = []
-        for line in lines[-tail:]:
+
+        def _bounded_int(name: str, raw: Any, maximum: int) -> int:
+            if isinstance(raw, bool):
+                raise ValueError(f"{name} must be an integer")
             try:
-                entries.append(_json.loads(line))
-            except _json.JSONDecodeError:
-                continue
-        return {"id": id, "entries": entries, "total": len(lines)}
+                parsed = int(raw)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"{name} must be an integer") from e
+            if not 1 <= parsed <= maximum:
+                raise ValueError(f"{name} must be between 1 and {maximum}")
+            return parsed
+
+        tail = _bounded_int("tail", tail, MAX_TRACE_RESULTS)
+        limit = _bounded_int("limit", limit, MAX_TRACE_RESULTS)
+        top = _bounded_int("top", top, MAX_SUMMARY_TOP)
+        if from_hit is not None:
+            if isinstance(from_hit, bool):
+                raise ValueError("from_hit must be a non-negative integer")
+            try:
+                from_hit = int(from_hit)
+            except (TypeError, ValueError) as e:
+                raise ValueError("from_hit must be a non-negative integer") from e
+            if from_hit < 0:
+                raise ValueError("from_hit must be a non-negative integer")
+        if expression is not None:
+            if not isinstance(expression, str):
+                raise ValueError("expression must be a string")
+            expression = expression.strip() or None
+        if isinstance(value, bool):
+            raise ValueError("value must be a string or integer")
+        if value is not None and not isinstance(value, (str, int)):
+            raise ValueError("value must be a string or integer")
+        value = str(value) if value is not None else None
+        if not isinstance(errors_only, bool):
+            raise ValueError("errors_only must be a boolean")
+        if not isinstance(summary, bool):
+            raise ValueError("summary must be a boolean")
+
+        if not bp.trace_path:
+            return {
+                "id": id, "entries": [], "total": 0, "returned": 0,
+                "truncated": False, "scan_complete": True,
+                "malformed_lines": 0, "result_bytes_truncated": False,
+                "oversized_entries": 0,
+            }
+        try:
+            result = query_trace(
+                bp.trace_path,
+                total=bp.trace_count,
+                tail=tail,
+                from_hit=from_hit,
+                limit=limit,
+                expression=expression,
+                value=value,
+                errors_only=errors_only,
+                summary=summary,
+                top=top,
+            )
+        except OSError:
+            return {
+                "id": id, "entries": [], "total": bp.trace_count,
+                "returned": 0, "truncated": bp.trace_count > 0,
+                "scan_complete": False, "malformed_lines": 0,
+                "result_bytes_truncated": False, "oversized_entries": 0,
+                "read_error": "trace file unavailable",
+            }
+        return {"id": id, **result}
 
     def _remove_bp_via_stub(self, bp: Breakpoint) -> None:
         """Send the z-packet that clears ``bp`` from the gdbstub.

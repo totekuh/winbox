@@ -243,7 +243,10 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg_bt": (LIVE, ""),
     "kdbg_bps": (LIVE, ""),
     "kdbg_bp": (LIVE, ""),
-    "kdbg_bp_trace": (EXCLUDED, "requires attached daemon with action bp; unit-tested"),
+    "kdbg_bp_trace": (
+        EXCLUDED,
+        "requires attached daemon with action bp; socket-integrated and live-verified",
+    ),
     "kdbg_rm": (LIVE, ""),
     "kdbg_disasm": (LIVE, ""),
     "kdbg_write_mem": (EXCLUDED, "writes into live kernel memory; a wrong "
@@ -295,5 +298,5 @@ MCP_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "kdbg_cont": "tests/test_mcp.py",
     "kdbg_step": "tests/test_mcp.py",
     "kdbg_interrupt": "tests/test_mcp.py",
-    "kdbg_bp_trace": "tests/test_kdbg_daemon.py",
+    "kdbg_bp_trace": "tests/test_kdbg_trace.py",
 }

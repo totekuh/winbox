@@ -3263,6 +3263,56 @@ class TestBpActions:
         assert trace_reply["result"]["total"] == 2
         assert len(trace_reply["result"]["entries"]) == 2
 
+    @pytest.mark.parametrize(
+        ("args", "message"),
+        [
+            ({"tail": 0}, "tail must be between"),
+            ({"tail": 201}, "tail must be between"),
+            ({"limit": 0}, "limit must be between"),
+            ({"top": 21}, "top must be between"),
+            ({"from_hit": -1}, "from_hit must be"),
+            ({"from_hit": True}, "from_hit must be"),
+            ({"errors_only": "yes"}, "errors_only must be"),
+            ({"summary": 1}, "summary must be"),
+        ],
+    )
+    def test_bp_trace_rejects_unbounded_or_wrong_typed_queries(
+        self, tmp_path, args, message,
+    ):
+        session = _make_session(
+            rsp=FakeRsp(), store=FakeStore({"nt!X": _KERNEL_VA_WP}),
+        )
+        session.cfg.root_dir = tmp_path
+        added = session.handle_op(
+            "bp_add", {"target": "nt!X", "actions": ["rax"]},
+        )["result"]
+
+        reply = session.handle_op("bp_trace", {"id": added["id"], **args})
+
+        assert not reply["ok"]
+        assert message in reply["error"]
+
+    def test_bp_trace_missing_file_is_explicit(self, tmp_path):
+        session = _make_session(
+            rsp=FakeRsp(), store=FakeStore({"nt!X": _KERNEL_VA_WP}),
+        )
+        session.cfg.root_dir = tmp_path
+        added = session.handle_op(
+            "bp_add", {"target": "nt!X", "actions": ["rax"]},
+        )["result"]
+        bp = session.bps[added["id"]]
+        bp.trace_count = 3
+        open(bp.trace_path, "w").close()
+        from pathlib import Path
+        Path(bp.trace_path).unlink()
+
+        reply = session.handle_op("bp_trace", {"id": added["id"]})
+
+        assert reply["ok"]
+        assert reply["result"]["read_error"] == "trace file unavailable"
+        assert reply["result"]["total"] == 3
+        assert reply["result"]["truncated"] is True
+
     def test_bp_no_actions_halts_normally(self):
         rsp = FakeRsp()
         store = FakeStore({"nt!X": _KERNEL_VA_WP})

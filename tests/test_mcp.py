@@ -3322,6 +3322,52 @@ class TestKdbgDaemonTools:
         assert len(out["bps"]) == 1
         assert out["bps"][0]["hits"] == 5
 
+    def test_bp_trace_forwards_bounded_query_options(self, mock_mcp):
+        from winbox.mcp import kdbg_bp_trace
+        client = self._client_with(call_result={
+            "id": 3, "entries": [], "total": 100, "returned": 0,
+            "truncated": False,
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_bp_trace(
+                3,
+                from_hit=40,
+                limit=50,
+                expression="[rsp+0x18]",
+                value="0x22c004",
+                errors_only=True,
+                summary=True,
+                top=7,
+            )
+
+        client.call.assert_called_once_with(
+            "bp_trace",
+            id=3,
+            tail=20,
+            from_hit=40,
+            limit=50,
+            expression="[rsp+0x18]",
+            value="0x22c004",
+            errors_only=True,
+            summary=True,
+            top=7,
+        )
+        assert _json_mod.loads(result)["total"] == 100
+
+    def test_bp_trace_default_query_remains_tail_compatible(self, mock_mcp):
+        from winbox.mcp import kdbg_bp_trace
+        client = self._client_with(call_result={
+            "id": 1, "entries": [], "total": 0, "returned": 0,
+            "truncated": False,
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            kdbg_bp_trace(1)
+
+        client.call.assert_called_once_with(
+            "bp_trace", id=1, tail=20, limit=20,
+            errors_only=False, summary=False, top=10,
+        )
+
     def test_rm_passes_id(self, mock_mcp):
         from winbox.mcp import kdbg_rm
         client = self._client_with(call_result={"removed": 0, "va": "0x123"})

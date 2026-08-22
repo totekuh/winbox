@@ -25,64 +25,64 @@ per-vCPU DR0..3 slots, which is the hardware path's ceiling. There is no
 `--mode auto` — breakpoints must carry their type explicitly. The failure
 messages name the wall you actually hit instead of guessing at one.
 
-### 22. Background jobs have no result-identity protection against PID recycling
+### 53. Predicates/actions need typed reads and bounded buffer capture
 
-`exec()` (nonce) and `exec_argv()` (look-behind) both verify that a
-guest-exec result actually belongs to the command that asked for it — the
-guard against qemu-ga handing back an abandoned result parked on a recycled
-Windows PID. Background jobs skip that entirely: `run_command_bg` →
-`exec_background`/`exec_detached` return a raw PID, and `JobStore` later
-polls `exec_status(pid)` with no nonce and no look-behind, so a buffered job
-whose short-lived PID gets recycled can read a foreign result. `--log` mode
-sidesteps it (output is redirected to files on VirtIO-FS, not the agent's
-buffered slot); the buffered (`JobMode.BUFFERED`) path is the exposure. The
-guest-layer launch retry added on 2026-08-10 (`_start_guest_exec`) covers
-these paths' *launch* but not their *result identity* — a real fix needs a
-job-scoped nonce echoed at spawn and checked at status-read, which is a
-bigger change than the foreground path took. Not yet reproduced;
-audit-derived from the same PID-recycle mechanism `git log` already fixed for
-the foreground path.
+The expression language reads only unsigned little-endian qwords. Masking a
+qword can approximate a byte/dword, but it is wrong at page boundaries and
+cannot capture the buffers, strings, lengths, and narrow fields that dominate
+IOCTL/RPC/parser research.
 
-The *kill* side is now guarded: `jobs kill` queries `tasklist` for the PID's
-image name before `taskkill`. If the PID is no longer `cmd.exe`/`runex.exe`
-(the expected process), kill is refused and the job is marked LOST. The
-*result-identity* side (wrong output read) still has no nonce guard — the
-full fix needs a job-scoped nonce echoed at spawn and checked at status-read.
+Add scalar `byte()`, `word()`, `dword()`, and `qword()` reads first, preserving
+short-circuiting, batching, candidate retry, unmapped counters, and exact CR3
+restore semantics. Then add action-only bounded `bytes(addr,len)`, ASCII, and
+UTF-16 capture with strict per-hit/per-trace size caps. Conditions must remain
+scalar and side-effect free. Moderate implementation effort, broad research
+payoff.
 
-**23. Fixed.** `pipe_close` and `_abort` already verify the PID is still
-`python.exe` via `_is_broker_alive()` before `taskkill`. If the PID was
-recycled to a different process, taskkill is skipped. The guard was added
-during the broker self-write fix (2026-08-10) and covers both `_abort`
-and `pipe_close` paths.
+### 41. `kdbg_cont` is a blocking MCP operation
 
-### 24. `pipe_recv` can silently lose bytes when the host times out after the broker already read them
+The cont tool blocks for up to `timeout` seconds. The daemon already services
+`interrupt` and `status` through `_pump_client`, but the initiating MCP request
+remains occupied. That is especially awkward for an AI agent waiting on a rare
+breakpoint: it cannot naturally poll progress, inspect accumulating action
+traces, or survive an MCP transport restart.
 
-The broker's `do_read` peeks then `ReadFile`s N bytes off the real pipe and
-writes `result.<seq>.json`. If the host-side `_poll_result` deadline passes in
-the window before that file is read (VirtIO-FS write latency under load),
-`pipe_recv` returns "timeout waiting for read result" — but the bytes are
-already gone from the pipe, the result file is orphaned (the no-sweep policy
-leaves it, by design, so a concurrent in-flight call's live result isn't
-deleted), and the next `pipe_recv` uses a fresh seq. The dequeued bytes are
-lost for good and any length-prefixed stream parse desyncs. The broker gets a
-budget `timeout - 1s` shorter than the host to make this rare, but it is not
-eliminated. A real fix needs a two-phase read (peek-and-hold until the host
-ACKs) or a bounded sweep that reclaims a still-unread result for the *same*
-logical read before issuing the next — a broker-protocol change. CONFIRMED,
-audit-derived.
+The smallest robust design is a durable host-side cont worker:
+`kdbg_cont_start` records a session token and returns immediately,
+`kdbg_cont_poll` reads a bounded persisted result/status, and interrupt/detach
+cancel it. The worker talks to the existing daemon protocol, so the RSP state
+machine does not need to become multithreaded. Guard concurrent starts, stale
+workers, daemon death, detach, and MCP restart. Moderate effort and the highest
+orchestration payoff for autonomous research.
 
-**25. Fixed.** `claim()` now persists a placeholder Job (pid=0,
-command="(spawning)") *before* calling `build()`. If `build()` fails, the
-placeholder is cleaned up. If `_save()` after spawn fails, the placeholder
-still exists — the job is visible in `jobs list` even though it has pid=0.
-No more orphan processes invisible to the ledger.
+### 54. Stop triage is fragmented across too many MCP calls
 
-**27. Fixed.** `disable_offline`/`enable_offline` now read
-`SYSTEM\Select\Current` via `hivexregedit --export` before rendering the
-`.reg`, and target the active ControlSet (001, 002, etc.) instead of
-hardcoding 001. `_system_services_reg` accepts a `control_set` parameter.
-Module-level constants still default to 001 for the build-time path (fresh
-images). `read_current_control_set` added to `offlinereg.py`.
+After a breakpoint or exception, an AI must separately request registers,
+nearby disassembly, stack qwords, the heuristic backtrace, breakpoint metadata,
+and often pointed-to memory. The halt is stable, but the repeated protocol
+round-trips waste time and context, and agents frequently omit one of the
+pieces needed to reason about the stop.
+
+Add a bounded `kdbg_context`/`kdbg_triage` response containing the stop reason,
+target/vCPU/CR3, registers, symbolized RIP, nearby disassembly, labeled stack,
+active breakpoint metadata, and an explicitly labeled heuristic backtrace.
+Optional memory follows must be caller-selected and tightly capped. This is a
+small composition layer over existing operations; it improves ergonomics more
+than raw capability, so it ranks below items 52/53/41.
+
+### 12. WoW64 detection is currently ineffective; 32-bit modules are absent
+
+`is_wow64()` looks for `Wow64Process` in `_PEB`, but that field is absent from
+the current Server 2025 PDB maps, so the function returns false. The live PDB
+does expose `_EPROCESS.WoW64Process` (offset `0x310` on the current build),
+which is the kernel-side detection path that should be used. The roadmap's
+previous claim that detection was already fixed was incorrect.
+
+After correcting detection, implement the 32-bit loader walk through
+`_EWOW64PROCESS`/PEB32 using 32-bit pointers and 32-bit UNICODE_STRING/LDR
+layouts. Keep native and WoW64 module results explicitly labeled; do not mix
+same-named 32/64-bit DLLs in the symbol store. Moderate effort, high payoff for
+legacy user-mode targets, but narrower than items 52/53/41.
 
 ### 26. kdbg read-surface residuals from the 2026-08-10 audit (accepted / minor)
 
@@ -103,27 +103,6 @@ Two findings from the read-surface audit were left as-is, deliberately:
   Unlike `user_dtb`, the primary `dtb` has no safe fallback (0 is useless), and
   a wrong `DirectoryTableBase` offset breaks the whole store loudly elsewhere,
   so a targeted guard here is low-value — folded into item 18.
-**10. Fixed.** See item 44 — `_mem_qword_reader` now distinguishes unmapped
-VA (returns 0, counts on bp) from transport failure (raises). Operator sees
-`predicate_read_errors` in `bp_list` instead of wondering why the bp never
-fires.
-
-**11 (pdb). Fixed.** `parse_types` raises on zero-field structs and warns on
-suspiciously sparse structs (sizeof >= 64, < 3 fields). Catches regex drift
-at parse time instead of as a confusing downstream error.
-
-**12. Partially fixed.** `is_wow64()` detects WoW64 via `PEB.Wow64Process`.
-`kdbg_user_lm` adds a warning when WoW64 detected ("only 64-bit modules
-listed"). The 32-bit module walk itself is not implemented yet — that's
-the full fix. Detection is the minimum useful step.
-
-**14. Fixed.** `kdbg_bp` now accepts `wp_type` ("write"/"read"/"access") and
-`wp_size` (1/2/4/8) parameters. `insert_breakpoint`/`remove_breakpoint`
-route to Z2/Z3/Z4 packets. Watchpoints share the DR0..3 pool with hw exec
-bps. Z3 (read-only) is unsupported by QEMU on x86-64 — hardware DR registers
-only support write (Z2) and access (Z4). Verified live — write and access
-watchpoints install/remove/list correctly; invalid type/size rejected at add
-time; 5th DR slot correctly refused.
 
 ### 15. `kdbg_bt` is a stack-scan heuristic, not a real unwinder
 
@@ -137,72 +116,17 @@ in the function's own docstring. Largest capability gap versus a WinDbg-class
 debugger, and the least tractable item here — a real fix means parsing
 `.pdata` and doing table-based unwind, not a local patch.
 
-### 17. SMP is tuned for `-smp 1`, not a first-class case
+### 17. SMP behavior is under-tested despite the four-vCPU default
 
-`_last_selected_vcpu` caching and the `sr.thread or "01"` default throughout
-`daemon.py` assume a single vCPU. `list_threads`/`select_thread` exist, but
-nothing scopes a breakpoint's fire-tracking to a specific core or distributes
-hardware breakpoints per-vCPU. Low tractability relative to impact — this is
-cross-cutting, not a local patch — hence listed near last.
-
-**18. Fixed.** `_validate_register_layout` checks RIP (canonical), CS
-(recognized selector), CR3 (non-zero, <52-bit cap) from the first g-packet
-at attach time. Catches QEMU register-XML drift before it silently corrupts
-CR3 filters and bp targeting.
-
-**19. Fixed.** `gdbstub_has_client()` reads `/proc/net/tcp` for ESTABLISHED
-connections to the gdbstub port. `kdbg_attach` refuses if another client is
-already connected. Verified live — raw TCP connect blocked subsequent attach.
-
-### 41. `kdbg_cont` is a blocking MCP operation
-
-The cont tool blocks for up to `timeout` seconds. The daemon internally
-services `interrupt` and `status` ops via `_pump_client`, but the MCP client
-is stuck waiting. A non-blocking design — cont returns immediately,
-`kdbg_status` polls for bp hits — would let the operator do other work (read
-memory, check state) while waiting for a rare breakpoint. This is a design
-gap, not a bug, and would require changes to the daemon protocol, MCP handler,
-and the `_wait_for_stop_serving` loop.
-
-### Edge cases to harden (2026-08-20)
-
-**35. Tested 2026-08-21 — PASS.** Target killed mid-session (scheduled
-`Stop-Process` fires while cont running). Cont timed out (target gone),
-detach cleaned up without crash, GA survived.
-
-### Capability roadmap (2026-08-21)
-
-**42. Fixed.** `kdbg_step(out=True)` reads `[rsp]`, plants temp hw bp at
-return address, conts until hit. Shares `_run_to` helper with step-over.
-
-**43. Fixed.** `kdbg_bt` already resolved all loaded modules (including
-user-mode) via `_best_symbol_for_va`. `kdbg_disasm` now annotates call/jmp
-targets with a `"sym"` field via `symbolicate_va` (extracted to `format.py`
-for reuse). Verified live — `call 0x7fff7f324940` renders as
-`ntdll!LdrpLogInternal+0x0`.
-
-**44. Fixed.** `_mem_qword_reader` now distinguishes unmapped VA (return 0,
-count `predicate_read_errors` on bp) from transport failure (raise
-`PredicateRuntimeError`). `bp_list` surfaces the read error count.
-
-**45. Fixed.** `poi()` function added to predicate grammar. Evaluates inner
-expression, reads qword at result. Nests: `poi(poi(rcx+0x10)+0x8) == 0x1234`
-chases two pointers. Offset arithmetic inside: `poi(rax+0x10)`,
-`poi(rax-0x8)`. 13 unit tests (parse + eval + nesting + errors). Verified
-live — conditional bp with poi() installs and evaluates; bad syntax rejected.
-
-**46. Already works.** `DaemonClient` is stateless — each MCP tool call
-opens a fresh Unix socket to the daemon, which survives MCP restarts as a
-separate setsid process. `session_alive()` checks the fcntl lock, not
-in-process state. Verified: fresh Python process connects to running daemon
-and gets full status. No code change needed — the architecture solved it.
-
-**47. Fixed.** `kdbg_bp` accepts `actions` — a list of expression strings
-(same grammar as conditions). On each in-target fire, expressions are
-evaluated and results appended to a JSONL trace file. The bp auto-continues
-instead of halting. `kdbg_bp_trace(bp_id)` reads the trace. Turns kdbg into
-a lightweight tracer: "log every IOCTL code through this dispatcher" is now
-`kdbg_bp(target, actions=["[rsp+0x18]"])` + `kdbg_bp_trace(id)`.
+`Config.vm_cpus` defaults to 4, so the old description of `-smp 1` as the
+default was wrong. Item 49 now carries the firing vCPU explicitly through
+predicate/action evaluation, and `_last_selected_vcpu` is a round-trip cache,
+not itself proof of a single-core assumption. The unresolved risk is narrower
+but real: `sr.thread or "01"` remains a fallback, and there is no focused live
+coverage for target-thread migration between vCPUs, simultaneous stops, or
+hardware breakpoint/watchpoint slot behavior across cores. Audit and test the
+actual QEMU semantics before redesigning anything; do not assume per-vCPU
+distribution is required. Cross-cutting and not an easy win.
 
 ---
 
@@ -219,11 +143,39 @@ gained `decode='qwords'`. See commit `9009a49`.
 **11 (auto mode).** `mode='auto'` removed entirely. Breakpoints must carry
 their type explicitly — only `mode='hw'` and `mode='soft'` accepted.
 
-**12.** Superseded by item 28 — `fork_daemon` auto-retries with gdbstub
-restart via HMP.
+**12 (daemon retry).** Superseded by item 28 — `fork_daemon` auto-retries
+with gdbstub restart via HMP.
 
 **13.** Dead `gdbstub.py` + tests deleted. `kdbg_detach` test mocks
 `ensure_not_paused` — no longer touches the real VM.
+
+**14.** `kdbg_bp` supports Z2/Z3/Z4 watchpoint packets, validated type/size,
+and the shared four-slot DR budget. Live write/access watchpoints passed; QEMU
+x86-64 does not provide a true read-only hardware watchpoint.
+
+**19.** `gdbstub_has_client()` detects established gdbstub connections and
+prevents a second attach from contending for QEMU's single client.
+
+**22.** Buffered CLI and MCP background jobs carry a unique echoed nonce.
+Every result path verifies it before accepting qemu-ga output; mismatch marks
+the job LOST instead of attributing a recycled PID's output. Unit coverage and
+the 2026-08-22 live `PID recycled — nonce mismatch` result confirm the guard.
+See commit `e5a44f2`.
+
+**23.** Pipe broker cleanup verifies that a recorded PID is still
+`python.exe` before taskkill, so PID recycling cannot kill a foreign process.
+
+**24.** `pipe_recv` reclaims the oldest orphaned successful read result before
+issuing a new read. Sequence-number correlation prevents one caller from
+stealing another's result; write results are never misread as bytes. The
+timeout/desynchronization scenario has dedicated regression coverage. See
+commit `e5a44f2`.
+
+**25.** Job creation persists a visible spawning placeholder before launch,
+preventing an untracked guest process when build or final persistence fails.
+
+**27.** Offline registry changes resolve `SYSTEM\Select\Current` and target
+the active ControlSet instead of assuming ControlSet001.
 
 **28.** `fork_daemon` retries up to 3 times on "empty stop reply": raw-closes
 socket, restarts gdbstub via HMP, reconnects.
@@ -243,6 +195,28 @@ eliminating mid-walk KPTI CR3 races. `list_modules` gained KPTI retry.
 **40.** Active probe removed entirely — superseded by passive verification
 in item 30. The probe false-positived because no kernel symbol fires
 reliably within any timeout on a quiet freshly-booted VM.
+
+**35.** Target death during an active continue was tested live: continue
+timed out, detach cleaned up, and the guest agent survived.
+
+**42.** Step-out uses the return address at `[rsp]` and the shared `_run_to`
+temporary-breakpoint path.
+
+**43.** Backtrace candidates resolve across loaded kernel/user modules, and
+disassembly annotates immediate call/jump targets with symbols.
+
+**44.** Predicate reads distinguish an unmapped VA (zero plus read-error
+counter) from transport/runtime failure (explicit predicate error).
+
+**45.** `poi()` supports nested pointer chasing and offsets in predicates and
+actions, with parser/runtime error coverage.
+
+**46.** The daemon protocol is already stateless per client connection and
+survives MCP restarts; no implementation change was needed.
+
+**47.** Breakpoint actions auto-continue and append structured JSONL traces,
+retrievable through `kdbg_bp_trace`. Item 49 later batched their reads and
+fixed trace-file lifecycle.
 
 **48.** Persistent debugger transport shipped in v1.5.20. `hmp()` now uses a
 serialized persistent QMP connection (with libvirt/virsh fallback), while a
@@ -293,6 +267,34 @@ skips with zero reads/traces; the unmapped edge made 39 hits, 39 read-error
 counters, and 39 zero-valued records. Cleanup removed every breakpoint and
 target, stopped the gdbstub, retained zero active/unqueryable CET processes,
 and left System events 1001/41/6008 empty since boot.
+
+**52.** Action traces now support a backwards-seeking fast tail,
+inclusive `from_hit`/`limit` pagination, exact expression projection,
+numeric-aware value filtering, error-only filtering, and streaming bounded
+summaries. Summaries report exact matched/error counts and numeric min/max,
+plus capped distinct values, top counts, and representative hit ids; every
+count, byte, expression, distinct-value, and display-text bound reports its
+own truncation state. Malformed, oversized, missing, CRLF, block-boundary,
+and unterminated-line cases are covered without loading the JSONL file.
+
+Unit tests cover query semantics and adversarial bounds, the real Unix-socket
+integration test composes filtering/pagination/summary through the daemon,
+and MCP tests cover the public argument surface. Final live validation on
+2026-08-22 traced 144 `ntdll!NtClose` hits in a CET-free PowerShell target:
+tailing returned hits 139–143, pagination returned 0–6 with `next_hit=7`,
+summary counts/min/max/top values matched all 144 records, decimal `1888`
+matched recorded hex `0x760`, expression projection and error-only filtering
+were correct, and `limit=201` was rejected. Cleanup removed the breakpoint,
+daemon, target, and gdbstub; the VM and guest agent remained healthy with no
+recent System 1001/41/6008 events. After the required MCP restart, a second
+through-MCP live pass traced 114 hits, returned hits 0–3 with `next_hit=4`,
+matched decimal `940` to hex `0x3ac`, projected only `rcx`, summarized all
+114 records, returned zero error-only matches, and rejected `limit=201`.
+Cleanup through MCP again left CET safe, the VM/agent healthy, the gdbstub
+stopped, and the same System event query empty. A final restarted-server edge
+pass captured 104 hits across two distinct live handle values: `top=1`
+returned one bucket with `top_values_complete=false`, while exact counts and
+min/max still covered the full trace.
 
 **21.** Private user-mode software breakpoint removal now records the exact
 CR3 used by `install_user_breakpoint` and re-enters that CR3 before sending
