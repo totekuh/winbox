@@ -4,13 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "winbox"
-version = "1.5.20"
-description = "Transparent Windows execution proxy for Kali — run Windows pentest tools via a headless QEMU/KVM VM"
+version = "1.5.21"
+description = "Isolated Windows vulnerability-research platform for Kali and AI agents"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "totekuh"}]
 readme = "README.md"
-keywords = ["windows", "kali", "pentest", "qemu", "kvm", "vm"]
+keywords = [
+    "windows", "kali", "vulnerability-research", "kernel-debugging",
+    "malware-analysis", "mcp", "qemu", "kvm",
+]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Environment :: Console",

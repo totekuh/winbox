@@ -9,8 +9,9 @@ import click
 def mcp_cmd() -> None:
     """Start the winbox MCP server (stdio transport).
 
-    Exposes vulnerability research primitives: python, ioctl, reg_query,
-    reg_set, ps — all executing inside the Windows VM.
+    Exposes the full research control plane to AI agents: VM lifecycle,
+    execution, hypervisor debugging, memory/symbol inspection, drivers,
+    IPC, defenses, networking, containment, and evidence collection.
     """
     try:
         from winbox.mcp import run_server

@@ -1,8 +1,17 @@
 # winbox
 
-Run Windows pentest tools from Kali. Transparently.
+**An isolated Windows vulnerability-research platform for Kali and AI agents.**
 
-winbox manages a headless Windows VM (Server Core 2022/2025 or Windows 11) via QEMU/KVM. Type `winbox exec SharpHound.exe -c All -d corp.local` on your Kali box and it Just Works — the VM starts automatically, runs the command, and prints the output.
+winbox turns a headless Windows VM (Server Core 2022/2025 or Windows 11) into
+an automation, instrumentation, and analysis environment controlled from
+Kali. Execute tools, drive a PDB-aware hypervisor debugger, inspect protected
+memory, exercise drivers and IPC, change security posture, contain malware,
+and collect evidence through one CLI and a 64-tool MCP surface.
+
+Transparent execution is still the shortest path in: type
+`winbox exec SharpHound.exe -c All -d corp.local` and winbox boots the VM,
+runs the command, and returns its output. It is now one workflow within the
+larger platform rather than the product's whole identity.
 
 ## Quick Demo
 
@@ -28,28 +37,32 @@ $ winbox shell                                       # SYSTEM shell with full PT
 PS C:\Windows\system32>
 ```
 
-## Features
+## Platform capabilities
 
-- **Transparent execution** — run `.exe` files as if they were native Kali commands
-- **Auto-start** — VM boots on demand, use `winbox suspend` to save state
-- **Shared filesystem** — `~/.winbox/shared/tools/` maps to `Z:\tools\` in Windows via VirtIO-FS
-- **One-shot upload & MSI** — `winbox upload` stages files on Z:\, `winbox msi` installs an MSI and cleans up
-- **Background jobs** — `--bg` for long-running tools, `--log` for persistent output
-- **Interactive shells** — ConPTY SYSTEM shell with resize support, or SSH into PowerShell
-- **Network integration** — VM traffic is NAT'd through Kali; push DNS, manage hosts file, join AD domains
-- **Snapshots** — save and restore VM state (auto-shuts VM down, bare `winbox snapshot` lists)
-- **AV toggle** — disable/enable Windows Defender on demand (`winbox av disable/enable`)
-- **AppLocker** — enable AppLocker with default rules for bypass testing
-- **Autologin** — persistent Administrator auto-login that survives reboots on Server 2022
-- **Network isolation** — disconnect/reconnect VM NIC while keeping host-VM channels alive
-- **Malware detonation lab** — `winbox capture` (host-side pcap on the bridge — prefers `dumpcap`, which Kali's Wireshark package lets the `wireshark` group run without root, falling back to `tcpdump` otherwise), `winbox sinkhole` (zero-dependency DNS sinkhole that answers every C2 lookup with the bridge IP and logs the domain, plus optional INETSim fake services), and `winbox detonate check` (read-only preflight that refuses to go green unless the guest genuinely can't reach the internet). See [docs/malware-detonation.md](docs/malware-detonation.md)
-- **binfmt_misc** — register `.exe` so you can run `./SharpHound.exe` directly from Kali
-- **MCP server** — 64 tools that expose the VM to AI agents (Claude Code) for assisted vulnerability research, including credentialed or background exec/Python/PowerShell, Defender enable/disable/status, HVCI/VBS detection and toggle, a session-based named-pipe broker, and a long-running hypervisor-level kernel debug session
-- **Hypervisor-level kernel debug** — `winbox kdbg` drives QEMU's gdbstub from outside the VM via a long-running session daemon, pure-Python RSP client, PDB-backed symbol cache, EPROCESS/module walkers, hardware breakpoints by default (Z1/DRs, KVM-virtualized — invisible to PatchGuard and `GetThreadContext`; `--mode auto` falls back to software 0xCC where the 4 DR slots run out, but note HVCI blocks software breakpoints on the 24H2 kernel — Windows 11 and Server 2025), conditional breakpoints (server-side predicates), and CR3-switching memory reads (PPL-resistant, EDR-invisible)
-- **VNC display** via virt-manager (`winbox vnc`) — plain VGA, no clipboard/resize
-- **x64dbg in the guest** — bundled in setup, extracted to `C:\Tools\x64dbg`, both x32 and x64 on PATH
-- **Python in the guest** — Python 3.13 installed during setup (pip, PATH, py.exe launcher) for MCP-driven research
-- **No VM internet needed for setup** — all tools and dependencies are staged from the host side
+- **MCP server** — 64 tools form a bounded, AI-native research control plane
+  for autonomous agents, covering VM lifecycle, execution, memory, symbols,
+  debugging, drivers, IPC, defenses, networking, event logs, and evidence
+  collection.
+- **Hypervisor instrumentation** — a persistent QMP/RSP transport, PDB-backed
+  symbols and Windows structure walks, CR3-aware reads/writes, breakpoints,
+  watchpoints, stepping, disassembly, predicates, and action traces operate
+  below the guest and across PPL boundaries.
+- **Target interaction** — send IOCTLs, inspect and hold named pipes, manage
+  services/registry/Defender/HVCI/AppLocker, run tools as SYSTEM or alternate
+  local users, and keep long-running jobs observable.
+- **Containment and detonation** — host-enforced network isolation, full NIC
+  unplug, packet capture, DNS sinkholing, optional INETSim services, snapshots,
+  and a fail-closed detonation preflight. See
+  [docs/malware-detonation.md](docs/malware-detonation.md).
+- **Reproducible Windows lab** — build and operate Server 2022, Server 2025,
+  or Windows 11 guests with automatic provisioning, VirtIO-FS staging,
+  snapshots, VNC, x64dbg, Python, and host-side dependency delivery.
+- **Transparent execution** — run `.exe` files like native Kali commands,
+  including background/logged jobs, one-shot uploads, MSI installation,
+  ConPTY SYSTEM shells, SSH, and optional `binfmt_misc` dispatch.
+- **Network and domain integration** — NAT through Kali, manage DNS/hosts,
+  join Active Directory domains, or isolate the target without losing the
+  guest-agent and VirtIO-FS control channels.
 
 ## Prerequisites
 
@@ -110,8 +123,8 @@ Notes for Server 2025:
   ESP layout), but on the Windows 11 24H2 kernel (build 26100). `--desktop` selects
   Desktop Experience, same as 2022.
 - Because it shares the 24H2 kernel, HVCI/VBS and Defender behavior can differ from
-  2022 — `winbox av status` reports the real Tamper-Protection state, and for `kdbg`
-  prefer `--mode hw`/`auto` if HVCI turns out to be on (it blocks software 0xCC bps).
+  2022 — `winbox av status` reports the real Tamper-Protection state. For `kdbg`,
+  use explicit hardware breakpoints when HVCI is on; it blocks software 0xCC bps.
 
 Notes for Win11:
 - No TPM / Secure Boot required — setup injects the `LabConfig` bypass keys so the
@@ -324,9 +337,13 @@ sudo winbox binfmt disable
 winbox binfmt status
 ```
 
-### MCP Server (AI-assisted vulnerability research)
+### MCP Server (AI-driven vulnerability research)
 
-winbox exposes an MCP server so AI agents (Claude Code, etc.) can interact with the Windows VM directly — run Python or PowerShell, send IOCTLs to drivers, query/set registry, list processes, talk to named pipes.
+The MCP server is the platform's agent control plane, not only a remote shell.
+AI agents can manage and contain the VM, run code, instrument live targets from
+the hypervisor, resolve PDB symbols, inspect protected address spaces, exercise
+drivers and named pipes, change defenses, and retrieve bounded evidence without
+constructing one-off transport glue.
 
 **Install:**
 
@@ -412,7 +429,7 @@ and requires a reboot.
 | `kdbg_stop()` | Stop the gdbstub listener |
 | `kdbg_status(port?)` | Show stub state + reachability |
 | `kdbg_symbols_load()` | Pull ntoskrnl.exe out, fetch PDB from msdl, persist symbols + struct layouts to `~/.winbox/symbols/` |
-| `kdbg_user_symbols_load(name, vm_path)` | Same flow for an arbitrary user-mode binary (per-process PDB) |
+| `kdbg_user_symbols_load(pid, module)` | Pull a module loaded in `pid`, fetch its matching PDB, and persist a process-correct symbol map |
 | `kdbg_sym(name, search?, limit?, rva?)` | Resolve `mod!sym` to VA or RVA; substring search supported |
 | `kdbg_struct(type_name, field?, module?)` | Dump full struct layout or one field offset |
 | `kdbg_ps()` | Walk `PsActiveProcessHead` (JSON: pid, dtb, eprocess, name) |
@@ -428,20 +445,20 @@ and requires a reboot.
 | `kdbg_attach(pid, port?)` | Fork the session daemon and attach to a target process. VM keeps running; bps stay armed until detach |
 | `kdbg_detach()` | Tear down the session and leave the VM running |
 | `kdbg_session()` | Show current daemon state (target pid, attach time, bp count, halted vs running) |
-| `kdbg_bp(target, mode?, condition?)` | Install a bp. `mode="hw"` (default; Z1/DR — invisible to PatchGuard + `GetThreadContext`, 4 slots/vCPU), `mode="soft"` (0xCC patch — unlimited but PG-visible), or `mode="auto"` (hw first, soft on slot exhaustion). **On the 24H2 kernel (Windows 11, Server 2025) use `hw`/`auto`: HVCI blocks the software 0xCC patch.** Optional `condition` is a server-side predicate evaluated on each fire (regs, `[reg+off]` qword reads, `==/!=/</<=/>/>=`, `&&`/`||`) |
+| `kdbg_bp(target, mode?, condition?, wp_type?, wp_size?, actions?)` | Install an explicit hardware/software breakpoint or hardware watchpoint. Optional predicates filter fires server-side; actions evaluate expressions, append JSONL trace records, and auto-continue. Hardware execution breakpoints and watchpoints share four DR slots; no implicit `auto` fallback can silently patch code. |
 | `kdbg_bps()` | List installed bps with hit/skip/error counters |
-| `kdbg_bp_trace(bp_id, tail?)` | Read the JSONL trace log for an action bp |
+| `kdbg_bp_trace(bp_id, tail?, from_hit?, limit?, expression?, value?, errors_only?, summary?, top?)` | Bounded backward tail or cursor pagination over action traces, with projection/filtering and AI-sized value/error/distribution summaries |
 | `kdbg_rm(bp_id)` | Remove an installed bp |
 | `kdbg_cont(timeout?)` | Resume; block until next stop in target's CR3 set (KPTI-aware: kernel + user PML4) |
-| `kdbg_step()` | Single-instruction step on the firing vCPU |
+| `kdbg_step(over?, out?)` | Single-step, step over calls/syscalls, or step out via a temporary return-address breakpoint |
 | `kdbg_interrupt()` | Halt a running cont via raw `\x03` on the RSP socket |
-| `kdbg_resume()` | Resume without waiting (fire-and-forget) |
+| `kdbg_resume(port?)` | Recovery valve for a VM left paused after a debugger/client failure |
 | `kdbg_regs()` | Dump GPRs + control regs from the firing vCPU |
 | `kdbg_stack(n?)` | Hex-dump the top `n` qwords of the current stack |
 | `kdbg_bt(depth?)` | Symbolicated backtrace (cross-module, with C++ demangling via `llvm-undname`) |
-| `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); `decode` modes for hex/utf8/utf16/disasm |
+| `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |
-| `kdbg_disasm(va, length?)` | Capstone disassembly at a target VA |
+| `kdbg_disasm(addr?, count?)` | Symbol-annotated Capstone disassembly at a target VA or the current RIP |
 
 The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker process per session (spawned as DETACHED_PROCESS | CREATE_NO_WINDOW inside the VM). IPC happens via `cmd.json`/`result.json` files on the VirtIO-FS share, so there's no VM round-trip on the polling path. This matters for protocols where a write on one handle must be answered on the same handle (stateless `send`/`recv` open fresh handles and never see each other's messages).
 
@@ -451,11 +468,22 @@ The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker pro
 
 ```
 Kali Linux
-├── winbox CLI (Python/Click)
-│   ├── virtio-serial ──────> QEMU Guest Agent (command execution, VM management)
+├── winbox control plane
+│   ├── CLI (Python/Click)
+│   └── MCP server (64 bounded agent tools)
+├── hypervisor research plane
+│   ├── QMP/HMP ────────────> VM + gdbstub lifecycle
+│   ├── persistent RSP ─────> vCPUs, memory, break/watchpoints, stepping
+│   └── PDB/symbol store ───> Windows types, processes, modules, disassembly
+├── guest interaction plane
+│   ├── virtio-serial ──────> QEMU Guest Agent (execution + management)
 │   ├── VirtIO-FS ──────────> ~/.winbox/shared/ <=> Z:\ in VM
 │   ├── SSH ────────────────> OpenSSH Server (interactive PowerShell)
 │   └── TCP listener ───────< ConPTY reverse shell (SYSTEM, resizable PTY)
+├── containment/evidence plane
+│   ├── libvirt nwfilter/link control
+│   ├── bridge packet capture
+│   └── DNS sinkhole + optional INETSim
 │
 └── Windows guest — Server Core 2022/2025 or Win11 (headless QEMU/KVM, plain VNC display)
     ├── QEMU Guest Agent          ← primary exec channel
@@ -468,11 +496,9 @@ Kali Linux
     └── NAT via libvirt           ← reaches anything Kali can reach
 ```
 
-**Four channels:**
-- **Guest Agent** (virtio-serial) — command execution for `winbox exec`, VM management
-- **VirtIO-FS** — shared filesystem, zero-copy via shared memory
-- **SSH** — interactive PowerShell sessions (`winbox ssh`)
-- **ConPTY** — SYSTEM-level interactive shell with full PTY (`winbox shell`)
+The separation is deliberate: QMP owns lifecycle, one serialized RSP owner
+controls debugger state, the guest agent handles in-guest automation, and
+host-side networking enforces containment even when the guest is hostile.
 
 ## Configuration
 

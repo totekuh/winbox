@@ -281,7 +281,7 @@ class GroupedCli(click.Group):
 @click.version_option(package_name="winbox")
 @click.pass_context
 def cli(ctx: click.Context) -> None:
-    """winbox — Transparent Windows execution proxy for Kali."""
+    """winbox — Windows vulnerability-research platform for Kali."""
     ctx.ensure_object(dict)
     ctx.obj["cfg"] = Config.load()
 

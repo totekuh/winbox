@@ -1,4 +1,4 @@
-"""winbox — Transparent Windows Execution Proxy for Kali."""
+"""winbox — isolated Windows vulnerability-research platform for Kali."""
 
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 

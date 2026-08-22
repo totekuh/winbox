@@ -1,4 +1,4 @@
-"""winbox MCP server - vuln research primitives for Windows VM."""
+"""MCP control plane for the winbox Windows vulnerability-research platform."""
 
 from __future__ import annotations
 
@@ -29,9 +29,11 @@ from winbox.vm.guest import _clixml_to_text
 mcp = FastMCP(
     "winbox",
     instructions=(
-        "Windows VM execution proxy for vulnerability research. "
-        "Run Python code, send IOCTLs, query/set registry, list processes — "
-        "all executing inside a Windows (Server 2022/2025 or 11) VM managed by QEMU/KVM."
+        "Isolated Windows vulnerability-research platform for AI agents. "
+        "Manage a QEMU/KVM Windows lab; execute and instrument targets; "
+        "debug from the hypervisor with PDB symbols, breakpoints, and memory "
+        "access; exercise drivers and IPC; control defenses and networking; "
+        "and collect bounded evidence."
     ),
 )
 
