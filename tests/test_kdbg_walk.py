@@ -281,31 +281,39 @@ def _list_proc_with_user_dtb(monkeypatch, raw_user_dtb_value: int):
     DTB = 0x12345000
 
     apl_off = _PROC_TYPES["_EPROCESS"]["fields"]["ActiveProcessLinks"]["off"]
-    pid_off = _PROC_TYPES["_EPROCESS"]["fields"]["UniqueProcessId"]["off"]
-    img_off = _PROC_TYPES["_EPROCESS"]["fields"]["ImageFileName"]["off"]
-    dtb_off = _PROC_TYPES["_KPROCESS"]["fields"]["DirectoryTableBase"]["off"]
-    user_off = _PROC_TYPES["_KPROCESS"]["fields"]["UserDirectoryTableBase"]["off"]
-
     flink = EPROC + apl_off
     qwords = {
         HEAD: flink,            # head -> first entry's flink
-        flink: HEAD,            # entry's flink -> head (single entry)
-        EPROC + pid_off: 1234,
-        EPROC + dtb_off: DTB,
-        EPROC + user_off: raw_user_dtb_value,
     }
 
     monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3_candidates", lambda vm: [0x999000])
     monkeypatch.setattr("winbox.kdbg.walk._read_u64",
                         lambda vm, cr3, va, cache: qwords[va])
-    monkeypatch.setattr("winbox.kdbg.walk._read_cstr",
-                        lambda vm, cr3, va, n, cache: "test.exe")
 
     class S:
         def resolve(self, name):
             return HEAD
         def struct(self, t, field=None, *, module="nt"):
             return _PROC_TYPES[t]
+
+    layout = walk._process_layout(S())
+
+    def read_span(vm, cr3, va, length, *, cache):
+        raw = bytearray(length)
+        def put(offset, size, value):
+            start = EPROC + offset - va
+            if 0 <= start and start + size <= length:
+                raw[start:start + size] = value.to_bytes(size, "little")
+        put(layout.active_links, 8, HEAD)
+        put(layout.pid, 8, 1234)
+        put(layout.dtb, 8, DTB)
+        put(layout.user_dtb, 8, raw_user_dtb_value)
+        start = EPROC + layout.image_name - va
+        if 0 <= start and start + 8 <= length:
+            raw[start:start + 8] = b"test.exe"
+        return bytes(raw)
+
+    monkeypatch.setattr(walk, "read_virt_cr3", read_span)
 
     procs = list_processes("vm", S())
     assert len(procs) == 1
@@ -340,6 +348,159 @@ def test_list_processes_rejects_zero_user_dtb(monkeypatch):
     (sentinel meaning "no second CR3 known")."""
     p = _list_proc_with_user_dtb(monkeypatch, 0)
     assert p.user_directory_table_base == 0
+
+
+def test_process_entry_coalesces_adjacent_fields_without_sparse_overread(monkeypatch):
+    """PID/Flink share a read; distant fields remain compact spans."""
+    eprocess = 0xFFFFE000_00100000
+    next_flink = 0xFFFFE000_00200448
+
+    class S:
+        def struct(self, type_name, field=None, *, module="nt"):
+            return _PROC_TYPES[type_name]
+
+    layout = walk._process_layout(S())
+    calls = []
+
+    def read_span(vm, cr3, va, length, *, cache):
+        calls.append((vm, cr3, va, length, cache))
+        raw = bytearray(length)
+
+        def put(offset, size, value):
+            start = eprocess + offset - va
+            if 0 <= start and start + size <= length:
+                raw[start:start + size] = value.to_bytes(size, "little")
+
+        put(layout.active_links, 8, next_flink)
+        put(layout.pid, 8, 4242)
+        put(layout.dtb, 8, 0x12345000)
+        put(layout.user_dtb, 8, 0x12344000)
+        name_start = eprocess + layout.image_name - va
+        if 0 <= name_start and name_start + 15 <= length:
+            raw[name_start:name_start + 15] = b"worker.exe\x00\x00\x00\x00\x00"
+        return bytes(raw)
+
+    monkeypatch.setattr(walk, "read_virt_cr3", read_span)
+    cache = walk.WalkCache()
+    record, flink = walk._read_process_entry(
+        "vm", 0x999000, eprocess, layout, cache,
+    )
+
+    assert calls == [
+        ("vm", 0x999000, eprocess + span.start, span.size, cache)
+        for span in layout.spans
+    ]
+    assert len(calls) == 4
+    assert sum(span.size for span in layout.spans) == 47
+    assert any(
+        span.start <= layout.pid
+        and layout.active_links + 8 <= span.start + span.size
+        for span in layout.spans
+    )
+    assert record == ProcessRecord(
+        pid=4242,
+        name="worker.exe",
+        eprocess=eprocess,
+        directory_table_base=0x12345000,
+        user_directory_table_base=0x12344000,
+    )
+    assert flink == next_flink
+
+
+def test_process_layout_rejects_out_of_bounds_symbol_offset():
+    types = {
+        **_PROC_TYPES,
+        "_EPROCESS": {
+            **_PROC_TYPES["_EPROCESS"],
+            "fields": {
+                **_PROC_TYPES["_EPROCESS"]["fields"],
+                "ImageFileName": {"off": 0x900, "type": ""},
+            },
+        },
+    }
+
+    class S:
+        def struct(self, type_name, field=None, *, module="nt"):
+            return types[type_name]
+
+    with pytest.raises(walk.HmpError, match="exceeds struct size"):
+        walk._process_layout(S())
+
+
+def test_process_layout_supports_pre_kpti_without_user_dtb():
+    types = {
+        **_PROC_TYPES,
+        "_KPROCESS": {
+            **_PROC_TYPES["_KPROCESS"],
+            "fields": {
+                "DirectoryTableBase": {"off": 0x28, "type": ""},
+            },
+        },
+    }
+
+    class S:
+        def struct(self, type_name, field=None, *, module="nt"):
+            return types[type_name]
+
+    layout = walk._process_layout(S())
+    assert layout.user_dtb is None
+    assert len(layout.spans) == 3
+
+
+def test_process_entry_rejects_short_coalesced_read(monkeypatch):
+    class S:
+        def struct(self, type_name, field=None, *, module="nt"):
+            return _PROC_TYPES[type_name]
+
+    layout = walk._process_layout(S())
+    monkeypatch.setattr(
+        walk,
+        "read_virt_cr3",
+        lambda vm, cr3, va, length, *, cache: b"\x00" * (length - 1),
+    )
+    with pytest.raises(walk.HmpError, match="short EPROCESS read"):
+        walk._read_process_entry(
+            "vm", 0x999000, 0xFFFFE000_00100000, layout, walk.WalkCache(),
+        )
+
+
+def test_find_process_stops_reading_immediately_after_match(monkeypatch):
+    """The lookup must not touch later EPROCESS records once PID matches."""
+    from winbox.kdbg.walk import find_process
+
+    head = 0xFFFFF800_00C26340
+    apl_off = _PROC_TYPES["_EPROCESS"]["fields"]["ActiveProcessLinks"]["off"]
+    system = 0xFFFFE000_00100000
+    target = 0xFFFFE000_00200000
+    tail = 0xFFFFE000_00300000
+    reads = []
+
+    class S:
+        def resolve(self, name):
+            return head
+        def struct(self, type_name, field=None, *, module="nt"):
+            return _PROC_TYPES[type_name]
+
+    monkeypatch.setattr(walk, "_cpu_cr3_candidates", lambda vm: [0x999000])
+    monkeypatch.setattr(
+        walk, "_read_u64",
+        lambda vm, cr3, va, cache: system + apl_off,
+    )
+
+    def read_entry(vm, cr3, eprocess, layout, cache):
+        reads.append(eprocess)
+        if eprocess == system:
+            return ProcessRecord(4, "System", system, 0x1AE000, 0), target + apl_off
+        if eprocess == target:
+            return ProcessRecord(828, "lsass.exe", target, 0x172643000, 0), tail + apl_off
+        pytest.fail("early-exit lookup read past the matching process")
+
+    monkeypatch.setattr(walk, "_read_process_entry", read_entry)
+    result = find_process("vm", S(), pid=828)
+
+    assert result is not None and result.name == "lsass.exe"
+    assert reads == [system, target]
+    assert walk._cached_kernel_cr3("vm") == 0x1AE000
 
 
 def test_cpu_cr3_comes_from_active_rsp_snapshot(monkeypatch):
@@ -486,7 +647,7 @@ def test_find_process_matches_name_longer_than_15_chars(monkeypatch):
         pid=1234, name=truncated, eprocess=0x1000,
         directory_table_base=0x2000, user_directory_table_base=0,
     )
-    monkeypatch.setattr(walk, "list_processes", lambda *a, **k: [rec])
+    monkeypatch.setattr(walk, "_iter_processes", lambda *a, **k: iter([rec]))
 
     assert find_process("winbox", None, name="SecurityHealthService.exe") is rec
     # A different long name that truncates differently must NOT match.
@@ -508,23 +669,10 @@ def test_list_processes_switches_to_system_dtb(monkeypatch):
     CPU_CR3 = 0x999000  # different from SYS_DTB
 
     apl_off = _PROC_TYPES["_EPROCESS"]["fields"]["ActiveProcessLinks"]["off"]
-    pid_off = _PROC_TYPES["_EPROCESS"]["fields"]["UniqueProcessId"]["off"]
-    img_off = _PROC_TYPES["_EPROCESS"]["fields"]["ImageFileName"]["off"]
-    dtb_off = _PROC_TYPES["_KPROCESS"]["fields"]["DirectoryTableBase"]["off"]
-    user_off = _PROC_TYPES["_KPROCESS"]["fields"]["UserDirectoryTableBase"]["off"]
-
     sys_flink = SYSTEM + apl_off
     p2_flink = PROC2 + apl_off
     qwords = {
         HEAD: sys_flink,
-        sys_flink: p2_flink,
-        SYSTEM + pid_off: 4,
-        SYSTEM + dtb_off: SYS_DTB,
-        SYSTEM + user_off: 0,
-        p2_flink: HEAD,
-        PROC2 + pid_off: 1234,
-        PROC2 + dtb_off: 0x5678000,
-        PROC2 + user_off: 0,
     }
 
     cr3s_used = []
@@ -535,8 +683,15 @@ def test_list_processes_switches_to_system_dtb(monkeypatch):
 
     monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3_candidates", lambda vm: [CPU_CR3])
     monkeypatch.setattr("winbox.kdbg.walk._read_u64", tracking_read_u64)
-    monkeypatch.setattr("winbox.kdbg.walk._read_cstr",
-                        lambda vm, cr3, va, n, cache: "System" if va == SYSTEM + img_off else "proc2.exe")
+
+    def read_entry(vm, cr3, eproc, layout, cache):
+        cr3s_used.append(cr3)
+        if eproc == SYSTEM:
+            return ProcessRecord(4, "System", SYSTEM, SYS_DTB, 0), p2_flink
+        assert eproc == PROC2
+        return ProcessRecord(1234, "proc2.exe", PROC2, 0x5678000, 0), HEAD
+
+    monkeypatch.setattr(walk, "_read_process_entry", read_entry)
 
     class S:
         def resolve(self, name):
@@ -567,18 +722,9 @@ def test_list_processes_no_switch_when_system_dtb_matches(monkeypatch):
     DTB = 0x1ae000
 
     apl_off = _PROC_TYPES["_EPROCESS"]["fields"]["ActiveProcessLinks"]["off"]
-    pid_off = _PROC_TYPES["_EPROCESS"]["fields"]["UniqueProcessId"]["off"]
-    dtb_off = _PROC_TYPES["_KPROCESS"]["fields"]["DirectoryTableBase"]["off"]
-    user_off = _PROC_TYPES["_KPROCESS"]["fields"]["UserDirectoryTableBase"]["off"]
-    img_off = _PROC_TYPES["_EPROCESS"]["fields"]["ImageFileName"]["off"]
-
     sys_flink = SYSTEM + apl_off
     qwords = {
         HEAD: sys_flink,
-        sys_flink: HEAD,
-        SYSTEM + pid_off: 4,
-        SYSTEM + dtb_off: DTB,
-        SYSTEM + user_off: 0,
     }
 
     cr3s_used = []
@@ -589,8 +735,13 @@ def test_list_processes_no_switch_when_system_dtb_matches(monkeypatch):
 
     monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3_candidates", lambda vm: [DTB])
     monkeypatch.setattr("winbox.kdbg.walk._read_u64", tracking_read_u64)
-    monkeypatch.setattr("winbox.kdbg.walk._read_cstr",
-                        lambda vm, cr3, va, n, cache: "System")
+    monkeypatch.setattr(
+        walk,
+        "_read_process_entry",
+        lambda vm, cr3, eproc, layout, cache: (
+            ProcessRecord(4, "System", SYSTEM, DTB, 0), HEAD,
+        ),
+    )
 
     class S:
         def resolve(self, name):

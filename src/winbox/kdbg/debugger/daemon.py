@@ -2146,11 +2146,10 @@ def fork_daemon(
         store = SymbolStore(cfg.symbols_dir)
         from winbox.kdbg.debugger.reader import use_local_rsp
         from winbox.kdbg.symbols import ensure_nt_base_current
-        from winbox.kdbg.walk import list_processes
+        from winbox.kdbg.walk import find_process
         with use_local_rsp(cfg.vm_name, rsp, initial_sr):
             ensure_nt_base_current(cfg, store)
-            procs = list_processes(cfg.vm_name, store)
-        target_rec = next((p for p in procs if p.pid == target_pid), None)
+            target_rec = find_process(cfg.vm_name, store, pid=target_pid)
         if target_rec is None:
             # Resume VM and close socket using the same safe pattern as
             # DaemonSession.shutdown(): raw socket close, no D-packet.

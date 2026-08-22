@@ -2854,6 +2854,7 @@ from winbox.kdbg.cet import (
     restore as _kdbg_restore_cet_policy,
 )
 from winbox.kdbg.pe import PeError as _KdbgPeError
+from winbox.kdbg.walk import find_process as _kdbg_find_process
 from winbox.kdbg.walk import list_modules as _kdbg_list_modules
 from winbox.kdbg.walk import list_processes as _kdbg_list_processes
 from winbox.kdbg.walk import list_user_modules as _kdbg_list_user_modules, is_wow64 as _kdbg_is_wow64
@@ -3102,8 +3103,7 @@ def kdbg_user_lm(pid: int) -> str:
     try:
         with _kdbg_debug_snapshot(cfg):
             cache = _KdbgWalkCache()
-            procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
-            target = next((p for p in procs if p.pid == pid), None)
+            target = _kdbg_find_process(cfg.vm_name, store, pid=pid, cache=cache)
             if target is None:
                 return f"pid {pid} not found"
             mods = _kdbg_list_user_modules(cfg.vm_name, store, target, cache=cache)
@@ -3158,8 +3158,7 @@ def kdbg_user_symbols_load(pid: int, module: str) -> str:
     try:
         with _kdbg_debug_snapshot(cfg):
             cache = _KdbgWalkCache()
-            procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
-            target = next((p for p in procs if p.pid == pid), None)
+            target = _kdbg_find_process(cfg.vm_name, store, pid=pid, cache=cache)
             if target is None:
                 return f"pid {pid} not found"
             mods = _kdbg_list_user_modules(cfg.vm_name, store, target, cache=cache)
@@ -3232,8 +3231,7 @@ def kdbg_read_va(pid: int, address: str, length: int) -> str:
         with _kdbg_debug_snapshot(cfg):
             store = _kdbg_get_store()
             cache = _KdbgWalkCache()
-            procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
-            target = next((p for p in procs if p.pid == pid), None)
+            target = _kdbg_find_process(cfg.vm_name, store, pid=pid, cache=cache)
             if target is None:
                 return f"pid {pid} not found"
             data = _kdbg_read_virt_cr3(

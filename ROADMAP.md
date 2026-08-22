@@ -25,22 +25,6 @@ per-vCPU DR0..3 slots, which is the hardware path's ceiling. There is no
 `--mode auto` — breakpoints must carry their type explicitly. The failure
 messages name the wall you actually hit instead of guessing at one.
 
-### 21. `bp_remove` on a private user-mode soft breakpoint can fail with E22
-
-Removing a soft breakpoint just installed via `kdbg_bp(mode="soft")` on a
-private (non-shared) user VA (`ntdll!NtClose` in a freshly attached process)
-returned `RuntimeError: z0 failed: z0 remove at <va> failed: b'E22'; bp
-still tracked, retry bp_remove`. CR3 state afterward was clean (no
-`_cr3_corrupted`), so the restore-safety invariant this file is built around
-held — but the byte itself was correctly restored by the time the session
-was torn down via `kdbg_detach` (confirmed with `kdbg_read_va`), which
-didn't go through the same `bp_remove` path that failed. Likely cause, not
-yet confirmed: `bp_remove`'s `z0` send may not re-apply the same
-CR3-masquerade `bp_add`'s install path uses, translating the VA through
-whichever CR3 happens to be active rather than the target's. Needs a repro
-against the actual code path before fixing — this is one live observation,
-not a bisected cause.
-
 ### 22. Background jobs have no result-identity protection against PID recycling
 
 `exec()` (nonce) and `exec_argv()` (look-behind) both verify that a
@@ -102,7 +86,7 @@ images). `read_current_control_set` added to `offlinereg.py`.
 
 ### 26. kdbg read-surface residuals from the 2026-08-10 audit (accepted / minor)
 
-Three findings from the read-surface audit were left as-is, deliberately:
+Two findings from the read-surface audit were left as-is, deliberately:
 
 * **`probe_port` treats every IPv6/unparsed listener as matching any host**
   (`hmp.py`). `_listening_sockets` records tcp6 LISTEN sockets as `(None,
@@ -119,12 +103,6 @@ Three findings from the read-surface audit were left as-is, deliberately:
   Unlike `user_dtb`, the primary `dtb` has no safe fallback (0 is useless), and
   a wrong `DirectoryTableBase` offset breaks the whole store loudly elsewhere,
   so a targeted guard here is low-value — folded into item 18.
-* **`find_process` materializes the whole process table for a single lookup**
-  (`walk.py`). A lazy generator that stops at the first match would save the
-  per-EPROCESS reads after the target. Minor perf; the per-walk cost dropped
-  sharply once `SymbolStore.load` was memoized (2026-08-10), so this is a low
-  priority.
-
 **10. Fixed.** See item 44 — `_mem_qword_reader` now distinguishes unmapped
 VA (returns 0, counts on bp) from transport failure (raises). Operator sees
 `predicate_read_errors` in `bp_list` instead of wondering why the bp never
@@ -188,25 +166,6 @@ and the `_wait_for_stop_serving` loop.
 
 ### Performance roadmap (2026-08-21)
 
-**48. HMP reads fork a virsh subprocess per call — use a persistent QMP socket**
-
-Every `xp`/`x`/`info registers` call in `hmp.py` does
-`subprocess.run(["virsh", ..., "qemu-monitor-command", ...])` — fork, exec,
-libvirt connect, QMP round-trip, exit. ~5-10ms per call. A `list_processes`
-walk does ~400-500 of these for ~100 processes: 2-5 seconds total.
-
-Fix: open a persistent Unix socket to QEMU's QMP monitor
-(`/var/run/libvirt/qemu/domain-<id>-<name>/monitor.sock` or the path from
-`virsh qemu-monitor-event --domain <vm> --event ...`), send
-`{"execute": "human-monitor-command", "arguments": {"command-line": "xp ..."}}`,
-parse the JSON response. Keep the socket open across calls. `hmp()` is the
-single choke point — everything upstream stays unchanged.
-
-Expected gain: ~10-20x faster for out-of-session reads (`kdbg_ps`,
-`kdbg_read_va`, `kdbg_user_lm`, symbol loading). Process walk from ~2-5s
-to ~200ms. Biggest single perf win available. Self-contained — only
-`hmp.py` changes.
-
 **49. CR3 masquerade overhead: 3 RSP round-trips per read in daemon path**
 
 Every in-session memory read (`op_mem`, `_mem_qword_reader` in predicates)
@@ -226,35 +185,6 @@ expressions per bp fire).
 Expected gain: ~30-50% faster predicate evaluation for multi-expression
 action breakpoints. Moderate complexity — predicate evaluator needs a
 two-pass design for the non-dependent case.
-
-**50. Coalesce adjacent EPROCESS field reads in process walker**
-
-`list_processes` reads pid, dtb, name, user_dtb as 4 separate `xp` calls
-per process. These fields all live within one EPROCESS — typically within
-a ~200 byte span. One `xp` read of the enclosing range would replace 4
-round-trips with 1, cutting the per-process cost by ~75%.
-
-Complication: field offsets come from PDB-parsed struct layouts and vary
-across Windows builds. The reader needs to compute the min/max offset span,
-issue one read, then slice. Safe — all offsets are validated at symbol-load
-time. Pairs well with item 48 (QMP socket) — subprocess overhead amplifies
-the per-call cost this eliminates.
-
-Expected gain: `kdbg_ps` 3-4x faster on top of whatever item 48 delivers.
-Same pattern applies to `list_modules` (module walker reads 3+ fields per
-LDR_DATA_TABLE_ENTRY).
-
-**51. `find_process` materializes full process list for single-PID lookup**
-
-`find_process(pid=N)` calls `list_processes()`, builds a full list, then
-linear-scans. A generator that yields and stops at first match would avoid
-reading every remaining EPROCESS. KPTI stabilization (switch to System's
-DTB after first EPROCESS) must happen before any yield — consume PID 4
-first, then yield-as-you-go.
-
-Expected gain: marginal (~10-50ms on a busy VM when target is early in
-the list). Lowest priority of the four. Worth doing only if already
-touching `walk.py` for item 50.
 
 ### Edge cases to harden (2026-08-20)
 
@@ -335,6 +265,48 @@ eliminating mid-walk KPTI CR3 races. `list_modules` gained KPTI retry.
 **40.** Active probe removed entirely — superseded by passive verification
 in item 30. The probe false-positived because no kernel symbol fires
 reliably within any timeout on a quiet freshly-booted VM.
+
+**48.** Persistent debugger transport shipped in v1.5.20. `hmp()` now uses a
+serialized persistent QMP connection (with libvirt/virsh fallback), while a
+process-safe persistent RSP broker exclusively owns debugger halt/resume,
+register, CR3, memory, and process/module-walk operations. CET preparation is
+an explicit fail-closed preflight with exact policy backup/restore.
+
+Final live validation on 2026-08-22 passed all nine release checks: the fresh
+MCP catalog exposed 64 tools; CET reported `UserShadowStack=OFF` and
+`StrictMode=OFF`; both unconfirmed policy-changing calls refused; the reader
+owned the connected gdbstub; process, kernel-module, and LSASS PE reads were
+correct; four concurrent debugger requests completed through broker
+serialization; and the System log contained zero event ID 1001 bugchecks
+since boot. See `docs/v1.5.20-final-check-handoff.md` for the full checklist
+and stress evidence.
+
+**21.** Private user-mode software breakpoint removal now records the exact
+CR3 used by `install_user_breakpoint` and re-enters that CR3 before sending
+`z0`; legacy tracked breakpoints without the recorded value retain safe
+candidate fallback. Unit coverage checks direct and fallback removal,
+registry retention on failure, exact CR3 restoration, and shutdown cleanup.
+Live validation on 2026-08-22 completed three consecutive
+`ntdll!NtClose` soft-breakpoint add/remove cycles, restored the original byte
+after every removal, left no tracked breakpoints, and kept the VM running.
+
+**50.** Process walking now derives compact read spans from the live
+PDB-backed EPROCESS layout and coalesces genuinely adjacent fields, including
+`UniqueProcessId` with `ActiveProcessLinks` on the validated Server 2025
+layout. It deliberately does not read the entire min/max field range: the
+real fields span about 1.4 KiB, and live benchmarking proved that sparse
+over-read was slower than compact RSP requests. Bounds, a 64 KiB sanity cap,
+short reads, pre-KPTI layouts, invalid user DTBs, and KPTI switching are
+covered. Warm `kdbg_ps` median improved from 232.1 ms to 226.7 ms across the
+same live VM rather than taking the initially measured 266 ms regression.
+
+**51.** `list_processes` and `find_process` now share a lazy internal walker;
+the latter returns immediately after a PID/name match without materializing
+the process table. PID 4 stabilization and boot-scoped CR3 caching happen
+before yielding, so an early return preserves the full-walk invariant. All
+single-PID CLI, MCP, and debugger-daemon consumers use the early lookup.
+Live integration proved a PID 4 lookup reads exactly one EPROCESS and takes
+about 22 ms warm on the validation VM.
 
 **11 (pdb).** `parse_types` raises `ValueError` on zero-field structs instead
 of returning useless empty layouts. Catches `llvm-pdbutil` format drift.

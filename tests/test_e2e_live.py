@@ -1241,6 +1241,40 @@ class TestKdbg:
             run("kdbg", "stop", expect_ok=False)
         assert _domstate(cfg.vm_name) == "running"
 
+    def test_private_user_soft_breakpoint_remove_restores_original_byte(
+        self, tool, run, cfg
+    ):
+        """Regression for roadmap #21: z0 removal must reuse install CR3."""
+        run("kdbg", "stop", expect_ok=False)
+        run("kdbg", "start")
+        try:
+            pid = self._target_pid(tool)
+            loaded = tool("kdbg_user_symbols_load")(pid, "ntdll")
+            assert "error" not in loaded.lower(), loaded
+            nt_close = tool("kdbg_sym")("ntdll!NtClose").split()[-1]
+            original = tool("kdbg_read_va")(pid, nt_close, 1).strip()
+            assert len(original) == 2 and original != "cc", original
+
+            tool("kdbg_attach")(pid)
+            try:
+                for _ in range(3):
+                    added = json.loads(tool("kdbg_bp")(
+                        "ntdll!NtClose", "soft"
+                    ))
+                    assert added["user_mode"] is True
+                    assert added["hw"] is False
+                    tool("kdbg_rm")(added["id"])
+                    assert json.loads(tool("kdbg_bps")())["bps"] == []
+                    restored = json.loads(tool("kdbg_mem")(
+                        nt_close, 1
+                    ))["bytes"]
+                    assert restored == original
+            finally:
+                tool("kdbg_detach")()
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+        assert _domstate(cfg.vm_name) == "running"
+
     def test_attach_works_after_a_reboot_without_a_manual_refresh(
         self, tool, run, cfg, ga, vm
     ):

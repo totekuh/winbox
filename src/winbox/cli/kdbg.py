@@ -61,7 +61,12 @@ from winbox.kdbg.hmp import (
     hmp as hmp_call,
     probe_port,
 )
-from winbox.kdbg.walk import list_modules, list_processes, list_user_modules
+from winbox.kdbg.walk import (
+    find_process,
+    list_modules,
+    list_processes,
+    list_user_modules,
+)
 from winbox.vm import VM, GuestAgent, VMState
 
 # Use the canonical HMP wrapper in tuple-mode for start/stop/status so the
@@ -494,8 +499,7 @@ def kdbg_read_va(
         with debug_snapshot(cfg):
             store = _get_store(cfg)
             cache = WalkCache()
-            procs = list_processes(cfg.vm_name, store, cache=cache)
-            target = next((p for p in procs if p.pid == pid), None)
+            target = find_process(cfg.vm_name, store, pid=pid, cache=cache)
             if target is None:
                 console.print(f"[red][-][/] pid {pid} not found in process list")
                 raise SystemExit(1)
@@ -551,8 +555,7 @@ def kdbg_user_lm(cfg: Config, vm: VM, ga: GuestAgent, pid: int) -> None:
     try:
         with debug_snapshot(cfg):
             cache = WalkCache()
-            procs = list_processes(cfg.vm_name, store, cache=cache)
-            target = next((p for p in procs if p.pid == pid), None)
+            target = find_process(cfg.vm_name, store, pid=pid, cache=cache)
             if target is None:
                 console.print(f"[red][-][/] pid {pid} not found in process list")
                 raise SystemExit(1)
@@ -604,8 +607,7 @@ def kdbg_user_symbols(cfg: Config, vm: VM, ga: GuestAgent, pid: int, module_name
     try:
         with debug_snapshot(cfg):
             cache = WalkCache()
-            procs = list_processes(cfg.vm_name, store, cache=cache)
-            target = next((p for p in procs if p.pid == pid), None)
+            target = find_process(cfg.vm_name, store, pid=pid, cache=cache)
             if target is None:
                 console.print(f"[red][-][/] pid {pid} not found in process list")
                 raise SystemExit(1)
@@ -709,11 +711,10 @@ def kdbg_user_bp(
     try:
         with debug_snapshot(cfg):
             store = _get_store(cfg)
-            procs = list_processes(cfg.vm_name, store)
+            target_proc = find_process(cfg.vm_name, store, pid=pid)
     except (SymbolStoreError, HmpError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
-    target_proc = next((p for p in procs if p.pid == pid), None)
     if target_proc is None:
         console.print(f"[red][-][/] pid {pid} not found")
         raise SystemExit(1)

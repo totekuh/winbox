@@ -2968,13 +2968,13 @@ class TestKdbgListTools:
         cfg.vm_name = "winbox"
         vm.state.return_value = VMState.PAUSED
 
-        procs = [ProcessRecord(pid=1234, name="target.exe",
+        target = ProcessRecord(pid=1234, name="target.exe",
                                eprocess=0xffffae00abcdef00,
-                               directory_table_base=0x7fa000)]
+                               directory_table_base=0x7fa000)
         payload = b"\xde\xad\xbe\xef"
 
         with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_list_processes", return_value=procs), \
+             patch("winbox.mcp._kdbg_find_process", return_value=target), \
              patch("winbox.mcp._kdbg_read_virt_cr3", return_value=payload):
             result = kdbg_read_va(pid=1234, address="0x7ff600001000", length=4)
 
@@ -3034,10 +3034,10 @@ class TestKdbgListTools:
                 active = False
                 events.append("exit")
 
-        def processes(*args, **kwargs):
+        def find(*args, **kwargs):
             assert active
-            events.append("processes")
-            return [ProcessRecord(1234, "target.exe", 0x1000, 0x2000)]
+            events.append("find")
+            return ProcessRecord(1234, "target.exe", 0x1000, 0x2000)
 
         def read(*args, **kwargs):
             assert active
@@ -3046,12 +3046,12 @@ class TestKdbgListTools:
 
         with patch("winbox.mcp._kdbg_debug_snapshot", snapshot), \
              patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_list_processes", side_effect=processes), \
+             patch("winbox.mcp._kdbg_find_process", side_effect=find), \
              patch("winbox.mcp._kdbg_read_virt_cr3", side_effect=read):
             result = kdbg_read_va(1234, "0x1000", 2)
 
         assert result == "4f4b"
-        assert events == ["enter", "processes", "read", "exit"]
+        assert events == ["enter", "find", "read", "exit"]
 
 
 # ─── kdbg session daemon tools (Tool 14) ───────────────────────────────────
@@ -3104,6 +3104,7 @@ class TestKdbgDaemonTools:
             "gdbstub_port": 1234,
         })
         with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
              patch("winbox.mcp._fork_daemon", return_value=1234) as ff:
             result = kdbg_attach(4584)
 
@@ -3153,6 +3154,7 @@ class TestKdbgDaemonTools:
         with patch("winbox.mcp._kdbg_client", return_value=client), \
              patch("winbox.mcp._kdbg_get_store", return_value=fake_store), \
              patch("winbox.mcp._kdbg_list_processes", return_value=[proc]), \
+             patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
              patch("winbox.mcp._fork_daemon", side_effect=DaemonError("gdbstub refused")):
             result = kdbg_attach(99999)
         assert "error: gdbstub refused" in result
@@ -3171,6 +3173,7 @@ class TestKdbgDaemonTools:
         with patch("winbox.mcp._kdbg_client", return_value=client), \
              patch("winbox.mcp._kdbg_get_store", return_value=fake_store), \
              patch("winbox.mcp._kdbg_list_processes", return_value=[proc]), \
+             patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
              patch("winbox.mcp._fork_daemon", return_value=1234), \
              patch("winbox.hvci.status", return_value=hvci_on):
             result = kdbg_attach(4584)
@@ -3192,6 +3195,7 @@ class TestKdbgDaemonTools:
         with patch("winbox.mcp._kdbg_client", return_value=client), \
              patch("winbox.mcp._kdbg_get_store", return_value=fake_store), \
              patch("winbox.mcp._kdbg_list_processes", return_value=[proc]), \
+             patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
              patch("winbox.mcp._fork_daemon", return_value=1234), \
              patch("winbox.hvci.status", return_value=hvci_off):
             result = kdbg_attach(4584)

@@ -18,7 +18,7 @@ regardless of which process was scheduled at halt time.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
 
 import logging
 import threading
@@ -63,6 +63,24 @@ class ProcessRecord:
                                         # 0 if the field is absent (pre-KPTI struct) or
                                         # the read failed. Either way the daemon falls
                                         # back to filtering on directory_table_base alone.
+
+
+@dataclass(frozen=True)
+class _ProcessSpan:
+    start: int
+    size: int
+
+
+@dataclass(frozen=True)
+class _ProcessLayout:
+    """Offsets and compact read spans needed to decode one EPROCESS."""
+
+    active_links: int
+    image_name: int
+    pid: int
+    dtb: int
+    user_dtb: int | None
+    spans: tuple[_ProcessSpan, ...]
 
 
 @dataclass
@@ -248,6 +266,173 @@ def _read_unicode_string(
 # ── Process list ────────────────────────────────────────────────────────
 
 
+def _process_layout(store: SymbolStore) -> _ProcessLayout:
+    eproc = store.struct("_EPROCESS")
+    eproc_fields = eproc["fields"]
+    kproc_fields = store.struct("_KPROCESS")["fields"]
+    active_links = int(eproc_fields["ActiveProcessLinks"]["off"])
+    image_name = int(eproc_fields["ImageFileName"]["off"])
+    pid = int(eproc_fields["UniqueProcessId"]["off"])
+    dtb = int(kproc_fields["DirectoryTableBase"]["off"])
+    raw_user_dtb = kproc_fields.get("UserDirectoryTableBase", {}).get("off")
+    user_dtb = int(raw_user_dtb) if raw_user_dtb is not None else None
+
+    fields = [(active_links, 8), (image_name, 15), (pid, 8), (dtb, 8)]
+    if user_dtb is not None:
+        fields.append((user_dtb, 8))
+    field_start = min(offset for offset, _ in fields)
+    field_end = max(offset + size for offset, size in fields)
+    eproc_size = int(eproc.get("size") or 0)
+    if field_start < 0 or field_end <= field_start:
+        raise HmpError("invalid negative/empty EPROCESS field span")
+    if eproc_size and field_end > eproc_size:
+        raise HmpError(
+            f"EPROCESS field span 0x{field_start:x}-0x{field_end:x} exceeds "
+            f"struct size 0x{eproc_size:x}"
+        )
+    # A corrupt/stale symbol map must not turn one process record into an
+    # unbounded debugger read even if its struct size is missing.
+    if field_end - field_start > 0x10000:
+        raise HmpError(
+            f"EPROCESS field span is implausibly large: 0x{field_end - field_start:x}"
+        )
+
+    # Merge fields only when they are adjacent or separated by a tiny hole.
+    # Real EPROCESS layouts place PID and ActiveProcessLinks together but DTB,
+    # UserDirectoryTableBase, and ImageFileName hundreds of bytes apart. One
+    # min/max read over those holes transfers ~1.4 KiB per process and is
+    # measurably slower than compact RSP reads despite fewer packets.
+    spans: list[_ProcessSpan] = []
+    for offset, size in sorted(fields):
+        if spans and offset <= spans[-1].start + spans[-1].size + 32:
+            previous = spans[-1]
+            end = max(previous.start + previous.size, offset + size)
+            spans[-1] = _ProcessSpan(previous.start, end - previous.start)
+        else:
+            spans.append(_ProcessSpan(offset, size))
+    return _ProcessLayout(
+        active_links=active_links,
+        image_name=image_name,
+        pid=pid,
+        dtb=dtb,
+        user_dtb=user_dtb,
+        spans=tuple(spans),
+    )
+
+
+def _read_process_entry(
+    vm_name: str,
+    cr3: int,
+    eprocess: int,
+    layout: _ProcessLayout,
+    cache: WalkCache,
+) -> tuple[ProcessRecord, int]:
+    """Decode one EPROCESS, coalescing adjacent fields into compact reads."""
+    chunks: list[tuple[_ProcessSpan, bytes]] = []
+    for span in layout.spans:
+        raw = read_virt_cr3(
+            vm_name,
+            cr3,
+            eprocess + span.start,
+            span.size,
+            cache=cache,
+        )
+        if len(raw) != span.size:
+            raise HmpError(
+                f"short EPROCESS read at 0x{eprocess + span.start:x}: "
+                f"expected {span.size}, got {len(raw)}"
+            )
+        chunks.append((span, raw))
+
+    def field(offset: int, size: int) -> bytes:
+        for span, raw in chunks:
+            if span.start <= offset and offset + size <= span.start + span.size:
+                start = offset - span.start
+                return raw[start:start + size]
+        raise HmpError(f"EPROCESS field at +0x{offset:x} is outside read spans")
+
+    pid = int.from_bytes(field(layout.pid, 8), "little")
+    dtb = int.from_bytes(field(layout.dtb, 8), "little")
+    name = field(layout.image_name, 15).split(b"\x00", 1)[0].decode(
+        "latin-1", errors="replace",
+    )
+    next_flink = int.from_bytes(field(layout.active_links, 8), "little")
+    user_dtb = 0
+    if layout.user_dtb is not None:
+        raw_user_dtb = int.from_bytes(field(layout.user_dtb, 8), "little")
+        if (
+            raw_user_dtb != 0
+            and (raw_user_dtb & 0xFFF) == 0
+            and raw_user_dtb < (1 << 52)
+        ):
+            user_dtb = raw_user_dtb
+    return ProcessRecord(
+        pid=pid,
+        name=name,
+        eprocess=eprocess,
+        directory_table_base=dtb,
+        user_directory_table_base=user_dtb,
+    ), next_flink
+
+
+def _iter_processes(
+    vm_name: str,
+    store: SymbolStore,
+    *,
+    cr3: int | None = None,
+    cache: WalkCache | None = None,
+) -> Iterator[ProcessRecord]:
+    """Yield live processes while the caller owns one debugger snapshot."""
+    explicit_cr3 = cr3
+
+    head = store.resolve("PsActiveProcessHead")
+    layout = _process_layout(store)
+
+    # Probe a cached PID 4 kernel DTB first, then every live vCPU CR3 and its
+    # KPTI partner. Each candidate gets a fresh page-table cache so failed
+    # translations cannot contaminate the successful walk.
+    cr3, flink, cache = _read_kernel_list_head(vm_name, head, explicit_cr3)
+    count = 0
+    seen: set[int] = set()
+    while flink != head and flink != 0 and count < MAX_PROCESSES:
+        if flink in seen:
+            break
+        seen.add(flink)
+        eproc = flink - layout.active_links
+        try:
+            record, next_flink = _read_process_entry(
+                vm_name, cr3, eproc, layout, cache,
+            )
+        except (HmpError, PageWalkError) as e:
+            # Bare `except Exception` here used to silently truncate the walk
+            # mid-list — callers thought they had the full process table.
+            # Surface the partial-truncation reason in logs (still partial
+            # data is returned so the UI shows what we did get).
+            logger.warning(
+                "list_processes: walk truncated at EPROCESS 0x%x (%d returned): %s",
+                eproc, count, e,
+            )
+            break
+        count += 1
+        # KPTI stabilization: System (first EPROCESS, PID 4) always has
+        # a valid kernel CR3. Switch to it for the rest of the walk to
+        # avoid mid-walk KPTI CR3 races on a running VM.
+        if count == 1 and record.pid == 4 and record.directory_table_base != cr3:
+            cr3 = record.directory_table_base
+            cache = WalkCache()
+        if record.pid == 4 and explicit_cr3 is None:
+            _remember_kernel_cr3(vm_name, record.directory_table_base)
+        # Stabilize/cache PID 4 before yielding so an early-exit lookup keeps
+        # the same boot-scoped CR3 invariant as a complete process walk.
+        yield record
+        flink = next_flink
+    if count >= MAX_PROCESSES:
+        logger.warning(
+            "list_processes: hit MAX_PROCESSES=%d cap; result is truncated",
+            MAX_PROCESSES,
+        )
+
+
 @snapshot_operation
 def list_processes(
     vm_name: str,
@@ -257,93 +442,10 @@ def list_processes(
     cache: WalkCache | None = None,
 ) -> list[ProcessRecord]:
     """Walk ``PsActiveProcessHead`` and return every live process."""
-    explicit_cr3 = cr3
-
-    head = store.resolve("PsActiveProcessHead")
-    eproc_fields = store.struct("_EPROCESS")["fields"]
-    apl_off = eproc_fields["ActiveProcessLinks"]["off"]
-    img_off = eproc_fields["ImageFileName"]["off"]
-    pid_off = eproc_fields["UniqueProcessId"]["off"]
-    kproc_fields = store.struct("_KPROCESS")["fields"]
-    dtb_off = kproc_fields["DirectoryTableBase"]["off"]
-    # UserDirectoryTableBase only exists on KVA Shadow / KPTI builds.
-    # Pre-KPTI Win10 / 2016 builds don't have this field; reading it
-    # would point at unrelated KPROCESS bytes. Probe the field map and
-    # only read if present.
-    user_dtb_off = kproc_fields.get("UserDirectoryTableBase", {}).get("off")
-
-    # Probe a cached PID 4 kernel DTB first, then every live vCPU CR3 and its
-    # KPTI partner. Each candidate gets a fresh page-table cache so failed
-    # translations cannot contaminate the successful walk.
-    cr3, flink, cache = _read_kernel_list_head(vm_name, head, explicit_cr3)
-    results: list[ProcessRecord] = []
-    seen: set[int] = set()
-    while flink != head and flink != 0 and len(results) < MAX_PROCESSES:
-        if flink in seen:
-            break
-        seen.add(flink)
-        eproc = flink - apl_off
-        try:
-            pid = _read_u64(vm_name, cr3, eproc + pid_off, cache)
-            dtb = _read_u64(vm_name, cr3, eproc + dtb_off, cache)
-            name = _read_cstr(vm_name, cr3, eproc + img_off, 15, cache)
-            user_dtb = 0
-            if user_dtb_off is not None:
-                # Best-effort: per-process read failure shouldn't kill the
-                # walk. Sentinel 0 means "no second CR3 known"; daemon
-                # filters fall back to single-CR3 mode for this process.
-                try:
-                    raw_user_dtb = _read_u64(vm_name, cr3, eproc + user_dtb_off, cache)
-                except (HmpError, PageWalkError):
-                    raw_user_dtb = 0
-                # Validate it looks like a PML4 physical address before
-                # trusting it. If the cached _KPROCESS struct map came
-                # from a different Windows build than the live kernel
-                # (struct shuffles between Server 2019/2022/24H2), the
-                # offset can point at an adjacent field and we'd hand
-                # the daemon a garbage CR3 — its filter would accept
-                # random fires. PML4 PAs are page-aligned (low 12 bits
-                # zero), non-zero, and below the architectural 52-bit
-                # phys-addr cap. Anything else is suspicious junk.
-                if (
-                    raw_user_dtb != 0
-                    and (raw_user_dtb & 0xFFF) == 0
-                    and raw_user_dtb < (1 << 52)
-                ):
-                    user_dtb = raw_user_dtb
-                else:
-                    user_dtb = 0
-        except (HmpError, PageWalkError) as e:
-            # Bare `except Exception` here used to silently truncate the walk
-            # mid-list — callers thought they had the full process table.
-            # Surface the partial-truncation reason in logs (still partial
-            # data is returned so the UI shows what we did get).
-            logger.warning(
-                "list_processes: walk truncated at EPROCESS 0x%x (%d returned): %s",
-                eproc, len(results), e,
-            )
-            break
-        results.append(ProcessRecord(
-            pid=pid, name=name, eprocess=eproc, directory_table_base=dtb,
-            user_directory_table_base=user_dtb,
-        ))
-        # KPTI stabilization: System (first EPROCESS, PID 4) always has
-        # a valid kernel CR3. Switch to it for the rest of the walk to
-        # avoid mid-walk KPTI CR3 races on a running VM.
-        if len(results) == 1 and pid == 4 and dtb != cr3:
-            cr3 = dtb
-            cache = WalkCache()
-        if pid == 4 and explicit_cr3 is None:
-            _remember_kernel_cr3(vm_name, dtb)
-        flink = _read_u64(vm_name, cr3, flink, cache)
-    if len(results) >= MAX_PROCESSES:
-        logger.warning(
-            "list_processes: hit MAX_PROCESSES=%d cap; result is truncated",
-            MAX_PROCESSES,
-        )
-    return results
+    return list(_iter_processes(vm_name, store, cr3=cr3, cache=cache))
 
 
+@snapshot_operation
 def find_process(
     vm_name: str,
     store: SymbolStore,
@@ -362,10 +464,11 @@ def find_process(
     of the request; this makes the match a 15-char-prefix match, which is
     inherently ambiguous for names sharing that prefix — the first is returned.
     """
-    for proc in list_processes(vm_name, store, cr3=cr3, cache=cache):
+    wanted_name = name.lower()[:15] if name is not None else None
+    for proc in _iter_processes(vm_name, store, cr3=cr3, cache=cache):
         if pid is not None and proc.pid == pid:
             return proc
-        if name is not None and proc.name.lower() == name.lower()[:15]:
+        if wanted_name is not None and proc.name.lower() == wanted_name:
             return proc
     return None
 

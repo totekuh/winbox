@@ -58,3 +58,30 @@ def test_live_parallel_walkers_are_serialized_across_cli_processes():
     assert lm.returncode == 0, lm_err or lm_out
     assert " processes)" in ps_out
     assert " modules)" in lm_out
+
+
+def test_live_pid4_lookup_exits_after_first_eprocess(monkeypatch):
+    """A single-PID lookup must not materialize the live process table."""
+    _require_safe_live_vm()
+
+    from winbox.config import Config
+    from winbox.kdbg import walk
+    from winbox.kdbg.debugger.reader import debug_snapshot
+    from winbox.kdbg.store import SymbolStore
+
+    cfg = Config.load()
+    store = SymbolStore(cfg.symbols_dir)
+    original = walk._read_process_entry
+    reads = 0
+
+    def counted(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(walk, "_read_process_entry", counted)
+    with debug_snapshot(cfg):
+        system = walk.find_process(cfg.vm_name, store, pid=4)
+
+    assert system is not None and system.name == "System"
+    assert reads == 1

@@ -287,7 +287,7 @@ class TestKdbgUserBreakpointOwnership:
         with patch("winbox.cli.kdbg.reader_info", return_value={"port": 1234}), \
              patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
              patch("winbox.cli.kdbg._get_store", return_value=cfg_store), \
-             patch("winbox.cli.kdbg.list_processes", return_value=[target]), \
+             patch("winbox.cli.kdbg.find_process", return_value=target), \
              patch(
                  "winbox.cli.kdbg.stop_reader",
                  side_effect=lambda cfg: events.append("stop"),

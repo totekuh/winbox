@@ -373,8 +373,8 @@ class TestWalkerEntryPointsHealFirst:
         from winbox.kdbg.debugger import daemon
 
         src = inspect.getsource(daemon.fork_daemon)
-        assert "list_processes" in src
-        assert src.index("RspClient.connect") < src.index("list_processes")
+        assert "find_process" in src
+        assert src.index("RspClient.connect") < src.index("find_process")
 
     def test_mcp_and_cli_store_accessors_heal(self):
         import inspect
