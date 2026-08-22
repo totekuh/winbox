@@ -47,6 +47,13 @@ from winbox.kdbg.debugger import (
     install_user_breakpoint,
     masquerade_cr3_candidates,
 )
+from winbox.kdbg.debugger.reader import debug_snapshot, reader_info, stop_reader
+from winbox.kdbg.cet import (
+    CetSafetyError,
+    prepare as prepare_cet,
+    query_status as query_cet_status,
+    restore as restore_cet_policy,
+)
 from winbox.kdbg.format import format_struct as _format_struct, format_sym as _format_sym
 from winbox.kdbg.hmp import (
     HmpError,
@@ -109,6 +116,15 @@ def kdbg_start(ctx: click.Context, port: int, any_interface: bool) -> None:
     bind = "0.0.0.0" if any_interface else "127.0.0.1"
     device = f"tcp:{bind}:{port}"
 
+    active_reader = reader_info(cfg)
+    if active_reader is not None:
+        owned_port = active_reader.get("port", 1234)
+        console.print(
+            f"[yellow][!][/] Persistent kdbg reader already owns the gdbstub "
+            f"on port {owned_port}. Run [bold]winbox kdbg stop[/] first."
+        )
+        raise SystemExit(1)
+
     # Refuse to double-start — QEMU will happily try to bind again and error
     # in HMP output, which is ugly. Fail fast with a clearer message.
     if probe_port("127.0.0.1", port):
@@ -146,6 +162,9 @@ def kdbg_stop(ctx: click.Context) -> None:
         console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
         raise SystemExit(1)
 
+    # The persistent reader owns QEMU's only RSP client. Release it before
+    # asking QMP to remove the listening gdbserver chardev.
+    stop_reader(cfg)
     rc, out, err = _hmp(cfg.vm_name, "gdbserver none")
     if rc != 0:
         console.print(f"[red][-][/] Failed to stop gdb stub: {err or out}")
@@ -176,6 +195,15 @@ def kdbg_status(ctx: click.Context, port: int) -> None:
             )
         return
 
+    active_reader = reader_info(cfg)
+    if active_reader is not None:
+        owned_port = active_reader.get("port", port)
+        console.print(
+            f"gdb stub: [green]connected[/] on 127.0.0.1:{owned_port} "
+            "(persistent reader owns it)"
+        )
+        return
+
     if not probe_port("127.0.0.1", port):
         console.print(f"gdb stub: [red]not running[/] (nothing on 127.0.0.1:{port})")
         return
@@ -183,6 +211,71 @@ def kdbg_status(ctx: click.Context, port: int) -> None:
     console.print(f"gdb stub: [green]listening[/] on 127.0.0.1:{port}")
     if DaemonClient(cfg).session_alive():
         console.print("  a winbox kdbg session is attached — [bold]winbox kdbg session[/]")
+
+
+@kdbg.command("cet-status")
+@needs_vm()
+def kdbg_cet_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
+    """Report whether this Windows boot is safe for QEMU debugging."""
+    try:
+        status = query_cet_status(ga)
+    except CetSafetyError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    state = "SAFE" if status.safe_for_debug else "UNSAFE"
+    colour = "green" if status.safe_for_debug else "red"
+    console.print(
+        f"[{colour}]{state}[/]: UserShadowStack={status.user_shadow_stack}, "
+        f"StrictMode={status.strict_mode}"
+    )
+
+
+@kdbg.command("prepare")
+@click.option(
+    "--confirm", is_flag=True,
+    help="Confirm disabling Windows user shadow stacks system-wide.",
+)
+@needs_vm()
+def kdbg_prepare(cfg: Config, vm: VM, ga: GuestAgent, confirm: bool) -> None:
+    """Prepare the VM for stable QEMU debugging; requires a reboot."""
+    if not confirm:
+        console.print(
+            "[yellow][!][/] This disables Windows CET user shadow stacks. "
+            "Re-run with --confirm, then reboot the VM."
+        )
+        raise SystemExit(1)
+    stop_reader(cfg)
+    try:
+        backup = prepare_cet(cfg, ga)
+    except CetSafetyError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if backup is None:
+        console.print("[green][+][/] CET UserShadowStack is already OFF; debugger is safe")
+    else:
+        console.print(f"[green][+][/] CET policy staged; original saved at {backup}")
+        console.print("[yellow][!][/] Reboot the VM before using kdbg")
+
+
+@kdbg.command("restore-cet")
+@click.option(
+    "--confirm", is_flag=True,
+    help="Confirm restoring the original Windows CET mitigation policy.",
+)
+@needs_vm()
+def kdbg_restore_cet(cfg: Config, vm: VM, ga: GuestAgent, confirm: bool) -> None:
+    """Restore the CET policy saved by ``kdbg prepare``; requires reboot."""
+    if not confirm:
+        console.print("[yellow][!][/] Re-run with --confirm to restore CET policy")
+        raise SystemExit(1)
+    stop_reader(cfg)
+    try:
+        restore_cet_policy(cfg, ga)
+    except CetSafetyError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    console.print("[green][+][/] Original CET policy restored")
+    console.print("[yellow][!][/] Reboot the VM for the restored policy to take effect")
 
 
 # ── Symbol / struct / walker subcommands ────────────────────────────────
@@ -305,15 +398,16 @@ def kdbg_ps(ctx: click.Context) -> None:
     cross-process reads.
     """
     cfg: Config = ctx.obj["cfg"]
-    store = _get_store(cfg)
     vm = VM(cfg)
-    if vm.state() != VMState.RUNNING:
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
         console.print(f"[red][-][/] VM not running ({vm.state().value})")
         raise SystemExit(1)
 
     try:
-        procs = list_processes(cfg.vm_name, store)
-    except SymbolStoreError as e:
+        with debug_snapshot(cfg):
+            store = _get_store(cfg)
+            procs = list_processes(cfg.vm_name, store)
+    except (SymbolStoreError, HmpError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
 
@@ -336,15 +430,16 @@ def kdbg_lm(ctx: click.Context) -> None:
     Shows base VA, image size, and driver/module name.
     """
     cfg: Config = ctx.obj["cfg"]
-    store = _get_store(cfg)
     vm = VM(cfg)
-    if vm.state() != VMState.RUNNING:
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
         console.print(f"[red][-][/] VM not running ({vm.state().value})")
         raise SystemExit(1)
 
     try:
-        mods = list_modules(cfg.vm_name, store)
-    except SymbolStoreError as e:
+        with debug_snapshot(cfg):
+            store = _get_store(cfg)
+            mods = list_modules(cfg.vm_name, store)
+    except (SymbolStoreError, HmpError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
 
@@ -383,9 +478,8 @@ def kdbg_read_va(
         winbox kdbg read-va 4712 0x7ff600001000 4096 -o /tmp/dump.bin
     """
     cfg: Config = ctx.obj["cfg"]
-    store = _get_store(cfg)
     vm = VM(cfg)
-    if vm.state() != VMState.RUNNING:
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
         console.print(f"[red][-][/] VM not running ({vm.state().value})")
         raise SystemExit(1)
 
@@ -396,22 +490,23 @@ def kdbg_read_va(
         # so the user gets the standard "Error: ..." prefix.
         raise click.BadParameter(f"invalid address: {address}")
 
-    cache = WalkCache()
-    procs = list_processes(cfg.vm_name, store, cache=cache)
-    target = next((p for p in procs if p.pid == pid), None)
-    if target is None:
-        console.print(f"[red][-][/] pid {pid} not found in process list")
-        raise SystemExit(1)
-
     try:
-        data = read_virt_cr3(
-            cfg.vm_name,
-            target.directory_table_base,
-            va,
-            length,
-            cache=cache,
-        )
-    except HmpError as e:
+        with debug_snapshot(cfg):
+            store = _get_store(cfg)
+            cache = WalkCache()
+            procs = list_processes(cfg.vm_name, store, cache=cache)
+            target = next((p for p in procs if p.pid == pid), None)
+            if target is None:
+                console.print(f"[red][-][/] pid {pid} not found in process list")
+                raise SystemExit(1)
+            data = read_virt_cr3(
+                cfg.vm_name,
+                target.directory_table_base,
+                va,
+                length,
+                cache=cache,
+            )
+    except (HmpError, SymbolStoreError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
 
@@ -444,27 +539,24 @@ def kdbg_user_lm(cfg: Config, vm: VM, ga: GuestAgent, pid: int) -> None:
     _PEB_LDR_DATA) out of the cached PDB on demand — no re-run of
     ``kdbg symbols`` needed.
     """
-    store = _get_store(cfg)
     try:
+        with debug_snapshot(cfg):
+            store = _get_store(cfg)
         # Lazy-extract the PEB structs if the store predates their addition.
         ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
     except (SymbolStoreError, SymbolLoadError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
 
-    cache = WalkCache()
     try:
-        procs = list_processes(cfg.vm_name, store, cache=cache)
-    except SymbolStoreError as e:
-        console.print(f"[red][-][/] {e}")
-        raise SystemExit(1)
-    target = next((p for p in procs if p.pid == pid), None)
-    if target is None:
-        console.print(f"[red][-][/] pid {pid} not found in process list")
-        raise SystemExit(1)
-
-    try:
-        mods = list_user_modules(cfg.vm_name, store, target, cache=cache)
+        with debug_snapshot(cfg):
+            cache = WalkCache()
+            procs = list_processes(cfg.vm_name, store, cache=cache)
+            target = next((p for p in procs if p.pid == pid), None)
+            if target is None:
+                console.print(f"[red][-][/] pid {pid} not found in process list")
+                raise SystemExit(1)
+            mods = list_user_modules(cfg.vm_name, store, target, cache=cache)
     except (SymbolStoreError, HmpError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
@@ -501,21 +593,26 @@ def kdbg_user_symbols(cfg: Config, vm: VM, ga: GuestAgent, pid: int, module_name
     short name (e.g. ``notepad`` for notepad.exe). Subsequent
     ``kdbg sym notepad!WinMain`` will resolve against that store.
     """
-    store = _get_store(cfg)
     try:
+        with debug_snapshot(cfg):
+            store = _get_store(cfg)
         ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
     except (SymbolStoreError, SymbolLoadError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
 
-    cache = WalkCache()
-    procs = list_processes(cfg.vm_name, store, cache=cache)
-    target = next((p for p in procs if p.pid == pid), None)
-    if target is None:
-        console.print(f"[red][-][/] pid {pid} not found in process list")
+    try:
+        with debug_snapshot(cfg):
+            cache = WalkCache()
+            procs = list_processes(cfg.vm_name, store, cache=cache)
+            target = next((p for p in procs if p.pid == pid), None)
+            if target is None:
+                console.print(f"[red][-][/] pid {pid} not found in process list")
+                raise SystemExit(1)
+            mods = list_user_modules(cfg.vm_name, store, target, cache=cache)
+    except (SymbolStoreError, HmpError) as e:
+        console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
-
-    mods = list_user_modules(cfg.vm_name, store, target, cache=cache)
     needle = module_name.lower()
     match = next(
         (m for m in mods if needle in m.name.lower()),
@@ -599,18 +696,23 @@ def kdbg_user_bp(
         with E22 from QEMU.
     """
     cfg: Config = ctx.obj["cfg"]
-    store = _get_store(cfg)
     vm = VM(cfg)
     if vm.state() != VMState.RUNNING:
         console.print(f"[red][-][/] VM not running ({vm.state().value})")
         raise SystemExit(1)
-    if not probe_port("127.0.0.1", port):
+    if reader_info(cfg) is None and not probe_port("127.0.0.1", port):
         console.print(f"[red][-][/] gdbstub not listening on 127.0.0.1:{port}")
         console.print("    run [bold]winbox kdbg start[/] first")
         raise SystemExit(1)
 
-    # Find target process to get its DTB.
-    procs = list_processes(cfg.vm_name, store)
+    # Find target process to get its DTB from one coherent VM snapshot.
+    try:
+        with debug_snapshot(cfg):
+            store = _get_store(cfg)
+            procs = list_processes(cfg.vm_name, store)
+    except (SymbolStoreError, HmpError) as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
     target_proc = next((p for p in procs if p.pid == pid), None)
     if target_proc is None:
         console.print(f"[red][-][/] pid {pid} not found")
@@ -635,6 +737,11 @@ def kdbg_user_bp(
         f"user_va=0x{user_va:x}[/]"
     )
 
+    # The lookup above used the shared reader; this legacy foreground flow
+    # now needs QEMU's one RSP client for itself. CET was checked before the
+    # snapshot opened, and stop_reader hands ownership over without removing
+    # the gdbserver listener.
+    stop_reader(cfg)
     cli = RspClient.connect("127.0.0.1", port, timeout=10.0)
     try:
         cli.handshake()
@@ -760,6 +867,9 @@ def kdbg_attach(ctx: click.Context, pid: int, port: int) -> None:
     if vm.state() != VMState.RUNNING:
         console.print(f"[red][-][/] VM not running ({vm.state().value})")
         raise SystemExit(1)
+    # Hand the one-client gdbstub from the background read broker to the
+    # interactive daemon. The listener remains up; only its RSP client exits.
+    stop_reader(cfg)
     if not probe_port("127.0.0.1", port):
         console.print(f"[red][-][/] gdbstub not listening on 127.0.0.1:{port}")
         console.print("    run [bold]winbox kdbg start[/] first")

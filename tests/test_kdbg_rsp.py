@@ -282,6 +282,31 @@ def test_write_memory_emits_M_with_hex_payload():
     assert b"$M2000,2:cc90#" in sent
 
 
+def test_write_registers_emits_G_and_returns_raw_reply():
+    cli, sock = _client([b"+", _frame(b"OK")])
+    blob = bytes(range(32))
+    assert cli.write_registers(blob) == b"OK"
+    assert b"$G" + blob.hex().encode() + b"#" in bytes(sock.sent)
+
+
+def test_physical_memory_mode_uses_qemu_rsp_extension():
+    cli, sock = _client([
+        b"+", _frame(b"OK"),
+        b"+", _frame(b"OK"),
+    ])
+    cli.set_physical_memory_mode(True)
+    cli.set_physical_memory_mode(False)
+    sent = bytes(sock.sent)
+    assert b"$Qqemu.PhyMemMode:1#" in sent
+    assert b"$Qqemu.PhyMemMode:0#" in sent
+
+
+def test_physical_memory_mode_rejection_is_explicit():
+    cli, _ = _client([b"+", _frame(b"")])
+    with pytest.raises(RspError, match="PhyMemMode:1 rejected"):
+        cli.set_physical_memory_mode(True)
+
+
 # ── thread / register ops ──────────────────────────────────────────────
 
 

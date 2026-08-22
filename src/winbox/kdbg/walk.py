@@ -21,8 +21,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import logging
+import threading
 
-from winbox.kdbg.hmp import HmpError, hmp, parse_registers
+from winbox.kdbg.debugger.reader import current_snapshot, snapshot_operation
+from winbox.kdbg.hmp import HmpError
 from winbox.kdbg.memory import (
     PageWalkError,
     WalkCache,
@@ -42,6 +44,13 @@ if TYPE_CHECKING:
 MAX_PROCESSES = 4096
 MAX_MODULES = 1024
 MAX_USER_MODULES = 1024
+
+# A kernel CR3 is a boot-scoped translation anchor, not cached process state.
+# PID 4's DirectoryTableBase remains valid for the lifetime of a Windows boot;
+# every list and structure is still read fresh on every call.  A failed probe
+# invalidates it, covering reboot, snapshot restore, and VM replacement.
+_kernel_cr3_by_vm: dict[str, int] = {}
+_kernel_cr3_lock = threading.Lock()
 
 
 @dataclass
@@ -85,15 +94,116 @@ class UserModuleRecord:
 
 
 def _cpu_cr3(vm_name: str) -> int:
-    # Parse only the registers, not the IDT. read_cpu_state() also runs
-    # parse_idt() and raises HmpError("IDT entry not found") when the dump has
-    # no IDT= line — which made `kdbg ps`/`kdbg lm` (they only need CR3) fail
-    # for a completely unrelated reason even though CR3 was present.
-    regs = parse_registers(hmp(vm_name, "info registers"))
-    try:
-        return regs["CR3"]
-    except KeyError:
-        raise HmpError("CR3 not found in `info registers` output")
+    snapshot = current_snapshot(vm_name)
+    if snapshot is None:
+        raise HmpError("no active RSP snapshot for CR3 read")
+    return snapshot.current_cr3
+
+
+def _cpu_cr3_candidates(vm_name: str) -> list[int]:
+    """Return CR3 from every halted vCPU through the active RSP snapshot."""
+    snapshot = current_snapshot(vm_name)
+    if snapshot is None:
+        raise HmpError("no active RSP snapshot for vCPU CR3 reads")
+    candidates = list(snapshot.cr3_candidates)
+    if not candidates:
+        raise HmpError("gdbstub returned no vCPU CR3 candidates")
+    return candidates
+
+
+def _cached_kernel_cr3(vm_name: str) -> int | None:
+    with _kernel_cr3_lock:
+        return _kernel_cr3_by_vm.get(vm_name)
+
+
+def _remember_kernel_cr3(vm_name: str, cr3: int) -> None:
+    # DirectoryTableBase is a physical PML4 address. Ignore corrupt/stale
+    # structure reads instead of poisoning every future walk.
+    if cr3 == 0 or cr3 & 0xFFF or cr3 >= (1 << 52):
+        return
+    with _kernel_cr3_lock:
+        _kernel_cr3_by_vm[vm_name] = cr3
+
+
+def _forget_kernel_cr3(vm_name: str, cr3: int | None = None) -> None:
+    with _kernel_cr3_lock:
+        if cr3 is None or _kernel_cr3_by_vm.get(vm_name) == cr3:
+            _kernel_cr3_by_vm.pop(vm_name, None)
+
+
+def _kernel_read_candidates(vm_name: str, explicit_cr3: int | None) -> list[int]:
+    """Build ordered kernel-CR3 candidates for a list-head probe."""
+    if explicit_cr3 is not None:
+        sampled = [explicit_cr3]
+    else:
+        sampled = _cpu_cr3_candidates(vm_name)
+
+    candidates: list[int] = []
+    for candidate in sampled:
+        # On KPTI builds the kernel/user PML4 roots are commonly adjacent.
+        for variant in (candidate, candidate ^ 0x1000):
+            if variant not in candidates:
+                candidates.append(variant)
+    return candidates
+
+
+def _read_kernel_list_head(
+    vm_name: str,
+    head: int,
+    explicit_cr3: int | None,
+) -> tuple[int, int, WalkCache]:
+    """Find a CR3 that maps ``head`` and return ``(cr3, flink, cache)``."""
+    def valid_flink(flink: int) -> bool:
+        # Both kernel lists live in canonical high-half virtual memory and
+        # LIST_ENTRY is pointer-aligned. During reboot, freed/transitioning
+        # pages commonly contain 0xFA poison; successful translation alone
+        # must not make such data a trusted bootstrap anchor.
+        # PsActiveProcessHead can never be empty (PID 4 exists), and the
+        # loaded-module list always contains nt itself. A self-link here is
+        # therefore stale-symbol/reboot data, not a legitimate empty list.
+        return (
+            flink not in (0, head)
+            and flink & 0x7 == 0
+            and flink >> 48 == 0xFFFF
+        )
+
+    cached = None if explicit_cr3 is not None else _cached_kernel_cr3(vm_name)
+    last_error: HmpError | None = None
+    if cached is not None:
+        # Fast path: do not sample volatile vCPU state at all once PID 4 gave
+        # us a boot-stable root. Try its KPTI partner too for defensive
+        # compatibility with stores created by older versions.
+        for candidate in (cached, cached ^ 0x1000):
+            candidate_cache = WalkCache()
+            try:
+                flink = _read_u64(vm_name, candidate, head, candidate_cache)
+            except (HmpError, PageWalkError) as exc:
+                last_error = exc
+                continue
+            if not valid_flink(flink):
+                last_error = HmpError(
+                    f"invalid kernel list pointer 0x{flink:x} via CR3 0x{candidate:x}"
+                )
+                continue
+            return candidate, flink, candidate_cache
+        _forget_kernel_cr3(vm_name, cached)
+
+    for candidate in _kernel_read_candidates(vm_name, explicit_cr3):
+        candidate_cache = WalkCache()
+        try:
+            flink = _read_u64(vm_name, candidate, head, candidate_cache)
+        except (HmpError, PageWalkError) as exc:
+            last_error = exc
+            continue
+        if not valid_flink(flink):
+            last_error = HmpError(
+                f"invalid kernel list pointer 0x{flink:x} via CR3 0x{candidate:x}"
+            )
+            continue
+        return candidate, flink, candidate_cache
+    if last_error is not None:
+        raise last_error
+    raise HmpError("no kernel CR3 candidates available")
 
 
 # Thin compat shims so the rest of this module reads as it did pre-K3.
@@ -138,6 +248,7 @@ def _read_unicode_string(
 # ── Process list ────────────────────────────────────────────────────────
 
 
+@snapshot_operation
 def list_processes(
     vm_name: str,
     store: SymbolStore,
@@ -146,10 +257,7 @@ def list_processes(
     cache: WalkCache | None = None,
 ) -> list[ProcessRecord]:
     """Walk ``PsActiveProcessHead`` and return every live process."""
-    if cr3 is None:
-        cr3 = _cpu_cr3(vm_name)
-    if cache is None:
-        cache = WalkCache()
+    explicit_cr3 = cr3
 
     head = store.resolve("PsActiveProcessHead")
     eproc_fields = store.struct("_EPROCESS")["fields"]
@@ -164,16 +272,10 @@ def list_processes(
     # only read if present.
     user_dtb_off = kproc_fields.get("UserDirectoryTableBase", {}).get("off")
 
-    # Flink of PsActiveProcessHead points at the first EPROCESS.ActiveProcessLinks.
-    # On KPTI builds the CPU may be in user mode — its CR3 maps only a
-    # kernel stub, not the full kernel address space. If the first read
-    # fails, retry with CR3 ^ 0x1000 (the kernel-mode KPTI half).
-    try:
-        flink = _read_u64(vm_name, cr3, head, cache)
-    except (PageWalkError, HmpError):
-        cr3 ^= 0x1000
-        cache = WalkCache()
-        flink = _read_u64(vm_name, cr3, head, cache)
+    # Probe a cached PID 4 kernel DTB first, then every live vCPU CR3 and its
+    # KPTI partner. Each candidate gets a fresh page-table cache so failed
+    # translations cannot contaminate the successful walk.
+    cr3, flink, cache = _read_kernel_list_head(vm_name, head, explicit_cr3)
     results: list[ProcessRecord] = []
     seen: set[int] = set()
     while flink != head and flink != 0 and len(results) < MAX_PROCESSES:
@@ -231,6 +333,8 @@ def list_processes(
         if len(results) == 1 and pid == 4 and dtb != cr3:
             cr3 = dtb
             cache = WalkCache()
+        if pid == 4 and explicit_cr3 is None:
+            _remember_kernel_cr3(vm_name, dtb)
         flink = _read_u64(vm_name, cr3, flink, cache)
     if len(results) >= MAX_PROCESSES:
         logger.warning(
@@ -269,6 +373,7 @@ def find_process(
 # ── Module list ─────────────────────────────────────────────────────────
 
 
+@snapshot_operation
 def list_modules(
     vm_name: str,
     store: SymbolStore,
@@ -277,10 +382,7 @@ def list_modules(
     cache: WalkCache | None = None,
 ) -> list[ModuleRecord]:
     """Walk ``PsLoadedModuleList`` and return every loaded kernel module."""
-    if cr3 is None:
-        cr3 = _cpu_cr3(vm_name)
-    if cache is None:
-        cache = WalkCache()
+    explicit_cr3 = cr3
 
     head = store.resolve("PsLoadedModuleList")
     ldr_fields = store.struct("_KLDR_DATA_TABLE_ENTRY")["fields"]
@@ -290,15 +392,7 @@ def list_modules(
     size_off = ldr_fields["SizeOfImage"]["off"]
     base_name_off = ldr_fields["BaseDllName"]["off"]
 
-    # On KPTI builds the CPU may be in user mode — its CR3 maps only a
-    # kernel stub. If the first read fails, retry with CR3 ^ 0x1000
-    # (the kernel-mode KPTI half), same as list_processes.
-    try:
-        flink = _read_u64(vm_name, cr3, head, cache)
-    except (PageWalkError, HmpError):
-        cr3 ^= 0x1000
-        cache = WalkCache()
-        flink = _read_u64(vm_name, cr3, head, cache)
+    cr3, flink, cache = _read_kernel_list_head(vm_name, head, explicit_cr3)
     results: list[ModuleRecord] = []
     seen: set[int] = set()
     while flink != head and flink != 0 and len(results) < MAX_MODULES:
@@ -361,6 +455,7 @@ def is_wow64(
         return False
 
 
+@snapshot_operation
 def list_user_modules(
     vm_name: str,
     store: SymbolStore,

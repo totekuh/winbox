@@ -2755,6 +2755,14 @@ def kdbg_start(port: int = 1234, any_interface: bool = False) -> str:
 
     bind = "0.0.0.0" if any_interface else "127.0.0.1"
 
+    active_reader = _kdbg_reader_info(cfg)
+    if active_reader is not None:
+        owned_port = active_reader.get("port", 1234)
+        return (
+            f"Persistent kdbg reader already owns the gdbstub on port "
+            f"{owned_port}. Call kdbg_stop() first."
+        )
+
     if _kdbg_probe("127.0.0.1", port):
         return (
             f"Something is already listening on 127.0.0.1:{port}. "
@@ -2782,6 +2790,7 @@ def kdbg_stop() -> str:
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
 
+    _kdbg_stop_reader(cfg)
     rc, out, err = _kdbg_hmp(cfg.vm_name, "gdbserver none")
     if rc != 0:
         return f"Failed to stop gdb stub: {err or out}"
@@ -2799,6 +2808,14 @@ def kdbg_status(port: int = 1234) -> str:
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
+
+    active_reader = _kdbg_reader_info(cfg)
+    if active_reader is not None:
+        owned_port = active_reader.get("port", port)
+        return (
+            f"gdb stub: connected on 127.0.0.1:{owned_port} "
+            "(persistent reader owns it)"
+        )
 
     if _kdbg_probe("127.0.0.1", port):
         return f"gdb stub: listening on 127.0.0.1:{port}"
@@ -2825,10 +2842,79 @@ from winbox.kdbg import (
     resolve_nt_base as _kdbg_resolve_nt_base,
 )
 from winbox.kdbg.hmp import HmpError as _KdbgHmpError
+from winbox.kdbg.debugger.reader import (
+    debug_snapshot as _kdbg_debug_snapshot,
+    reader_info as _kdbg_reader_info,
+    stop_reader as _kdbg_stop_reader,
+)
+from winbox.kdbg.cet import (
+    CetSafetyError as _KdbgCetSafetyError,
+    prepare as _kdbg_prepare_cet,
+    query_status as _kdbg_query_cet_status,
+    restore as _kdbg_restore_cet_policy,
+)
 from winbox.kdbg.pe import PeError as _KdbgPeError
 from winbox.kdbg.walk import list_modules as _kdbg_list_modules
 from winbox.kdbg.walk import list_processes as _kdbg_list_processes
 from winbox.kdbg.walk import list_user_modules as _kdbg_list_user_modules, is_wow64 as _kdbg_is_wow64
+
+
+@mcp.tool()
+def kdbg_cet_status() -> str:
+    """Report whether Windows CET state is safe for QEMU GDB stop/resume.
+
+    Repeated debug stops on affected QEMU/KVM versions can bugcheck Windows
+    while UserShadowStack is active. This read-only check must report OFF
+    before kdbg memory/walker/attach operations are allowed.
+    """
+    _, _, ga = _ensure_vm_ready()
+    try:
+        status = _kdbg_query_cet_status(ga)
+    except _KdbgCetSafetyError as exc:
+        return f"error: {exc}"
+    state = "SAFE" if status.safe_for_debug else "UNSAFE"
+    return (
+        f"{state}: UserShadowStack={status.user_shadow_stack}, "
+        f"StrictMode={status.strict_mode}"
+    )
+
+
+@mcp.tool()
+def kdbg_prepare(confirm: bool = False) -> str:
+    """Disable CET user shadow stacks for stable kdbg use; reboot required.
+
+    This weakens a Windows exploit mitigation, so ``confirm`` must be true.
+    The original raw policy is backed up on the host and can be restored with
+    ``kdbg_restore_cet``.
+    """
+    if not confirm:
+        return (
+            "refused: this disables Windows CET UserShadowStack system-wide; "
+            "call again with confirm=true, then reboot the VM"
+        )
+    cfg, _, ga = _ensure_vm_ready()
+    _kdbg_stop_reader(cfg)
+    try:
+        backup = _kdbg_prepare_cet(cfg, ga)
+    except _KdbgCetSafetyError as exc:
+        return f"error: {exc}"
+    if backup is None:
+        return "CET UserShadowStack is already OFF; debugger is safe"
+    return f"CET policy staged; original saved at {backup}; reboot required"
+
+
+@mcp.tool()
+def kdbg_restore_cet(confirm: bool = False) -> str:
+    """Restore the CET policy backed up by ``kdbg_prepare``; reboot required."""
+    if not confirm:
+        return "refused: call again with confirm=true to restore the CET policy"
+    cfg, _, ga = _ensure_vm_ready()
+    _kdbg_stop_reader(cfg)
+    try:
+        _kdbg_restore_cet_policy(cfg, ga)
+    except _KdbgCetSafetyError as exc:
+        return f"error: {exc}"
+    return "original CET policy restored; reboot required"
 
 
 def _kdbg_get_store() -> _KdbgStore:
@@ -2935,9 +3021,10 @@ def kdbg_ps() -> str:
     state = vm.state()
     if state not in (VMState.RUNNING, VMState.PAUSED):
         return f"VM is not running (state: {state.value})"
-    store = _kdbg_get_store()
     try:
-        procs = _kdbg_list_processes(cfg.vm_name, store)
+        with _kdbg_debug_snapshot(cfg):
+            store = _kdbg_get_store()
+            procs = _kdbg_list_processes(cfg.vm_name, store)
     except (_KdbgStoreError, _KdbgHmpError) as e:
         return f"error: {e}"
     out = [
@@ -2965,9 +3052,10 @@ def kdbg_lm() -> str:
     state = vm.state()
     if state not in (VMState.RUNNING, VMState.PAUSED):
         return f"VM is not running (state: {state.value})"
-    store = _kdbg_get_store()
     try:
-        mods = _kdbg_list_modules(cfg.vm_name, store)
+        with _kdbg_debug_snapshot(cfg):
+            store = _kdbg_get_store()
+            mods = _kdbg_list_modules(cfg.vm_name, store)
     except (_KdbgStoreError, _KdbgHmpError) as e:
         return f"error: {e}"
     out = [
@@ -3004,23 +3092,25 @@ def kdbg_user_lm(pid: int) -> str:
     state = vm.state()
     if state not in (VMState.RUNNING, VMState.PAUSED):
         return f"VM is not running (state: {state.value})"
-    store = _kdbg_get_store()
     try:
+        with _kdbg_debug_snapshot(cfg):
+            store = _kdbg_get_store()
         _kdbg_ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
     except (_KdbgStoreError, _KdbgSymbolLoadError) as e:
         return f"error: {e}"
 
-    cache = _KdbgWalkCache()
     try:
-        procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
-    except (_KdbgStoreError, _KdbgHmpError) as e:
-        return f"error: {e}"
-    target = next((p for p in procs if p.pid == pid), None)
-    if target is None:
-        return f"pid {pid} not found"
-
-    try:
-        mods = _kdbg_list_user_modules(cfg.vm_name, store, target, cache=cache)
+        with _kdbg_debug_snapshot(cfg):
+            cache = _KdbgWalkCache()
+            procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
+            target = next((p for p in procs if p.pid == pid), None)
+            if target is None:
+                return f"pid {pid} not found"
+            mods = _kdbg_list_user_modules(cfg.vm_name, store, target, cache=cache)
+            try:
+                wow64 = _kdbg_is_wow64(cfg.vm_name, store, target, cache=cache)
+            except Exception:
+                wow64 = False
     except (_KdbgStoreError, _KdbgHmpError) as e:
         return f"error: {e}"
     out = [
@@ -3033,14 +3123,11 @@ def kdbg_user_lm(pid: int) -> str:
         for m in mods
     ]
     result: dict = {"modules": out}
-    try:
-        if _kdbg_is_wow64(cfg.vm_name, store, target, cache=cache):
-            result["warning"] = (
-                "WoW64 process — only 64-bit modules listed. "
-                "The 32-bit module list (PEB.Wow64Process) is not walked yet."
-            )
-    except Exception:
-        pass
+    if wow64:
+        result["warning"] = (
+            "WoW64 process — only 64-bit modules listed. "
+            "The 32-bit module list (PEB.Wow64Process) is not walked yet."
+        )
     return _json.dumps(result, indent=2)
 
 
@@ -3061,23 +3148,21 @@ def kdbg_user_symbols_load(pid: int, module: str) -> str:
     Returns a one-line summary on success, error string otherwise.
     """
     cfg, vm, ga = _ensure_vm_ready()
-    store = _kdbg_get_store()
     try:
+        with _kdbg_debug_snapshot(cfg):
+            store = _kdbg_get_store()
         _kdbg_ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
     except (_KdbgStoreError, _KdbgSymbolLoadError) as e:
         return f"error: {e}"
 
-    cache = _KdbgWalkCache()
     try:
-        procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
-    except (_KdbgStoreError, _KdbgHmpError) as e:
-        return f"error: {e}"
-    target = next((p for p in procs if p.pid == pid), None)
-    if target is None:
-        return f"pid {pid} not found"
-
-    try:
-        mods = _kdbg_list_user_modules(cfg.vm_name, store, target, cache=cache)
+        with _kdbg_debug_snapshot(cfg):
+            cache = _KdbgWalkCache()
+            procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
+            target = next((p for p in procs if p.pid == pid), None)
+            if target is None:
+                return f"pid {pid} not found"
+            mods = _kdbg_list_user_modules(cfg.vm_name, store, target, cache=cache)
     except (_KdbgStoreError, _KdbgHmpError) as e:
         return f"error: {e}"
 
@@ -3112,15 +3197,15 @@ def kdbg_user_symbols_load(pid: int, module: str) -> str:
 @mcp.tool()
 def kdbg_read_va(pid: int, address: str, length: int) -> str:
     """Read virtual memory from an arbitrary process WITHOUT an attached
-    debugger session — uses HMP page-walks directly.
+    debugger session through the persistent RSP reader.
 
     Looks up the target's EPROCESS, grabs its ``DirectoryTableBase``,
-    and walks the page tables manually against that CR3 to read
-    ``length`` bytes at ``address``. Works without ``kdbg_attach`` and
-    regardless of which process was scheduled on the CPU.
+    temporarily selects that CR3 through QEMU's gdbstub, and reads
+    ``length`` bytes at ``address``. One broker owns the single RSP client
+    across calls and serializes concurrent MCP/CLI transactions.
 
-    For in-session reads (after ``kdbg_attach``), prefer ``kdbg_mem``:
-    same effect but ~40x faster (gdbstub CR3-masquerade vs HMP).
+    For in-session reads after ``kdbg_attach``, use ``kdbg_mem`` because the
+    interactive daemon already owns the same gdbstub connection.
 
     Returns a bare hex string of the bytes. Pair with ``kdbg_ps`` to
     find a PID first.
@@ -3143,22 +3228,21 @@ def kdbg_read_va(pid: int, address: str, length: int) -> str:
     except ValueError:
         return f"invalid address: {address!r}"
 
-    store = _kdbg_get_store()
-    cache = _KdbgWalkCache()
     try:
-        procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
-    except (_KdbgStoreError, _KdbgHmpError) as e:
-        return f"error: {e}"
-    target = next((p for p in procs if p.pid == pid), None)
-    if target is None:
-        return f"pid {pid} not found"
-
-    try:
-        data = _kdbg_read_virt_cr3(
-            cfg.vm_name, target.directory_table_base, va, length, cache=cache,
-        )
+        with _kdbg_debug_snapshot(cfg):
+            store = _kdbg_get_store()
+            cache = _KdbgWalkCache()
+            procs = _kdbg_list_processes(cfg.vm_name, store, cache=cache)
+            target = next((p for p in procs if p.pid == pid), None)
+            if target is None:
+                return f"pid {pid} not found"
+            data = _kdbg_read_virt_cr3(
+                cfg.vm_name, target.directory_table_base, va, length, cache=cache,
+            )
     except _KdbgHmpError as e:
         return f"read failed: {e}"
+    except _KdbgStoreError as e:
+        return f"error: {e}"
     return data.hex()
 
 
@@ -3249,6 +3333,9 @@ def kdbg_attach(pid: int, port: int = 1234) -> str:
             f"daemon_pid={info.get('daemon_pid', '?')}); call kdbg_detach first"
         )
 
+    # Transfer ownership from the background read broker to the interactive
+    # debugger daemon without tearing down the listening gdbserver.
+    _kdbg_stop_reader(cfg)
     from winbox.kdbg.hmp import gdbstub_has_client
     if gdbstub_has_client(port):
         return (

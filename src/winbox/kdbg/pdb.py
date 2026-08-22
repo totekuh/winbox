@@ -46,6 +46,9 @@ NT_DEFAULT_TYPES: tuple[str, ...] = (
     "_KPROCESS",
     "_ETHREAD",
     "_KTHREAD",
+    # RSP does not expose IDTR directly. KPCR is reachable from GS/KERNEL_GS
+    # and its IdtBase field gives the same safe kernel-base anchor without HMP.
+    "_KPCR",
     "_LIST_ENTRY",
     "_UNICODE_STRING",
     "_LDR_DATA_TABLE_ENTRY",

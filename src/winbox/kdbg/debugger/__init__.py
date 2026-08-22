@@ -1,8 +1,9 @@
 """Hypervisor-level debugger primitives — drives QEMU's gdbstub.
 
-Layered on top of the read-only kdbg surface (HMP memory reads, PDB
-symbol resolution, EPROCESS/PEB walkers). This package adds the
-*active* side: breakpoints, single-step, register write, run control.
+The persistent RSP reader supplies coherent stateless memory reads and
+EPROCESS/PEB walkers; the session daemon adds the active side: breakpoints,
+single-step, register writes, and run control. QMP/HMP only controls the
+gdbserver lifecycle and other non-debugger VM operations.
 
 The MVP target is invisible-to-the-OS user-mode debugging of XDR
 components (Defender, CrowdStrike, etc.) where any in-guest debugger
@@ -14,26 +15,7 @@ KdDebuggerEnabled, IsDebuggerPresent, NtQueryInformationProcess).
 
 from __future__ import annotations
 
-from winbox.kdbg.debugger.client import ClientError, DaemonClient
-from winbox.kdbg.debugger.daemon import (
-    DaemonError,
-    DaemonSession,
-    fork_daemon,
-    lock_path,
-    masquerade_cr3_candidates,
-    session_path,
-    sock_path,
-)
-from winbox.kdbg.debugger.install import (
-    InstallError,
-    InstallReport,
-    install_user_breakpoint,
-)
-from winbox.kdbg.debugger.rsp import (
-    RspClient,
-    RspError,
-    StopReply,
-)
+import importlib
 
 __all__ = [
     "ClientError",
@@ -52,3 +34,39 @@ __all__ = [
     "session_path",
     "sock_path",
 ]
+
+
+_EXPORT_MODULE = {
+    "ClientError": "client",
+    "DaemonClient": "client",
+    "DaemonError": "daemon",
+    "DaemonSession": "daemon",
+    "fork_daemon": "daemon",
+    "lock_path": "daemon",
+    "masquerade_cr3_candidates": "daemon",
+    "session_path": "daemon",
+    "sock_path": "daemon",
+    "InstallError": "install",
+    "InstallReport": "install",
+    "install_user_breakpoint": "install",
+    "RspClient": "rsp",
+    "RspError": "rsp",
+    "StopReply": "rsp",
+}
+
+
+def __getattr__(name: str):
+    """Load debugger layers lazily to keep the read transport acyclic.
+
+    ``winbox.kdbg.memory`` imports the lightweight reader, whose package import
+    must not eagerly import ``daemon`` (the daemon itself imports
+    ``winbox.kdbg``).  Public imports keep their previous API through this
+    module-level lazy resolver.
+    """
+    module_name = _EXPORT_MODULE.get(name)
+    if module_name is None:
+        raise AttributeError(name)
+    module = importlib.import_module(f"winbox.kdbg.debugger.{module_name}")
+    value = getattr(module, name)
+    globals()[name] = value
+    return value

@@ -3,11 +3,28 @@
 from __future__ import annotations
 
 import subprocess
+import importlib
 from unittest.mock import patch
 
 import pytest
 
 from winbox.kdbg.hmp import HmpError, hmp
+
+hmp_module = importlib.import_module("winbox.kdbg.hmp")
+
+
+@pytest.fixture(autouse=True)
+def force_virsh_transport():
+    """These legacy tests specifically exercise subprocess semantics."""
+    with (
+        patch.object(hmp_module, "_qmp_socket_paths", return_value=[]),
+        patch.object(
+            hmp_module,
+            "_libvirt_hmp",
+            side_effect=hmp_module._QmpUnavailable("disabled for test"),
+        ),
+    ):
+        yield
 
 
 def test_hmp_timeout_is_wrapped_as_hmperror():

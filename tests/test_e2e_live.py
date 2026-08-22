@@ -1316,6 +1316,9 @@ class TestKdbg:
 
     def test_mcp_stub_lifecycle_tools(self, tool, cfg):
         """The MCP mirrors of `kdbg start/status/stop`."""
+        assert "UserShadowStack=" in tool("kdbg_cet_status")()
+        assert tool("kdbg_prepare")().startswith("refused:")
+        assert tool("kdbg_restore_cet")().startswith("refused:")
         tool("kdbg_stop")()
         assert "listening" in tool("kdbg_start")()
         try:
@@ -1327,6 +1330,9 @@ class TestKdbg:
     def test_kdbg_cli_surface(self, run, tool, cfg):
         """The CLI mirrors of the tools exercised above. These are separate
         code paths from the MCP tools, not thin wrappers over them."""
+        assert "UserShadowStack=" in run("kdbg", "cet-status").output
+        assert "--confirm" in run("kdbg", "prepare", expect_ok=False).output
+        assert "--confirm" in run("kdbg", "restore-cet", expect_ok=False).output
         run("kdbg", "start")
         try:
             run("kdbg", "symbols")

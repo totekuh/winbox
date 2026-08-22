@@ -10,6 +10,7 @@ suite — no need to re-mock llvm-pdbutil here.
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import nullcontext
 
 import pytest
 
@@ -31,9 +32,9 @@ class TestResolveNtBaseMzGuard:
     RVA = 0x100000
     BASE = 0xFFFFF80000000000  # page-aligned + canonical-high
 
-    def _cfg(self):
+    def _cfg(self, tmp_path):
         from types import SimpleNamespace
-        return SimpleNamespace(vm_name="winbox")
+        return SimpleNamespace(vm_name="winbox", symbols_dir=tmp_path)
 
     def _idt_entry_for(self, handler: int) -> bytes:
         entry = bytearray(16)
@@ -42,34 +43,54 @@ class TestResolveNtBaseMzGuard:
         entry[8:12] = ((handler >> 32) & 0xFFFFFFFF).to_bytes(4, "little")
         return bytes(entry)
 
-    def _patch(self, monkeypatch, *, mz: bytes):
+    def _patch(self, monkeypatch, tmp_path, *, mz: bytes):
         handler = self.BASE + self.RVA
         idt_base = 0xFFFFF78000000000
-        monkeypatch.setattr(
-            symbols, "read_cpu_state", lambda vm: {"IDT_BASE": idt_base}
+        kpcr = 0xFFFFF78000100000
+        cr3 = 0x12345000
+        store = SymbolStore(tmp_path)
+        store.save(
+            module="nt", build="TEST", image="nt.pdb",
+            symbols={"KiDivideErrorFault": self.RVA},
+            types={"_KPCR": {
+                "size": 0x200,
+                "fields": {"IdtBase": {"off": 0x38, "type": "void*"}},
+            }},
+            base=self.BASE,
         )
+        snapshot = type("Snapshot", (), {
+            "cr3_candidates": (cr3,), "kernel_gs_bases": (kpcr,),
+        })()
+        monkeypatch.setattr(symbols, "debug_snapshot", lambda cfg: nullcontext(snapshot))
 
-        def fake_read(vm, va, size):
+        def fake_read(vm, read_cr3, va, size, **kwargs):
+            assert read_cr3 in (cr3, cr3 ^ 0x1000)
+            if va == kpcr + 0x38:
+                return idt_base.to_bytes(8, "little")
             if va == idt_base:
                 return self._idt_entry_for(handler)
             if va == self.BASE:
                 return mz
             raise AssertionError(f"unexpected read at 0x{va:x}")
 
-        monkeypatch.setattr(symbols, "read_virt_current", fake_read)
+        monkeypatch.setattr(symbols, "read_virt_cr3", fake_read)
 
-    def test_valid_mz_returns_base(self, monkeypatch):
+    def test_valid_mz_returns_base(self, monkeypatch, tmp_path):
         from winbox.kdbg.symbols import resolve_nt_base
-        self._patch(monkeypatch, mz=b"MZ")
-        assert resolve_nt_base(self._cfg(), {"KiDivideErrorFault": self.RVA}) == self.BASE
+        self._patch(monkeypatch, tmp_path, mz=b"MZ")
+        assert resolve_nt_base(
+            self._cfg(tmp_path), {"KiDivideErrorFault": self.RVA},
+        ) == self.BASE
 
-    def test_missing_mz_raises_instead_of_returning_wrong_base(self, monkeypatch):
+    def test_missing_mz_raises_instead_of_returning_wrong_base(self, monkeypatch, tmp_path):
         from winbox.kdbg.symbols import resolve_nt_base
         # Simulates the KPTI case: the page-aligned/canonical checks pass but
         # the base doesn't point at ntoskrnl.
-        self._patch(monkeypatch, mz=b"\x00\x00")
-        with pytest.raises(SymbolLoadError, match="MZ header"):
-            resolve_nt_base(self._cfg(), {"KiDivideErrorFault": self.RVA})
+        self._patch(monkeypatch, tmp_path, mz=b"\x00\x00")
+        with pytest.raises(SymbolLoadError, match="header"):
+            resolve_nt_base(
+                self._cfg(tmp_path), {"KiDivideErrorFault": self.RVA},
+            )
 
 
 def _save_nt(store: SymbolStore, build: str = "ABCD1234", types: dict | None = None) -> None:

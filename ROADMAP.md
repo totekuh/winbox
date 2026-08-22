@@ -186,6 +186,76 @@ memory, check state) while waiting for a rare breakpoint. This is a design
 gap, not a bug, and would require changes to the daemon protocol, MCP handler,
 and the `_wait_for_stop_serving` loop.
 
+### Performance roadmap (2026-08-21)
+
+**48. HMP reads fork a virsh subprocess per call — use a persistent QMP socket**
+
+Every `xp`/`x`/`info registers` call in `hmp.py` does
+`subprocess.run(["virsh", ..., "qemu-monitor-command", ...])` — fork, exec,
+libvirt connect, QMP round-trip, exit. ~5-10ms per call. A `list_processes`
+walk does ~400-500 of these for ~100 processes: 2-5 seconds total.
+
+Fix: open a persistent Unix socket to QEMU's QMP monitor
+(`/var/run/libvirt/qemu/domain-<id>-<name>/monitor.sock` or the path from
+`virsh qemu-monitor-event --domain <vm> --event ...`), send
+`{"execute": "human-monitor-command", "arguments": {"command-line": "xp ..."}}`,
+parse the JSON response. Keep the socket open across calls. `hmp()` is the
+single choke point — everything upstream stays unchanged.
+
+Expected gain: ~10-20x faster for out-of-session reads (`kdbg_ps`,
+`kdbg_read_va`, `kdbg_user_lm`, symbol loading). Process walk from ~2-5s
+to ~200ms. Biggest single perf win available. Self-contained — only
+`hmp.py` changes.
+
+**49. CR3 masquerade overhead: 3 RSP round-trips per read in daemon path**
+
+Every in-session memory read (`op_mem`, `_mem_qword_reader` in predicates)
+does: G-packet write (swap CR3) → `m` read → G-packet write (restore CR3).
+That's 3 socket round-trips for 1 logical read. A `poi(poi(rcx+0x10)+0x8)`
+predicate does 6 round-trips for 2 reads.
+
+Fix: batch multiple reads under one masquerade. `_cr3_masqueraded_call`
+already takes a `fn` callable — callers could pass a multi-read lambda.
+For predicates: evaluate the full expression tree, collect all addresses
+that need reading, do them all under one masquerade, then resolve.
+Complication: `poi()` chains are data-dependent (second address depends on
+first read), so only independent reads can batch. Still helps `op_stack`
+(already batched) and action-list evaluation (multiple independent
+expressions per bp fire).
+
+Expected gain: ~30-50% faster predicate evaluation for multi-expression
+action breakpoints. Moderate complexity — predicate evaluator needs a
+two-pass design for the non-dependent case.
+
+**50. Coalesce adjacent EPROCESS field reads in process walker**
+
+`list_processes` reads pid, dtb, name, user_dtb as 4 separate `xp` calls
+per process. These fields all live within one EPROCESS — typically within
+a ~200 byte span. One `xp` read of the enclosing range would replace 4
+round-trips with 1, cutting the per-process cost by ~75%.
+
+Complication: field offsets come from PDB-parsed struct layouts and vary
+across Windows builds. The reader needs to compute the min/max offset span,
+issue one read, then slice. Safe — all offsets are validated at symbol-load
+time. Pairs well with item 48 (QMP socket) — subprocess overhead amplifies
+the per-call cost this eliminates.
+
+Expected gain: `kdbg_ps` 3-4x faster on top of whatever item 48 delivers.
+Same pattern applies to `list_modules` (module walker reads 3+ fields per
+LDR_DATA_TABLE_ENTRY).
+
+**51. `find_process` materializes full process list for single-PID lookup**
+
+`find_process(pid=N)` calls `list_processes()`, builds a full list, then
+linear-scans. A generator that yields and stops at first match would avoid
+reading every remaining EPROCESS. KPTI stabilization (switch to System's
+DTB after first EPROCESS) must happen before any yield — consume PID 4
+first, then yield-as-you-go.
+
+Expected gain: marginal (~10-50ms on a busy VM when target is early in
+the list). Lowest priority of the four. Worth doing only if already
+touching `walk.py` for item 50.
+
 ### Edge cases to harden (2026-08-20)
 
 **35. Tested 2026-08-21 — PASS.** Target killed mid-session (scheduled

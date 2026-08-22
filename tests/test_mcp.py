@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
@@ -53,6 +55,7 @@ def mock_mcp(cfg):
     mcp_mod._initialized = True
 
     original_exec_python = mcp_mod._exec_python
+    original_debug_snapshot = mcp_mod._kdbg_debug_snapshot
 
     def capturing_exec_python(code, timeout=300, args=None):
         ga.captured_code = code
@@ -60,10 +63,15 @@ def mock_mcp(cfg):
         return original_exec_python(code, timeout=timeout, args=args)
 
     mcp_mod._exec_python = capturing_exec_python
+    # Unit tests must never touch a real VM monitor. Transaction behavior has
+    # dedicated tests in test_kdbg_snapshot.py; individual MCP tests can
+    # override this stub when asserting the operation boundary.
+    mcp_mod._kdbg_debug_snapshot = lambda _cfg: nullcontext()
 
     yield ga, vm, cfg
 
     mcp_mod._exec_python = original_exec_python
+    mcp_mod._kdbg_debug_snapshot = original_debug_snapshot
     mcp_mod._cfg = None
     mcp_mod._vm = None
     mcp_mod._ga = None
@@ -2675,6 +2683,15 @@ class TestKdbgTools:
         assert "already listening" in result
         hmp.assert_not_called()
 
+    def test_start_refuses_when_persistent_reader_owns_stub(self, mock_mcp):
+        from winbox.mcp import kdbg_start
+        with patch("winbox.mcp._kdbg_reader_info", return_value={"port": 4321}), \
+             patch("winbox.mcp._kdbg_hmp") as hmp:
+            result = kdbg_start()
+        assert "reader already owns" in result
+        assert "4321" in result
+        hmp.assert_not_called()
+
     def test_start_vm_not_running(self, mock_mcp):
         from winbox.mcp import kdbg_start
         ga, vm, cfg = mock_mcp
@@ -2781,6 +2798,15 @@ class TestKdbgTools:
         assert "not running" in result.lower()
         probe.assert_not_called()
 
+    def test_status_reports_connected_reader_without_probe(self, mock_mcp):
+        from winbox.mcp import kdbg_status
+        with patch("winbox.mcp._kdbg_reader_info", return_value={"port": 1234}), \
+             patch("winbox.mcp._kdbg_probe") as probe:
+            result = kdbg_status()
+        assert "connected" in result
+        assert "persistent reader owns it" in result
+        probe.assert_not_called()
+
     def test_kdbg_probe_helper_real_socket(self):
         """Direct unit test for _kdbg_probe with a real ephemeral listener."""
         import socket as _sk
@@ -2798,6 +2824,46 @@ class TestKdbgTools:
     def test_kdbg_probe_helper_closed_port(self):
         from winbox.mcp import _kdbg_probe
         assert _kdbg_probe("127.0.0.1", 1, timeout=0.1) is False
+
+
+class TestKdbgCetTools:
+    def test_status_reports_safe_boot(self, mock_mcp):
+        from winbox.mcp import kdbg_cet_status
+
+        status = SimpleNamespace(
+            safe_for_debug=True, user_shadow_stack="OFF", strict_mode="OFF",
+        )
+        with patch("winbox.mcp._kdbg_query_cet_status", return_value=status):
+            result = kdbg_cet_status()
+        assert result == "SAFE: UserShadowStack=OFF, StrictMode=OFF"
+
+    def test_prepare_refuses_without_confirmation(self, mock_mcp):
+        from winbox.mcp import kdbg_prepare
+
+        with patch("winbox.mcp._kdbg_prepare_cet") as prepare:
+            result = kdbg_prepare()
+        assert result.startswith("refused:")
+        prepare.assert_not_called()
+
+    def test_prepare_stops_reader_before_policy_change(self, mock_mcp, tmp_path):
+        from winbox.mcp import kdbg_prepare
+
+        backup = tmp_path / "kdbg-cet-backup.json"
+        with patch("winbox.mcp._kdbg_stop_reader") as stop, patch(
+            "winbox.mcp._kdbg_prepare_cet", return_value=backup,
+        ):
+            result = kdbg_prepare(confirm=True)
+        assert str(backup) in result
+        assert "reboot required" in result
+        stop.assert_called_once()
+
+    def test_restore_refuses_without_confirmation(self, mock_mcp):
+        from winbox.mcp import kdbg_restore_cet
+
+        with patch("winbox.mcp._kdbg_restore_cet_policy") as restore:
+            result = kdbg_restore_cet()
+        assert result.startswith("refused:")
+        restore.assert_not_called()
 
 
 class TestKdbgListTools:
@@ -2872,7 +2938,7 @@ class TestKdbgListTools:
             assert entry["size"].startswith("0x")
 
     def test_kdbg_ps_works_when_paused(self, mock_mcp):
-        """kdbg_ps uses HMP, not GA — must work while paused (no resume)."""
+        """kdbg_ps uses the debugger transport and never VM.resume()."""
         import json as _json
         from winbox.kdbg.walk import ProcessRecord
         from winbox.mcp import kdbg_ps
@@ -2894,7 +2960,7 @@ class TestKdbgListTools:
         assert parsed[0]["pid"] == 4
 
     def test_kdbg_read_va_works_when_paused(self, mock_mcp):
-        """kdbg_read_va uses HMP page-walks — must work while paused."""
+        """kdbg_read_va uses one debugger snapshot and never VM.resume()."""
         from winbox.kdbg.walk import ProcessRecord
         from winbox.mcp import kdbg_read_va
 
@@ -2914,6 +2980,78 @@ class TestKdbgListTools:
 
         vm.resume.assert_not_called()
         assert result == "deadbeef"
+
+    def test_kdbg_ps_walk_is_inside_snapshot(self, mock_mcp):
+        from contextlib import contextmanager
+        from winbox.kdbg.walk import ProcessRecord
+        from winbox.mcp import kdbg_ps
+
+        _, _, cfg = mock_mcp
+        active = False
+        events = []
+
+        @contextmanager
+        def snapshot(snapshot_cfg):
+            nonlocal active
+            assert snapshot_cfg is cfg
+            active = True
+            events.append("enter")
+            try:
+                yield
+            finally:
+                active = False
+                events.append("exit")
+
+        def walk(*args, **kwargs):
+            assert active
+            events.append("walk")
+            return [ProcessRecord(4, "System", 0x1000, 0x2000)]
+
+        with patch("winbox.mcp._kdbg_debug_snapshot", snapshot), \
+             patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_list_processes", side_effect=walk):
+            kdbg_ps()
+
+        assert events == ["enter", "walk", "exit"]
+
+    def test_composite_read_va_stays_in_one_snapshot(self, mock_mcp):
+        from contextlib import contextmanager
+        from winbox.kdbg.walk import ProcessRecord
+        from winbox.mcp import kdbg_read_va
+
+        _, _, cfg = mock_mcp
+        active = False
+        events = []
+
+        @contextmanager
+        def snapshot(snapshot_cfg):
+            nonlocal active
+            active = True
+            events.append("enter")
+            try:
+                yield
+            finally:
+                active = False
+                events.append("exit")
+
+        def processes(*args, **kwargs):
+            assert active
+            events.append("processes")
+            return [ProcessRecord(1234, "target.exe", 0x1000, 0x2000)]
+
+        def read(*args, **kwargs):
+            assert active
+            events.append("read")
+            return b"OK"
+
+        with patch("winbox.mcp._kdbg_debug_snapshot", snapshot), \
+             patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_list_processes", side_effect=processes), \
+             patch("winbox.mcp._kdbg_read_virt_cr3", side_effect=read):
+            result = kdbg_read_va(1234, "0x1000", 2)
+
+        assert result == "4f4b"
+        assert events == ["enter", "processes", "read", "exit"]
 
 
 # ─── kdbg session daemon tools (Tool 14) ───────────────────────────────────

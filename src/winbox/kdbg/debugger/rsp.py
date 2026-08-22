@@ -508,6 +508,29 @@ class RspClient:
             )
         return cr3
 
+    def write_registers(self, registers: bytes) -> bytes:
+        """``G`` — replace the selected vCPU's complete register block.
+
+        Returning the raw reply lets safety-critical callers distinguish a
+        clean ``OK`` from a stub-specific rejection while keeping packet
+        framing and error handling inside this client.
+        """
+        return self._exchange(b"G" + registers.hex().encode("ascii"))
+
+    def set_physical_memory_mode(self, enabled: bool) -> None:
+        """Select QEMU gdbstub physical-memory mode for subsequent ``m`` ops.
+
+        This is QEMU's documented ``Qqemu.PhyMemMode`` extension.  Callers
+        must restore virtual mode in ``finally``; leaving it enabled would
+        silently reinterpret later virtual addresses as physical addresses.
+        """
+        value = b"1" if enabled else b"0"
+        response = self._exchange(b"Qqemu.PhyMemMode:" + value)
+        if response != b"OK":
+            raise RspError(
+                f"Qqemu.PhyMemMode:{value.decode()} rejected: {response!r}"
+            )
+
     # Chunk size for memory I/O — kept comfortably under the smallest
     # PacketSize any historical QEMU build advertises (typically 0x1000
     # bytes data, leaving ~4 KB for hex-encoded reply framing). Big

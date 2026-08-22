@@ -2061,6 +2061,14 @@ def fork_daemon(
     The parent waits on a status pipe for the child to either say "OK"
     (everything wired) or "ERR: ..." (and exits with that error).
     """
+    # Fail closed before attaching QEMU's gdbstub. Repeated RSP stop/resume is
+    # known to corrupt CET shadow-stack state on affected QEMU/KVM builds.
+    from winbox.kdbg.cet import CetSafetyError, require_safe
+    try:
+        require_safe(cfg)
+    except CetSafetyError as exc:
+        raise DaemonError(str(exc)) from exc
+
     pipe_r, pipe_w = os.pipe()
     pid = os.fork()
     if pid > 0:
@@ -2132,12 +2140,16 @@ def fork_daemon(
                 )
                 time.sleep(0.3)  # let stub settle
 
-        # VM is now halted — CR3 is stable, safe to walk kernel structures.
+        # VM is now halted. Route every bootstrap register/memory operation
+        # through this already-owned RSP connection; opening the background
+        # reader here would contend for QEMU's single gdb client.
         store = SymbolStore(cfg.symbols_dir)
+        from winbox.kdbg.debugger.reader import use_local_rsp
         from winbox.kdbg.symbols import ensure_nt_base_current
-        ensure_nt_base_current(cfg, store)
         from winbox.kdbg.walk import list_processes
-        procs = list_processes(cfg.vm_name, store)
+        with use_local_rsp(cfg.vm_name, rsp, initial_sr):
+            ensure_nt_base_current(cfg, store)
+            procs = list_processes(cfg.vm_name, store)
         target_rec = next((p for p in procs if p.pid == target_pid), None)
         if target_rec is None:
             # Resume VM and close socket using the same safe pattern as
@@ -2171,7 +2183,8 @@ def fork_daemon(
             eprocess=target_rec.eprocess,
         )
 
-        _validate_module_bases(cfg, rsp, target, store)
+        with use_local_rsp(cfg.vm_name, rsp, initial_sr):
+            _validate_module_bases(cfg, rsp, target, store)
 
         listen_sock = _bind_unix_socket(sock_path(cfg))
         _write_session_file(session_path(cfg), {

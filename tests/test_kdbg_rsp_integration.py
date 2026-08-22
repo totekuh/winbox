@@ -4,10 +4,9 @@ Requires a running winbox VM with the gdbstub started via
 ``winbox kdbg start``. The kernel symbol store must already have nt
 loaded (via ``winbox kdbg symbols``).
 
-Each primitive in rsp.py gets *independent* verification — bp install
-is confirmed by reading the physical page directly via HMP (not via
-gdbstub's `m`, which may shim the read), memory reads cross-check
-between RSP and HMP-derived physical reads, etc.
+Each primitive in rsp.py gets end-to-end verification against real QEMU. The
+suite refuses to attach unless the guest passes the same CET safety gate as
+the product paths.
 
 Run with:  pytest -m integration -k rsp
 Skip with: pytest -m 'not integration'
@@ -16,15 +15,16 @@ Skip with: pytest -m 'not integration'
 from __future__ import annotations
 
 import struct
-import subprocess
-
 import pytest
 
 from winbox.config import Config
 from winbox.kdbg import SymbolStore
 from winbox.kdbg.debugger import RspClient, RspError
-from winbox.kdbg.hmp import hmp, parse_registers, probe_port
+from winbox.kdbg.cet import CetSafetyError, require_safe
+from winbox.kdbg.debugger.reader import stop_reader, use_local_rsp
+from winbox.kdbg.hmp import probe_port
 from winbox.kdbg.memory import read_phys, virt_to_phys
+from winbox.vm import GuestAgent, VM, VMState
 
 
 pytestmark = pytest.mark.integration
@@ -35,7 +35,13 @@ pytestmark = pytest.mark.integration
 
 @pytest.fixture(scope="module")
 def cfg():
-    return Config.load()
+    config = Config.load()
+    try:
+        require_safe(config, GuestAgent(config))
+    except CetSafetyError as exc:
+        pytest.skip(f"live RSP tests require prepared CET state: {exc}")
+    stop_reader(config)
+    return config
 
 
 @pytest.fixture(scope="module")
@@ -61,12 +67,10 @@ def cli_conn(cfg):
         c.close()
     except Exception:
         pass
-    # Belt-and-braces: ensure VM is running for next test (close() should
-    # achieve this; this is the safety net).
-    subprocess.run(
-        ["virsh", "-c", "qemu:///system", "resume", "winbox"],
-        capture_output=True,
-    )
+    # Belt-and-braces: product cleanup must leave the guest running.
+    vm = VM(cfg)
+    if vm.state() == VMState.PAUSED:
+        vm.resume()
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -78,24 +82,6 @@ def _rip(regs: bytes) -> int:
 
 def _gpr(regs: bytes, idx: int) -> int:
     return struct.unpack_from("<Q", regs, idx * 8)[0]
-
-
-def _vcpu_cr3(vm_name: str, vcpu_id_str: str) -> int:
-    """Read CR3 of the named gdb-thread (1-based) via HMP."""
-    vcpu_zero_idx = int(vcpu_id_str) - 1
-    text = hmp(vm_name, "info registers -a")
-    block = text.split(f"CPU#{vcpu_zero_idx}", 1)
-    if len(block) != 2:
-        raise RuntimeError(f"vCPU {vcpu_id_str} not found in HMP output")
-    rest = block[1].split("CPU#", 1)[0]
-    return parse_registers(rest)["CR3"]
-
-
-def _domstate(vm_name: str = "winbox") -> str:
-    return subprocess.run(
-        ["virsh", "-c", "qemu:///system", "domstate", vm_name],
-        capture_output=True, text=True,
-    ).stdout.strip()
 
 
 # ── Tests ────────────────────────────────────────────────────────────────
@@ -128,9 +114,8 @@ def test_list_threads_returns_all_vcpus(cli_conn):
         int(t)  # parses as a valid id
 
 
-def test_rsp_read_memory_matches_hmp_physical_read(cli_conn, cfg):
-    """Independent cross-check: RSP `m` and HMP `xp` (after page walk)
-    must return the same bytes for the same VA."""
+def test_rsp_virtual_read_matches_rsp_physical_mode(cli_conn, cfg):
+    """Cross-check virtual `m` against physical mode after a page walk."""
     threads = cli_conn.list_threads()
     cli_conn.select_thread(threads[0])
     regs = cli_conn.read_registers()
@@ -138,34 +123,35 @@ def test_rsp_read_memory_matches_hmp_physical_read(cli_conn, cfg):
 
     rsp_bytes = cli_conn.read_memory(rip, 16)
 
-    cr3 = _vcpu_cr3(cfg.vm_name, threads[0])
-    page_pa = virt_to_phys(cfg.vm_name, cr3, rip & ~0xFFF)
-    hmp_bytes = read_phys(cfg.vm_name, page_pa + (rip & 0xFFF), 16)
+    stop = cli_conn.query_halt_reason()
+    with use_local_rsp(cfg.vm_name, cli_conn, stop):
+        cr3 = cli_conn.read_cr3()
+        page_pa = virt_to_phys(cfg.vm_name, cr3, rip & ~0xFFF)
+        physical_bytes = read_phys(cfg.vm_name, page_pa + (rip & 0xFFF), 16)
 
-    assert rsp_bytes == hmp_bytes
+    assert rsp_bytes == physical_bytes
 
 
 def test_breakpoint_install_actually_patches_physical_page(cli_conn, cfg, swap_va):
-    """Install bp, verify 0xCC lives in the physical page (HMP, not RSP).
-    Remove, verify original byte restored."""
+    """Install bp, verify 0xCC in physical mode, then verify restoration."""
     threads = cli_conn.list_threads()
     cli_conn.select_thread(threads[0])
-    cr3 = _vcpu_cr3(cfg.vm_name, threads[0])
-    page_pa = virt_to_phys(cfg.vm_name, cr3, swap_va & ~0xFFF)
-    page_off = swap_va & 0xFFF
+    stop = cli_conn.query_halt_reason()
+    with use_local_rsp(cfg.vm_name, cli_conn, stop):
+        cr3 = cli_conn.read_cr3()
+        page_pa = virt_to_phys(cfg.vm_name, cr3, swap_va & ~0xFFF)
+        page_off = swap_va & 0xFFF
 
-    original = read_phys(cfg.vm_name, page_pa + page_off, 1)
-    assert original != b"\xcc"  # don't fight a stale bp from a previous run
+        original = read_phys(cfg.vm_name, page_pa + page_off, 1)
+        assert original != b"\xcc"
 
-    cli_conn.insert_breakpoint(swap_va, kind=1)
-    try:
-        patched = read_phys(cfg.vm_name, page_pa + page_off, 1)
-        assert patched == b"\xcc"
-    finally:
-        cli_conn.remove_breakpoint(swap_va, kind=1)
+        cli_conn.insert_breakpoint(swap_va, kind=1)
+        try:
+            assert read_phys(cfg.vm_name, page_pa + page_off, 1) == b"\xcc"
+        finally:
+            cli_conn.remove_breakpoint(swap_va, kind=1)
 
-    restored = read_phys(cfg.vm_name, page_pa + page_off, 1)
-    assert restored == original
+        assert read_phys(cfg.vm_name, page_pa + page_off, 1) == original
 
 
 def test_breakpoint_fires_at_correct_va(cli_conn, swap_va):
@@ -251,5 +237,5 @@ def test_close_leaves_vm_running_after_cont(cli_conn, cfg):
     cli_conn.cont()
     cli_conn.close()
     # close() ran detach; VM should be running.
-    state = _domstate(cfg.vm_name)
-    assert state == "running", f"expected running, got {state!r}"
+    state = VM(cfg).state()
+    assert state == VMState.RUNNING, f"expected running, got {state.value!r}"

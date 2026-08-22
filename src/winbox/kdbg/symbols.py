@@ -22,8 +22,9 @@ from typing import TYPE_CHECKING, Iterable
 
 _log = logging.getLogger(__name__)
 
-from winbox.kdbg.hmp import HmpError, read_cpu_state
-from winbox.kdbg.memory import read_virt_current
+from winbox.kdbg.debugger.reader import debug_snapshot
+from winbox.kdbg.hmp import HmpError
+from winbox.kdbg.memory import read_virt_cr3
 from winbox.kdbg.pdb import (
     NT_DEFAULT_TYPES,
     build_type_map,
@@ -133,29 +134,13 @@ def copy_user_module(
 
 
 def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
-    """Derive ntoskrnl's load base from the live guest via the IDT.
+    """Derive ntoskrnl's load base using RSP registers and memory only.
 
-    ``info registers`` on x86-64 shows ``IDT= <base> <limit>``. We read
-    the first IDT entry (INT 0 = ``KiDivideErrorFault``), reconstruct the
-    64-bit handler VA from its three offset halves, and subtract the
-    symbol's RVA to get the load base. One virtual read beats walking
-    backwards from RIP looking for ``MZ``.
+    QEMU's gdb register block exposes GS_BASE/KERNEL_GS_BASE but not IDTR.
+    One of those bases is Windows' KPCR on each halted vCPU; ``_KPCR.IdtBase``
+    gives the IDT anchor without issuing HMP ``info registers``.  Candidate
+    KPCRs and CR3s are validated by the IDT handler and final MZ header.
     """
-    state = read_cpu_state(cfg.vm_name)
-    idt_base = state.get("IDT_BASE")
-    if idt_base is None:
-        raise SymbolLoadError("IDT base not available from info registers")
-
-    entry = read_virt_current(cfg.vm_name, idt_base, 16)
-    if len(entry) != 16:
-        raise SymbolLoadError(
-            f"short IDT read: expected 16 bytes at 0x{idt_base:x}, got {len(entry)}"
-        )
-    off_low = int.from_bytes(entry[0:2], "little")
-    off_mid = int.from_bytes(entry[6:8], "little")
-    off_high = int.from_bytes(entry[8:12], "little")
-    handler = off_low | (off_mid << 16) | (off_high << 32)
-
     rva = nt_syms.get("KiDivideErrorFault")
     if rva is None:
         raise SymbolLoadError(
@@ -163,33 +148,57 @@ def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
             "this PDB may not be ntkrnlmp"
         )
 
-    base = handler - rva
-    if base & 0xFFF:
+    store = SymbolStore(cfg.symbols_dir)
+    try:
+        idt_off = int(store.struct("_KPCR", "IdtBase")["off"])
+    except (KeyError, TypeError, SymbolStoreError) as exc:
         raise SymbolLoadError(
-            f"computed nt base 0x{base:x} is not page-aligned — "
-            "IDT[0] handler probably doesn't belong to nt"
-        )
-    if (base >> 47) != 0x1FFFF:
-        raise SymbolLoadError(
-            f"computed nt base 0x{base:x} is not canonical-high — "
-            "something is wrong with the IDT read"
-        )
-    # Confirm the computed base actually points at ntoskrnl by checking for the
-    # MZ header. This is the guard for KVA-Shadow/KPTI guests: there IDT[0]
-    # targets the KiDivideErrorFaultShadow trampoline in .KVASCODE, not
-    # KiDivideErrorFault, so `handler - rva` lands on the wrong page. The
-    # page-aligned/canonical checks above pass whenever the shadow delta is a
-    # page multiple, which would otherwise cache a silently-wrong base and make
-    # every later walk read garbage. Turn that into a clean, named failure.
-    head = read_virt_current(cfg.vm_name, base, 2)
-    if head[:2] != b"MZ":
-        raise SymbolLoadError(
-            f"computed nt base 0x{base:x} does not point at an MZ header "
-            f"(got {head[:2]!r}) — IDT[0] is likely a KPTI/KVA-Shadow "
-            "trampoline, not KiDivideErrorFault; nt base cannot be derived "
-            "this way on this guest"
-        )
-    return base
+            "_KPCR.IdtBase is missing from the nt symbol store; reload nt symbols"
+        ) from exc
+
+    failures: list[str] = []
+    with debug_snapshot(cfg) as snapshot:
+        cr3s: list[int] = []
+        for sampled in snapshot.cr3_candidates:
+            for candidate in (sampled, sampled ^ 0x1000):
+                if candidate not in cr3s:
+                    cr3s.append(candidate)
+        for kpcr in snapshot.kernel_gs_bases:
+            for cr3 in cr3s:
+                try:
+                    idt_raw = read_virt_cr3(
+                        cfg.vm_name, cr3, kpcr + idt_off, 8,
+                    )
+                    idt_base = int.from_bytes(idt_raw, "little")
+                    if idt_base >> 47 != 0x1FFFF or idt_base & 0xF:
+                        raise SymbolLoadError(f"invalid IDT base 0x{idt_base:x}")
+                    entry = read_virt_cr3(cfg.vm_name, cr3, idt_base, 16)
+                    if len(entry) != 16:
+                        raise SymbolLoadError(
+                            f"short IDT read at 0x{idt_base:x}: {len(entry)}"
+                        )
+                    handler = (
+                        int.from_bytes(entry[0:2], "little")
+                        | (int.from_bytes(entry[6:8], "little") << 16)
+                        | (int.from_bytes(entry[8:12], "little") << 32)
+                    )
+                    base = handler - rva
+                    if base & 0xFFF or base >> 47 != 0x1FFFF:
+                        raise SymbolLoadError(
+                            f"invalid nt base candidate 0x{base:x}"
+                        )
+                    head = read_virt_cr3(cfg.vm_name, cr3, base, 2)
+                    if head != b"MZ":
+                        raise SymbolLoadError(
+                            f"nt base candidate 0x{base:x} has header {head!r}"
+                        )
+                    return base
+                except (HmpError, SymbolLoadError) as exc:
+                    failures.append(
+                        f"KPCR=0x{kpcr:x}/CR3=0x{cr3:x}: {exc}"
+                    )
+    detail = failures[-1] if failures else "no canonical KPCR candidates from RSP"
+    raise SymbolLoadError(f"could not resolve nt base through KPCR/IDT: {detail}")
 
 
 # ── Generic module loader ───────────────────────────────────────────────
@@ -401,6 +410,14 @@ def ensure_nt_base_current(cfg: Config, store: SymbolStore) -> bool:
         # compare against.
         return False
 
+    # Stores created before the RSP-only resolver did not extract KPCR.
+    # Upgrade them lazily from the already-cached PDB. Failure here is not
+    # itself fatal: resolve_nt_base below reports the precise missing-field
+    # error, and test/custom stores may provide their own resolver.
+    try:
+        ensure_types_loaded(cfg, store, ["_KPCR"], module="nt")
+    except Exception:
+        pass
     try:
         live = resolve_nt_base(cfg, syms)
     except Exception:

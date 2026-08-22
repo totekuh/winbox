@@ -1,35 +1,38 @@
-"""Physical/virtual memory reads via HMP + CR3 page walker.
+"""Physical/virtual memory reads through the persistent QEMU gdbstub.
 
 Three layers, from raw to convenient:
 
-1. ``read_phys(vm, pa, length)`` — dumb ``xp`` passthrough. CR3-agnostic,
-   only physical addresses. The foundation everything else builds on.
-2. ``read_virt_current(vm, va, length)`` — HMP ``x`` passthrough. Uses the
-   CPU's current CR3, so only sees whichever process was scheduled when
-   the VM halted.
-3. ``read_virt_cr3(vm, cr3, va, length)`` — manual 4-level page walk using
-   ``read_phys``. The "CR3 switching" primitive — lets us read any
-   process's user address space from any halt.
+1. ``read_phys`` uses QEMU's RSP physical-memory mode.
+2. ``read_virt_current`` reads through the vCPU's captured CR3.
+3. ``read_virt_cr3`` temporarily writes an explicit CR3 through RSP, reads
+   virtual memory, and restores the original register block before resume.
 
-Why not use the gdbstub socket directly? The user may already have a gdb
-client attached through pygdbmi-mcp; QEMU only allows a single gdb
-client, so fighting for the socket would break interactive sessions.
-HMP is always available and plays nicely alongside an attached gdb.
+The persistent reader broker owns QEMU's single gdb connection across CLI and
+MCP processes. HMP ``x``/``xp`` are intentionally absent so debugger state has
+one owner and related reads share one fast, coherent transaction. Live stress
+testing later proved stop/resume itself is unsafe while CET user shadow stacks
+are active, so reader/daemon startup enforces the CET safety gate.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
-from winbox.kdbg.hmp import HmpError, hmp
+from winbox.kdbg.debugger.reader import (
+    ReaderError,
+    current_snapshot,
+    snapshot_operation,
+)
+from winbox.kdbg.hmp import HmpError
 
 
-# ── Text parsing for `xp`/`x` output ────────────────────────────────────
+# ── Compatibility parser for historical HMP fixtures ───────────────────
 
 # `xp /<N>bx 0xADDR` prints lines like:
 #   0000000000123000: 0x48 0x89 0x5c 0x24 0x10 0x57 0x48 0x83 ...
 # We parse any line of that shape into (address, [bytes]).
+import re
+
 _HEX_LINE_RE = re.compile(
     r"^\s*([0-9A-Fa-f]{1,16})\s*:\s*((?:0x[0-9A-Fa-f]{2}\s*)+)",
 )
@@ -53,13 +56,14 @@ def parse_hex_dump(text: str) -> bytes:
     return bytes(out)
 
 
-# ── Physical reads via `xp` ─────────────────────────────────────────────
+# ── RSP-backed physical/current-context reads ───────────────────────────
 
 # QEMU `xp` happily takes large counts, but a single HMP call has to round-
 # trip through virsh, so we batch at a reasonable page-sized chunk.
 _PHYS_CHUNK_DEFAULT = 4096
 
 
+@snapshot_operation
 def read_phys(
     vm_name: str,
     addr: int,
@@ -67,7 +71,7 @@ def read_phys(
     *,
     chunk: int = _PHYS_CHUNK_DEFAULT,
 ) -> bytes:
-    """Read ``length`` bytes of physical memory starting at ``addr``."""
+    """Read ``length`` physical bytes through QEMU's RSP extension."""
     if length <= 0:
         return b""
     out = bytearray()
@@ -75,11 +79,14 @@ def read_phys(
     cursor = addr
     while remaining > 0:
         take = min(remaining, chunk)
-        text = hmp(vm_name, f"xp /{take}bx 0x{cursor:x}")
-        data = parse_hex_dump(text)
+        snapshot = current_snapshot(vm_name)
+        if snapshot is None:  # decorator invariant, defensive for monkeypatches
+            raise ReaderError("no active RSP snapshot")
+        data = snapshot.read_physical(cursor, take)
         if len(data) < take:
-            raise HmpError(
-                f"xp truncated: asked {take} bytes at 0x{cursor:x}, got {len(data)}"
+            raise ReaderError(
+                f"RSP physical read truncated: asked {take} bytes at "
+                f"0x{cursor:x}, got {len(data)}"
             )
         out += data[:take]
         remaining -= take
@@ -87,6 +94,7 @@ def read_phys(
     return bytes(out)
 
 
+@snapshot_operation
 def read_virt_current(
     vm_name: str,
     addr: int,
@@ -94,7 +102,7 @@ def read_virt_current(
     *,
     chunk: int = _PHYS_CHUNK_DEFAULT,
 ) -> bytes:
-    """Read virtual memory using the *current* CPU context's CR3.
+    """Read virtual memory using the captured vCPU context's CR3.
 
     Useful when the VA is already mapped in whatever process was
     scheduled at halt time (e.g. kernel addresses, which are in every
@@ -107,11 +115,14 @@ def read_virt_current(
     cursor = addr
     while remaining > 0:
         take = min(remaining, chunk)
-        text = hmp(vm_name, f"x /{take}bx 0x{cursor:x}")
-        data = parse_hex_dump(text)
+        snapshot = current_snapshot(vm_name)
+        if snapshot is None:
+            raise ReaderError("no active RSP snapshot")
+        data = snapshot.read_virtual(snapshot.current_cr3, cursor, take)
         if len(data) < take:
-            raise HmpError(
-                f"x truncated: asked {take} bytes at 0x{cursor:x}, got {len(data)}"
+            raise ReaderError(
+                f"RSP virtual read truncated: asked {take} bytes at "
+                f"0x{cursor:x}, got {len(data)}"
             )
         out += data[:take]
         remaining -= take
@@ -218,6 +229,7 @@ def virt_to_phys(
     return page_pa | (va & PAGE_MASK)
 
 
+@snapshot_operation
 def read_virt_cr3(
     vm_name: str,
     cr3: int,
@@ -226,38 +238,22 @@ def read_virt_cr3(
     *,
     cache: WalkCache | None = None,
 ) -> bytes:
-    """Read ``length`` bytes from ``va`` under an arbitrary CR3.
+    """Read ``length`` bytes from ``va`` under an arbitrary CR3 via RSP.
 
     The core CR3-switching primitive: given the ``DirectoryTableBase`` of
     any process, read its virtual memory from any halt — no matter which
     process was actually running on the CPU.
 
-    Reads cross page boundaries by splitting at 4 KiB, 2 MiB, 1 GiB walks
-    are cached per-CR3 so sequential reads only pay for the final PT
-    lookup. Caller may supply a ``WalkCache`` to extend caching across
-    calls in the same debug session.
+    ``cache`` remains accepted for API compatibility; QEMU performs the page
+    translation after the broker masquerades the halted vCPU's CR3, so a
+    client-side page-table cache is no longer necessary.
     """
     if length <= 0:
         return b""
-    if cache is None:
-        cache = WalkCache()
-
-    out = bytearray()
-    cursor = va
-    remaining = length
-    while remaining > 0:
-        # Only translate the page base — bytes in one page share a PTE.
-        page_base = cursor & ~PAGE_MASK
-        offset_in_page = cursor - page_base
-        bytes_in_page = PAGE_SIZE - offset_in_page
-        take = min(bytes_in_page, remaining)
-
-        page_phys = virt_to_phys(vm_name, cr3, page_base, cache=cache)
-        data = read_phys(vm_name, page_phys + offset_in_page, take)
-        out += data
-        cursor += take
-        remaining -= take
-    return bytes(out)
+    snapshot = current_snapshot(vm_name)
+    if snapshot is None:
+        raise ReaderError("no active RSP snapshot")
+    return snapshot.read_virtual(cr3, va, length)
 
 
 # ── Typed read shortcuts (used by walkers) ──────────────────────────────

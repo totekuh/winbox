@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import importlib
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from winbox.vm import VMState
+
+hmp_module = importlib.import_module("winbox.kdbg.hmp")
 
 
 @pytest.fixture
@@ -21,6 +26,11 @@ def kdbg_env(cfg):
 
     with patch("winbox.cli.kdbg.VM", return_value=vm), \
          patch("winbox.cli.Config.load", return_value=cfg), \
+         patch("winbox.kdbg.hmp._qmp_socket_paths", return_value=[]), \
+         patch(
+             "winbox.kdbg.hmp._libvirt_hmp",
+             side_effect=hmp_module._QmpUnavailable("disabled for subprocess tests"),
+         ), \
          patch("winbox.kdbg.hmp.subprocess.run") as mock_run, \
          patch("winbox.cli.kdbg.probe_port", return_value=False) as mock_probe:
         # Default: virsh succeeds and the HMP output looks like a real start
@@ -80,6 +90,15 @@ class TestKdbgStart:
         result = runner.invoke(cli, ["kdbg", "start"])
         assert result.exit_code == 1
         assert "already listening" in result.output
+        kdbg_env["run"].assert_not_called()
+
+    def test_refuses_when_persistent_reader_owns_stub(self, runner, kdbg_env):
+        from winbox.cli import cli
+        with patch("winbox.cli.kdbg.reader_info", return_value={"port": 4321}):
+            result = runner.invoke(cli, ["kdbg", "start"])
+        assert result.exit_code == 1
+        assert "reader already owns" in result.output
+        assert "4321" in result.output
         kdbg_env["run"].assert_not_called()
 
     def test_refuses_when_vm_not_running(self, runner, kdbg_env):
@@ -181,6 +200,110 @@ class TestKdbgStatus:
         assert result.exit_code == 0
         assert "not running" in result.output
         kdbg_env["probe"].assert_not_called()
+
+    def test_status_reports_connected_reader_without_probe(self, runner, kdbg_env):
+        from winbox.cli import cli
+        with patch("winbox.cli.kdbg.reader_info", return_value={"port": 1234}):
+            result = runner.invoke(cli, ["kdbg", "status"])
+        assert result.exit_code == 0
+        assert "persistent reader owns it" in result.output
+        kdbg_env["probe"].assert_not_called()
+
+
+class TestKdbgCetSafety:
+    def test_status_reports_safe_boot(self, runner, kdbg_env):
+        from types import SimpleNamespace
+        from winbox.cli import cli
+
+        with patch("winbox.cli.VM", return_value=kdbg_env["vm"]), patch(
+            "winbox.cli.GuestAgent",
+        ), patch("winbox.cli.ensure_running"), patch(
+            "winbox.cli.kdbg.query_cet_status",
+            return_value=SimpleNamespace(
+                safe_for_debug=True, user_shadow_stack="OFF", strict_mode="OFF",
+            ),
+        ):
+            result = runner.invoke(cli, ["kdbg", "cet-status"])
+        assert result.exit_code == 0
+        assert "SAFE" in result.output
+        assert "UserShadowStack=OFF" in result.output
+
+    def test_prepare_requires_explicit_confirmation(self, runner, kdbg_env):
+        from winbox.cli import cli
+
+        with patch("winbox.cli.VM", return_value=kdbg_env["vm"]), patch(
+            "winbox.cli.GuestAgent",
+        ), patch("winbox.cli.ensure_running"), patch(
+            "winbox.cli.kdbg.prepare_cet",
+        ) as prepare:
+            result = runner.invoke(cli, ["kdbg", "prepare"])
+        assert result.exit_code == 1
+        assert "--confirm" in result.output
+        prepare.assert_not_called()
+
+    def test_prepare_stops_reader_and_preserves_backup(self, runner, kdbg_env, tmp_path):
+        from winbox.cli import cli
+
+        backup = tmp_path / "kdbg-cet-backup.json"
+        with patch("winbox.cli.VM", return_value=kdbg_env["vm"]), patch(
+            "winbox.cli.GuestAgent",
+        ), patch("winbox.cli.ensure_running"), patch(
+            "winbox.cli.kdbg.stop_reader",
+        ) as stop, patch(
+            "winbox.cli.kdbg.prepare_cet", return_value=backup,
+        ):
+            result = runner.invoke(cli, ["kdbg", "prepare", "--confirm"])
+        assert result.exit_code == 0
+        compact_output = "".join(result.output.split())
+        assert "kdbg-cet-backup.json" in compact_output
+        assert "Reboot" in result.output
+        stop.assert_called_once()
+
+    def test_restore_requires_explicit_confirmation(self, runner, kdbg_env):
+        from winbox.cli import cli
+
+        with patch("winbox.cli.VM", return_value=kdbg_env["vm"]), patch(
+            "winbox.cli.GuestAgent",
+        ), patch("winbox.cli.ensure_running"), patch(
+            "winbox.cli.kdbg.restore_cet_policy",
+        ) as restore:
+            result = runner.invoke(cli, ["kdbg", "restore-cet"])
+        assert result.exit_code == 1
+        restore.assert_not_called()
+
+
+class TestKdbgUserBreakpointOwnership:
+    def test_hands_persistent_reader_to_foreground_rsp_client(self, runner, kdbg_env):
+        from winbox.cli import cli
+        from winbox.kdbg.walk import ProcessRecord
+
+        cfg_store = MagicMock()
+        target = ProcessRecord(
+            pid=1234, name="target.exe", eprocess=0xFFFF0000,
+            directory_table_base=0x123000,
+        )
+        rsp = MagicMock()
+        events = []
+        with patch("winbox.cli.kdbg.reader_info", return_value={"port": 1234}), \
+             patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg._get_store", return_value=cfg_store), \
+             patch("winbox.cli.kdbg.list_processes", return_value=[target]), \
+             patch(
+                 "winbox.cli.kdbg.stop_reader",
+                 side_effect=lambda cfg: events.append("stop"),
+             ), patch("winbox.cli.kdbg.RspClient") as rsp_cls, patch(
+                 "winbox.cli.kdbg.install_user_breakpoint",
+                 return_value=SimpleNamespace(elapsed=0.001, target_dtb=0x123000),
+             ):
+            rsp_cls.connect.side_effect = lambda *a, **kw: events.append("connect") or rsp
+            result = runner.invoke(
+                cli, ["kdbg", "user-bp", "1234", "0x7ff600001000", "--max-hits", "0"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert events == ["stop", "connect"]
+        kdbg_env["probe"].assert_not_called()
+        rsp.close.assert_called_once()
 
 
 class TestKdbgResume:

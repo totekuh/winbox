@@ -7,6 +7,7 @@ fundamentally a list-traversal test.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,14 @@ from winbox.kdbg.walk import (
     is_wow64,
     list_user_modules,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_live_snapshot(monkeypatch):
+    import winbox.kdbg.debugger.reader as reader
+    monkeypatch.setattr(
+        reader, "debug_snapshot_for_vm", lambda _vm: nullcontext(),
+    )
 
 
 # ── Fakes ───────────────────────────────────────────────────────────────
@@ -96,6 +105,13 @@ _TYPES = {
 @pytest.fixture
 def store() -> FakeStore:
     return FakeStore(_TYPES)
+
+
+@pytest.fixture(autouse=True)
+def clear_kernel_cr3_cache():
+    walk._kernel_cr3_by_vm.clear()
+    yield
+    walk._kernel_cr3_by_vm.clear()
 
 
 def _proc(eproc: int = 0xFFFFE001_00100000, dtb: int = 0x12345000) -> ProcessRecord:
@@ -279,7 +295,7 @@ def _list_proc_with_user_dtb(monkeypatch, raw_user_dtb_value: int):
         EPROC + user_off: raw_user_dtb_value,
     }
 
-    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3", lambda vm: 0x999000)
+    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3_candidates", lambda vm: [0x999000])
     monkeypatch.setattr("winbox.kdbg.walk._read_u64",
                         lambda vm, cr3, va, cache: qwords[va])
     monkeypatch.setattr("winbox.kdbg.walk._read_cstr",
@@ -326,24 +342,137 @@ def test_list_processes_rejects_zero_user_dtb(monkeypatch):
     assert p.user_directory_table_base == 0
 
 
-def test_cpu_cr3_reads_cr3_without_requiring_an_idt_line(monkeypatch):
-    """_cpu_cr3 (used by `kdbg ps`/`lm`, which only need CR3) must not fail
-    just because the register dump has no IDT= line — it used to route through
-    read_cpu_state, whose parse_idt raised HmpError on a missing IDT."""
+def test_cpu_cr3_comes_from_active_rsp_snapshot(monkeypatch):
     from winbox.kdbg.walk import _cpu_cr3
+    from types import SimpleNamespace
 
-    dump_without_idt = "RAX=0000000000000000 RIP=fffff80000000000\nCR3=00000000001aa000\n"
-    monkeypatch.setattr(walk, "hmp", lambda vm, cmd: dump_without_idt)
+    snapshot = SimpleNamespace(current_cr3=0x1AA000)
+    monkeypatch.setattr(walk, "current_snapshot", lambda vm: snapshot)
     assert _cpu_cr3("winbox") == 0x1AA000
 
 
-def test_cpu_cr3_raises_hmperror_when_cr3_absent(monkeypatch):
+def test_cpu_cr3_requires_active_rsp_snapshot(monkeypatch):
     from winbox.kdbg.hmp import HmpError
     from winbox.kdbg.walk import _cpu_cr3
 
-    monkeypatch.setattr(walk, "hmp", lambda vm, cmd: "RAX=0 RIP=0\n")
-    with pytest.raises(HmpError, match="CR3 not found"):
+    monkeypatch.setattr(walk, "current_snapshot", lambda vm: None)
+    with pytest.raises(HmpError, match="no active RSP snapshot"):
         _cpu_cr3("winbox")
+
+
+def test_cpu_cr3_candidates_reads_every_vcpu_and_deduplicates(monkeypatch):
+    from types import SimpleNamespace
+    snapshot = SimpleNamespace(cr3_candidates=(0x100000, 0x200000))
+    monkeypatch.setattr(walk, "current_snapshot", lambda vm: snapshot)
+    assert walk._cpu_cr3_candidates("vm") == [0x100000, 0x200000]
+
+
+def test_cached_kernel_cr3_avoids_volatile_vcpu_sampling(monkeypatch):
+    head = 0xFFFFF800_00100000
+    stable = 0x1AE000
+    walk._remember_kernel_cr3("vm", stable)
+    monkeypatch.setattr(
+        walk, "_cpu_cr3_candidates",
+        lambda vm: pytest.fail("cached fast path must not sample vCPU CR3"),
+    )
+    monkeypatch.setattr(
+        walk, "_read_u64",
+        lambda vm, cr3, va, cache: 0xFFFFE000_DEADBEE8 if cr3 == stable else 0,
+    )
+    cr3, flink, _ = walk._read_kernel_list_head("vm", head, None)
+    assert (cr3, flink) == (stable, 0xFFFFE000_DEADBEE8)
+
+
+def test_stale_cached_cr3_is_invalidated_then_all_vcpus_are_tried(monkeypatch):
+    from winbox.kdbg.memory import PageWalkError
+
+    head = 0xFFFFF800_00100000
+    stale = 0x1AE000
+    working_user_half = 0x880000
+    working_kernel_half = working_user_half ^ 0x1000
+    walk._remember_kernel_cr3("vm", stale)
+    monkeypatch.setattr(
+        walk, "_cpu_cr3_candidates", lambda vm: [0x770000, working_user_half]
+    )
+    attempted = []
+
+    def read(vm, cr3, va, cache):
+        attempted.append(cr3)
+        if cr3 == working_kernel_half:
+            return 0xFFFFE000_00001238
+        raise PageWalkError(f"0x{cr3:x} does not map head")
+
+    monkeypatch.setattr(walk, "_read_u64", read)
+    cr3, flink, _ = walk._read_kernel_list_head("vm", head, None)
+    assert (cr3, flink) == (working_kernel_half, 0xFFFFE000_00001238)
+    assert attempted == [
+        stale, stale ^ 0x1000,
+        0x770000, 0x770000 ^ 0x1000,
+        working_user_half, working_kernel_half,
+    ]
+    assert walk._cached_kernel_cr3("vm") is None
+
+
+def test_reboot_poison_pointer_is_rejected_as_a_cr3_candidate(monkeypatch):
+    head = 0xFFFFF800_00100000
+    poisoned = 0x1AE000
+    working = 0x2BE000
+    walk._remember_kernel_cr3("vm", poisoned)
+    monkeypatch.setattr(walk, "_cpu_cr3_candidates", lambda vm: [working])
+
+    def read(vm, cr3, va, cache):
+        if cr3 in (poisoned, poisoned ^ 0x1000):
+            return 0x000FAFAFAFAFA0B0
+        return 0xFFFFE000_00100448
+
+    monkeypatch.setattr(walk, "_read_u64", read)
+    cr3, flink, _ = walk._read_kernel_list_head("vm", head, None)
+    assert (cr3, flink) == (working, 0xFFFFE000_00100448)
+    assert walk._cached_kernel_cr3("vm") is None
+
+
+def test_impossible_empty_kernel_list_is_rejected(monkeypatch):
+    head = 0xFFFFF800_00100000
+    stale = 0x1AE000
+    working = 0x2BE000
+    walk._remember_kernel_cr3("vm", stale)
+    monkeypatch.setattr(walk, "_cpu_cr3_candidates", lambda vm: [working])
+    monkeypatch.setattr(
+        walk, "_read_u64",
+        lambda vm, cr3, va, cache: (
+            head if cr3 in (stale, stale ^ 0x1000) else 0xFFFFE000_00100448
+        ),
+    )
+    cr3, _, _ = walk._read_kernel_list_head("vm", head, None)
+    assert cr3 == working
+
+
+def test_explicit_cr3_ignores_cache_and_live_vcpus(monkeypatch):
+    head = 0xFFFFF800_00100000
+    walk._remember_kernel_cr3("vm", 0x1AE000)
+    monkeypatch.setattr(
+        walk, "_cpu_cr3_candidates",
+        lambda vm: pytest.fail("explicit CR3 must not sample vCPUs"),
+    )
+    seen = []
+
+    def read(vm, cr3, va, cache):
+        seen.append(cr3)
+        return 0xFFFFE000_00004320
+
+    monkeypatch.setattr(walk, "_read_u64", read)
+    cr3, flink, _ = walk._read_kernel_list_head("vm", head, 0x990000)
+    assert (cr3, flink) == (0x990000, 0xFFFFE000_00004320)
+    assert seen == [0x990000]
+    assert walk._cached_kernel_cr3("vm") == 0x1AE000
+
+
+def test_kernel_cr3_cache_is_scoped_per_vm():
+    walk._remember_kernel_cr3("vm-a", 0x100000)
+    walk._remember_kernel_cr3("vm-b", 0x200000)
+    walk._forget_kernel_cr3("vm-a", 0x100000)
+    assert walk._cached_kernel_cr3("vm-a") is None
+    assert walk._cached_kernel_cr3("vm-b") == 0x200000
 
 
 def test_find_process_matches_name_longer_than_15_chars(monkeypatch):
@@ -404,7 +533,7 @@ def test_list_processes_switches_to_system_dtb(monkeypatch):
         cr3s_used.append(cr3)
         return qwords[va]
 
-    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3", lambda vm: CPU_CR3)
+    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3_candidates", lambda vm: [CPU_CR3])
     monkeypatch.setattr("winbox.kdbg.walk._read_u64", tracking_read_u64)
     monkeypatch.setattr("winbox.kdbg.walk._read_cstr",
                         lambda vm, cr3, va, n, cache: "System" if va == SYSTEM + img_off else "proc2.exe")
@@ -419,6 +548,7 @@ def test_list_processes_switches_to_system_dtb(monkeypatch):
     assert len(procs) == 2
     assert procs[0].pid == 4
     assert procs[1].pid == 1234
+    assert walk._cached_kernel_cr3("vm") == SYS_DTB
 
     # First reads use CPU_CR3, reads after System should use SYS_DTB
     first_read_cr3 = cr3s_used[0]
@@ -457,7 +587,7 @@ def test_list_processes_no_switch_when_system_dtb_matches(monkeypatch):
         cr3s_used.append(cr3)
         return qwords[va]
 
-    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3", lambda vm: DTB)
+    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3_candidates", lambda vm: [DTB])
     monkeypatch.setattr("winbox.kdbg.walk._read_u64", tracking_read_u64)
     monkeypatch.setattr("winbox.kdbg.walk._read_cstr",
                         lambda vm, cr3, va, n, cache: "System")
@@ -472,6 +602,7 @@ def test_list_processes_no_switch_when_system_dtb_matches(monkeypatch):
     assert len(procs) == 1
     # All reads should use the same CR3
     assert all(c == DTB for c in cr3s_used)
+    assert walk._cached_kernel_cr3("vm") == DTB
 
 
 # ── WoW64 detection ───────────────────────────────────────────────────

@@ -141,6 +141,9 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "office": (EXCLUDED, "needs a licensed Microsoft Office installer image"),
 
     # kdbg
+    "kdbg cet-status": (LIVE, "read-only debugger safety preflight"),
+    "kdbg prepare": (LIVE, "confirmation-refusal path only; does not change policy"),
+    "kdbg restore-cet": (LIVE, "confirmation-refusal path only; does not change policy"),
     "kdbg start": (LIVE, ""),
     "kdbg stop": (LIVE, ""),
     "kdbg status": (LIVE, ""),
@@ -215,6 +218,9 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "pipe_close": (LIVE, "including the double-close case"),
 
     # kdbg
+    "kdbg_cet_status": (LIVE, "read-only debugger safety preflight"),
+    "kdbg_prepare": (LIVE, "confirmation-refusal path only; does not change policy"),
+    "kdbg_restore_cet": (LIVE, "confirmation-refusal path only; does not change policy"),
     "kdbg_start": (LIVE, ""),
     "kdbg_stop": (LIVE, ""),
     "kdbg_status": (LIVE, ""),

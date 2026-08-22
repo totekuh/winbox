@@ -1,13 +1,12 @@
-"""Tests for the memory parsing helpers and CR3 page walker.
+"""Tests for the memory helpers and retained x86 page translator.
 
-We never touch a real VM — the page walker is driven through a fake
-``hmp`` that serves pre-canned ``xp`` output from an in-memory physical
-backing store.
+We never touch a real VM — an in-memory DebugSnapshot stands in for the
+persistent RSP reader.
 """
 
 from __future__ import annotations
 
-import re
+from contextlib import nullcontext
 
 import pytest
 
@@ -79,15 +78,15 @@ def test_parse_idt_returns_base_and_limit():
 
 
 class FakeMemory:
-    """Minimal physical-RAM simulator driven through an ``xp`` shim.
-
-    Tests patch ``winbox.kdbg.memory.hmp`` with ``FakeMemory().hmp`` to
-    avoid touching virsh/QEMU. We only support the ``xp /<N>bx 0x<addr>``
-    form the walker issues — not a general HMP simulator.
-    """
+    """Minimal physical RAM plus RSP-snapshot adapter."""
 
     def __init__(self) -> None:
         self.ram: dict[int, int] = {}
+        self.vm_name = "vm"
+        self.current_cr3 = 0x200000
+        self.cr3_candidates = (self.current_cr3,)
+        self.kernel_gs_bases = ()
+        self.virtual_reads: list[tuple[int, int, int]] = []
 
     def write_bytes(self, addr: int, data: bytes) -> None:
         for i, b in enumerate(data):
@@ -96,27 +95,32 @@ class FakeMemory:
     def write_qword(self, addr: int, value: int) -> None:
         self.write_bytes(addr, value.to_bytes(8, "little"))
 
-    def hmp(self, vm_name, command, *, timeout=15):  # signature matches kdbg.hmp.hmp
-        match = re.match(
-            r"xp /(\d+)bx 0x([0-9A-Fa-f]+)\s*$",
-            command,
-        )
-        if not match:
-            raise AssertionError(f"unexpected HMP command in test: {command}")
-        count = int(match.group(1))
-        base = int(match.group(2), 16)
-        out_lines = []
-        for off in range(0, count, 16):
-            chunk = [self.ram.get(base + off + i, 0) for i in range(min(16, count - off))]
-            hex_bytes = " ".join(f"0x{b:02x}" for b in chunk)
-            out_lines.append(f"{base + off:016x}: {hex_bytes}")
-        return "\n".join(out_lines) + "\n"
+    def read_physical(self, addr: int, length: int) -> bytes:
+        return bytes(self.ram.get(addr + offset, 0) for offset in range(length))
+
+    def read_virtual(self, cr3: int, addr: int, length: int) -> bytes:
+        self.virtual_reads.append((cr3, addr, length))
+        out = bytearray()
+        cursor = addr
+        remaining = length
+        cache = WalkCache()
+        while remaining:
+            take = min(remaining, 0x1000 - (cursor & 0xFFF))
+            pa = virt_to_phys("vm", cr3, cursor, cache=cache)
+            out += self.read_physical(pa, take)
+            cursor += take
+            remaining -= take
+        return bytes(out)
 
 
 @pytest.fixture
 def fake_mem(monkeypatch):
     mem = FakeMemory()
-    monkeypatch.setattr(memory, "hmp", mem.hmp)
+    import winbox.kdbg.debugger.reader as reader
+    monkeypatch.setattr(memory, "current_snapshot", lambda _vm=None: mem)
+    monkeypatch.setattr(
+        reader, "debug_snapshot_for_vm", lambda _vm: nullcontext(mem),
+    )
     return mem
 
 
@@ -165,6 +169,7 @@ def test_read_virt_cr3_reads_bytes_across_cr3(fake_mem):
     fake_mem.write_bytes(0x3A0100, b"hello world")
     out = read_virt_cr3("vm", 0x200000, 0x7FF600000100, 11)
     assert out == b"hello world"
+    assert fake_mem.virtual_reads[-1] == (0x200000, 0x7FF600000100, 11)
 
 
 def test_read_virt_cr3_spans_page_boundary(fake_mem):
