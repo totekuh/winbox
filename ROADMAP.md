@@ -50,22 +50,43 @@ the last two remove repeated agent round-trips and address arithmetic.
 | 4 | **53 — typed reads and bounded captures** | 3 | 5 | Completed in predicates/actions and trace metadata. |
 | 5 | **41 — durable asynchronous continue** | 3 | 5 | Completed in CLI/MCP with process/socket integration coverage. |
 
-Verification: the complete default suite passes (`2424 passed, 5 skipped`),
-and the real detached Unix-socket worker passed six consecutive process-boundary
-runs. Live Server 2025 validation against `services.exe` captured 1,270 action
-hits with exact-width scalar, raw-byte, ASCII, and UTF-16 values; a durable
-continue was started, polled, cancelled, and recovered through MCP; and the
-original `services!RQueryServiceStatus` hardware breakpoint was restored.
-The API-4 Docker worker reused the cached exact binary and returned decomp
-schema 5 with mapped lines, RVAs, omitted bytes/VAs by default, and explicit
-opt-in coordinates. Post-reload MCP calls returned native structured content,
-bounded classified errors, and correctly labelled an invalid timeout as a
-non-retryable `invalid_argument`.
+### Completed third top-five batch (2026-08-23)
 
-Items 62 (verified PDB enrichment), 66 (truthful runtime verification), and 58
-(build-keyed PE publication) are now the highest-value correctness/quality
-tier. Items 61 and 65 remain the main hostile-input and long-session resource
-management work.
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **66 — truthful runtime verification** | 4 | 5 | Completed with immutable input snapshots and scoped evidence claims. |
+| 2 | **58 — build-keyed PE/symbol publication** | 3 | 5 | Completed with exact-build selection and concurrent atomic publication. |
+| 3 | **61 — Ghidra resource controls and request liveness** | 3 | 5 | Completed in worker API 5 and the constrained Docker runtime. |
+| 4 | **62 — verified PDB enrichment and provenance** | 3 | 5 | Completed with function-public metadata, naming, and durable recovery provenance. |
+| 5 | **65 — cache visibility, pruning, and LRU** | 4 | 4 | Completed through CLI/MCP with legacy-project inventory and dry-run-first pruning. |
+
+Verification: the complete default suite passes (`2443 passed, 5 skipped`),
+and the real Docker/PyGhidra integration passes against worker API 5. The final
+image runs with a 4 GiB memory ceiling, equal swap ceiling, two CPUs, bounded
+logs, and a configurable two-program LRU. Live Server 2025 validation mapped
+`services!RQueryServiceStatus` through runtime RVA `0xfae0` to Ghidra RVA
+`0xfae0`, matched CodeView GUID+age and current instruction bytes, applied the
+verified PDB name without hiding Ghidra's original name, and returned warm
+project/decompile-cache hits. The reloaded MCP catalog exposes 75 structured
+tools; cache inventory grouped current and legacy projects sharing one SHA,
+dry-run pruning selected entries without deletion, and applying while the
+worker was live was refused.
+
+### Next top-three sequence
+
+This is the next balance of tractability and direct AI-vulnerability-research
+payoff. Item 26 remains explicitly accepted/minor and item 8 remains a watched
+intermittent condition rather than active implementation work.
+
+| Rank | Item | Ease | ROI | Why next |
+|---:|---|---:|---:|---|
+| 1 | **17 — SMP correctness audit and live coverage** | 4 | 4 | Bound and verify the four-vCPU semantics before deeper debugger work relies on them. |
+| 2 | **12 — real WoW64 detection/module support** | 2 | 4 | Unlock correct 32-bit modules, symbols, and decompilation for legacy attack surfaces. |
+| 3 | **15 — Windows x64 `.pdata` unwinding** | 1 | 5 | Replace heuristic stacks with trustworthy call chains for crash and exploitability triage. |
+
+Recommended execution order is 17 → 12 → 15. The unwinder has the highest raw
+capability payoff but should be staged after the smaller SMP correctness audit
+and the bounded WoW64 expansion.
 
 ### 56. Completed — guest-derived module path hardening
 
