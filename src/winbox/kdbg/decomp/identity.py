@@ -138,7 +138,9 @@ def _static_pdb_key(pe) -> str | None:
     return None
 
 
-def parse_live_pe(read: Callable[[int, int], bytes], base: int) -> PeIdentity:
+def parse_live_pe(
+    read: Callable[[int, int], bytes], base: int, *, include_pdb: bool = True,
+) -> PeIdentity:
     """Parse identity fields from a mapped PE using a bounded read callback."""
     first = _read_exact(read, base, 4096, "initial PE headers")
     if first[:2] != b"MZ":
@@ -179,7 +181,7 @@ def parse_live_pe(read: Callable[[int, int], bytes], base: int) -> PeIdentity:
     pdb_key = None
     # IMAGE_DIRECTORY_ENTRY_DEBUG is data-directory index 6.
     debug_slot = directory + 6 * 8
-    if debug_slot + 8 <= optional + optional_size:
+    if include_pdb and debug_slot + 8 <= optional + optional_size:
         debug_rva, debug_size = struct.unpack_from("<II", header, debug_slot)
         if debug_rva and debug_size:
             pdb_key = _read_live_pdb_key(read, base, image_size, debug_rva, debug_size)

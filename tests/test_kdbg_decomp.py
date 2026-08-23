@@ -88,6 +88,22 @@ def test_parse_live_pe_extracts_codeview_identity():
     assert result.pdb_key == key
 
 
+def test_parse_live_pe_can_validate_headers_when_codeview_page_is_discarded():
+    image, _ = _live_pe()
+    base = 0x7FF600000000
+
+    def read(address, length):
+        if address >= base + 0x2000:
+            raise RuntimeError("discarded image page")
+        return image[address - base:address - base + length]
+
+    result = parse_live_pe(read, base, include_pdb=False)
+    assert result.machine == 0x8664
+    assert result.timestamp == 0x12345678
+    assert result.image_size == 0x5000
+    assert result.pdb_key is None
+
+
 def test_pyghidra_discovery_preserves_venv_python_symlink(monkeypatch, tmp_path):
     system_python = tmp_path / "system-python"
     system_python.write_text("", encoding="utf-8")
@@ -1126,9 +1142,9 @@ def test_daemon_module_at_uses_fresh_user_loader_walk(monkeypatch, tmp_path):
     result = session.op_module_at("0x101234")
     assert result == {
         "name": "x.dll", "base": "0x100000", "size": 0x3000,
-        "rva": "0x1234", "kind": "user", "full_path": "C:\\x.dll",
-        "loader_entry": "0x9", "inventory": "fresh",
-    }
+            "rva": "0x1234", "kind": "user", "full_path": "C:\\x.dll",
+            "loader_entry": "0x9", "inventory": "fresh", "architecture": "x64",
+        }
     assert session._last_selected_vcpu is None
 
 

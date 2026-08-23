@@ -396,6 +396,26 @@ class RspClient:
             first = self._exchange(b"qsThreadInfo")
         return ids
 
+    def current_thread(self) -> str:
+        """Return the gdbstub's current vCPU via ``qC``.
+
+        Minimal ``Sxx`` stop replies omit the firing thread.  Guessing a CPU
+        in that case is unsafe on SMP guests because the following ``g``
+        packet would sample a different register file.  ``qC`` is the RSP
+        mechanism for resolving that ambiguity without a resume.
+        """
+        response = self._exchange(b"qC")
+        if not response.startswith(b"QC") or len(response) <= 2:
+            raise RspError(f"malformed qC response: {response!r}")
+        thread = response[2:].decode("ascii", errors="strict")
+        # This client explicitly negotiates multiprocess off, so QEMU thread
+        # IDs are plain hexadecimal vCPU identifiers.
+        try:
+            int(thread, 16)
+        except ValueError as exc:
+            raise RspError(f"malformed qC thread id: {thread!r}") from exc
+        return thread
+
     def select_thread(self, thread: str, *, op: str = "g") -> None:
         """``H<op><thread>`` — set the thread for subsequent ``op`` packets.
 

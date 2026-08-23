@@ -761,29 +761,26 @@ def test_list_processes_no_switch_when_system_dtb_matches(monkeypatch):
 
 _WOW64_TYPES = {
     **_PROC_TYPES,
-    "_PEB": {
-        "size": 0x7C8,
-        "fields": {
-            "Ldr": {"off": 0x18, "type": ""},
-            "Wow64Process": {"off": 0x2C0, "type": ""},
-        },
+    "_EWOW64PROCESS": {
+        "size": 0x10,
+        "fields": {"Peb": {"off": 0, "type": ""}},
     },
 }
 
 
 def test_is_wow64_true(monkeypatch):
-    """Non-zero PEB.Wow64Process means WoW64."""
+    """EPROCESS.WoW64Process -> EWOW64PROCESS.Peb means WoW64."""
     target = ProcessRecord(
         pid=1234, name="wow32.exe", eprocess=0xFFFFE000_00100000,
         directory_table_base=0x12345000, user_directory_table_base=0,
     )
-    PEB_OFF = 0x550
-    PEB_VA = 0x7FFE_0000_0000
-    WOW64_OFF = 0x2C0
+    WOW64_OFF = 0x580
+    WOW64_PROCESS = 0xFFFFE000_00200000
+    PEB32 = 0x7FFE0000
 
     qwords = {
-        target.eprocess + PEB_OFF: PEB_VA,
-        PEB_VA + WOW64_OFF: 0x7FFE_0001_0000,  # non-zero = WoW64
+        target.eprocess + WOW64_OFF: WOW64_PROCESS,
+        WOW64_PROCESS: PEB32,
     }
 
     monkeypatch.setattr("winbox.kdbg.walk._read_u64",
@@ -794,7 +791,7 @@ def test_is_wow64_true(monkeypatch):
             types = {**_WOW64_TYPES}
             types["_EPROCESS"] = {
                 "size": 0xB80,
-                "fields": {**_PROC_TYPES["_EPROCESS"]["fields"], "Peb": {"off": PEB_OFF, "type": ""}},
+                "fields": {**_PROC_TYPES["_EPROCESS"]["fields"], "WoW64Process": {"off": WOW64_OFF, "type": ""}},
             }
             return types[t]
 
@@ -802,16 +799,15 @@ def test_is_wow64_true(monkeypatch):
 
 
 def test_is_wow64_false(monkeypatch):
-    """Zero PEB.Wow64Process means native 64-bit."""
+    """Zero EPROCESS.WoW64Process means native 64-bit."""
     target = ProcessRecord(
         pid=1234, name="native64.exe", eprocess=0xFFFFE000_00100000,
         directory_table_base=0x12345000, user_directory_table_base=0,
     )
-    PEB_OFF = 0x550
-    PEB_VA = 0x7FFE_0000_0000
+    WOW64_OFF = 0x580
 
     qwords = {
-        target.eprocess + PEB_OFF: PEB_VA,
+        target.eprocess + WOW64_OFF: 0,
     }
 
     monkeypatch.setattr("winbox.kdbg.walk._read_u64",
@@ -822,7 +818,7 @@ def test_is_wow64_false(monkeypatch):
             types = {**_WOW64_TYPES}
             types["_EPROCESS"] = {
                 "size": 0xB80,
-                "fields": {**_PROC_TYPES["_EPROCESS"]["fields"], "Peb": {"off": PEB_OFF, "type": ""}},
+                "fields": {**_PROC_TYPES["_EPROCESS"]["fields"], "WoW64Process": {"off": WOW64_OFF, "type": ""}},
             }
             return types[t]
 
@@ -830,7 +826,7 @@ def test_is_wow64_false(monkeypatch):
 
 
 def test_is_wow64_no_field(monkeypatch):
-    """If _PEB has no Wow64Process field, return False (old Windows build)."""
+    """If EPROCESS has no WoW64Process field, detection is safely false."""
     target = ProcessRecord(
         pid=1234, name="old.exe", eprocess=0xFFFFE000_00100000,
         directory_table_base=0x12345000, user_directory_table_base=0,
@@ -850,3 +846,95 @@ def test_is_wow64_no_field(monkeypatch):
             return types[t]
 
     assert is_wow64("vm", S(), target) is False
+
+
+def test_wow64_module_walk_returns_x86_loader_view(monkeypatch):
+    target = _proc()
+    native_peb = 0x7FF700000000
+    native_ldr = 0x7FF700001000
+    native_head = native_ldr + 0x10
+    wow_process = 0xFFFFE00100200000
+    peb32 = 0x7FFDF000
+    ldr32 = 0x77001000
+    head32 = ldr32 + 0x0C
+    entry32 = 0x77002000
+    types = {
+        **_TYPES,
+        "_EPROCESS": {"size": 0x800, "fields": {
+            "Peb": {"off": 0x550, "type": ""},
+            "WoW64Process": {"off": 0x580, "type": ""},
+        }},
+        "_EWOW64PROCESS": {"size": 8, "fields": {"Peb": {"off": 0, "type": ""}}},
+    }
+    store = FakeStore(types)
+    qwords = {
+        target.eprocess + 0x550: native_peb,
+        native_peb + 0x18: native_ldr,
+        native_head: native_head,
+        target.eprocess + 0x580: wow_process,
+        wow_process: peb32,
+    }
+    dwords = {
+        peb32 + 0x0C: ldr32,
+        head32: entry32,
+        entry32: head32,
+        entry32 + 0x18: 0x400000,
+        entry32 + 0x20: 0x12000,
+    }
+    _stub_reads(monkeypatch, _Backing(qwords=qwords, dwords=dwords, strings={}))
+    monkeypatch.setattr(
+        walk, "_read_unicode_string32",
+        lambda vm, cr3, va, cache: {
+            entry32 + 0x24: "C:\\Windows\\SysWOW64\\legacy.exe",
+            entry32 + 0x2C: "legacy.exe",
+        }[va],
+    )
+
+    mods = list_user_modules("vm", store, target)
+    assert mods == [UserModuleRecord(
+        "legacy.exe", 0x400000, 0x12000,
+        "C:\\Windows\\SysWOW64\\legacy.exe", entry32, "x86",
+    )]
+
+
+def test_wow64_duplicate_main_exe_prefers_x86_record(monkeypatch):
+    """Native PEB compatibility entry must not masquerade as an x64 EXE."""
+    target = _proc()
+    peb = 0x7FF700000000
+    ldr = 0x7FF700001000
+    head = ldr + 0x10
+    entry = 0x7FF700002000
+    qwords = {
+        target.eprocess + 0x550: peb,
+        peb + 0x18: ldr,
+        head: entry,
+        entry: head,
+        entry + 0x30: 0x7C0000,
+    }
+    dwords = {entry + 0x40: 0x5D000}
+    strings = {
+        entry + 0x58: "cmd.exe",
+        entry + 0x48: r"C:\Windows\SysWOW64\cmd.exe",
+    }
+    _stub_reads(monkeypatch, _Backing(qwords=qwords, dwords=dwords, strings=strings))
+    x86 = UserModuleRecord(
+        "cmd.exe", 0x7C0000, 0x5D000, r"C:\Windows\SysWOW64\cmd.exe",
+        0x77002000, "x86",
+    )
+    monkeypatch.setattr(walk, "_list_wow64_modules", lambda *a, **k: [x86])
+    mods = list_user_modules("vm", store=FakeStore(_TYPES), target=target)
+    assert mods == [x86]
+
+
+def test_wow64_rejects_peb_above_32bit(monkeypatch):
+    target = _proc()
+    store = FakeStore({
+        "_EPROCESS": {"fields": {"WoW64Process": {"off": 0x580}}},
+        "_EWOW64PROCESS": {"fields": {"Peb": {"off": 0}}},
+    })
+    values = {
+        target.eprocess + 0x580: 0xFFFFE00100200000,
+        0xFFFFE00100200000: 0x1_00000000,
+    }
+    monkeypatch.setattr(walk, "_read_u64", lambda vm, cr3, va, cache: values[va])
+    assert is_wow64("vm", store, target) is False

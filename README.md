@@ -434,12 +434,12 @@ and requires a reboot.
 | `kdbg_stop()` | Stop the gdbstub listener |
 | `kdbg_status(port?)` | Show stub state + reachability |
 | `kdbg_symbols_load()` | Pull ntoskrnl.exe out, fetch PDB from msdl, persist symbols + struct layouts to `~/.winbox/symbols/` |
-| `kdbg_user_symbols_load(pid, module)` | Pull a module loaded in `pid`, fetch its matching PDB, and persist a process-correct symbol map |
+| `kdbg_user_symbols_load(pid, module, architecture?)` | Pull an x86/x64 module loaded in `pid`, fetch its matching PDB, and persist a separate architecture-correct symbol map |
 | `kdbg_sym(name, search?, limit?, rva?)` | Resolve `mod!sym` to VA or RVA; substring search supported |
 | `kdbg_struct(type_name, field?, module?)` | Dump full struct layout or one field offset |
 | `kdbg_ps()` | Walk `PsActiveProcessHead` (JSON: pid, dtb, eprocess, name) |
 | `kdbg_lm()` | Walk `PsLoadedModuleList` (JSON: base, size, name) |
-| `kdbg_user_lm(pid)` | Walk `PEB.Ldr` for one process — modules actually loaded in target |
+| `kdbg_user_lm(pid)` | Walk native and WoW64 PEB loader views; every module is labelled x64 or x86 |
 | `kdbg_read_va(pid, address, length)` | CR3-switching arbitrary-process read; works against PPL targets (1MB cap, hex bytes) |
 | `kdbg_base_refresh()` | Re-resolve nt load base after ASLR reboot |
 
@@ -467,8 +467,8 @@ and bounded recovery hints instead of prose that an agent must parse.
 | `kdbg_resume(port?)` | Recovery valve for a VM left paused after a debugger/client failure |
 | `kdbg_regs()` | Dump GPRs + control regs from the firing vCPU |
 | `kdbg_stack(n?)` | Hex-dump the top `n` qwords of the current stack |
-| `kdbg_bt(depth?)` | Symbolicated backtrace (cross-module, with C++ demangling via `llvm-undname`) |
-| `kdbg_context(disasm_count?, stack_qwords?, bt_depth?, memory?)` | Return one stop-epoch-pinned triage bundle with registers, symbolized assembly, stack, heuristic backtrace, breakpoints, and bounded optional memory reads |
+| `kdbg_bt(depth?)` | Windows x64 `.pdata`/xdata backtrace with explicit live vs verified-static metadata provenance |
+| `kdbg_context(disasm_count?, stack_qwords?, bt_depth?, memory?)` | Return one stop-epoch-pinned triage bundle with registers, symbolized assembly, stack, metadata-driven backtrace, breakpoints, and bounded optional memory reads |
 | `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |
 | `kdbg_disasm(addr?, count?, instruction_bytes?)` | Symbol-annotated Capstone disassembly; raw bytes are opt-in |

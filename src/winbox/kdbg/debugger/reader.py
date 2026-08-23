@@ -184,7 +184,17 @@ class _LocalRspSnapshot(DebugSnapshot):
         threads = rsp.list_threads()
         if not threads:
             raise ReaderError("gdbstub returned no vCPUs")
-        self._vcpu = stop.thread or threads[0]
+        self._vcpu = stop.thread or rsp.current_thread()
+        if self._vcpu not in threads:
+            # Accept equivalent zero-padded spellings (QEMU versions differ
+            # between "1" and "01"), but never silently select another CPU.
+            try:
+                wanted = int(self._vcpu, 16)
+                self._vcpu = next(t for t in threads if int(t, 16) == wanted)
+            except (ValueError, StopIteration) as exc:
+                raise ReaderError(
+                    f"stop vCPU {self._vcpu!r} is absent from gdbstub thread list"
+                ) from exc
         cr3s: list[int] = []
         kernel_gs_bases: list[int] = []
         regs_by_thread: dict[str, bytes] = {}

@@ -56,6 +56,7 @@ NT_DEFAULT_TYPES: tuple[str, ...] = (
     # Needed by walk_user_modules — PEB→Ldr→InLoadOrderModuleList walk.
     "_PEB",
     "_PEB_LDR_DATA",
+    "_EWOW64PROCESS",
 )
 
 

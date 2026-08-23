@@ -326,6 +326,19 @@ def test_list_threads_consumes_qf_then_qs_until_l():
     assert cli.list_threads() == ["1", "2", "3"]
 
 
+def test_current_thread_queries_qc():
+    cli, sock = _client([b"+", _frame(b"QC2")])
+    assert cli.current_thread() == "2"
+    assert b"$qC#" in bytes(sock.sent)
+
+
+@pytest.mark.parametrize("reply", [b"", b"OK", b"QC", b"QCnope", b"QCp1.2"])
+def test_current_thread_rejects_ambiguous_or_malformed_reply(reply):
+    cli, _ = _client([b"+", _frame(reply)])
+    with pytest.raises(RspError, match="qC"):
+        cli.current_thread()
+
+
 def test_read_registers_returns_raw_bytes():
     # A valid x86-64 g-packet is >= _MIN_G_PACKET bytes (through the control
     # registers); use a realistic-length blob.

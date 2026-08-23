@@ -981,7 +981,7 @@ class DaemonSession:
             # Skip the Hg if the firing vCPU is the one we already
             # selected last iteration. On -smp 1 (default) this elides
             # an entire round-trip per fire.
-            firing_vcpu = sr.thread or "01"
+            firing_vcpu = self._stop_vcpu(sr)
             if self._last_selected_vcpu != firing_vcpu:
                 self._select_thread(firing_vcpu)
             regs = self.rsp.read_registers()
@@ -1010,7 +1010,7 @@ class DaemonSession:
                 except PredicateRuntimeError as e:
                     bp.predicate_errors += 1
                     bp.hits += 1
-                    self._capture_stop_with_regs(sr, regs)
+                    self._capture_stop_with_regs(sr, regs, vcpu=firing_vcpu)
                     return {
                         "reason": "predicate_error",
                         "error": str(e),
@@ -1023,7 +1023,7 @@ class DaemonSession:
                 if bp._predicate is not None:
                     bp.predicate_hits += 1
 
-            self._capture_stop_with_regs(sr, regs)
+            self._capture_stop_with_regs(sr, regs, vcpu=firing_vcpu)
             if bp is not None:
                 bp.hits += 1
                 if bp.hw and not self._hw_bp_verified:
@@ -1043,16 +1043,55 @@ class DaemonSession:
         if self.stop is None:
             raise RuntimeError("not halted; cont first")
         vcpu = self.stop.vcpu
+        # QEMU checks an execution hardware breakpoint before executing the
+        # instruction.  Leaving Z1 installed while issuing vCont;s therefore
+        # traps at the same RIP forever.  Suspend only the exact firing exec
+        # breakpoint; watchpoints and software INT3 handling have different
+        # semantics and are not affected by this pre-execution retrigger.
+        suspended_bp = self.bps.get(self._bp_by_va.get(self.stop.rip, -1))
+        if suspended_bp is not None and (
+            not suspended_bp.hw or suspended_bp.wp_type is not None
+        ):
+            suspended_bp = None
+        if suspended_bp is not None:
+            self.rsp.remove_breakpoint(
+                suspended_bp.va, kind=1, hardware=True,
+            )
+
+        def restore_suspended_bp() -> None:
+            if suspended_bp is None:
+                return
+            try:
+                self.rsp.insert_breakpoint(
+                    suspended_bp.va, kind=1, hardware=True,
+                )
+            except Exception:
+                # Do not advertise a breakpoint that is no longer installed.
+                self.bps.pop(suspended_bp.bp_id, None)
+                self._bp_by_va.pop(suspended_bp.va, None)
+                raise
+
+        def forget_suspended_bp() -> None:
+            if suspended_bp is not None:
+                self.bps.pop(suspended_bp.bp_id, None)
+                self._bp_by_va.pop(suspended_bp.va, None)
+
         self._begin_resume()
         try:
             self.rsp.step(vcpu)
         except Exception:
+            # A failed exchange does not tell us whether QEMU accepted the
+            # resume packet.  Do not issue another breakpoint command against
+            # a possibly-running stub or claim the removed breakpoint exists.
+            forget_suspended_bp()
             self._mark_indeterminate()
             raise
         try:
             sr = self.rsp.wait_for_stop(timeout=5.0)
         except RspError as e:
             if "timed out" not in str(e).lower():
+                forget_suspended_bp()
+                self._mark_indeterminate()
                 raise
             # Step didn't complete in the budget. The stub may still owe
             # us a stop reply (single-step trap pending in QEMU), or be
@@ -1065,10 +1104,15 @@ class DaemonSession:
                 self.rsp.interrupt()
                 sr_recovery = self.rsp.wait_for_stop(timeout=2.0)
                 self._capture_stop(sr_recovery)
-                recovered = True
-            except RspError:
+            except Exception:
                 # Recovery interrupt+wait also failed → genuine hang.
+                forget_suspended_bp()
                 self._mark_indeterminate()
+            else:
+                # The target is definitely halted, so breakpoint restoration
+                # is safe.  Its helper drops bookkeeping if reinsertion fails.
+                restore_suspended_bp()
+                recovered = True
             if recovered:
                 raise RuntimeError(
                     "step did not complete within 5s; stub recovered to halted state"
@@ -1077,8 +1121,20 @@ class DaemonSession:
                 "step did not complete within 5s and recovery halt failed; "
                 "stub state is indeterminate, daemon may need restart"
             ) from e
-        self._select_thread(sr.thread or vcpu)
-        self._capture_stop(sr)
+        try:
+            self._select_thread(self._stop_vcpu(sr, fallback=vcpu))
+            self._capture_stop(sr)
+        except Exception:
+            # We received a stop reply, but cannot safely expose evidence from
+            # a half-captured stop.  Best-effort restore while QEMU is halted;
+            # regardless of that outcome, mark the debugger state unknown.
+            try:
+                restore_suspended_bp()
+            except Exception:
+                pass
+            self._mark_indeterminate()
+            raise
+        restore_suspended_bp()
         return {"reason": "step", **self._stop_summary()}
 
     _STEP_OVER_MNEMONICS = frozenset({"call", "syscall", "sysenter"})
@@ -1375,33 +1431,228 @@ class DaemonSession:
         }
 
     def op_bt(self, depth: int = 8) -> dict[str, Any]:
-        """Crude backtrace: walk RSP qwords, treat anything that looks
-        like a kernel/user code VA as a return address, symbolicate via
-        the loaded stores. Best-effort — frame-pointer-omitted code
-        won't unwind nicely; that needs proper CFI which is out of scope."""
+        """Unwind a Windows x64 call chain from live PE ``.pdata``/xdata."""
         if self.stop is None:
             raise RuntimeError("not halted; cont first")
         depth = max(1, min(int(depth), 64))
-        rsp_va = struct.unpack_from("<Q", self.stop.raw_regs, 7 * 8)[0]
-        # Dump enough stack to find candidates
-        scan_qwords = min(depth * 8, 256)
-        mem = self.op_mem(rsp_va, scan_qwords * 8)
-        raw = bytes.fromhex(mem["bytes"])
+        return self._unwind_backtrace(depth)
 
-        frames = []
-        for i in range(0, len(raw), 8):
-            qw = int.from_bytes(raw[i:i + 8], "little")
-            if not _looks_like_code_va(qw):
-                continue
-            sym = self._best_symbol_for_va(qw)
-            frames.append({
-                "addr": f"0x{qw:x}",
-                "sym": sym,
-                "stack_off": f"+0x{i:x}",
-            })
-            if len(frames) >= depth:
+    def _unwind_backtrace(self, depth: int) -> dict[str, Any]:
+        """Epoch-stable, bounded live-image unwind implementation."""
+        from winbox.kdbg.unwind import PeX64Unwinder, UnwindError
+
+        stop = self._require_stop_epoch()
+        epoch = {"session_id": self.session_id, "stop_id": self.stop_id}
+        registers = {
+            name: struct.unpack_from("<Q", stop.raw_regs, index * 8)[0]
+            for index, name in enumerate(_GPR_NAMES)
+        }
+        rip = stop.rip
+        rsp = registers["rsp"]
+        initial_rsp = rsp
+
+        # Read through a page cache so a typical frame costs no more than one
+        # live read for xdata and one for its stack page.  Every underlying
+        # read is stop-epoch pinned.
+        pages: dict[int, bytes] = {}
+
+        def live_read(va: int, length: int) -> bytes:
+            if length < 0 or length > 16 * 1024 * 1024:
+                raise UnwindError(f"live unwind read out of bounds: {length}")
+            output = bytearray()
+            while length:
+                page = va & ~0xFFF
+                offset = va - page
+                take = min(length, 0x1000 - offset)
+                if page not in pages:
+                    pages[page] = bytes.fromhex(
+                        self.op_mem(page, 0x1000, **epoch)["bytes"]
+                    )
+                chunk = pages[page][offset:offset + take]
+                if len(chunk) != take:
+                    raise UnwindError(f"short live page at 0x{page:x}")
+                output.extend(chunk)
+                va += take
+                length -= take
+            return bytes(output)
+
+        def verified_static_reader(module):
+            """Use a cached PE only after matching it to the live image."""
+            from winbox.kdbg.decomp.identity import (
+                IdentityError,
+                parse_live_pe,
+                parse_static_pe,
+                sha256_file,
+                validate_identity,
+            )
+
+            stem = str(module.name).rsplit(".", 1)[0].lower()
+            if stem.startswith("ntoskrnl") or stem.startswith("ntkrnl"):
+                store_name = "nt"
+            else:
+                store_name = stem
+                if getattr(module, "architecture", "x64") == "x86":
+                    store_name += "_x86"
+            record = self.store.load(store_name)
+            raw_path = record.get("pe_path")
+            expected_sha = record.get("pe_sha256")
+            if not raw_path or not expected_sha:
+                raise UnwindError(
+                    f"live unwind metadata is unavailable and {store_name} "
+                    "has no hash-bound cached PE"
+                )
+            path = Path(raw_path).resolve(strict=True)
+            digest = sha256_file(path)
+            if digest.lower() != str(expected_sha).lower():
+                raise UnwindError(f"cached PE hash mismatch for {module.name}")
+            static = parse_static_pe(path)
+            identity_warning = None
+            try:
+                live = parse_live_pe(live_read, module.base)
+            except IdentityError as exc:
+                # Windows may decommit the page containing the RSDS record
+                # along with other discardable image data.  Header identity
+                # (machine, timestamp, SizeOfImage) remains independently
+                # verifiable and still fails closed on any mismatch.
+                live = parse_live_pe(live_read, module.base, include_pdb=False)
+                identity_warning = f"live CodeView unavailable: {exc}"
+            confidence = validate_identity(
+                live, static, module_name=module.name,
+                live_module_size=module.size,
+            )
+            first_section = min(
+                (section.virtual_address for section in static.sections),
+                default=0x1000,
+            )
+
+            def read_static(va: int, length: int) -> bytes:
+                rva = va - module.base
+                if rva < 0 or length < 0 or rva + length > static.image_size:
+                    raise UnwindError("static unwind read lies outside image")
+                if rva < first_section:
+                    if rva + length > first_section:
+                        raise UnwindError("static unwind read crosses PE headers")
+                    with path.open("rb") as handle:
+                        handle.seek(rva)
+                        data = handle.read(length)
+                else:
+                    selected = next(
+                        (section for section in static.sections
+                         if section.file_offset(rva) is not None),
+                        None,
+                    )
+                    if selected is None:
+                        raise UnwindError(f"RVA 0x{rva:x} has no static bytes")
+                    offset = selected.file_offset(rva)
+                    assert offset is not None
+                    available = selected.raw_offset + selected.raw_size - offset
+                    if length > available:
+                        raise UnwindError("static unwind read crosses section data")
+                    with path.open("rb") as handle:
+                        handle.seek(offset)
+                        data = handle.read(length)
+                if len(data) != length:
+                    raise UnwindError(f"short cached PE read: {len(data)}/{length}")
+                return data
+
+            return read_static, confidence, identity_warning
+
+        try:
+            modules = [
+                (module, "kernel") for module in self._live_modules("kernel")
+            ] + [
+                (module, "user") for module in self._live_modules("user")
+            ]
+        except Exception as exc:
+            return {
+                "rsp": f"0x{rsp:x}", "method": "windows-x64-pdata",
+                "complete": False, "error": f"module inventory failed: {exc}",
+                "frames": [],
+            }
+
+        unwinders: dict[tuple[int, int], tuple[PeX64Unwinder, str]] = {}
+        frames: list[dict[str, Any]] = []
+        visited: set[tuple[int, int]] = set()
+        error: str | None = None
+        complete = False
+        for frame_index in range(depth):
+            if rip == 0:
+                complete = True
                 break
-        return {"rsp": f"0x{rsp_va:x}", "frames": frames}
+            key = (rip, rsp)
+            if key in visited:
+                error = "unwind loop detected"
+                break
+            visited.add(key)
+            matches = [
+                (module, kind) for module, kind in modules
+                if module.base <= rip < module.base + module.size
+            ]
+            if not matches:
+                error = f"0x{rip:x} is outside every live module"
+                break
+            module, kind = min(matches, key=lambda item: item[0].size)
+            frame = {
+                "index": frame_index,
+                "addr": f"0x{rip:x}",
+                "rsp": f"0x{rsp:x}",
+                "sym": self._best_symbol_for_va(rip),
+                "module": module.name,
+                "rva": f"0x{rip - module.base:x}",
+                "architecture": getattr(module, "architecture", "x64"),
+            }
+            frames.append(frame)
+            if getattr(module, "architecture", "x64") != "x64":
+                error = "x86 WoW64 stack unwinding is not supported by the x64 unwinder"
+                break
+            try:
+                cache_key = (module.base, module.size)
+                cached = unwinders.get(cache_key)
+                if cached is None:
+                    try:
+                        unwinder = PeX64Unwinder(
+                            module.base, module.size, live_read,
+                        )
+                        metadata_source = "live-image"
+                    except (UnwindError, RuntimeError) as live_exc:
+                        static_read, confidence, identity_warning = (
+                            verified_static_reader(module)
+                        )
+                        unwinder = PeX64Unwinder(
+                            module.base, module.size, static_read,
+                        )
+                        metadata_source = f"verified-static:{confidence}"
+                        frame["live_metadata_error"] = str(live_exc)
+                        if identity_warning:
+                            frame["identity_warning"] = identity_warning
+                    unwinders[cache_key] = (unwinder, metadata_source)
+                else:
+                    unwinder, metadata_source = cached
+                step = unwinder.unwind(rip, rsp, registers, live_read)
+                frame["unwind"] = "leaf" if step.leaf else "pdata"
+                frame["metadata"] = metadata_source
+                if step.operations:
+                    frame["operations"] = list(step.operations)
+            except (UnwindError, RuntimeError) as exc:
+                error = f"{module.name}+0x{rip - module.base:x}: {exc}"
+                break
+            if step.rsp <= rsp or step.rsp - initial_rsp > 16 * 1024 * 1024:
+                error = f"implausible caller RSP 0x{step.rsp:x}"
+                break
+            rip, rsp, registers = step.rip, step.rsp, step.registers
+        else:
+            complete = False
+            error = f"depth limit {depth} reached"
+
+        result: dict[str, Any] = {
+            "rsp": f"0x{initial_rsp:x}",
+            "method": "windows-x64-pdata",
+            "complete": complete,
+            "frames": frames,
+        }
+        if error:
+            result["error"] = error
+        return result
 
     def op_context(
         self,
@@ -1479,7 +1730,7 @@ class DaemonSession:
         response["assembly"] = assembly
 
         rsp_va = struct.unpack_from("<Q", stop.raw_regs, 7 * 8)[0]
-        scan_qwords = max(stack_qwords, min(bt_depth * 8, 128))
+        scan_qwords = stack_qwords
         stack_raw = b""
         if scan_qwords:
             try:
@@ -1499,20 +1750,12 @@ class DaemonSession:
                 for offset in range(0, min(len(stack_raw), stack_qwords * 8), 8)
             ],
         }
-        frames = []
-        if bt_depth:
-            for offset in range(0, len(stack_raw), 8):
-                value = int.from_bytes(stack_raw[offset:offset + 8], "little")
-                if not _looks_like_code_va(value):
-                    continue
-                frames.append({
-                    "addr": f"0x{value:x}",
-                    "sym": self._best_symbol_for_va(value),
-                    "stack_off": f"+0x{offset:x}",
-                })
-                if len(frames) >= bt_depth:
-                    break
-        response["backtrace"] = {"rsp": f"0x{rsp_va:x}", "frames": frames}
+        response["backtrace"] = (
+            self._unwind_backtrace(bt_depth) if bt_depth else {
+                "rsp": f"0x{rsp_va:x}", "method": "windows-x64-pdata",
+                "complete": False, "frames": [],
+            }
+        )
 
         bps = self.op_bp_list()["bps"]
         response["breakpoints"] = {
@@ -1579,7 +1822,7 @@ class DaemonSession:
 
     @staticmethod
     def _module_payload(module, *, kind: str, va: int) -> dict[str, Any]:
-        return {
+        payload = {
             "name": module.name,
             "base": f"0x{module.base:x}",
             "size": module.size,
@@ -1589,6 +1832,9 @@ class DaemonSession:
             "loader_entry": f"0x{module.entry:x}",
             "inventory": "fresh",
         }
+        if kind == "user":
+            payload["architecture"] = getattr(module, "architecture", "x64")
+        return payload
 
     def op_module_at(
         self,
@@ -1652,6 +1898,11 @@ class DaemonSession:
             if rva_value < 0 or rva_value >= (1 << 32):
                 raise ValueError(f"RVA outside supported PE range: {rva_value}")
             wanted = module.lower()
+            wanted_arch = None
+            if "@" in wanted:
+                wanted, _, wanted_arch = wanted.rpartition("@")
+                if wanted_arch not in {"x86", "x64"}:
+                    raise ValueError("module architecture must be @x86 or @x64")
             wanted_stem = wanted.rsplit(".", 1)[0]
             selected_pair = None
             kernel_name = (
@@ -1661,6 +1912,8 @@ class DaemonSession:
             for kind in (("kernel", "user") if kernel_name else ("user", "kernel")):
                 matches = []
                 for candidate in self._live_modules(kind):
+                    if wanted_arch and getattr(candidate, "architecture", "x64") != wanted_arch:
+                        continue
                     name = str(candidate.name).lower()
                     stem = name.rsplit(".", 1)[0]
                     if name == wanted or stem == wanted_stem:
@@ -1740,7 +1993,7 @@ class DaemonSession:
         return struct.unpack_from("<Q", regs, 16 * 8)[0]
 
     def _capture_stop(self, sr) -> None:
-        vcpu = sr.thread or "01"
+        vcpu = self._stop_vcpu(sr)
         self._select_thread(vcpu)
         regs = self.rsp.read_registers()
         self._capture_stop_with_regs(sr, regs, vcpu=vcpu)
@@ -1752,7 +2005,7 @@ class DaemonSession:
         gate in op_cont) has just read regs to evaluate a condition.
         """
         if vcpu is None:
-            vcpu = sr.thread or "01"
+            vcpu = self._stop_vcpu(sr)
             self._select_thread(vcpu)
         self.stop = StopState(
             vcpu=vcpu,
@@ -1763,6 +2016,28 @@ class DaemonSession:
         )
         self.stop_id += 1
         self.run_state = "halted"
+
+    def _stop_vcpu(self, sr, *, fallback: str | None = None) -> str:
+        """Resolve a stop to one concrete vCPU without SMP guessing.
+
+        QEMU normally includes ``thread:`` in a T-stop.  A legacy/minimal
+        S-stop does not; for an explicitly targeted single-step its requested
+        vCPU is authoritative, otherwise query ``qC``.  Every returned id is
+        syntax-checked before it can reach an ``Hg`` packet.
+        """
+        vcpu = sr.thread or fallback
+        if vcpu is None:
+            try:
+                vcpu = self.rsp.current_thread()
+            except RspError as exc:
+                raise RuntimeError(
+                    "stop reply omitted its vCPU and qC could not resolve it"
+                ) from exc
+        try:
+            int(vcpu, 16)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"invalid vCPU id in stop reply: {vcpu!r}") from exc
+        return str(vcpu)
 
     def _begin_resume(self) -> None:
         """Invalidate stop-derived evidence before a resume packet is sent."""
@@ -1790,7 +2065,9 @@ class DaemonSession:
         """
         rsp = self.rsp
         session = self
-        vcpu_hint = vcpu or (self.stop.vcpu if self.stop is not None else "01")
+        vcpu_hint = vcpu or (
+            self.stop.vcpu if self.stop is not None else self._pick_vcpu()
+        )
         _UNMAPPED_SIGNS = (b"E14", b"E0E", b"E08", b"failed")
 
         def _read(addr: int, width: int = 8, *, raw: bool = False):
@@ -1854,7 +2131,9 @@ class DaemonSession:
         except _MemoryReadNeeded:
             pass
 
-        vcpu_hint = vcpu or (self.stop.vcpu if self.stop is not None else "01")
+        vcpu_hint = vcpu or (
+            self.stop.vcpu if self.stop is not None else self._pick_vcpu()
+        )
         rsp = self.rsp
 
         def _direct_read(addr: int, width: int = 8, *, raw: bool = False):

@@ -58,6 +58,9 @@ class FakeRsp:
     def list_threads(self):
         return list(self.threads)
 
+    def current_thread(self):
+        return self.selected
+
     def select_thread(self, thread):
         self.selected = thread
 

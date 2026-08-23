@@ -47,7 +47,12 @@ from winbox.kdbg.debugger import (
     install_user_breakpoint,
     masquerade_cr3_candidates,
 )
-from winbox.kdbg.debugger.reader import debug_snapshot, reader_info, stop_reader
+from winbox.kdbg.debugger.reader import (
+    ReaderError,
+    debug_snapshot,
+    reader_info,
+    stop_reader,
+)
 from winbox.kdbg.cet import (
     CetSafetyError,
     format_status as format_cet_status,
@@ -532,7 +537,7 @@ def kdbg_read_va(
 
 @kdbg.command("user-lm")
 @click.argument("pid", type=int)
-@needs_vm()
+@needs_vm(auto_start=False)
 def kdbg_user_lm(cfg: Config, vm: VM, ga: GuestAgent, pid: int) -> None:
     """Walk PEB.Ldr for ``pid`` and list every loaded user-mode module.
 
@@ -547,8 +552,10 @@ def kdbg_user_lm(cfg: Config, vm: VM, ga: GuestAgent, pid: int) -> None:
         with debug_snapshot(cfg):
             store = _get_store(cfg)
         # Lazy-extract the PEB structs if the store predates their addition.
-        ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
-    except (SymbolStoreError, SymbolLoadError) as e:
+        ensure_types_loaded(
+            cfg, store, ["_PEB", "_PEB_LDR_DATA", "_EWOW64PROCESS"], module="nt"
+        )
+    except (SymbolStoreError, SymbolLoadError, ReaderError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
 
@@ -560,7 +567,7 @@ def kdbg_user_lm(cfg: Config, vm: VM, ga: GuestAgent, pid: int) -> None:
                 console.print(f"[red][-][/] pid {pid} not found in process list")
                 raise SystemExit(1)
             mods = list_user_modules(cfg.vm_name, store, target, cache=cache)
-    except (SymbolStoreError, HmpError) as e:
+    except (SymbolStoreError, HmpError, ReaderError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
 
@@ -570,17 +577,26 @@ def kdbg_user_lm(cfg: Config, vm: VM, ga: GuestAgent, pid: int) -> None:
         return
 
     console.print(f"[dim]pid {pid} ({target.name}) — DTB 0x{target.directory_table_base:x}[/]")
-    console.print("[dim]  Base              Size        Name[/]")
+    console.print("[dim]  Base              Size        Arch  Name[/]")
     for m in mods:
-        console.print(f"  0x{m.base:016x}  0x{m.size:08x}  {m.name}")
+        console.print(
+            f"  0x{m.base:016x}  0x{m.size:08x}  {m.architecture:4}  {m.name}"
+        )
     console.print(f"[dim]({len(mods)} modules)[/]")
 
 
 @kdbg.command("user-symbols")
 @click.argument("pid", type=int)
 @click.argument("module_name", metavar="MODULE")
-@needs_vm()
-def kdbg_user_symbols(cfg: Config, vm: VM, ga: GuestAgent, pid: int, module_name: str) -> None:
+@click.option(
+    "--architecture", type=click.Choice(["auto", "x86", "x64"]),
+    default="auto", show_default=True,
+)
+@needs_vm(auto_start=False)
+def kdbg_user_symbols(
+    cfg: Config, vm: VM, ga: GuestAgent, pid: int, module_name: str,
+    architecture: str,
+) -> None:
     """Load PDB symbols for a user-mode MODULE in ``pid``.
 
     MODULE matches against PEB.Ldr entries (case-insensitive substring
@@ -599,8 +615,10 @@ def kdbg_user_symbols(cfg: Config, vm: VM, ga: GuestAgent, pid: int, module_name
     try:
         with debug_snapshot(cfg):
             store = _get_store(cfg)
-        ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
-    except (SymbolStoreError, SymbolLoadError) as e:
+        ensure_types_loaded(
+            cfg, store, ["_PEB", "_PEB_LDR_DATA", "_EWOW64PROCESS"], module="nt"
+        )
+    except (SymbolStoreError, SymbolLoadError, ReaderError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
 
@@ -612,25 +630,29 @@ def kdbg_user_symbols(cfg: Config, vm: VM, ga: GuestAgent, pid: int, module_name
                 console.print(f"[red][-][/] pid {pid} not found in process list")
                 raise SystemExit(1)
             mods = list_user_modules(cfg.vm_name, store, target, cache=cache)
-    except (SymbolStoreError, HmpError) as e:
+    except (SymbolStoreError, HmpError, ReaderError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
     needle = module_name.lower()
-    match = next(
-        (m for m in mods if needle in m.name.lower()),
-        None,
-    )
-    if match is None:
-        match = next(
-            (m for m in mods if needle in m.full_path.lower()),
-            None,
-        )
-    if match is None:
+    matches = [m for m in mods if needle in m.name.lower()]
+    if not matches:
+        matches = [m for m in mods if needle in m.full_path.lower()]
+    if architecture != "auto":
+        matches = [m for m in matches if m.architecture == architecture]
+    if not matches:
         console.print(f"[red][-][/] no module matching {module_name!r} in pid {pid}")
         console.print(f"    try [bold]winbox kdbg user-lm {pid}[/] to see what's loaded")
         raise SystemExit(1)
+    identities = {(m.name.lower(), m.architecture) for m in matches}
+    if architecture == "auto" and len(identities) > 1:
+        choices = ", ".join(f"{name}@{arch}" for name, arch in sorted(identities))
+        console.print(f"[red][-][/] ambiguous module; use --architecture ({choices})")
+        raise SystemExit(1)
+    match = matches[0]
 
     short_name = match.name.rsplit(".", 1)[0].lower()
+    if match.architecture == "x86":
+        short_name += "_x86"
     cached_basename = match.name
 
     with console.status(f"[blue]Copying {match.name}, fetching PDB, parsing..."):
@@ -1413,7 +1435,7 @@ def kdbg_context(
 @click.option("-n", "--depth", type=int, default=8, show_default=True)
 @click.pass_context
 def kdbg_bt(ctx: click.Context, depth: int) -> None:
-    """Crude stack walk; symbolicate likely return addresses."""
+    """Unwind the live Windows x64 stack from PE .pdata metadata."""
     cfg: Config = ctx.obj["cfg"]
     try:
         result = _client(cfg).call("bt", depth=depth)
@@ -1422,12 +1444,22 @@ def kdbg_bt(ctx: click.Context, depth: int) -> None:
         raise SystemExit(1)
     frames = result.get("frames", [])
     if not frames:
-        console.print("[dim](no candidate code addresses near RSP)[/]")
+        console.print("[dim](no unwindable frames)[/]")
+        if result.get("error"):
+            console.print(f"[yellow][!][/] {result['error']}")
         return
-    console.print(f"[dim]RSP = {result['rsp']}[/]")
+    console.print(
+        f"[dim]RSP = {result['rsp']}  method={result.get('method', 'unknown')}[/]"
+    )
     for f in frames:
         sym = f.get("sym") or "?"
-        console.print(f"  {f['stack_off']:6s}  {f['addr']}  {sym}")
+        location = f"{f.get('module', '?')}+{f.get('rva', '?')}"
+        console.print(
+            f"  #{f.get('index', '?'):<2}  {f['addr']}  {f.get('rsp', '?')}  "
+            f"{location}  {sym}  [{f.get('unwind', 'partial')}]"
+        )
+    if result.get("error"):
+        console.print(f"[yellow][!][/] partial: {result['error']}")
 
 
 @kdbg.command("detach")

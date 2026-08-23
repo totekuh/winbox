@@ -3189,9 +3189,10 @@ def kdbg_user_lm(pid: int) -> dict[str, Any]:
     The user-space mirror of ``kdbg_lm``. Shows the EXE plus every DLL
     Windows mapped into the target's address space, in load order.
 
-    The envelope result is ``{pid, modules, count}``; each module contains
-    ``{base, size, name, full_path}``. ``base`` is a user VA meaningful only
-    against that process's CR3.
+    The envelope result is ``{pid, modules, count, wow64}``; each module
+    contains ``{base, size, name, full_path, architecture}``. WoW64 processes
+    include both loader views with x86/x64 same-name DLLs kept distinct.
+    ``base`` is a user VA meaningful only against that process's CR3.
 
     First call after a fresh VM auto-extracts the PEB struct layouts
     from the cached PDB if they're missing — no kdbg_symbols_load
@@ -3209,7 +3210,9 @@ def kdbg_user_lm(pid: int) -> dict[str, Any]:
     try:
         with _kdbg_debug_snapshot(cfg):
             store = _kdbg_get_store()
-        _kdbg_ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
+        _kdbg_ensure_types_loaded(
+            cfg, store, ["_PEB", "_PEB_LDR_DATA", "_EWOW64PROCESS"], module="nt"
+        )
     except (_KdbgStoreError, _KdbgSymbolLoadError) as e:
         return _research_error(e, operation="kdbg_user_lm")
 
@@ -3234,20 +3237,20 @@ def kdbg_user_lm(pid: int) -> dict[str, Any]:
             "size": f"0x{m.size:08x}",
             "name": m.name,
             "full_path": m.full_path,
+            "architecture": m.architecture,
         }
         for m in mods
     ]
-    result: dict = {"pid": pid, "modules": out, "count": len(out)}
-    if wow64:
-        result["warning"] = (
-            "WoW64 process — only 64-bit modules listed. "
-            "The 32-bit module list (PEB.Wow64Process) is not walked yet."
-        )
+    result: dict = {
+        "pid": pid, "modules": out, "count": len(out), "wow64": wow64,
+    }
     return _research_ok(result)
 
 
 @mcp.tool()
-def kdbg_user_symbols_load(pid: int, module: str) -> dict[str, Any]:
+def kdbg_user_symbols_load(
+    pid: int, module: str, architecture: str = "auto",
+) -> dict[str, Any]:
     """Load PDB symbols for a user-mode module in ``pid``.
 
     Pulls the binary out of the VM via VirtIO-FS, fetches the matching
@@ -3259,6 +3262,8 @@ def kdbg_user_symbols_load(pid: int, module: str) -> dict[str, Any]:
         pid: Target process ID (must be in kdbg_ps output).
         module: Substring matched against PEB.Ldr BaseDllName, then
             FullDllName. Examples: 'notepad.exe', 'ntdll', 'kernelbase'.
+        architecture: ``auto``, ``x86``, or ``x64``. Auto refuses an
+            ambiguous same-name WoW64 match instead of mixing symbol stores.
 
     Returns module/build/symbol-count/base metadata in the common envelope.
     """
@@ -3266,7 +3271,9 @@ def kdbg_user_symbols_load(pid: int, module: str) -> dict[str, Any]:
     try:
         with _kdbg_debug_snapshot(cfg):
             store = _kdbg_get_store()
-        _kdbg_ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
+        _kdbg_ensure_types_loaded(
+            cfg, store, ["_PEB", "_PEB_LDR_DATA", "_EWOW64PROCESS"], module="nt"
+        )
     except (_KdbgStoreError, _KdbgSymbolLoadError) as e:
         return _research_error(e, operation="kdbg_user_symbols_load")
 
@@ -3282,17 +3289,35 @@ def kdbg_user_symbols_load(pid: int, module: str) -> dict[str, Any]:
     except (_KdbgStoreError, _KdbgHmpError) as e:
         return _research_error(e, operation="kdbg_user_symbols_load")
 
+    architecture = architecture.lower().strip()
+    if architecture not in {"auto", "x86", "x64"}:
+        return _research_error(
+            "architecture must be 'auto', 'x86', or 'x64'",
+            operation="kdbg_user_symbols_load",
+        )
     needle = module.lower()
-    match = next((m for m in mods if needle in m.name.lower()), None)
-    if match is None:
-        match = next((m for m in mods if needle in m.full_path.lower()), None)
-    if match is None:
+    matches = [m for m in mods if needle in m.name.lower()]
+    if not matches:
+        matches = [m for m in mods if needle in m.full_path.lower()]
+    if architecture != "auto":
+        matches = [m for m in matches if m.architecture == architecture]
+    if not matches:
         return _research_error(
             f"no module matching {module!r} in pid {pid}",
             operation="kdbg_user_symbols_load",
         )
+    identities = {(m.name.lower(), m.architecture) for m in matches}
+    if architecture == "auto" and len(identities) > 1:
+        choices = ", ".join(f"{name}@{arch}" for name, arch in sorted(identities))
+        return _research_error(
+            f"ambiguous module {module!r}; choose architecture: {choices}",
+            operation="kdbg_user_symbols_load",
+        )
+    match = matches[0]
 
     short_name = match.name.rsplit(".", 1)[0].lower()
+    if match.architecture == "x86":
+        short_name += "_x86"
     cached_basename = match.name
 
     try:
@@ -3310,6 +3335,7 @@ def kdbg_user_symbols_load(pid: int, module: str) -> dict[str, Any]:
     return _research_ok({
         "pid": pid, "module": short_name, "build": info.build,
         "symbol_count": info.symbol_count, "base": f"0x{info.base:x}",
+        "architecture": match.architecture,
     })
 
 
@@ -4292,19 +4318,21 @@ def kdbg_stack(n: int = 16) -> dict[str, Any]:
 
 @mcp.tool()
 def kdbg_bt(depth: int = 8) -> dict[str, Any]:
-    """Crude stack-walk backtrace; symbolicates plausible return addrs.
+    """Unwind the live Windows x64 stack through PE .pdata/xdata.
 
-    Treats values on the stack that look like canonical-high (kernel)
-    or canonical-low user-image addresses as candidate return addresses
-    and resolves them against loaded symbol stores. Best-effort only —
-    frame-pointer-omitted code won't unwind cleanly without proper
-    CFI, which is out of scope for this primitive.
+    Uses RUNTIME_FUNCTION metadata, including unwind-v2 epilogs, chained
+    records, nonvolatile restores, and machine frames. Metadata provenance is
+    explicit: live image pages are preferred; Windows-discarded pages may use
+    only an exact hash/identity-verified cached PE. Stack values always come
+    from the pinned live stop. Malformed, missing, or x86 metadata returns a
+    truthful partial trace with an error instead of guessed stack candidates.
 
     Args:
         depth: Max frames to return (1..64).
 
     Returns:
-        JSON ``{rsp, frames}`` where each frame has ``addr, sym, stack_off``.
+        JSON ``{rsp, method, complete, frames, error?}``; frames include
+        address, RSP, module/RVA, symbol, unwind operations, and metadata source.
     """
     cfg = _kdbg_cfg_only()
     try:

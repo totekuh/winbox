@@ -74,19 +74,24 @@ worker was live was refused.
 
 ### Next top-three sequence
 
-This is the next balance of tractability and direct AI-vulnerability-research
-payoff. Item 26 remains explicitly accepted/minor and item 8 remains a watched
-intermittent condition rather than active implementation work.
+Completed on 2026-08-23. Item 26 remains explicitly accepted/minor and item 8
+remains a watched intermittent condition rather than active implementation
+work.
 
 | Rank | Item | Ease | ROI | Why next |
 |---:|---|---:|---:|---|
-| 1 | **17 — SMP correctness audit and live coverage** | 4 | 4 | Bound and verify the four-vCPU semantics before deeper debugger work relies on them. |
-| 2 | **12 — real WoW64 detection/module support** | 2 | 4 | Unlock correct 32-bit modules, symbols, and decompilation for legacy attack surfaces. |
-| 3 | **15 — Windows x64 `.pdata` unwinding** | 1 | 5 | Replace heuristic stacks with trustworthy call chains for crash and exploitability triage. |
+| 1 | **17 — SMP correctness audit and live coverage** | 4 | 4 | Completed; tested migration on CPUs 2, 3, and 4 plus same-vCPU stepping. |
+| 2 | **12 — real WoW64 detection/module support** | 2 | 4 | Completed; live-tested against a SysWOW64 `cmd.exe`. |
+| 3 | **15 — Windows x64 `.pdata` unwinding** | 1 | 5 | Completed; live-tested in kernel and user/RPC stacks. |
 
-Recommended execution order is 17 → 12 → 15. The unwinder has the highest raw
-capability payoff but should be staged after the smaller SMP correctness audit
-and the bounded WoW64 expansion.
+The implemented order was 17 → 12 → 15, followed by live edge fixes for unwind
+v2 epilogs, discarded image metadata, and hardware-breakpoint stepping.
+Final verification passed the complete default suite (`2473 passed, 5 skipped,
+140 deselected`), the explicit daemon/socket integration suite (`7 passed`),
+and the reloaded MCP live workflow against `services.exe` on vCPU 3. The live
+step advanced `RQueryServiceStatus+0x0` to `+0x5` while preserving the hardware
+breakpoint, and the metadata-driven trace reached RPC runtime frames before
+truthfully stopping at an unstaged exact `ntdll.dll` image.
 
 ### 56. Completed — guest-derived module path hardening
 
@@ -374,25 +379,23 @@ round-trips waste time and context, and agents frequently omit one of the
 pieces needed to reason about the stop.
 
 `kdbg_context` now returns an epoch-pinned target/stop, registers, symbolized
-RIP and branch targets, nearby assembly, labelled stack, explicitly heuristic
-backtrace, and bounded breakpoint metadata. Callers may request at most four
+RIP and branch targets, nearby assembly, labelled stack, Windows x64
+metadata-driven backtrace, and bounded breakpoint metadata. Callers may request at most four
 memory follows, 256 bytes each and 1024 bytes total. Zero-sized components,
 bad integer/bool inputs, missing stop state, unreadable evidence, and every cap
 are covered in daemon/MCP/CLI tests.
 
-### 12. WoW64 detection is currently ineffective; 32-bit modules are absent
+### 12. Completed — real WoW64 detection and 32-bit module support
 
-`is_wow64()` looks for `Wow64Process` in `_PEB`, but that field is absent from
-the current Server 2025 PDB maps, so the function returns false. The live PDB
-does expose `_EPROCESS.WoW64Process` (offset `0x310` on the current build),
-which is the kernel-side detection path that should be used. The roadmap's
-previous claim that detection was already fixed was incorrect.
-
-After correcting detection, implement the 32-bit loader walk through
-`_EWOW64PROCESS`/PEB32 using 32-bit pointers and 32-bit UNICODE_STRING/LDR
-layouts. Keep native and WoW64 module results explicitly labeled; do not mix
-same-named 32/64-bit DLLs in the symbol store. Moderate effort, high payoff for
-legacy user-mode targets, but narrower than items 52/53/41.
+Detection now follows `_EPROCESS.WoW64Process` to `_EWOW64PROCESS.Peb`. The
+walker handles PEB32, 32-bit pointers, bounded UNICODE_STRING32 values, corrupt
+cycles, zero/invalid pointers, and both native and x86 loader views. Results
+carry `architecture`; the duplicate native-view main EXE is removed, same-name
+x86/x64 DLLs remain explicit, auto symbol loading refuses ambiguity, and x86
+stores use a separate `<module>_x86` key. Live Server 2025 validation against
+`C:\Windows\SysWOW64\cmd.exe` returned the x86 executable plus x86 ntdll,
+KERNEL32, KERNELBASE, ucrtbase, and sechost beside the native WoW64 support
+DLLs. The native services process remained x64-only.
 
 ### 26. kdbg read-surface residuals from the 2026-08-10 audit (accepted / minor)
 
@@ -414,29 +417,60 @@ Two findings from the read-surface audit were left as-is, deliberately:
   a wrong `DirectoryTableBase` offset breaks the whole store loudly elsewhere,
   so a targeted guard here is low-value — folded into item 18.
 
-### 15. `kdbg_bt` is a stack-scan heuristic, not a real unwinder
+### 15. Completed — Windows x64 `.pdata` unwinding
 
-`op_bt` walks RSP-relative stack qwords and treats anything that looks like
-a canonical code address as a return address (`_looks_like_code_va`). There's
-no `.pdata`/`RUNTIME_FUNCTION` parsing anywhere in the codebase, and x64
-Windows release binaries are frame-pointer-omitted almost everywhere non-leaf
-— so against real targets (AV/EDR components, optimized code) this backtrace
-will systematically drop or fabricate frames. Already flagged as best-effort
-in the function's own docstring. Largest capability gap versus a WinDbg-class
-debugger, and the least tractable item here — a real fix means parsing
-`.pdata` and doing table-based unwind, not a local patch.
+`kdbg_bt` and `kdbg_context` now parse PE32+ exception directories,
+RUNTIME_FUNCTION entries, unwind v1/v2 xdata, chained records, prolog state,
+nonvolatile saves, frame registers, small/large allocations, machine frames,
+and bounded v2 epilog instruction sequences. Leaf functions pop the ABI return
+slot; malformed/unsupported metadata returns an explicit partial trace instead
+of falling back to candidate-address scanning.
 
-### 17. SMP behavior is under-tested despite the four-vCPU default
+Metadata comes from live mapped images when present. Windows decommits
+discardable `.pdata` in user processes, so the fallback requires a hash-bound
+cached PE and validates its machine, timestamp, SizeOfImage, and CodeView key
+when the RSDS page remains mapped; if RSDS was also discarded it reports the
+weaker header-identity confidence. Stack values always come from the pinned
+live stop. Live kernel validation produced the complete
+HalProcessorIdle → PpmIdleDefaultExecute → PpmIdleExecuteTransition → PoIdle →
+KiIdleLoop chain. Live user validation at `services!RQueryServiceStatus`
+produced 13 exact services/RPCRT4 frames before truthfully stopping at an
+uncached ntdll image.
 
-`Config.vm_cpus` defaults to 4, so the old description of `-smp 1` as the
-default was wrong. Item 49 now carries the firing vCPU explicitly through
-predicate/action evaluation, and `_last_selected_vcpu` is a round-trip cache,
-not itself proof of a single-core assumption. The unresolved risk is narrower
-but real: `sr.thread or "01"` remains a fallback, and there is no focused live
-coverage for target-thread migration between vCPUs, simultaneous stops, or
-hardware breakpoint/watchpoint slot behavior across cores. Audit and test the
-actual QEMU semantics before redesigning anything; do not assume per-vCPU
-distribution is required. Cross-cutting and not an easy win.
+### 17. Completed — SMP correctness audit and four-vCPU live coverage
+
+All silent `sr.thread or "01"` fallbacks are gone. T-stop vCPU ids are
+syntax-checked; minimal S-stops resolve through RSP `qC`; explicit step targets
+remain authoritative; snapshots reject a stop CPU absent from the enumerated
+set (while accepting equivalent zero padding). Breakpoint migration tests prove
+that unrelated-CR3 hits on one CPU cannot make the accepted hit sample another
+CPU's registers, and accepted hits no longer send a redundant second `Hg`.
+
+QEMU's all-stop four-vCPU behavior was verified live: the same user hardware
+breakpoint fired correctly on vCPUs 2, 4, and 3 across separate runs, with the
+target CR3 and stop epoch preserved. Single-step stays on the firing CPU.
+Because QEMU checks Z1 before instruction execution, stepping at the breakpoint
+now temporarily removes that exact hardware execution breakpoint, steps once,
+and reinstalls it; live RIP advanced from `services+0xfae0` to `+0xfae5` on
+vCPU 3 and the breakpoint remained installed with its hit count intact.
+
+### 68. WoW64 x86 call-stack unwinding remains unsupported
+
+The module, symbol, address, and decompilation paths now distinguish x86 from
+x64, but the new unwinder deliberately stops when RIP enters an x86 module.
+Trustworthy 32-bit unwinding needs frame-pointer/FPO data and x86-specific
+epilog rules rather than applying x64 `.pdata` semantics. This is the remaining
+WoW64 capability gap for crash/exploitability triage.
+
+### 69. User unwind depth depends on pre-staged exact binaries
+
+Windows may decommit `.pdata` and even the RSDS page after registering a user
+image. An attached daemon cannot safely invoke the guest agent to copy a newly
+encountered dependency, so the trace stops explicitly when neither live
+metadata nor a hash-bound cached PE exists. Preloading symbols/binaries solves
+it (live RPCRT4 depth grew from two to thirteen frames), but agent UX would be
+better with an attach-time immutable binary manifest or a separate broker that
+can stage exact module artifacts without contending for the gdbstub.
 
 ---
 

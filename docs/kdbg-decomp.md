@@ -112,9 +112,9 @@ with bytes from another.
 
 For the first look at any halt, use `kdbg_context()` (or `winbox kdbg
 context`). It returns registers, symbolized nearby assembly, labelled stack,
-heuristic backtrace, active breakpoints, and optional caller-selected memory in
+Windows x64 `.pdata` backtrace, active breakpoints, and optional caller-selected memory in
 one stop-pinned response. Disassembly is capped at 32 instructions, stack at 32
-qwords, backtrace at 16 candidates, and optional memory at four reads of 256
+qwords, backtrace at 16 frames, and optional memory at four reads of 256
 bytes each/1024 bytes combined.
 
 For rare breakpoints, prefer `kdbg_cont_start(timeout)`. It launches a tiny

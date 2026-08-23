@@ -71,6 +71,9 @@ class FakeRsp:
     def list_threads(self) -> list[str]:
         return list(self._threads)
 
+    def current_thread(self) -> str:
+        return self._threads[-1]
+
     def select_thread(self, t: str, *, op: str = "g") -> None:
         pass
 
@@ -186,6 +189,67 @@ def test_stop_epoch_invalidates_stale_reads_after_new_stop():
     })
     assert reply["ok"] is False
     assert "stale debugger stop" in reply["error"]
+
+
+def test_minimal_stop_reply_queries_current_vcpu_instead_of_guessing():
+    from winbox.kdbg.debugger.rsp import StopReply
+
+    rsp = FakeRsp(threads=("01", "02", "03", "04"))
+    selected: list[str] = []
+    rsp.select_thread = lambda thread, op="g": selected.append(thread)
+    session = _make_session(rsp=rsp)
+    session._capture_stop(StopReply(5, None, None, "S05"))
+    assert session.stop.vcpu == "04"
+    assert selected == ["04"]
+
+
+def test_stop_reply_rejects_non_hex_vcpu_before_hg_packet():
+    from winbox.kdbg.debugger.rsp import StopReply
+
+    session = _make_session()
+    with pytest.raises(RuntimeError, match="invalid vCPU"):
+        session._capture_stop(StopReply(5, "1;Gdeadbeef", None, "T05"))
+
+
+def test_cont_tracks_breakpoint_migration_across_vcpus():
+    """A silent unrelated-CR3 hit on CPU2 followed by CPU3 must sample CPU3."""
+    from winbox.kdbg.debugger.rsp import StopReply
+
+    target_cr3 = 0x4D6BB000
+
+    class MigratingRsp(FakeRsp):
+        def __init__(self):
+            super().__init__(threads=("01", "02", "03", "04"))
+            self.selected = "01"
+            self.selections: list[str] = []
+            self.stops = [
+                StopReply(5, "02", "hwbreak", "T05thread:02;"),
+                StopReply(5, "03", "hwbreak", "T05thread:03;"),
+            ]
+
+        def select_thread(self, thread, *, op="g"):
+            self.selected = thread
+            self.selections.append(thread)
+
+        def wait_for_stop(self, *, timeout=None):
+            return self.stops.pop(0)
+
+        def read_registers(self):
+            return _blob(
+                rip=0xFFFFF80608628780,
+                cr3=0xABC000 if self.selected == "02" else target_cr3,
+            )
+
+    rsp = MigratingRsp()
+    session = _make_session(
+        rsp=rsp,
+        target=TargetInfo(pid=4584, dtb=target_cr3, name="notepad.exe"),
+    )
+    result = session.op_cont(timeout=1.0)
+    assert result["reason"] == "bp"
+    assert session.stop.vcpu == "03"
+    assert rsp.selections == ["02", "03"]
+    assert rsp.continued == 2
 
 
 def test_resume_clears_stop_evidence_and_status_reports_running():
@@ -911,6 +975,109 @@ def test_op_step_recovers_from_wait_for_stop_timeout():
     # And the recovery stop was captured so the next op sees the halted state.
     assert session.stop is not None
     assert session.stop.signal == 2  # SIGINT from our forced halt
+
+
+def test_op_step_temporarily_suspends_firing_hardware_breakpoint():
+    """Z1 at current RIP must not cause a no-progress single-step loop."""
+    from winbox.kdbg.debugger.rsp import StopReply
+
+    rip = 0x7FF600001000
+
+    class AdvancingRsp(FakeRsp):
+        def wait_for_stop(self, *, timeout=None):
+            self.regs_blob = _blob(rip=rip + 1, cr3=0x4D6BB000)
+            return StopReply(5, "03", None, "T05thread:03;")
+
+    rsp = AdvancingRsp(threads=("01", "02", "03", "04"))
+    session = _make_session(rsp=rsp)
+    bp = Breakpoint(
+        bp_id=7, va=rip, target="app!entry", user_mode=True, hw=True,
+        installed_at=time.monotonic(),
+    )
+    session.bps[7] = bp
+    session._bp_by_va[rip] = 7
+    session.stop = StopState(
+        vcpu="03", rip=rip, cr3=0x4D6BB000, signal=5,
+        raw_regs=_blob(rip=rip, cr3=0x4D6BB000),
+    )
+    session.run_state = "halted"
+
+    result = session.op_step()
+    assert result["rip"] == f"0x{rip + 1:x}"
+    assert result["vcpu"] == "03"
+    assert rsp.bps_removed == [(rip, 1, True, None)]
+    assert rsp.bps_inserted == [(rip, 1, True, None)]
+    assert session.bps[7] is bp
+
+
+def test_op_step_drops_tracking_when_suspended_breakpoint_restore_fails():
+    """Never advertise a hardware breakpoint that QEMU rejected on restore."""
+    from winbox.kdbg.debugger.rsp import RspError, StopReply
+
+    rip = 0x7FF600001000
+
+    class RestoreFailsRsp(FakeRsp):
+        def wait_for_stop(self, *, timeout=None):
+            self.regs_blob = _blob(rip=rip + 1, cr3=0x4D6BB000)
+            return StopReply(5, "03", None, "T05thread:03;")
+
+        def insert_breakpoint(self, addr, *, kind=1, hardware=False, wp_type=None):
+            raise RspError("restore rejected")
+
+    rsp = RestoreFailsRsp(threads=("01", "02", "03", "04"))
+    session = _make_session(rsp=rsp)
+    session.bps[7] = Breakpoint(
+        bp_id=7, va=rip, target="app!entry", user_mode=True, hw=True,
+        installed_at=time.monotonic(),
+    )
+    session._bp_by_va[rip] = 7
+    session.stop = StopState(
+        vcpu="03", rip=rip, cr3=0x4D6BB000, signal=5,
+        raw_regs=_blob(rip=rip, cr3=0x4D6BB000),
+    )
+    session.run_state = "halted"
+
+    with pytest.raises(RspError, match="restore rejected"):
+        session.op_step()
+    assert 7 not in session.bps
+    assert rip not in session._bp_by_va
+    assert session.run_state == "halted"
+
+
+def test_op_step_capture_failure_restores_bp_then_marks_state_indeterminate():
+    """A post-stop capture failure cannot leave stale halted evidence."""
+    from winbox.kdbg.debugger.rsp import RspError, StopReply
+
+    rip = 0x7FF600001000
+
+    class CaptureFailsRsp(FakeRsp):
+        def wait_for_stop(self, *, timeout=None):
+            return StopReply(5, "03", None, "T05thread:03;")
+
+        def read_registers(self):
+            raise RspError("register read failed")
+
+    rsp = CaptureFailsRsp(threads=("01", "02", "03", "04"))
+    session = _make_session(rsp=rsp)
+    bp = Breakpoint(
+        bp_id=7, va=rip, target="app!entry", user_mode=True, hw=True,
+        installed_at=time.monotonic(),
+    )
+    session.bps[7] = bp
+    session._bp_by_va[rip] = 7
+    session.stop = StopState(
+        vcpu="03", rip=rip, cr3=0x4D6BB000, signal=5,
+        raw_regs=_blob(rip=rip, cr3=0x4D6BB000),
+    )
+    session.run_state = "halted"
+
+    with pytest.raises(RspError, match="register read failed"):
+        session.op_step()
+    assert rsp.bps_removed == [(rip, 1, True, None)]
+    assert rsp.bps_inserted == [(rip, 1, True, None)]
+    assert session.bps[7] is bp
+    assert session.stop is None
+    assert session.run_state == "indeterminate"
 
 
 def test_op_step_propagates_non_timeout_rsp_error():
