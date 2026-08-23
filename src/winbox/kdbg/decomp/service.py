@@ -89,6 +89,8 @@ def query_decomp(
     detail: str = "compact",
     lines: str = "",
     assembly: str = "nearby",
+    instruction_bytes: bool = False,
+    runtime_vas: bool = False,
     daemon_client: DaemonClient | None = None,
     decomp_client: DecompClient | None = None,
 ) -> dict[str, Any]:
@@ -330,10 +332,20 @@ def query_decomp(
         **result,
         "warnings": warnings,
     }
-    return _format_result(composed, detail)
+    return _format_result(
+        composed, detail,
+        instruction_bytes=bool(instruction_bytes),
+        runtime_vas=bool(runtime_vas),
+    )
 
 
-def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
+def _format_result(
+    result: dict[str, Any],
+    detail: str,
+    *,
+    instruction_bytes: bool = True,
+    runtime_vas: bool = True,
+) -> dict[str, Any]:
     """Apply the public response envelope without weakening verification.
 
     The diagnostic form is the internal evidence record. Compact/standard
@@ -359,7 +371,11 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
     nearby_assembly: list[dict[str, Any]] = []
     for instruction in result.get("instructions") or []:
         nearby_assembly.append(
-            _format_instruction(instruction, ghidra_base, module_base)
+            _format_instruction(
+                instruction, ghidra_base, module_base,
+                instruction_bytes=instruction_bytes,
+                runtime_vas=runtime_vas,
+            )
         )
 
     kind, direction, distance = _mapping_relation(mapping, requested_static)
@@ -405,7 +421,11 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
         mapped = source_line.get("assembly") or []
         if mapped:
             item["assembly"] = [
-                _format_instruction(instruction, ghidra_base, module_base)
+                _format_instruction(
+                    instruction, ghidra_base, module_base,
+                    instruction_bytes=instruction_bytes,
+                    runtime_vas=runtime_vas,
+                )
                 for instruction in mapped
             ]
         if "assembly_complete" in source_line:
@@ -413,7 +433,7 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
         pseudocode.append(item)
 
     compact: dict[str, Any] = {
-        "schema": "winbox.kdbg-decomp/4",
+        "schema": "winbox.kdbg-decomp/5",
         "detail": detail,
         "target": result.get("target"),
         "stop_epoch": result.get("stop_epoch"),
@@ -430,6 +450,10 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
             "source": function.get("source"),
         },
         "assembly_mode": result.get("assembly_mode") or "nearby",
+        "assembly_fields": {
+            "instruction_bytes": instruction_bytes,
+            "runtime_vas": runtime_vas,
+        },
         "assembly": nearby_assembly,
         "pseudocode": pseudocode,
         "line_selection": mapping.get("selection"),
@@ -475,16 +499,18 @@ def _format_instruction(
     instruction: dict[str, Any],
     ghidra_base: int | None,
     module_base: int | None,
+    *,
+    instruction_bytes: bool = True,
+    runtime_vas: bool = True,
 ) -> dict[str, Any]:
     address = _hex_int(instruction.get("address"))
-    item: dict[str, Any] = {
-        "bytes": instruction.get("bytes"),
-        "text": instruction.get("text"),
-    }
+    item: dict[str, Any] = {"text": instruction.get("text")}
+    if instruction_bytes:
+        item["bytes"] = instruction.get("bytes")
     if address is not None and ghidra_base is not None:
         instruction_rva = address - ghidra_base
         item["rva"] = f"0x{instruction_rva:x}"
-        if module_base is not None:
+        if runtime_vas and module_base is not None:
             item["va"] = f"0x{module_base + instruction_rva:x}"
     if instruction.get("current"):
         item["current"] = True
@@ -494,11 +520,10 @@ def _format_instruction(
         if static_target is None or ghidra_base is None:
             continue
         target_rva = static_target - ghidra_base
-        target_item = {
-            "rva": f"0x{target_rva:x}",
-            "static_va": f"0x{static_target:x}",
-        }
-        if module_base is not None:
+        target_item = {"rva": f"0x{target_rva:x}"}
+        if runtime_vas:
+            target_item["static_va"] = f"0x{static_target:x}"
+        if runtime_vas and module_base is not None:
             target_item["runtime_va"] = f"0x{module_base + target_rva:x}"
         symbol = (instruction.get("flow_target_symbols") or {}).get(str(target))
         if symbol:

@@ -13,7 +13,9 @@ import pytest
 
 from winbox.config import Config
 from winbox.kdbg.decomp.client import DecompClient, DecompError
-from winbox.kdbg.decomp.client import WORKER_API
+from winbox.kdbg.decomp.client import (
+    WORKER_API, lock_path, protocol_family, session_path, socket_path,
+)
 from winbox.kdbg.decomp.docker import (
     IMAGE,
     DockerError,
@@ -33,6 +35,18 @@ def test_container_name_is_stable_and_scoped_to_state_root(tmp_path):
     assert container_name(first) == container_name(same)
     assert container_name(first) != container_name(other)
     assert container_name(first).startswith("winbox-ghidra-")
+    assert container_name(first).endswith(f"-{protocol_family()}")
+
+
+def test_worker_runtime_namespace_changes_with_protocol_api(monkeypatch, tmp_path):
+    import winbox.kdbg.decomp.client as client_module
+
+    cfg = Config(winbox_dir=tmp_path)
+    current = (socket_path(cfg), lock_path(cfg), session_path(cfg))
+    monkeypatch.setattr(client_module, "WORKER_API", "999")
+    newer = (socket_path(cfg), lock_path(cfg), session_path(cfg))
+    assert current != newer
+    assert all("api999" in str(path) for path in newer)
 
 
 def test_image_and_container_inspection_fail_closed_on_reserved_name(monkeypatch, tmp_path):
@@ -79,7 +93,7 @@ def test_start_uses_private_hardened_current_uid_container(monkeypatch, tmp_path
     def docker(*args, **kwargs):
         calls.append(args)
         if args[0] == "run":
-            path = Path(cfg.winbox_dir) / "decomp" / "decomp.sock"
+            path = socket_path(cfg)
             listener = socket.socket(socket.AF_UNIX)
             listener.bind(str(path))
             listener.close()
@@ -97,7 +111,8 @@ def test_start_uses_private_hardened_current_uid_container(monkeypatch, tmp_path
     ]
     assert "no-new-privileges" in command
     assert not any(value.startswith("--publish") or value == "-p" for value in command)
-    assert "/run/winbox/decomp.sock" in command
+    assert f"/run/winbox/decomp-{protocol_family()}.sock" in command
+    assert f"io.winbox.worker-api={WORKER_API}" in command
 
 
 def test_lifecycle_lock_serializes_concurrent_first_starts(monkeypatch, tmp_path):
@@ -204,11 +219,10 @@ def test_legacy_host_worker_is_migrated_before_docker_start(monkeypatch, tmp_pat
     assert exchanges == [{"op": "shutdown", "args": {}}]
 
 
-def test_stale_worker_api_is_migrated_before_query(monkeypatch, tmp_path):
+def test_stale_worker_api_is_refused_without_shutdown(monkeypatch, tmp_path):
     client = DecompClient(Config(winbox_dir=tmp_path))
     monkeypatch.setattr(client, "active_backend", lambda: "docker")
-    apis = iter(["1", "1"])
-    monkeypatch.setattr(client, "active_worker_api", lambda: next(apis))
+    monkeypatch.setattr(client, "active_worker_api", lambda: "1")
     migrations = []
     monkeypatch.setattr(
         client, "_shutdown_conflicting_worker",
@@ -220,8 +234,9 @@ def test_stale_worker_api_is_migrated_before_query(monkeypatch, tmp_path):
         lambda *a, **k: {"ok": True, "result": {"worker_api": WORKER_API}},
     )
 
-    assert client.call("status")["worker_api"] == WORKER_API
-    assert migrations == [("docker API 1", f"docker API {WORKER_API}")]
+    with pytest.raises(DecompError, match="refusing automatic shutdown"):
+        client.call("status")
+    assert migrations == []
 
 
 def test_mcp_lifecycle_serializes_results_and_errors(monkeypatch, tmp_path):
@@ -233,12 +248,14 @@ def test_mcp_lifecycle_serializes_results_and_errors(monkeypatch, tmp_path):
     monkeypatch.setattr(package, "install_service", lambda *a, **k: {"installed": True})
     monkeypatch.setattr(package, "start_service", lambda *a, **k: {"started": True})
     monkeypatch.setattr(package, "stop_service", lambda *a, **k: {"stopped": True})
-    assert json.loads(mcp_module.kdbg_ghidra_install()) == {"installed": True}
-    assert json.loads(mcp_module.kdbg_ghidra_run()) == {"started": True}
-    assert json.loads(mcp_module.kdbg_ghidra_stop()) == {"stopped": True}
+    assert mcp_module.kdbg_ghidra_install()["result"] == {"installed": True}
+    assert mcp_module.kdbg_ghidra_run()["result"] == {"started": True}
+    assert mcp_module.kdbg_ghidra_stop()["result"] == {"stopped": True}
 
     monkeypatch.setattr(
         package, "start_service",
         lambda *a, **k: (_ for _ in ()).throw(DecompError("reserved name")),
     )
-    assert mcp_module.kdbg_ghidra_run() == "error: reserved name"
+    error = mcp_module.kdbg_ghidra_run()
+    assert error["ok"] is False
+    assert error["error"]["message"] == "reserved name"

@@ -39,8 +39,12 @@ winbox kdbg ghidra stop          # keeps analyzed projects and binaries
 
 The runtime container publishes no port, has networking disabled, runs as the
 calling UID/GID, drops every capability, enables `no-new-privileges`, and uses
-a read-only root filesystem. Its only API is a mode-0600 Unix socket under
-`~/.winbox/decomp/`. Immutable full-SHA binary copies and Ghidra-versioned
+a read-only root filesystem. Its only API is a mode-0600, worker-API-namespaced
+Unix socket under `~/.winbox/decomp/`. Sockets, locks, session records, logs,
+Docker lifecycle locks, and container names include `apiN`, so concurrently
+installed old/new clients cannot shut down or downgrade one another. An API
+mismatch inside a namespace is refused with reload/version guidance. Immutable
+full-SHA binary copies and Ghidra-versioned
 projects live in mode-0700 `cache/` and `projects/` directories there.
 
 For local worker development only, `WINBOX_DECOMP_BACKEND=host` restores the
@@ -70,12 +74,19 @@ The MCP equivalents are:
 ```text
 kdbg_decomp(addr="", symbol="", module="", rva="", cursor="", before=3,
             after=5, full=false, binary="", timeout=60, detail="compact",
-            lines="", assembly="nearby")
+            lines="", assembly="nearby", instruction_bytes=false,
+            runtime_vas=false)
 kdbg_decomp_status()
 kdbg_ghidra_install(pull=true)
 kdbg_ghidra_run()
 kdbg_ghidra_stop()
 ```
+
+All `kdbg_*` MCP calls return structured content using the common
+`winbox.mcp/1` envelope: `{schema, ok, result, error}`. Errors contain a stable
+`code`, message, `retryable` flag, operation, and at most three bounded recovery
+hints. Interactive CLI commands retain readable pretty JSON; MCP does not send
+indented JSON strings.
 
 The first request for a binary starts the container/JVM lazily and runs Ghidra
 analysis, which can take minutes for a kernel image. Later queries reuse the
@@ -96,6 +107,15 @@ one stop-pinned response. Disassembly is capped at 32 instructions, stack at 32
 qwords, backtrace at 16 candidates, and optional memory at four reads of 256
 bytes each/1024 bytes combined.
 
+For rare breakpoints, prefer `kdbg_cont_start(timeout)`. It launches a tiny
+detached host client, atomically persists a token and daemon session identity,
+and returns immediately. `kdbg_cont_poll(token)` reads its bounded state after
+ordinary calls or an MCP reload; `kdbg_cont_cancel(token)`, `kdbg_interrupt`,
+and detach cooperatively halt it. Duplicate starts, stale/dead workers, daemon
+replacement, mismatched tokens, 24-hour timeout bounds, cancellation races,
+and oversized persisted results are handled explicitly. CLI equivalents are
+`cont-start`, `cont-poll`, and `cont-cancel`.
+
 ## Response detail and mapping honesty
 
 `detail="compact"` is the default agent response. It includes only the target,
@@ -104,6 +124,11 @@ pseudocode, explicit assembly-to-pseudocode mapping, concise verification,
 cache state, warnings, and whole-function code when `full=true`. RVAs are the
 shared coordinate: runtime and Ghidra image bases can differ without making the
 assembly/source relationship ambiguous.
+
+Compact MCP output omits raw instruction bytes and repeated runtime/static VAs
+by default. Set `instruction_bytes=true` or `runtime_vas=true` only when that
+evidence is needed. The main live location and every instruction/flow-target
+RVA remain present, and `assembly_fields` records exactly what was included.
 
 Larger evidence is opt-in:
 
@@ -169,8 +194,9 @@ as already executing the first semantic C statement. Diagnostic output retains
 the legacy coarse `mapping.confidence` (`exact`, `nearest`, `function-only`)
 alongside the more precise mapping kind.
 
-Call and branch targets are emitted as explicit `rva`, `static_va`, and
-`runtime_va` coordinates, with a nearest verified module symbol when available.
+Call and branch targets always carry `rva` and a nearest verified module symbol
+when available. `static_va` and `runtime_va` are added when
+`runtime_vas=true`.
 Addressed lines report `assembly_complete`; if the global mapping cap is hit,
 the response identifies the affected pseudocode line range. An address in an
 undecoded function gap is labelled `undecoded-gap` and shows the nearest
@@ -199,6 +225,10 @@ container crash therefore cannot corrupt debugger RSP state; the next request
 recreates the service and reopens the durable project. Image/container labels
 and a state-root fingerprint prevent lifecycle commands from touching an
 unrelated container that happens to use a reserved name.
+
+Every lifecycle/status CLI JSON surface bypasses Rich and is byte-for-byte safe
+to pipe through `jq` or `python -m json.tool`, including at narrow terminal
+widths.
 
 The kdbg module walk restores the complete selected-vCPU register packet,
 invalidates its thread-selection cache, and poisons the debugger session if

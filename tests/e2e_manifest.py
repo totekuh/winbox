@@ -181,6 +181,10 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg user-bp": (LIVE, "argument validation only"),
     "kdbg cont": (EXCLUDED, "blocks until a breakpoint fires or its budget "
                             "expires; leaves the guest halted on timeout"),
+    "kdbg cont-start": (EXCLUDED, "continues the guest asynchronously; durable "
+                                  "worker lifecycle is socket-integrated"),
+    "kdbg cont-poll": (EXCLUDED, "paired with cont-start; socket-integrated"),
+    "kdbg cont-cancel": (EXCLUDED, "paired with cont-start; socket-integrated"),
     "kdbg step": (EXCLUDED, "single-steps a halted guest; see kdbg cont"),
     "kdbg interrupt": (EXCLUDED, "halts the guest CPU; see kdbg cont"),
 }
@@ -272,6 +276,9 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
                                  "coverage the RSP-level tests do not give"),
     "kdbg_cont": (EXCLUDED, "blocks until a breakpoint fires or its budget "
                             "expires; leaves the guest halted on timeout"),
+    "kdbg_cont_start": (LIVE, "start a durable continue against the live VM"),
+    "kdbg_cont_poll": (LIVE, "poll the durable live continue token"),
+    "kdbg_cont_cancel": (LIVE, "interrupt and cancel the live continue"),
     "kdbg_step": (EXCLUDED, "single-steps a halted guest; see kdbg_cont"),
     "kdbg_interrupt": (EXCLUDED, "halts the guest CPU; see kdbg_cont"),
 }
@@ -303,6 +310,9 @@ CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "mcp": "tests/test_mcp.py",
     "office": "tests/test_office.py",
     "kdbg cont": "tests/test_kdbg_daemon.py",
+    "kdbg cont-start": "tests/test_kdbg_continue_job.py",
+    "kdbg cont-poll": "tests/test_kdbg_continue_job.py",
+    "kdbg cont-cancel": "tests/test_kdbg_continue_job.py",
     "kdbg step": "tests/test_kdbg_daemon.py",
     "kdbg interrupt": "tests/test_kdbg_daemon.py",
     "kdbg context": "tests/test_kdbg_daemon.py",

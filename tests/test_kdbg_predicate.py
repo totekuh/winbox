@@ -10,6 +10,8 @@ from winbox.kdbg.debugger.predicate import (
     And,
     BitAnd,
     Cmp,
+    CaptureRead,
+    CaptureValue,
     IntLit,
     MemRead,
     Or,
@@ -17,6 +19,7 @@ from winbox.kdbg.debugger.predicate import (
     PredicateRuntimeError,
     PredicateSyntaxError,
     RegRef,
+    TypedRead,
     parse,
 )
 
@@ -173,6 +176,36 @@ def test_parse_non_str_rejected():
         parse(123)
 
 
+@pytest.mark.parametrize(
+    ("source", "width"),
+    [("byte(rcx)", 1), ("word(rcx+2)", 2),
+     ("dword(rcx-4)", 4), ("qword(poi(rcx))", 8)],
+)
+def test_parse_typed_scalar_reads(source, width):
+    ast = parse(source)
+    assert isinstance(ast, TypedRead)
+    assert ast.width == width
+
+
+def test_buffer_captures_are_action_only_and_root_only():
+    with pytest.raises(PredicateSyntaxError, match="action-only"):
+        parse("bytes(rcx,16)")
+    capture = parse("bytes(poi(rcx),16)", allow_capture=True)
+    assert isinstance(capture, CaptureRead)
+    assert capture.length == 16
+    with pytest.raises(PredicateSyntaxError, match="complete action"):
+        parse("rax == bytes(rcx,8)", allow_capture=True)
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["bytes(rcx,0)", "bytes(rcx,257)", "ascii(rcx,999)", "utf16(rcx,3)"],
+)
+def test_buffer_capture_lengths_are_install_time_bounded(source):
+    with pytest.raises(PredicateSyntaxError):
+        parse(source, allow_capture=True)
+
+
 # ── Eval ────────────────────────────────────────────────────────────────
 
 
@@ -277,6 +310,48 @@ def test_eval_overflow_wraps_to_64():
     blob = _blob(rcx=(0 - 0x10) & 0xFFFFFFFFFFFFFFFF)
     mem = _mem_from({0: 0xc0de})
     assert ast.eval(blob, mem) == 1
+
+
+def test_typed_reads_request_exact_width_at_page_boundary():
+    calls = []
+
+    def mem(address, width=8, *, raw=False):
+        calls.append((address, width, raw))
+        assert address == 0x1FFF
+        assert width == 1
+        return 0xAB
+
+    assert parse("byte(rcx) == 0xab").eval(_blob(rcx=0x1FFF), mem) == 1
+    assert calls == [(0x1FFF, 1, False)]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("byte(rcx)", 0x88),
+        ("word(rcx)", 0x7788),
+        ("dword(rcx)", 0x55667788),
+        ("qword(rcx)", 0x1122334455667788),
+    ],
+)
+def test_typed_reads_are_unsigned_little_endian(source, expected):
+    payload = bytes.fromhex("8877665544332211")
+
+    def mem(_address, width=8, *, raw=False):
+        return int.from_bytes(payload[:width], "little")
+
+    assert parse(source).eval(_blob(rcx=0x1000), mem) == expected
+
+
+def test_capture_returns_exact_raw_bytes_without_scalar_coercion():
+    ast = parse("utf16(rcx,4)", allow_capture=True)
+
+    def mem(address, width=8, *, raw=False):
+        assert (address, width, raw) == (0x2000, 4, True)
+        return b"A\x00B\x00"
+
+    value = ast.eval(_blob(rcx=0x2000), mem)
+    assert value == CaptureValue("utf16", 0x2000, b"A\x00B\x00")
 
 
 # ── Regressions: leaked-exception shielding ─────────────────────────────
@@ -573,4 +648,3 @@ def test_parse_poi_missing_paren():
 def test_parse_poi_empty():
     with pytest.raises(PredicateSyntaxError):
         parse("poi() == 0")
-

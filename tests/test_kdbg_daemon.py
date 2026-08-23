@@ -3313,6 +3313,121 @@ class TestBpActions:
         }
         assert cr3_writes == [session.target.dtb, 0x1ae000]
 
+    def test_typed_scalars_and_buffer_captures_share_one_masquerade(self, tmp_path):
+        cfg = FakeCfg()
+        cfg.root_dir = tmp_path
+        rsp = FakeRsp()
+        cr3_writes = _record_g_cr3s(rsp)
+        session = _make_session(
+            rsp=rsp, store=FakeStore({"nt!X": _KERNEL_VA_WP}),
+        )
+        session.cfg = cfg
+        added = session.handle_op("bp_add", {
+            "target": "nt!X",
+            "condition": "byte(rcx) == 0x41 && dword(rdx) == 0x44332211",
+            "actions": [
+                "word(r8)", "bytes(r9,4)", "ascii(r10,4)", "utf16(r11,4)",
+            ],
+        })
+        assert added["ok"], added
+        bp = session.bps[added["result"]["id"]]
+        regs = _blob(
+            rcx=0x1000, rdx=0x2000, r8=0x3000, r9=0x4000,
+            r10=0x5000, r11=0x6000, rip=_KERNEL_VA_WP, cr3=0x1ae000,
+        )
+        memory = {
+            0x1000: b"A", 0x2000: bytes.fromhex("11223344"),
+            0x3000: bytes.fromhex("3412"), 0x4000: bytes.fromhex("deadbeef"),
+            0x5000: b"A\x01B\x7f", 0x6000: b"O\x00K\x00",
+        }
+
+        def read_memory(va, length):
+            return memory[va][:length]
+
+        rsp.read_memory = read_memory
+        truthy, values = session._evaluate_breakpoint_expressions(
+            bp, regs, vcpu="01",
+        )
+        assert truthy is True
+        assert values == {
+            "word(r8)": "0x1234",
+            "bytes(r9,4)": "hex:deadbeef",
+            "ascii(r10,4)": "ascii:A.B.",
+            "utf16(r11,4)": "utf16:OK",
+        }
+        session._append_action_trace(bp, regs, values)
+        assert bp.capture_bytes == 12
+        trace = session.handle_op("bp_trace", {"id": bp.bp_id, "tail": 1})
+        assert trace["ok"], trace
+        assert trace["result"]["entries"][0]["values"] == values
+        assert cr3_writes == [session.target.dtb, 0x1ae000]
+
+    def test_capture_conditions_and_oversized_hit_are_rejected_at_install(self, tmp_path):
+        session = _make_session(
+            rsp=FakeRsp(), store=FakeStore({"nt!X": _KERNEL_VA_WP}),
+        )
+        session.cfg.root_dir = tmp_path
+        condition = session.handle_op("bp_add", {
+            "target": "nt!X", "condition": "bytes(rcx,8)",
+        })
+        assert not condition["ok"]
+        assert "action-only" in condition["error"]
+        oversized = session.handle_op("bp_add", {
+            "target": "nt!X", "actions": ["bytes(rcx,256)"] * 5,
+        })
+        assert not oversized["ok"]
+        assert "cap is 1024" in oversized["error"]
+        too_many = session.handle_op("bp_add", {
+            "target": "nt!X", "actions": ["rax"] * 17,
+        })
+        assert not too_many["ok"]
+        assert "at most 16" in too_many["error"]
+        malformed = session.handle_op("bp_add", {
+            "target": "nt!X", "actions": ["rax", 7],
+        })
+        assert not malformed["ok"]
+        assert "expression must be a string" in malformed["error"]
+        empty_wrong_type = session.handle_op("bp_add", {
+            "target": "nt!X", "actions": "",
+        })
+        assert not empty_wrong_type["ok"]
+        assert "actions must be a list" in empty_wrong_type["error"]
+
+    def test_capture_trace_budget_stops_future_reads_explicitly(
+        self, tmp_path, monkeypatch,
+    ):
+        import winbox.kdbg.debugger.daemon as daemon_module
+
+        monkeypatch.setattr(daemon_module, "MAX_CAPTURE_BYTES_PER_TRACE", 8)
+        cfg = FakeCfg()
+        cfg.root_dir = tmp_path
+        rsp = FakeRsp()
+        reads = []
+        rsp.read_memory = lambda va, n: reads.append((va, n)) or b"ABCD"[:n]
+        session = _make_session(
+            rsp=rsp, store=FakeStore({"nt!X": _KERNEL_VA_WP}),
+        )
+        session.cfg = cfg
+        added = session.handle_op("bp_add", {
+            "target": "nt!X", "actions": ["bytes(rcx,4)"],
+        })["result"]
+        bp = session.bps[added["id"]]
+        regs = _blob(rcx=0x1000, rip=_KERNEL_VA_WP, cr3=0x1ae000)
+
+        session._execute_actions(bp, regs)
+        session._execute_actions(bp, regs)
+        session._execute_actions(bp, regs)
+
+        import json
+        entries = [json.loads(line) for line in open(bp.trace_path)]
+        assert [entry["values"]["bytes(rcx,4)"] for entry in entries] == [
+            "hex:41424344", "hex:41424344",
+            "error: capture trace byte budget exhausted (8 bytes)",
+        ]
+        assert reads == [(0x1000, 4), (0x1000, 4)]
+        assert bp.capture_bytes == 8
+        assert bp.capture_limit_reached is True
+
     def test_condition_and_actions_share_one_masquerade(self, tmp_path):
         """The hot path batches a matching predicate with all its actions."""
         cfg = FakeCfg()

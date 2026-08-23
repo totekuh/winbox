@@ -61,6 +61,8 @@ from winbox.kdbg.debugger.install import (
     _CR3_OFFSET_IN_G,  # for read-via-CR3-masquerade memory reads
 )
 from winbox.kdbg.debugger.predicate import (
+    CaptureRead,
+    CaptureValue,
     PredicateRuntimeError,
     PredicateSyntaxError,
     parse as parse_predicate,
@@ -87,7 +89,7 @@ from winbox.kdbg.debugger.trace import (
 
 def _runtime_dir(cfg: Config) -> Path:
     """Where lock/sock/session/log live. Reuses cfg's root for portability."""
-    p = cfg.root_dir if hasattr(cfg, "root_dir") else (Path.home() / ".winbox")
+    p = cfg.root_dir if hasattr(cfg, "root_dir") else cfg.winbox_dir
     p = Path(p)
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -110,6 +112,10 @@ def log_path(cfg: Config) -> Path:
 
 
 # ── Session state ───────────────────────────────────────────────────────
+
+MAX_BREAKPOINT_ACTIONS = 16
+MAX_CAPTURE_BYTES_PER_HIT = 1024
+MAX_CAPTURE_BYTES_PER_TRACE = 16 * 1024 * 1024
 
 
 @dataclass
@@ -140,6 +146,9 @@ class Breakpoint:
     _action_asts: list = field(default_factory=list, repr=False)
     trace_count: int = 0
     trace_path: str = ""
+    capture_bytes_per_hit: int = 0
+    capture_bytes: int = 0
+    capture_limit_reached: bool = False
 
 
 @dataclass
@@ -527,13 +536,30 @@ class DaemonSession:
             except PredicateSyntaxError as e:
                 raise RuntimeError(f"bad condition: {e}") from e
 
-        action_list = actions or []
+        action_list = [] if actions is None else actions
+        if not isinstance(action_list, list):
+            raise RuntimeError("actions must be a list of expression strings")
+        if len(action_list) > MAX_BREAKPOINT_ACTIONS:
+            raise RuntimeError(
+                f"actions may contain at most {MAX_BREAKPOINT_ACTIONS} expressions"
+            )
         action_asts = []
         for i, expr in enumerate(action_list):
+            if not isinstance(expr, str):
+                raise RuntimeError(f"bad action[{i}]: expression must be a string")
             try:
-                action_asts.append(parse_predicate(expr))
+                action_asts.append(parse_predicate(expr, allow_capture=True))
             except PredicateSyntaxError as e:
                 raise RuntimeError(f"bad action[{i}]: {e}") from e
+        capture_bytes_per_hit = sum(
+            ast.capture_length for ast in action_asts
+            if isinstance(ast, CaptureRead)
+        )
+        if capture_bytes_per_hit > MAX_CAPTURE_BYTES_PER_HIT:
+            raise RuntimeError(
+                f"action captures request {capture_bytes_per_hit} bytes per hit; "
+                f"cap is {MAX_CAPTURE_BYTES_PER_HIT}"
+            )
 
         va = self._resolve_target(target)
         is_user = (va >> 47) != 0x1FFFF
@@ -582,6 +608,7 @@ class DaemonSession:
                 actions=action_list,
                 _action_asts=action_asts,
                 trace_path=_trace,
+                capture_bytes_per_hit=capture_bytes_per_hit,
             )
             self.bps[bp_id] = bp
             self._bp_by_va[va] = bp_id
@@ -656,6 +683,7 @@ class DaemonSession:
             actions=action_list,
             _action_asts=action_asts,
             trace_path=_trace,
+            capture_bytes_per_hit=capture_bytes_per_hit,
         )
         self.bps[bp_id] = bp
         self._bp_by_va[va] = bp_id
@@ -698,6 +726,10 @@ class DaemonSession:
                 entry["actions"] = b.actions
                 entry["trace_count"] = b.trace_count
                 entry["trace_path"] = b.trace_path
+                entry["capture_bytes"] = b.capture_bytes
+                entry["capture_bytes_per_hit"] = b.capture_bytes_per_hit
+                entry["capture_bytes_limit"] = MAX_CAPTURE_BYTES_PER_TRACE
+                entry["capture_limit_reached"] = b.capture_limit_reached
             entries.append(entry)
         return {"bps": entries}
 
@@ -1748,7 +1780,7 @@ class DaemonSession:
         *,
         vcpu: str | None = None,
     ):
-        """Build a closure that reads a qword from target's address space.
+        """Build a closure for typed scalars and bounded raw captures.
 
         Unmapped VA reads return 0 (predicate composes with dangling-pointer
         cases). Transport/session errors raise PredicateRuntimeError so the
@@ -1761,10 +1793,12 @@ class DaemonSession:
         vcpu_hint = vcpu or (self.stop.vcpu if self.stop is not None else "01")
         _UNMAPPED_SIGNS = (b"E14", b"E0E", b"E08", b"failed")
 
-        def _read(addr: int) -> int:
+        def _read(addr: int, width: int = 8, *, raw: bool = False):
+            if width < 1 or width > 256:
+                raise PredicateRuntimeError(f"invalid predicate read width: {width}")
             try:
                 data = session._cr3_masqueraded_call(
-                    vcpu_hint, fired_regs, lambda: rsp.read_memory(addr, 8)
+                    vcpu_hint, fired_regs, lambda: rsp.read_memory(addr, width)
                 )
             except RspError as e:
                 err_str = str(e).encode()
@@ -1781,11 +1815,11 @@ class DaemonSession:
                 if "G-packet" in str(e):
                     raise PredicateRuntimeError(str(e)) from e
                 raise
-            if len(data) != 8:
+            if len(data) != width:
                 raise PredicateRuntimeError(
-                    f"short mem read at 0x{addr:x}: got {len(data)} bytes"
+                    f"short mem read at 0x{addr:x}: got {len(data)}/{width} bytes"
                 )
-            return int.from_bytes(data, "little")
+            return data if raw else int.from_bytes(data, "little")
 
         return _read
 
@@ -1812,7 +1846,7 @@ class DaemonSession:
         user/kernel expressions and the documented unmapped-read-as-zero
         behavior; only this exceptional path pays the old round-trip cost.
         """
-        def _probe_read(_addr: int) -> int:
+        def _probe_read(_addr: int, _width: int = 8, *, raw: bool = False):
             raise _MemoryReadNeeded()
 
         try:
@@ -1823,18 +1857,20 @@ class DaemonSession:
         vcpu_hint = vcpu or (self.stop.vcpu if self.stop is not None else "01")
         rsp = self.rsp
 
-        def _direct_read(addr: int) -> int:
+        def _direct_read(addr: int, width: int = 8, *, raw: bool = False):
+            if width < 1 or width > 256:
+                raise PredicateRuntimeError(f"invalid predicate read width: {width}")
             try:
-                data = rsp.read_memory(addr, 8)
+                data = rsp.read_memory(addr, width)
             except RspError as e:
                 # Let the outer candidate loop restart the complete, pure
                 # evaluation under the other verified KPTI CR3 half.
                 raise _CandidateReadFailed(e)
-            if len(data) != 8:
+            if len(data) != width:
                 raise PredicateRuntimeError(
-                    f"short mem read at 0x{addr:x}: got {len(data)} bytes"
+                    f"short mem read at 0x{addr:x}: got {len(data)}/{width} bytes"
                 )
-            return int.from_bytes(data, "little")
+            return data if raw else int.from_bytes(data, "little")
 
         for candidate in self.target.masquerade_candidates:
             try:
@@ -1852,9 +1888,32 @@ class DaemonSession:
     def _evaluate_action_values(bp: Breakpoint, regs: bytes, mem) -> dict[str, str]:
         values: dict[str, str] = {}
         for expr_str, ast in zip(bp.actions, bp._action_asts):
+            if isinstance(ast, CaptureRead) and (
+                bp.capture_bytes + bp.capture_bytes_per_hit
+                > MAX_CAPTURE_BYTES_PER_TRACE
+            ):
+                values[expr_str] = (
+                    "error: capture trace byte budget exhausted "
+                    f"({MAX_CAPTURE_BYTES_PER_TRACE} bytes)"
+                )
+                continue
             try:
                 val = ast.eval(regs, mem)
-                values[expr_str] = f"0x{val:x}"
+                if isinstance(val, CaptureValue):
+                    if val.kind == "bytes":
+                        rendered = "hex:" + val.data.hex()
+                    elif val.kind == "ascii":
+                        rendered = "ascii:" + "".join(
+                            chr(byte) if 32 <= byte < 127 else "."
+                            for byte in val.data
+                        )
+                    else:
+                        rendered = "utf16:" + val.data.decode(
+                            "utf-16-le", errors="replace"
+                        ).rstrip("\x00")
+                    values[expr_str] = rendered
+                else:
+                    values[expr_str] = f"0x{val:x}"
             except Exception as e:
                 values[expr_str] = f"error: {e}"
         return values
@@ -1946,6 +2005,13 @@ class DaemonSession:
             "values": values,
         }
         bp.trace_count += 1
+        if bp.capture_bytes_per_hit:
+            if bp.capture_bytes + bp.capture_bytes_per_hit <= MAX_CAPTURE_BYTES_PER_TRACE:
+                bp.capture_bytes += bp.capture_bytes_per_hit
+            else:
+                bp.capture_limit_reached = True
+            if bp.capture_bytes >= MAX_CAPTURE_BYTES_PER_TRACE:
+                bp.capture_limit_reached = True
         if bp.trace_path:
             try:
                 with open(bp.trace_path, "a") as f:

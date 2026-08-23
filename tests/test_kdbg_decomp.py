@@ -249,10 +249,15 @@ def test_query_decomp_composes_rva_identity_and_worker(monkeypatch, tmp_path):
         daemon_client=daemon, decomp_client=worker,
     )
 
-    assert result["schema"] == "winbox.kdbg-decomp/4"
+    assert result["schema"] == "winbox.kdbg-decomp/5"
     assert result["detail"] == "compact"
     assert result["location"]["rva"] == "0x1000"
     assert result["verified"]["identity"] == "pdb-guid-age"
+    assert result["assembly_fields"] == {
+        "instruction_bytes": False, "runtime_vas": False,
+    }
+    assert "bytes" not in result["assembly"][0]
+    assert "va" not in result["assembly"][0]
     assert "mapped assembly was truncated at the bounded response limit" in result[
         "warnings"
     ]
@@ -533,6 +538,16 @@ def test_response_detail_levels_keep_diagnostics_opt_in():
     assert standard["identity"]["static"]["sha256"] == "a" * 64
     assert standard["analysis"]["project_cached"] is True
     assert _format_result(raw, "diagnostic") is raw
+
+    lean = _format_result(
+        raw, "compact", instruction_bytes=False, runtime_vas=False,
+    )
+    assert lean["assembly_fields"] == {
+        "instruction_bytes": False, "runtime_vas": False,
+    }
+    assert lean["assembly"][0] == {
+        "text": "MOV EAX,0x1", "rva": "0x1000", "current": True,
+    }
 
 
 def test_compact_formatter_derives_direction_from_worker_api_one_mapping():
@@ -890,21 +905,33 @@ def test_mcp_decomp_serializes_result_and_surfaces_error(monkeypatch, tmp_path):
         return {"ok": 1}
 
     monkeypatch.setattr(package, "query_decomp", query)
-    assert json.loads(mcp_module.kdbg_decomp(
+    reply = mcp_module.kdbg_decomp(
         symbol="sample!focus", cursor="opaque", detail="diagnostic",
         lines="1-22", assembly="mapped"
-    )) == {"ok": 1}
+    )
+    assert reply["ok"] is True
+    assert reply["result"] == {"ok": 1}
     assert captured["symbol"] == "sample!focus"
     assert captured["cursor"] == "opaque"
     assert captured["detail"] == "diagnostic"
     assert captured["lines"] == "1-22"
     assert captured["assembly"] == "mapped"
+    assert captured["instruction_bytes"] is False
+    assert captured["runtime_vas"] is False
 
     def fail(*args, **kwargs):
         raise DecompError("wrong build")
 
     monkeypatch.setattr(package, "query_decomp", fail)
-    assert mcp_module.kdbg_decomp() == "error: wrong build"
+    error = mcp_module.kdbg_decomp()
+    assert error["ok"] is False
+    assert error["error"] == {
+        "code": "identity_mismatch", "message": "wrong build",
+        "operation": "kdbg_decomp", "retryable": False,
+        "recovery": [
+            "Refresh the target module and symbols, then retry with the verified binary."
+        ],
+    }
 
 
 def test_mcp_decomp_status_does_not_require_session(monkeypatch, tmp_path):
@@ -915,7 +942,9 @@ def test_mcp_decomp_status_does_not_require_session(monkeypatch, tmp_path):
     cfg = Config(winbox_dir=tmp_path)
     monkeypatch.setattr(mcp_module, "_kdbg_cfg_only", lambda: cfg)
     monkeypatch.setattr(package, "worker_status", lambda value: {"running": False})
-    assert json.loads(mcp_module.kdbg_decomp_status()) == {"running": False}
+    reply = mcp_module.kdbg_decomp_status()
+    assert reply["schema"] == "winbox.mcp/1"
+    assert reply["result"] == {"running": False}
 
 
 def test_cli_decomp_emits_machine_safe_unwrapped_json(monkeypatch, tmp_path):
@@ -947,6 +976,38 @@ def test_cli_decomp_emits_machine_safe_unwrapped_json(monkeypatch, tmp_path):
     assert captured["rva"] == "0x1000"
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["kdbg", "decomp-status"],
+        ["kdbg", "ghidra", "status"],
+        ["kdbg", "ghidra", "run"],
+        ["kdbg", "ghidra", "stop"],
+        ["kdbg", "ghidra", "install", "--no-pull"],
+    ],
+)
+def test_cli_ghidra_json_survives_narrow_terminal(
+    monkeypatch, tmp_path, arguments,
+):
+    import json
+    import winbox.kdbg.decomp as package
+    from click.testing import CliRunner
+    from winbox.cli import cli
+
+    cfg = Config(winbox_dir=tmp_path)
+    payload = {"value": "x" * 500, "nested": {"path": "/a/very/long/path"}}
+    monkeypatch.setattr("winbox.cli.Config.load", lambda: cfg)
+    monkeypatch.setattr(package, "worker_status", lambda _cfg: payload)
+    monkeypatch.setattr(package, "start_service", lambda _cfg: payload)
+    monkeypatch.setattr(package, "stop_service", lambda _cfg: payload)
+    monkeypatch.setattr(package, "install_service", lambda _cfg, **_kw: payload)
+
+    result = CliRunner(env={"COLUMNS": "20"}).invoke(cli, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == payload
+
+
 def test_mcp_context_forwards_bounded_evidence_options(monkeypatch, tmp_path):
     import json
     import winbox.mcp as mcp_module
@@ -961,10 +1022,11 @@ def test_mcp_context_forwards_bounded_evidence_options(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mcp_module, "_kdbg_cfg_only", lambda: cfg)
     monkeypatch.setattr(mcp_module, "_kdbg_client", lambda _cfg: Client())
-    result = json.loads(mcp_module.kdbg_context(
+    reply = mcp_module.kdbg_context(
         disasm_count=4, stack_qwords=5, bt_depth=2,
         memory=[{"va": "0x1000", "length": 8}],
-    ))
+    )
+    result = reply["result"]
     assert result["schema"] == "winbox.kdbg-context/1"
     assert captured == {
         "op": "context", "disasm_count": 4, "stack_qwords": 5,
@@ -998,6 +1060,38 @@ def test_cli_context_emits_machine_safe_json(monkeypatch, tmp_path):
         "op": "context", "disasm_count": 3,
         "stack_qwords": 4, "bt_depth": 2,
     }
+
+
+@pytest.mark.parametrize(
+    ("arguments", "patch_name", "expected"),
+    [
+        (["kdbg", "cont-start", "--timeout", "600"], "start_continue", "starting"),
+        (["kdbg", "cont-poll", "tok"], "poll_continue", "running"),
+        (["kdbg", "cont-cancel", "tok"], "cancel_continue", "cancel_requested"),
+    ],
+)
+def test_cli_async_continue_commands_emit_machine_safe_json(
+    monkeypatch, tmp_path, arguments, patch_name, expected,
+):
+    import json
+    import winbox.kdbg.debugger.continue_job as jobs
+    from click.testing import CliRunner
+    from winbox.cli import cli
+
+    cfg = Config(winbox_dir=tmp_path)
+    monkeypatch.setattr("winbox.cli.Config.load", lambda: cfg)
+    monkeypatch.setattr(
+        jobs, patch_name,
+        lambda *args, **kwargs: {
+            "schema": "winbox.kdbg-cont/1", "token": "tok",
+            "state": expected, "active": True, "value": "x" * 500,
+        },
+    )
+
+    result = CliRunner(env={"COLUMNS": "20"}).invoke(cli, arguments)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["state"] == expected
 
 
 class _Rsp:

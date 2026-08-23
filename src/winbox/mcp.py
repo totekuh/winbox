@@ -8,6 +8,7 @@ import textwrap
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -37,6 +38,75 @@ mcp = FastMCP(
         "and collect bounded evidence."
     ),
 )
+
+_RESEARCH_ENVELOPE = "winbox.mcp/1"
+
+
+def _research_ok(result: Any) -> dict[str, Any]:
+    """Structured, compact contract for AI-facing research tools."""
+    return {
+        "schema": _RESEARCH_ENVELOPE,
+        "ok": True,
+        "result": result,
+        "error": None,
+    }
+
+
+def _research_error(exc: BaseException | str, *, operation: str) -> dict[str, Any]:
+    """Classify common failures so an agent can recover without prose parsing."""
+    message = str(exc)
+    lower = message.lower()
+    code = "operation_failed"
+    retryable = False
+    recovery: list[str] = []
+    if ("no kdbg session" in lower or "no session is attached" in lower
+            or "no kdbg daemon" in lower or "daemon is not running" in lower):
+        code = "no_session"
+        recovery = ["Call kdbg_attach with the target PID, then retry."]
+    elif ("stop changed" in lower or "stale" in lower
+          or "continuation no longer matches" in lower
+          or "stop id" in lower and "does not match" in lower):
+        code = "stale_stop"
+        retryable = True
+        recovery = ["Call kdbg_context at the current halt and retry without the stale cursor."]
+    elif "busy" in lower or "already active" in lower:
+        code = "busy"
+        retryable = True
+        recovery = ["Poll the active operation or interrupt it before retrying."]
+    elif "timeout must be" in lower:
+        code = "invalid_argument"
+    elif "timed out" in lower or "timeout" in lower:
+        code = "timeout"
+        retryable = True
+        recovery = ["Check status before retrying with a bounded larger timeout."]
+    elif "worker api" in lower or "reload/version" in lower:
+        code = "worker_version_mismatch"
+        recovery = ["Reload the MCP client or run kdbg_decomp_status, then retry."]
+    elif ("identity" in lower or "wrong build" in lower
+          or "exact cached pe" in lower or "codeview" in lower):
+        code = "identity_mismatch"
+        recovery = ["Refresh the target module and symbols, then retry with the verified binary."]
+    elif ("not installed" in lower or "unavailable" in lower
+          or "not listening" in lower or "not found" in lower):
+        code = "prerequisite_missing"
+        recovery = ["Inspect the relevant status tool and install or start the missing prerequisite."]
+    elif ("must be" in lower or "between" in lower or "at most" in lower
+          or "cap is" in lower or "mutually exclusive" in lower
+          or "invalid" in lower or "not a valid" in lower or "too large" in lower
+          or "does not match the current job" in lower):
+        code = "invalid_argument"
+    return {
+        "schema": _RESEARCH_ENVELOPE,
+        "ok": False,
+        "result": None,
+        "error": {
+            "code": code,
+            "message": message[:2048],
+            "operation": operation,
+            "retryable": retryable,
+            "recovery": recovery[:3],
+        },
+    }
 
 # ─── Shared state ───────────────────────────────────────────────────────────
 
@@ -2736,7 +2806,7 @@ from winbox.kdbg.hmp import probe_port as _kdbg_probe  # canonical, no shim need
 
 
 @mcp.tool()
-def kdbg_start(port: int = 1234, any_interface: bool = False) -> str:
+def kdbg_start(port: int = 1234, any_interface: bool = False) -> dict[str, Any]:
     """Start the QEMU gdb stub for hypervisor-level kernel debug.
 
     This exposes a gdb remote-protocol endpoint on the Kali host (inside
@@ -2754,54 +2824,67 @@ def kdbg_start(port: int = 1234, any_interface: bool = False) -> str:
     """
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
-        return f"VM is not running (state: {vm.state().value})"
+        return _research_error(
+            f"VM is not running (state: {vm.state().value})", operation="kdbg_start"
+        )
 
     bind = "0.0.0.0" if any_interface else "127.0.0.1"
 
     active_reader = _kdbg_reader_info(cfg)
     if active_reader is not None:
         owned_port = active_reader.get("port", 1234)
-        return (
+        return _research_error(
             f"Persistent kdbg reader already owns the gdbstub on port "
-            f"{owned_port}. Call kdbg_stop() first."
+            f"{owned_port}. Call kdbg_stop() first.", operation="kdbg_start"
         )
 
     if _kdbg_probe("127.0.0.1", port):
-        return (
+        return _research_error(
             f"Something is already listening on 127.0.0.1:{port}. "
-            "Call kdbg_stop() first, or pick a different port."
+            "Call kdbg_stop() first, or pick a different port.",
+            operation="kdbg_start",
         )
 
     rc, out, err = _kdbg_hmp(cfg.vm_name, f"gdbserver tcp:{bind}:{port}")
     if rc != 0:
-        return f"Failed to start gdb stub: {err or out}"
+        return _research_error(
+            f"Failed to start gdb stub: {err or out}", operation="kdbg_start"
+        )
     if "Waiting for gdb connection" not in out:
-        return f"Unexpected HMP response: {out}"
+        return _research_error(
+            f"Unexpected HMP response: {out}", operation="kdbg_start"
+        )
 
-    prefix = "[WARNING: 0.0.0.0 — LAN-accessible] " if any_interface else ""
-    return (
-        f"{prefix}gdb stub listening on {bind}:{port}. "
-        f"Attach from Kali: gdb -ex 'set architecture i386:x86-64' "
-        f"-ex 'target remote :{port}'"
-    )
+    return _research_ok({
+        "listening": True, "bind": bind, "port": port,
+        "lan_accessible": bool(any_interface),
+        "gdb_command": (
+            "gdb -ex 'set architecture i386:x86-64' "
+            f"-ex 'target remote :{port}'"
+        ),
+    })
 
 
 @mcp.tool()
-def kdbg_stop() -> str:
+def kdbg_stop() -> dict[str, Any]:
     """Stop the QEMU gdb stub. Any attached gdb session gets EOF."""
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
-        return f"VM is not running (state: {vm.state().value})"
+        return _research_error(
+            f"VM is not running (state: {vm.state().value})", operation="kdbg_stop"
+        )
 
     _kdbg_stop_reader(cfg)
     rc, out, err = _kdbg_hmp(cfg.vm_name, "gdbserver none")
     if rc != 0:
-        return f"Failed to stop gdb stub: {err or out}"
-    return "gdb stub stopped"
+        return _research_error(
+            f"Failed to stop gdb stub: {err or out}", operation="kdbg_stop"
+        )
+    return _research_ok({"stopped": True})
 
 
 @mcp.tool()
-def kdbg_status(port: int = 1234) -> str:
+def kdbg_status(port: int = 1234) -> dict[str, Any]:
     """Show whether the gdb stub is listening.
 
     Probes 127.0.0.1:<port> with a TCP connect. QEMU's stub only
@@ -2809,20 +2892,30 @@ def kdbg_status(port: int = 1234) -> str:
     the usual signal that a gdb session is already attached.
     """
     cfg, vm, ga = _get_state()
-    if vm.state() != VMState.RUNNING:
-        return f"VM is not running (state: {vm.state().value})"
+    vm_state = vm.state()
+    if vm_state != VMState.RUNNING:
+        return _research_ok({
+            "state": "vm_not_running", "vm_state": vm_state.value,
+            "listening": False, "port": port,
+        })
 
     active_reader = _kdbg_reader_info(cfg)
     if active_reader is not None:
         owned_port = active_reader.get("port", port)
-        return (
-            f"gdb stub: connected on 127.0.0.1:{owned_port} "
-            "(persistent reader owns it)"
-        )
+        return _research_ok({
+            "state": "connected", "listening": True, "host": "127.0.0.1",
+            "port": owned_port, "owner": "persistent_reader",
+        })
 
     if _kdbg_probe("127.0.0.1", port):
-        return f"gdb stub: listening on 127.0.0.1:{port}"
-    return f"gdb stub: not running (nothing on 127.0.0.1:{port})"
+        return _research_ok({
+            "state": "listening", "listening": True,
+            "host": "127.0.0.1", "port": port,
+        })
+    return _research_ok({
+        "state": "stopped", "listening": False,
+        "host": "127.0.0.1", "port": port,
+    })
 
 
 # ─── Tool 13: kdbg symbol / walker / CR3-read tools ────────────────────────
@@ -2865,7 +2958,7 @@ from winbox.kdbg.walk import list_user_modules as _kdbg_list_user_modules, is_wo
 
 
 @mcp.tool()
-def kdbg_cet_status() -> str:
+def kdbg_cet_status() -> dict[str, Any]:
     """Report whether Windows CET state is safe for QEMU GDB stop/resume.
 
     Repeated debug stops on affected QEMU/KVM versions can bugcheck Windows
@@ -2876,12 +2969,15 @@ def kdbg_cet_status() -> str:
     try:
         status = _kdbg_query_cet_status(ga)
     except _KdbgCetSafetyError as exc:
-        return f"error: {exc}"
-    return _kdbg_format_cet_status(status)
+        return _research_error(exc, operation="kdbg_cet_status")
+    return _research_ok({
+        "safe_for_debug": bool(status.safe_for_debug),
+        "summary": _kdbg_format_cet_status(status),
+    })
 
 
 @mcp.tool()
-def kdbg_prepare(confirm: bool = False) -> str:
+def kdbg_prepare(confirm: bool = False) -> dict[str, Any]:
     """Hide CET-SS from the VM for stable kdbg use; reboot required.
 
     This weakens a Windows exploit mitigation, so ``confirm`` must be true.
@@ -2889,34 +2985,40 @@ def kdbg_prepare(confirm: bool = False) -> str:
     host and can be restored with ``kdbg_restore_cet``.
     """
     if not confirm:
-        return (
+        return _research_error(
             "refused: this disables Windows CET UserShadowStack and hides "
             "the VM cet-ss CPU feature; "
-            "call again with confirm=true, then reboot the VM"
+            "call again with confirm=true, then reboot the VM",
+            operation="kdbg_prepare",
         )
     cfg, _, ga = _ensure_vm_ready()
     _kdbg_stop_reader(cfg)
     try:
         backup = _kdbg_prepare_cet(cfg, ga)
     except _KdbgCetSafetyError as exc:
-        return f"error: {exc}"
+        return _research_error(exc, operation="kdbg_prepare")
     if backup is None:
-        return "CET is disabled for every running process; debugger is safe"
-    return f"CET policy staged; original saved at {backup}; reboot required"
+        return _research_ok({"changed": False, "safe_for_debug": True})
+    return _research_ok({
+        "changed": True, "backup": str(backup), "reboot_required": True,
+    })
 
 
 @mcp.tool()
-def kdbg_restore_cet(confirm: bool = False) -> str:
+def kdbg_restore_cet(confirm: bool = False) -> dict[str, Any]:
     """Restore the CET policy backed up by ``kdbg_prepare``; reboot required."""
     if not confirm:
-        return "refused: call again with confirm=true to restore the CET policy"
+        return _research_error(
+            "refused: call again with confirm=true to restore the CET policy",
+            operation="kdbg_restore_cet",
+        )
     cfg, _, ga = _ensure_vm_ready()
     _kdbg_stop_reader(cfg)
     try:
         _kdbg_restore_cet_policy(cfg, ga)
     except _KdbgCetSafetyError as exc:
-        return f"error: {exc}"
-    return "original CET policy restored; reboot required"
+        return _research_error(exc, operation="kdbg_restore_cet")
+    return _research_ok({"restored": True, "reboot_required": True})
 
 
 def _kdbg_get_store() -> _KdbgStore:
@@ -2936,7 +3038,7 @@ def _kdbg_get_store() -> _KdbgStore:
 
 
 @mcp.tool()
-def kdbg_symbols_load() -> str:
+def kdbg_symbols_load() -> dict[str, Any]:
     """Load symbols + struct offsets for nt.
 
     Pulls ntoskrnl.exe from the running VM, fetches ntkrnlmp.pdb from
@@ -2953,15 +3055,18 @@ def kdbg_symbols_load() -> str:
     try:
         info = _kdbg_load_nt(cfg, ga, store)
     except (_KdbgSymbolLoadError, _KdbgStoreError, _KdbgPeError) as e:
-        return f"error: {e}"
-    base_txt = f"base=0x{info.base:x}" if info.base else "base=unresolved"
-    return (
-        f"nt {info.build}: {info.symbol_count} symbols, {info.type_count} types, {base_txt}"
-    )
+        return _research_error(e, operation="kdbg_symbols_load")
+    return _research_ok({
+        "module": "nt", "build": info.build,
+        "symbol_count": info.symbol_count, "type_count": info.type_count,
+        "base": f"0x{info.base:x}" if info.base else None,
+    })
 
 
 @mcp.tool()
-def kdbg_sym(name: str, search: bool = False, limit: int = 16, rva: bool = False) -> str:
+def kdbg_sym(
+    name: str, search: bool = False, limit: int = 16, rva: bool = False,
+) -> dict[str, Any]:
     """Resolve a kernel symbol. Use ``mod!sym`` to pick a module (default nt).
 
     By default returns the absolute virtual address. Pass ``rva=True`` to
@@ -2980,14 +3085,16 @@ def kdbg_sym(name: str, search: bool = False, limit: int = 16, rva: bool = False
     try:
         lines = format_sym(store, name, search=search, limit=limit, rva=rva)
     except _KdbgStoreError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_sym")
     if not lines:
-        return f"no matches for {name}"
-    return "\n".join(lines)
+        return _research_error(f"no matches for {name}", operation="kdbg_sym")
+    return _research_ok({"query": name, "matches": lines})
 
 
 @mcp.tool()
-def kdbg_struct(type_name: str, field: str = "", module: str = "nt") -> str:
+def kdbg_struct(
+    type_name: str, field: str = "", module: str = "nt",
+) -> dict[str, Any]:
     """Return a struct layout or a single field offset from the symbol store.
 
     Without ``field``, returns the whole struct as a compact list of
@@ -3005,30 +3112,34 @@ def kdbg_struct(type_name: str, field: str = "", module: str = "nt") -> str:
     try:
         lines = format_struct(store, type_name, field=field or None, module=module)
     except _KdbgStoreError as e:
-        return f"error: {e}"
-    return "\n".join(lines)
+        return _research_error(e, operation="kdbg_struct")
+    return _research_ok({
+        "module": module, "type": type_name, "field": field or None,
+        "lines": lines,
+    })
 
 
 @mcp.tool()
-def kdbg_ps() -> str:
+def kdbg_ps() -> dict[str, Any]:
     """Walk ``PsActiveProcessHead`` and return all running processes.
 
-    Returns a JSON array of ``{pid, dtb, eprocess, name}``. ``dtb`` is
-    the ``DirectoryTableBase`` (feed it or the pid to ``kdbg_read_va``
-    for cross-process reads). Addresses are hex strings.
+    The envelope result is ``{processes, count}``; each process contains
+    ``{pid, dtb, eprocess, name}``. ``dtb`` is the DirectoryTableBase.
 
     Requires ``kdbg_symbols_load`` to have been run first.
     """
     cfg, vm, _ = _get_state()
     state = vm.state()
     if state not in (VMState.RUNNING, VMState.PAUSED):
-        return f"VM is not running (state: {state.value})"
+        return _research_error(
+            f"VM is not running (state: {state.value})", operation="kdbg_ps"
+        )
     try:
         with _kdbg_debug_snapshot(cfg):
             store = _kdbg_get_store()
             procs = _kdbg_list_processes(cfg.vm_name, store)
     except (_KdbgStoreError, _KdbgHmpError) as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_ps")
     out = [
         {
             "pid": p.pid,
@@ -3038,28 +3149,28 @@ def kdbg_ps() -> str:
         }
         for p in procs
     ]
-    return _json.dumps(out, indent=2)
+    return _research_ok({"processes": out, "count": len(out)})
 
 
 @mcp.tool()
-def kdbg_lm() -> str:
+def kdbg_lm() -> dict[str, Any]:
     """Walk ``PsLoadedModuleList`` and return all loaded kernel modules.
 
-    Returns a JSON array of ``{base, size, name}``. ``base`` is the
-    DllBase VA and ``size`` is SizeOfImage, both hex strings. Use this
-    to locate driver images when you need to resolve addresses inside
-    non-nt drivers.
+    The envelope result is ``{modules, count}``; each module contains
+    ``{base, size, name}``. ``base`` is DllBase and ``size`` is SizeOfImage.
     """
     cfg, vm, _ = _get_state()
     state = vm.state()
     if state not in (VMState.RUNNING, VMState.PAUSED):
-        return f"VM is not running (state: {state.value})"
+        return _research_error(
+            f"VM is not running (state: {state.value})", operation="kdbg_lm"
+        )
     try:
         with _kdbg_debug_snapshot(cfg):
             store = _kdbg_get_store()
             mods = _kdbg_list_modules(cfg.vm_name, store)
     except (_KdbgStoreError, _KdbgHmpError) as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_lm")
     out = [
         {
             "base": f"0x{m.base:016x}",
@@ -3068,20 +3179,19 @@ def kdbg_lm() -> str:
         }
         for m in mods
     ]
-    return _json.dumps(out, indent=2)
+    return _research_ok({"modules": out, "count": len(out)})
 
 
 @mcp.tool()
-def kdbg_user_lm(pid: int) -> str:
+def kdbg_user_lm(pid: int) -> dict[str, Any]:
     """Walk PEB.Ldr and return all user-mode modules in ``pid``.
 
     The user-space mirror of ``kdbg_lm``. Shows the EXE plus every DLL
     Windows mapped into the target's address space, in load order.
 
-    Returns a JSON array of ``{base, size, name, full_path}``. ``base``
-    is a *user* VA in the target's address space and is only meaningful
-    against that process's CR3 — pair with ``kdbg_read_va`` to read
-    bytes out of a specific module.
+    The envelope result is ``{pid, modules, count}``; each module contains
+    ``{base, size, name, full_path}``. ``base`` is a user VA meaningful only
+    against that process's CR3.
 
     First call after a fresh VM auto-extracts the PEB struct layouts
     from the cached PDB if they're missing — no kdbg_symbols_load
@@ -3093,27 +3203,31 @@ def kdbg_user_lm(pid: int) -> str:
     cfg, vm, _ = _get_state()
     state = vm.state()
     if state not in (VMState.RUNNING, VMState.PAUSED):
-        return f"VM is not running (state: {state.value})"
+        return _research_error(
+            f"VM is not running (state: {state.value})", operation="kdbg_user_lm"
+        )
     try:
         with _kdbg_debug_snapshot(cfg):
             store = _kdbg_get_store()
         _kdbg_ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
     except (_KdbgStoreError, _KdbgSymbolLoadError) as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_user_lm")
 
     try:
         with _kdbg_debug_snapshot(cfg):
             cache = _KdbgWalkCache()
             target = _kdbg_find_process(cfg.vm_name, store, pid=pid, cache=cache)
             if target is None:
-                return f"pid {pid} not found"
+                return _research_error(
+                    f"pid {pid} not found", operation="kdbg_user_lm"
+                )
             mods = _kdbg_list_user_modules(cfg.vm_name, store, target, cache=cache)
             try:
                 wow64 = _kdbg_is_wow64(cfg.vm_name, store, target, cache=cache)
             except Exception:
                 wow64 = False
     except (_KdbgStoreError, _KdbgHmpError) as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_user_lm")
     out = [
         {
             "base": f"0x{m.base:016x}",
@@ -3123,17 +3237,17 @@ def kdbg_user_lm(pid: int) -> str:
         }
         for m in mods
     ]
-    result: dict = {"modules": out}
+    result: dict = {"pid": pid, "modules": out, "count": len(out)}
     if wow64:
         result["warning"] = (
             "WoW64 process — only 64-bit modules listed. "
             "The 32-bit module list (PEB.Wow64Process) is not walked yet."
         )
-    return _json.dumps(result, indent=2)
+    return _research_ok(result)
 
 
 @mcp.tool()
-def kdbg_user_symbols_load(pid: int, module: str) -> str:
+def kdbg_user_symbols_load(pid: int, module: str) -> dict[str, Any]:
     """Load PDB symbols for a user-mode module in ``pid``.
 
     Pulls the binary out of the VM via VirtIO-FS, fetches the matching
@@ -3146,7 +3260,7 @@ def kdbg_user_symbols_load(pid: int, module: str) -> str:
         module: Substring matched against PEB.Ldr BaseDllName, then
             FullDllName. Examples: 'notepad.exe', 'ntdll', 'kernelbase'.
 
-    Returns a one-line summary on success, error string otherwise.
+    Returns module/build/symbol-count/base metadata in the common envelope.
     """
     cfg, vm, ga = _ensure_vm_ready()
     try:
@@ -3154,24 +3268,29 @@ def kdbg_user_symbols_load(pid: int, module: str) -> str:
             store = _kdbg_get_store()
         _kdbg_ensure_types_loaded(cfg, store, ["_PEB", "_PEB_LDR_DATA"], module="nt")
     except (_KdbgStoreError, _KdbgSymbolLoadError) as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_user_symbols_load")
 
     try:
         with _kdbg_debug_snapshot(cfg):
             cache = _KdbgWalkCache()
             target = _kdbg_find_process(cfg.vm_name, store, pid=pid, cache=cache)
             if target is None:
-                return f"pid {pid} not found"
+                return _research_error(
+                    f"pid {pid} not found", operation="kdbg_user_symbols_load"
+                )
             mods = _kdbg_list_user_modules(cfg.vm_name, store, target, cache=cache)
     except (_KdbgStoreError, _KdbgHmpError) as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_user_symbols_load")
 
     needle = module.lower()
     match = next((m for m in mods if needle in m.name.lower()), None)
     if match is None:
         match = next((m for m in mods if needle in m.full_path.lower()), None)
     if match is None:
-        return f"no module matching {module!r} in pid {pid}"
+        return _research_error(
+            f"no module matching {module!r} in pid {pid}",
+            operation="kdbg_user_symbols_load",
+        )
 
     short_name = match.name.rsplit(".", 1)[0].lower()
     cached_basename = match.name
@@ -3186,16 +3305,16 @@ def kdbg_user_symbols_load(pid: int, module: str) -> str:
             wanted_types=(),
         )
     except (_KdbgSymbolLoadError, _KdbgStoreError, _KdbgPeError) as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_user_symbols_load")
 
-    return (
-        f"{short_name} {info.build}: {info.symbol_count} symbols, "
-        f"base=0x{info.base:x}"
-    )
+    return _research_ok({
+        "pid": pid, "module": short_name, "build": info.build,
+        "symbol_count": info.symbol_count, "base": f"0x{info.base:x}",
+    })
 
 
 @mcp.tool()
-def kdbg_read_va(pid: int, address: str, length: int) -> str:
+def kdbg_read_va(pid: int, address: str, length: int) -> dict[str, Any]:
     """Read virtual memory from an arbitrary process WITHOUT an attached
     debugger session through the persistent RSP reader.
 
@@ -3207,8 +3326,8 @@ def kdbg_read_va(pid: int, address: str, length: int) -> str:
     For in-session reads after ``kdbg_attach``, use ``kdbg_mem`` because the
     interactive daemon already owns the same gdbstub connection.
 
-    Returns a bare hex string of the bytes. Pair with ``kdbg_ps`` to
-    find a PID first.
+    Returns ``{pid, va, bytes}`` in the common envelope. Pair with
+    ``kdbg_ps`` to find a PID first.
 
     Args:
         pid: Target process ID (must be in kdbg_ps output).
@@ -3218,15 +3337,21 @@ def kdbg_read_va(pid: int, address: str, length: int) -> str:
     cfg, vm, _ = _get_state()
     state = vm.state()
     if state not in (VMState.RUNNING, VMState.PAUSED):
-        return f"VM is not running (state: {state.value})"
+        return _research_error(
+            f"VM is not running (state: {state.value})", operation="kdbg_read_va"
+        )
     if length <= 0:
-        return "length must be > 0"
+        return _research_error("length must be > 0", operation="kdbg_read_va")
     if length > 1024 * 1024:
-        return f"length {length} too large - cap at 1MB"
+        return _research_error(
+            f"length {length} too large - cap at 1MB", operation="kdbg_read_va"
+        )
     try:
         va = int(address, 0)
     except ValueError:
-        return f"invalid address: {address!r}"
+        return _research_error(
+            f"invalid address: {address!r}", operation="kdbg_read_va"
+        )
 
     try:
         with _kdbg_debug_snapshot(cfg):
@@ -3234,19 +3359,21 @@ def kdbg_read_va(pid: int, address: str, length: int) -> str:
             cache = _KdbgWalkCache()
             target = _kdbg_find_process(cfg.vm_name, store, pid=pid, cache=cache)
             if target is None:
-                return f"pid {pid} not found"
+                return _research_error(
+                    f"pid {pid} not found", operation="kdbg_read_va"
+                )
             data = _kdbg_read_virt_cr3(
                 cfg.vm_name, target.directory_table_base, va, length, cache=cache,
             )
     except _KdbgHmpError as e:
-        return f"read failed: {e}"
+        return _research_error(f"read failed: {e}", operation="kdbg_read_va")
     except _KdbgStoreError as e:
-        return f"error: {e}"
-    return data.hex()
+        return _research_error(e, operation="kdbg_read_va")
+    return _research_ok({"pid": pid, "va": f"0x{va:x}", "bytes": data.hex()})
 
 
 @mcp.tool()
-def kdbg_base_refresh() -> str:
+def kdbg_base_refresh() -> dict[str, Any]:
     """Re-resolve and persist the nt load base from the live guest.
 
     ASLR re-randomizes the kernel base on every reboot. After a VM
@@ -3256,18 +3383,22 @@ def kdbg_base_refresh() -> str:
     cfg, vm, _ = _get_state()
     state = vm.state()
     if state not in (VMState.RUNNING, VMState.PAUSED):
-        return f"VM is not running (state: {state.value})"
+        return _research_error(
+            f"VM is not running (state: {state.value})", operation="kdbg_base_refresh"
+        )
     store = _kdbg_get_store()
     try:
         data = store.load("nt")
     except _KdbgStoreError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_base_refresh")
     try:
         base = _kdbg_resolve_nt_base(cfg, data.get("symbols", {}))
     except Exception as e:
-        return f"could not resolve nt base: {e}"
+        return _research_error(
+            f"could not resolve nt base: {e}", operation="kdbg_base_refresh"
+        )
     store.set_base("nt", base)
-    return f"nt base = 0x{base:x}"
+    return _research_ok({"module": "nt", "base": f"0x{base:x}"})
 
 
 # ─── Tool 14: kdbg session daemon (interactive debugger) ─────────────────
@@ -3305,7 +3436,7 @@ def _kdbg_cfg_only():
 
 
 @mcp.tool()
-def kdbg_attach(pid: int, port: int = 1234) -> str:
+def kdbg_attach(pid: int, port: int = 1234) -> dict[str, Any]:
     """Attach a kdbg debugging session to a Windows process via the gdbstub.
 
     Forks a long-running daemon that holds the gdb connection alive
@@ -3320,16 +3451,17 @@ def kdbg_attach(pid: int, port: int = 1234) -> str:
         port: gdbstub TCP port the daemon should connect to.
 
     Returns:
-        JSON with daemon_pid + target info on success, or error string.
+        The common envelope with daemon PID, target, and gdbstub metadata.
     """
     cfg, vm, ga = _ensure_vm_ready()
     client = _kdbg_client(cfg)
     if client.session_alive():
         info = client.session_info() or {}
-        return (
-            f"error: another session is active "
+        return _research_error(
+            f"another session is active "
             f"(target {info.get('target_name', '?')}({info.get('target_pid', '?')}), "
-            f"daemon_pid={info.get('daemon_pid', '?')}); call kdbg_detach first"
+            f"daemon_pid={info.get('daemon_pid', '?')}); call kdbg_detach first",
+            operation="kdbg_attach",
         )
 
     # Transfer ownership from the background read broker to the interactive
@@ -3337,15 +3469,16 @@ def kdbg_attach(pid: int, port: int = 1234) -> str:
     _kdbg_stop_reader(cfg)
     from winbox.kdbg.hmp import gdbstub_has_client
     if gdbstub_has_client(port):
-        return (
-            f"error: another gdb client is already connected to port {port}. "
-            f"Disconnect it first — QEMU's gdbstub accepts only one client."
+        return _research_error(
+            f"another gdb client is already connected to port {port}. "
+            f"Disconnect it first — QEMU's gdbstub accepts only one client.",
+            operation="kdbg_attach",
         )
 
     try:
         daemon_pid = _fork_daemon(cfg, pid, gdbstub_port=port)
     except _DaemonError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_attach")
     info = client.session_info() or {}
     result = {
         "daemon_pid": daemon_pid,
@@ -3369,11 +3502,11 @@ def kdbg_attach(pid: int, port: int = 1234) -> str:
     except Exception:
         pass  # GA might be unresponsive after gdbstub connected
 
-    return _json.dumps(result, indent=2)
+    return _research_ok(result)
 
 
 @mcp.tool()
-def kdbg_session() -> str:
+def kdbg_session() -> dict[str, Any]:
     """Show current kdbg session info, or report no session.
 
     Safe to call when nothing is attached — returns ``{"attached": false}``
@@ -3383,12 +3516,12 @@ def kdbg_session() -> str:
     cfg = _kdbg_cfg_only()
     client = _kdbg_client(cfg)
     if not client.session_alive():
-        return _json.dumps({"attached": False}, indent=2)
+        return _research_ok({"attached": False})
     try:
         result = client.call("status")
     except _ClientError as e:
-        return f"error: {e}"
-    return _json.dumps({"attached": True, **result}, indent=2)
+        return _research_error(e, operation="kdbg_session")
+    return _research_ok({"attached": True, **result})
 
 
 @mcp.tool()
@@ -3398,8 +3531,8 @@ def kdbg_bp(
     condition: str | None = None,
     wp_type: str | None = None,
     wp_size: int = 1,
-    actions: list | None = None,
-) -> str:
+    actions: list[str] | None = None,
+) -> dict[str, Any]:
     """Install a breakpoint or watchpoint at TARGET in the attached process.
 
     Defaults to **hardware breakpoint** (CPU debug register, Z1
@@ -3430,6 +3563,8 @@ def kdbg_bp(
                         (qword little-endian read in target's CR3)
               deref   = ``poi(atom)`` or ``poi(atom+0xN)`` — chained
                         qword read; ``poi()`` nests for pointer chases
+              typed   = ``byte(atom)``, ``word(atom)``, ``dword(atom)``, or
+                        ``qword(atom)`` for exact little-endian widths
               ops     = ``== != < <= > >=``, ``&`` (bitwise AND),
                         ``&& ||`` (short-circuit), parens
               literal = ``0x...`` or decimal
@@ -3454,12 +3589,12 @@ def kdbg_bp(
             4-slot DR0..3 pool with hw execution breakpoints.
         wp_size: Watched region size in bytes (1, 2, 4, or 8).
             Only meaningful when ``wp_type`` is set. Default 1.
-        actions: List of expression strings to evaluate on each
-            in-target fire. Same grammar as ``condition``. When set,
-            the bp auto-continues instead of halting — results are
-            appended to a JSONL trace file. Read with ``kdbg_bp_trace``.
-            Example: ``["rcx", "[rsp+0x18]", "poi(rdx+0x10)"]``
-            logs register and memory values on each fire.
+        actions: Up to 16 expression strings evaluated on each in-target
+            fire. Scalar expressions use the condition grammar. A complete
+            action may additionally be ``bytes(addr,literal_len)``,
+            ``ascii(addr,literal_len)``, or ``utf16(addr,literal_len)``.
+            Captures are capped at 256 bytes each, 1024 raw bytes per hit,
+            and 16 MiB per trace. Action hits append JSONL and auto-continue.
 
     Returns:
         JSON ``{id, va, user_mode, hw, condition, elapsed_ms}``. For
@@ -3476,19 +3611,16 @@ def kdbg_bp(
     if wp_type is not None:
         kwargs["wp_type"] = wp_type
         kwargs["wp_size"] = int(wp_size)
-    if actions:
-        kwargs["actions"] = list(actions)
+    if actions is not None:
+        kwargs["actions"] = actions
     try:
-        return _json.dumps(
-            _kdbg_client(cfg).call("bp_add", **kwargs),
-            indent=2,
-        )
+        return _research_ok(_kdbg_client(cfg).call("bp_add", **kwargs))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_bp")
 
 
 @mcp.tool()
-def kdbg_bps() -> str:
+def kdbg_bps() -> dict[str, Any]:
     """List all installed breakpoints in the current session.
 
     Returns:
@@ -3501,9 +3633,9 @@ def kdbg_bps() -> str:
     """
     cfg = _kdbg_cfg_only()
     try:
-        return _json.dumps(_kdbg_client(cfg).call("bp_list"), indent=2)
+        return _research_ok(_kdbg_client(cfg).call("bp_list"))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_bps")
 
 
 @mcp.tool()
@@ -3517,7 +3649,7 @@ def kdbg_bp_trace(
     errors_only: bool = False,
     summary: bool = False,
     top: int = 10,
-) -> str:
+) -> dict[str, Any]:
     """Query the trace log for a breakpoint with actions.
 
     Action breakpoints auto-continue and log expression values to a
@@ -3568,16 +3700,13 @@ def kdbg_bp_trace(
     if value is not None:
         kwargs["value"] = value
     try:
-        return _json.dumps(
-            _kdbg_client(cfg).call("bp_trace", **kwargs),
-            indent=2,
-        )
+        return _research_ok(_kdbg_client(cfg).call("bp_trace", **kwargs))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_bp_trace")
 
 
 @mcp.tool()
-def kdbg_rm(bp_id: int) -> str:
+def kdbg_rm(bp_id: int) -> dict[str, Any]:
     """Remove a breakpoint by id.
 
     Args:
@@ -3588,13 +3717,13 @@ def kdbg_rm(bp_id: int) -> str:
     """
     cfg = _kdbg_cfg_only()
     try:
-        return _json.dumps(_kdbg_client(cfg).call("bp_remove", id=bp_id), indent=2)
+        return _research_ok(_kdbg_client(cfg).call("bp_remove", id=bp_id))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_rm")
 
 
 @mcp.tool()
-def kdbg_cont(timeout: float = 30.0) -> str:
+def kdbg_cont(timeout: float = 30.0) -> dict[str, Any]:
     """Resume the VM; block until next bp hit in target's CR3.
 
     The daemon silent-continues fires that aren't in the target process
@@ -3619,12 +3748,57 @@ def kdbg_cont(timeout: float = 30.0) -> str:
             timeout=float(timeout),
         )
     except _ClientError as e:
-        return f"error: {e}"
-    return _json.dumps(result, indent=2)
+        return _research_error(e, operation="kdbg_cont")
+    return _research_ok(result)
 
 
 @mcp.tool()
-def kdbg_step(over: bool = False, out: bool = False) -> str:
+def kdbg_cont_start(timeout: float = 300.0) -> dict[str, Any]:
+    """Start a durable continue operation and return immediately.
+
+    The host worker survives MCP transport reloads. Use the returned token
+    with ``kdbg_cont_poll``; call ``kdbg_cont_cancel`` to halt early.
+
+    Args:
+        timeout: Continue budget in seconds (0.5..86400).
+    """
+    from winbox.kdbg.debugger.continue_job import ContinueJobError, start_continue
+
+    try:
+        return _research_ok(start_continue(_kdbg_cfg_only(), timeout=timeout))
+    except ContinueJobError as exc:
+        return _research_error(exc, operation="kdbg_cont_start")
+
+
+@mcp.tool()
+def kdbg_cont_poll(token: str = "") -> dict[str, Any]:
+    """Poll the durable continue operation without blocking.
+
+    Args:
+        token: Token returned by ``kdbg_cont_start``. Empty selects the current
+            job, which is useful after an MCP reload.
+    """
+    from winbox.kdbg.debugger.continue_job import ContinueJobError, poll_continue
+
+    try:
+        return _research_ok(poll_continue(_kdbg_cfg_only(), token=token))
+    except ContinueJobError as exc:
+        return _research_error(exc, operation="kdbg_cont_poll")
+
+
+@mcp.tool()
+def kdbg_cont_cancel(token: str = "") -> dict[str, Any]:
+    """Interrupt and cancel the current durable continue operation."""
+    from winbox.kdbg.debugger.continue_job import ContinueJobError, cancel_continue
+
+    try:
+        return _research_ok(cancel_continue(_kdbg_cfg_only(), token=token))
+    except ContinueJobError as exc:
+        return _research_error(exc, operation="kdbg_cont_cancel")
+
+
+@mcp.tool()
+def kdbg_step(over: bool = False, out: bool = False) -> dict[str, Any]:
     """Single-step the firing vCPU.
 
     Only valid after a stop (call ``kdbg_cont`` first or attach to a
@@ -3647,13 +3821,15 @@ def kdbg_step(over: bool = False, out: bool = False) -> str:
     else:
         op = "step"
     try:
-        return _json.dumps(_kdbg_client(cfg).call(op), indent=2)
+        return _research_ok(_kdbg_client(cfg).call(op))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_step")
 
 
 @mcp.tool()
-def kdbg_disasm(addr: str = "", count: int = 8) -> str:
+def kdbg_disasm(
+    addr: str = "", count: int = 8, instruction_bytes: bool = False,
+) -> dict[str, Any]:
     """Disassemble x86-64 instructions at ADDR (or current RIP if empty).
 
     Reads up to ~16*count bytes (instructions are 1-15 bytes each) from
@@ -3669,13 +3845,16 @@ def kdbg_disasm(addr: str = "", count: int = 8) -> str:
         count: How many instructions to decode (1..64).
 
     Returns:
-        JSON ``{base, instructions: [{addr, bytes, mnemonic, op_str}]}``
-        or error string. Each instruction's ``bytes`` is hex-encoded.
+        The common envelope with ``{base, instruction_bytes, instructions}``.
+        Raw bytes appear only when ``instruction_bytes=true``.
     """
     try:
         import capstone as _cs
     except ImportError:
-        return "error: capstone not installed (apt install python3-capstone)"
+        return _research_error(
+            "capstone not installed (apt install python3-capstone)",
+            operation="kdbg_disasm",
+        )
 
     cfg = _kdbg_cfg_only()
     client = _kdbg_client(cfg)
@@ -3686,12 +3865,14 @@ def kdbg_disasm(addr: str = "", count: int = 8) -> str:
             regs = client.call("regs")
             addr_int = int(regs.get("rip", "0x0"), 16)
         except _ClientError as e:
-            return f"error: {e}"
+            return _research_error(e, operation="kdbg_disasm")
     else:
         try:
             addr_int = int(addr.strip(), 0)
         except ValueError:
-            return f"error: not a valid VA: {addr!r}"
+            return _research_error(
+                f"not a valid VA: {addr!r}", operation="kdbg_disasm"
+            )
 
     n = max(1, min(int(count), 64))
     # Cap at 15 bytes per instruction; over-read is harmless, gets discarded
@@ -3700,12 +3881,12 @@ def kdbg_disasm(addr: str = "", count: int = 8) -> str:
     try:
         result = client.call("mem", va=hex(addr_int), length=bytes_to_read)
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_disasm")
 
     try:
         raw = bytes.fromhex(result["bytes"])
     except (KeyError, ValueError):
-        return f"error: malformed mem result"
+        return _research_error("malformed mem result", operation="kdbg_disasm")
 
     md = _cs.Cs(_cs.CS_ARCH_X86, _cs.CS_MODE_64)
     md.detail = True
@@ -3720,10 +3901,11 @@ def kdbg_disasm(addr: str = "", count: int = 8) -> str:
     for ins in md.disasm(raw, addr_int):
         entry = {
             "addr": f"0x{ins.address:x}",
-            "bytes": ins.bytes.hex(),
             "mnemonic": ins.mnemonic,
             "op_str": ins.op_str,
         }
+        if instruction_bytes:
+            entry["bytes"] = ins.bytes.hex()
         if any(g in (_CALL, _JUMP) for g in ins.groups):
             for op in ins.operands:
                 if op.type == _IMM:
@@ -3735,10 +3917,11 @@ def kdbg_disasm(addr: str = "", count: int = 8) -> str:
         if len(insns) >= n:
             break
 
-    return _json.dumps({
+    return _research_ok({
         "base": f"0x{addr_int:x}",
+        "instruction_bytes": bool(instruction_bytes),
         "instructions": insns,
-    }, indent=2)
+    })
 
 
 @mcp.tool()
@@ -3756,7 +3939,9 @@ def kdbg_decomp(
     detail: str = "compact",
     lines: str = "",
     assembly: str = "nearby",
-) -> str:
+    instruction_bytes: bool = False,
+    runtime_vas: bool = False,
+) -> dict[str, Any]:
     """Return focused Ghidra pseudocode for ADDR or the current RIP.
 
     Combines live debugger state with static analysis safely: resolves ADDR
@@ -3790,6 +3975,8 @@ def kdbg_decomp(
             Empty uses ``before``/``after`` context around the mapped RIP.
         assembly: ``nearby`` (default) or ``mapped`` to attach corresponding
             assembly to every address-bearing selected pseudocode line.
+        instruction_bytes: Include raw instruction bytes (off by default).
+        runtime_vas: Include repeated static/runtime VAs in addition to RVAs.
     """
     from winbox.kdbg.decomp import DecompError, query_decomp
 
@@ -3810,14 +3997,16 @@ def kdbg_decomp(
             detail=detail,
             lines=lines,
             assembly=assembly,
+            instruction_bytes=instruction_bytes,
+            runtime_vas=runtime_vas,
         )
     except DecompError as exc:
-        return f"error: {exc}"
-    return _json.dumps(result, indent=2)
+        return _research_error(exc, operation="kdbg_decomp")
+    return _research_ok(result)
 
 
 @mcp.tool()
-def kdbg_decomp_status() -> str:
+def kdbg_decomp_status() -> dict[str, Any]:
     """Show Docker/PyGhidra API, worker/JVM state, and analysis-cache status.
 
     This is safe without an attached debugger and does not start the JVM.
@@ -3825,11 +4014,11 @@ def kdbg_decomp_status() -> str:
     """
     from winbox.kdbg.decomp import worker_status
 
-    return _json.dumps(worker_status(_kdbg_cfg_only()), indent=2)
+    return _research_ok(worker_status(_kdbg_cfg_only()))
 
 
 @mcp.tool()
-def kdbg_ghidra_install(pull: bool = True) -> str:
+def kdbg_ghidra_install(pull: bool = True) -> dict[str, Any]:
     """Build the pinned, self-contained headless Ghidra Docker image.
 
     This is the one-time dependency installation for ``kdbg_decomp``. It
@@ -3842,15 +4031,13 @@ def kdbg_ghidra_install(pull: bool = True) -> str:
     from winbox.kdbg.decomp import DecompError, install_service
 
     try:
-        return _json.dumps(
-            install_service(_kdbg_cfg_only(), pull=bool(pull)), indent=2
-        )
+        return _research_ok(install_service(_kdbg_cfg_only(), pull=bool(pull)))
     except DecompError as exc:
-        return f"error: {exc}"
+        return _research_error(exc, operation="kdbg_ghidra_install")
 
 
 @mcp.tool()
-def kdbg_ghidra_run() -> str:
+def kdbg_ghidra_run() -> dict[str, Any]:
     """Start and verify the private persistent headless Ghidra API.
 
     No TCP port is exposed. The current-UID container communicates through a
@@ -3860,13 +4047,13 @@ def kdbg_ghidra_run() -> str:
     from winbox.kdbg.decomp import DecompError, start_service
 
     try:
-        return _json.dumps(start_service(_kdbg_cfg_only()), indent=2)
+        return _research_ok(start_service(_kdbg_cfg_only()))
     except DecompError as exc:
-        return f"error: {exc}"
+        return _research_error(exc, operation="kdbg_ghidra_run")
 
 
 @mcp.tool()
-def kdbg_ghidra_stop() -> str:
+def kdbg_ghidra_stop() -> dict[str, Any]:
     """Stop and remove only the labelled winbox headless Ghidra container.
 
     Analyzed projects and immutable binary caches remain on the host so the
@@ -3875,13 +4062,13 @@ def kdbg_ghidra_stop() -> str:
     from winbox.kdbg.decomp import DecompError, stop_service
 
     try:
-        return _json.dumps(stop_service(_kdbg_cfg_only()), indent=2)
+        return _research_ok(stop_service(_kdbg_cfg_only()))
     except DecompError as exc:
-        return f"error: {exc}"
+        return _research_error(exc, operation="kdbg_ghidra_stop")
 
 
 @mcp.tool()
-def kdbg_interrupt() -> str:
+def kdbg_interrupt() -> dict[str, Any]:
     """Async halt request — breaks out of an in-flight ``kdbg_cont``.
 
     Useful when ``kdbg_cont`` is sitting in a long wait and you want
@@ -3890,14 +4077,25 @@ def kdbg_interrupt() -> str:
     ``reason=interrupt``.
     """
     cfg = _kdbg_cfg_only()
+    from winbox.kdbg.debugger.continue_job import (
+        ACTIVE_STATES, ContinueJobError, cancel_continue, poll_continue,
+    )
     try:
-        return _json.dumps(_kdbg_client(cfg).call("interrupt"), indent=2)
+        job = poll_continue(cfg)
+        if job.get("state") in ACTIVE_STATES:
+            return _research_ok(cancel_continue(cfg, token=str(job["token"])))
+    except ContinueJobError:
+        # Direct daemon interrupt below remains the recovery path when the
+        # durable state is unavailable or corrupt.
+        pass
+    try:
+        return _research_ok(_kdbg_client(cfg).call("interrupt"))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_interrupt")
 
 
 @mcp.tool()
-def kdbg_regs() -> str:
+def kdbg_regs() -> dict[str, Any]:
     """Dump full register state at the most recent halt.
 
     Returns:
@@ -3906,13 +4104,15 @@ def kdbg_regs() -> str:
     """
     cfg = _kdbg_cfg_only()
     try:
-        return _json.dumps(_kdbg_client(cfg).call("regs"), indent=2)
+        return _research_ok(_kdbg_client(cfg).call("regs"))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_regs")
 
 
 @mcp.tool()
-def kdbg_mem(va: str, length: int = 64, decode: str = "hex") -> str:
+def kdbg_mem(
+    va: str, length: int = 64, decode: str = "hex",
+) -> dict[str, Any]:
     """Read LENGTH bytes at VA in the attached target's address space.
 
     Uses the same CR3-masquerade trick as bp install — temporarily
@@ -3942,7 +4142,7 @@ def kdbg_mem(va: str, length: int = 64, decode: str = "hex") -> str:
     try:
         result = _kdbg_client(cfg).call("mem", va=va, length=int(length))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_mem")
 
     if decode != "hex":
         try:
@@ -3971,11 +4171,11 @@ def kdbg_mem(va: str, length: int = 64, decode: str = "hex") -> str:
             ]
         else:
             result["decoded"] = f"unknown decode mode: {decode!r}"
-    return _json.dumps(result, indent=2)
+    return _research_ok(result)
 
 
 @mcp.tool()
-def kdbg_write_mem(va: str, data: str) -> str:
+def kdbg_write_mem(va: str, data: str) -> dict[str, Any]:
     """Write hex-encoded DATA at VA in the attached target's address space.
 
     Mirror of ``kdbg_mem`` but for writes. Uses CR3-masquerade so the
@@ -3995,17 +4195,13 @@ def kdbg_write_mem(va: str, data: str) -> str:
             ``"deadbeef"`` writes 4 bytes, ``"00"`` writes one zero.
 
     Returns:
-        JSON ``{va, length}`` with the byte count actually written,
-        or error string.
+        The common envelope with ``{va, length}``.
     """
     cfg = _kdbg_cfg_only()
     try:
-        return _json.dumps(
-            _kdbg_client(cfg).call("write_mem", va=va, data=data),
-            indent=2,
-        )
+        return _research_ok(_kdbg_client(cfg).call("write_mem", va=va, data=data))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_write_mem")
 
 
 @mcp.tool()
@@ -4014,7 +4210,7 @@ def kdbg_context(
     stack_qwords: int = 16,
     bt_depth: int = 8,
     memory: list[dict[str, object]] | None = None,
-) -> str:
+) -> dict[str, Any]:
     """Return one bounded triage bundle for the current halted stop.
 
     The response pins registers, symbolized nearby assembly, stack qwords,
@@ -4031,19 +4227,19 @@ def kdbg_context(
     """
     cfg = _kdbg_cfg_only()
     try:
-        return _json.dumps(_kdbg_client(cfg).call(
+        return _research_ok(_kdbg_client(cfg).call(
             "context",
             disasm_count=disasm_count,
             stack_qwords=stack_qwords,
             bt_depth=bt_depth,
             memory=memory or [],
-        ), indent=2)
+        ))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_context")
 
 
 @mcp.tool()
-def kdbg_stack(n: int = 16) -> str:
+def kdbg_stack(n: int = 16) -> dict[str, Any]:
     """Read N qwords starting at RSP (current halt's stack pointer).
 
     Reads target's address space via CR3 masquerade, so this works
@@ -4061,13 +4257,13 @@ def kdbg_stack(n: int = 16) -> str:
     """
     cfg = _kdbg_cfg_only()
     try:
-        return _json.dumps(_kdbg_client(cfg).call("stack", n=int(n)), indent=2)
+        return _research_ok(_kdbg_client(cfg).call("stack", n=int(n)))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_stack")
 
 
 @mcp.tool()
-def kdbg_bt(depth: int = 8) -> str:
+def kdbg_bt(depth: int = 8) -> dict[str, Any]:
     """Crude stack-walk backtrace; symbolicates plausible return addrs.
 
     Treats values on the stack that look like canonical-high (kernel)
@@ -4084,13 +4280,13 @@ def kdbg_bt(depth: int = 8) -> str:
     """
     cfg = _kdbg_cfg_only()
     try:
-        return _json.dumps(_kdbg_client(cfg).call("bt", depth=int(depth)), indent=2)
+        return _research_ok(_kdbg_client(cfg).call("bt", depth=int(depth)))
     except _ClientError as e:
-        return f"error: {e}"
+        return _research_error(e, operation="kdbg_bt")
 
 
 @mcp.tool()
-def kdbg_detach() -> str:
+def kdbg_detach() -> dict[str, Any]:
     """Tear down the kdbg session: remove bps, resume VM, release lock.
 
     Safe to call when no session is active — returns "no session".
@@ -4098,7 +4294,18 @@ def kdbg_detach() -> str:
     cfg = _kdbg_cfg_only()
     client = _kdbg_client(cfg)
     if not client.session_alive():
-        return "no kdbg session attached"
+        return _research_ok({"detached": False, "already_detached": True})
+    from winbox.kdbg.debugger.continue_job import (
+        ACTIVE_STATES, ContinueJobError, cancel_continue, poll_continue,
+        wait_continue,
+    )
+    try:
+        job = poll_continue(cfg)
+        if job.get("state") in ACTIVE_STATES:
+            cancel_continue(cfg, token=str(job["token"]))
+            wait_continue(cfg, token=str(job["token"]), timeout=5.0)
+    except ContinueJobError as exc:
+        return _research_error(exc, operation="kdbg_detach")
     try:
         client.call("detach")
     except _ClientError as e:
@@ -4109,20 +4316,26 @@ def kdbg_detach() -> str:
     from winbox.kdbg.hmp import ensure_not_paused
 
     deadline = _time.monotonic() + 5.0
-    result = "warning: daemon didn't exit within 5s; lock may be stale"
+    detached = False
+    warning = "daemon didn't exit within 5s; lock may be stale"
     while _time.monotonic() < deadline:
         if not client.session_alive():
-            result = "detached"
+            detached = True
+            warning = None
             break
         _time.sleep(0.1)
     # A daemon that didn't shut down cleanly never resumed the CPU, so the VM
     # is left paused and every later tool call sees it as down.
     note = ensure_not_paused(cfg.vm_name)
-    return f"{result} ({note})" if note else result
+    return _research_ok({
+        "detached": detached,
+        "warning": warning,
+        "recovery": note or None,
+    })
 
 
 @mcp.tool()
-def kdbg_resume(port: int = 1234) -> str:
+def kdbg_resume(port: int = 1234) -> dict[str, Any]:
     """Recovery valve — resume a VM stuck in 'paused (debug)' state.
 
     Connects briefly to the gdbstub and sends cont+detach so QEMU's
@@ -4137,27 +4350,36 @@ def kdbg_resume(port: int = 1234) -> str:
         # Already running: there is nothing to continue, and connecting to
         # the gdbstub anyway halts a healthy VM (QEMU stops the guest CPU
         # the moment a client attaches) — a "no-op" that isn't one.
-        return "VM is already running; nothing to resume"
+        return _research_ok({"resumed": False, "already_running": True})
 
     client = _kdbg_client(cfg)
     if client.session_alive():
-        return "error: a kdbg session is active; call kdbg_detach instead"
+        return _research_error(
+            "a kdbg session is active; call kdbg_detach instead",
+            operation="kdbg_resume",
+        )
 
     from winbox.kdbg.hmp import probe_port as _kdbg_probe_port
     if not _kdbg_probe_port("127.0.0.1", port):
-        return f"error: gdbstub not listening on 127.0.0.1:{port}"
+        return _research_error(
+            f"gdbstub not listening on 127.0.0.1:{port}", operation="kdbg_resume"
+        )
 
     try:
         c = _RspClient.connect("127.0.0.1", port, timeout=5)
     except (OSError, _RspError) as e:
-        return f"error: gdbstub connect failed: {e}"
+        return _research_error(
+            f"gdbstub connect failed: {e}", operation="kdbg_resume"
+        )
     try:
         try:
             c.handshake()
             c.query_halt_reason()
             c.cont()
         except (_RspError, OSError) as e:
-            return f"error: gdbstub resume failed: {e}"
+            return _research_error(
+                f"gdbstub resume failed: {e}", operation="kdbg_resume"
+            )
     finally:
         # close() does interrupt+detach which leaves VM running -- but its
         # own docstring warns the sequence can race QEMU and leave the VM
@@ -4168,8 +4390,10 @@ def kdbg_resume(port: int = 1234) -> str:
     _time.sleep(0.3)
     final = vm.state()
     if final == VMState.RUNNING:
-        return "VM resumed"
-    return f"VM state after release: {final.value}"
+        return _research_ok({"resumed": True, "state": final.value})
+    return _research_error(
+        f"VM state after release: {final.value}", operation="kdbg_resume"
+    )
 
 
 # ─── Entry point ────────────────────────────────────────────────────────────

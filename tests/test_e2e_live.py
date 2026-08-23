@@ -1145,6 +1145,15 @@ class TestJobs:
 
 class TestKdbg:
     @staticmethod
+    def _result(tool, name, *args, **kwargs):
+        """Unwrap and validate the common structured KDBG MCP envelope."""
+        response = tool(name)(*args, **kwargs)
+        assert response["schema"] == "winbox.mcp/1", response
+        assert response["ok"] is True, response
+        assert response["error"] is None, response
+        return response["result"]
+
+    @staticmethod
     def _target_pid(tool, module="winlogon.exe"):
         """A PID to attach to. Nothing more.
 
@@ -1168,17 +1177,21 @@ class TestKdbg:
     def test_symbols_and_lookups(self, run, tool):
         run("kdbg", "start")
         try:
-            assert "symbols" in tool("kdbg_symbols_load")()
-            assert "PsInitialSystemProcess" in tool("kdbg_sym")(
-                "nt!PsInitialSystemProcess"
+            symbols = self._result(tool, "kdbg_symbols_load")
+            assert symbols["module"] == "nt" and symbols["symbol_count"] > 0
+            match = self._result(
+                tool, "kdbg_sym", "nt!PsInitialSystemProcess"
+            )["matches"]
+            assert "PsInitialSystemProcess" in match[0]
+            layout = self._result(
+                tool, "kdbg_struct", "_EPROCESS", "UniqueProcessId"
             )
-            assert "UniqueProcessId" in tool("kdbg_struct")(
-                "_EPROCESS", "UniqueProcessId"
-            )
-            assert "ntoskrnl.exe" in tool("kdbg_lm")()
-            procs = json.loads(tool("kdbg_ps")())
+            assert layout["field"] == "UniqueProcessId" and layout["lines"]
+            modules = self._result(tool, "kdbg_lm")["modules"]
+            assert any(m["name"].lower() == "ntoskrnl.exe" for m in modules)
+            procs = self._result(tool, "kdbg_ps")["processes"]
             assert any(p["name"] == "System" for p in procs)
-            tool("kdbg_base_refresh")()
+            self._result(tool, "kdbg_base_refresh")
         finally:
             run("kdbg", "stop")
 
@@ -1188,28 +1201,47 @@ class TestKdbg:
         run("kdbg", "start")
         try:
             pid = self._target_pid(tool)
-            loaded = tool("kdbg_user_symbols_load")(pid, "ntdll")
-            assert "error" not in loaded.lower(), loaded
-            nt_close = tool("kdbg_sym")("ntdll!NtClose").split()[-1]
-            session = json.loads(tool("kdbg_attach")(pid))
+            loaded = self._result(tool, "kdbg_user_symbols_load", pid, "ntdll")
+            assert loaded["module"] == "ntdll" and loaded["symbol_count"] > 0
+            nt_close = self._result(
+                tool, "kdbg_sym", "ntdll!NtClose"
+            )["matches"][0].split()[-1]
+            user_modules = self._result(tool, "kdbg_user_lm", pid)["modules"]
+            assert any(m["name"].lower() == "winlogon.exe" for m in user_modules)
+            read = self._result(tool, "kdbg_read_va", pid, "0x7FFE0000", 16)
+            assert len(read["bytes"]) == 32
+            session = self._result(tool, "kdbg_attach", pid)
             assert session["target"]["pid"] == pid
 
-            assert json.loads(tool("kdbg_session")())["attached"] is True
-            assert "winlogon.exe" in tool("kdbg_user_lm")(pid)
-            assert len(tool("kdbg_read_va")(pid, "0x7FFE0000", 16).strip()) == 32
-            tool("kdbg_regs")()
-            tool("kdbg_stack")()
-            tool("kdbg_bt")()
-            context = json.loads(tool("kdbg_context")())
+            assert self._result(tool, "kdbg_session")["attached"] is True
+            self._result(tool, "kdbg_regs")
+            self._result(tool, "kdbg_stack")
+            self._result(tool, "kdbg_bt")
+            context = self._result(tool, "kdbg_context")
             assert context["schema"] == "winbox.kdbg-context/1"
             assert context["state"] == "halted"
-            tool("kdbg_mem")("0x7FFE0000", 16)
-            tool("kdbg_disasm")("", 4)
-            lifecycle = json.loads(tool("kdbg_ghidra_run")())
+            started = self._result(tool, "kdbg_cont_start", 30)
+            polled = self._result(tool, "kdbg_cont_poll", started["token"])
+            assert polled["state"] in {"starting", "running"}
+            self._result(tool, "kdbg_cont_cancel", started["token"])
+            deadline = time.monotonic() + 5
+            while True:
+                polled = self._result(tool, "kdbg_cont_poll", started["token"])
+                if not polled["active"]:
+                    break
+                assert time.monotonic() < deadline, polled
+                time.sleep(0.05)
+            assert polled["state"] == "cancelled"
+            assert polled["result"]["reason"] == "interrupt"
+            self._result(tool, "kdbg_mem", "0x7FFE0000", 16)
+            self._result(tool, "kdbg_disasm", "", 4)
+            lifecycle = self._result(tool, "kdbg_ghidra_run")
             assert lifecycle["api"]["worker_pid"] == 1
-            assert json.loads(tool("kdbg_decomp_status")())["image_installed"]
-            decomp = json.loads(tool("kdbg_decomp")(nt_close, 1, 2))
-            assert decomp["schema"] == "winbox.kdbg-decomp/4"
+            assert self._result(tool, "kdbg_decomp_status")["image_installed"]
+            decomp = self._result(
+                tool, "kdbg_decomp", nt_close, before=1, after=2
+            )
+            assert decomp["schema"] == "winbox.kdbg-decomp/5"
             assert decomp["detail"] == "compact"
             assert decomp["target"]["name"]
             assert decomp["verified"]["identity"] == "pdb-guid-age"
@@ -1218,11 +1250,11 @@ class TestKdbg:
                 "ambiguous", "unmapped",
             }
             assert decomp["function"]["name"]
-            assert json.loads(tool("kdbg_bps")())["bps"] == []
+            assert self._result(tool, "kdbg_bps")["bps"] == []
 
-            tool("kdbg_detach")()
-            assert json.loads(tool("kdbg_session")())["attached"] is False
-            assert json.loads(tool("kdbg_ghidra_stop")())["stopped"]
+            self._result(tool, "kdbg_detach")
+            assert self._result(tool, "kdbg_session")["attached"] is False
+            assert self._result(tool, "kdbg_ghidra_stop")["stopped"]
         finally:
             run("kdbg", "stop", expect_ok=False)
 
@@ -1234,8 +1266,8 @@ class TestKdbg:
         run("kdbg", "start")
         try:
             pid = self._target_pid(tool)
-            tool("kdbg_attach")(pid)
-            tool("kdbg_symbols_load")()
+            self._result(tool, "kdbg_attach", pid)
+            self._result(tool, "kdbg_symbols_load")
             try:
                 # Which mechanism works depends on the image. Win11 runs
                 # HVCI by default, which protects kernel code pages, so a
@@ -1248,15 +1280,15 @@ class TestKdbg:
                     mode: tool("kdbg_bp")("nt!NtCreateFile", mode)
                     for mode in ("hw", "soft")
                 }
-                assert any("error" not in out.lower() for out in attempts.values()), (
+                assert any(out["ok"] for out in attempts.values()), (
                     "no breakpoint mechanism worked: " + repr(attempts)
                 )
-                bps = json.loads(tool("kdbg_bps")())["bps"]
+                bps = self._result(tool, "kdbg_bps")["bps"]
                 assert bps, "breakpoint did not register"
-                tool("kdbg_rm")(bps[0]["id"])
-                assert json.loads(tool("kdbg_bps")())["bps"] == []
+                self._result(tool, "kdbg_rm", bps[0]["id"])
+                assert self._result(tool, "kdbg_bps")["bps"] == []
             finally:
-                tool("kdbg_detach")()
+                self._result(tool, "kdbg_detach")
         finally:
             run("kdbg", "stop", expect_ok=False)
         assert _domstate(cfg.vm_name) == "running"
@@ -1269,28 +1301,32 @@ class TestKdbg:
         run("kdbg", "start")
         try:
             pid = self._target_pid(tool)
-            loaded = tool("kdbg_user_symbols_load")(pid, "ntdll")
-            assert "error" not in loaded.lower(), loaded
-            nt_close = tool("kdbg_sym")("ntdll!NtClose").split()[-1]
-            original = tool("kdbg_read_va")(pid, nt_close, 1).strip()
+            loaded = self._result(tool, "kdbg_user_symbols_load", pid, "ntdll")
+            assert loaded["module"] == "ntdll" and loaded["symbol_count"] > 0
+            nt_close = self._result(
+                tool, "kdbg_sym", "ntdll!NtClose"
+            )["matches"][0].split()[-1]
+            original = self._result(
+                tool, "kdbg_read_va", pid, nt_close, 1
+            )["bytes"]
             assert len(original) == 2 and original != "cc", original
 
-            tool("kdbg_attach")(pid)
+            self._result(tool, "kdbg_attach", pid)
             try:
                 for _ in range(3):
-                    added = json.loads(tool("kdbg_bp")(
-                        "ntdll!NtClose", "soft"
-                    ))
+                    added = self._result(
+                        tool, "kdbg_bp", "ntdll!NtClose", "soft"
+                    )
                     assert added["user_mode"] is True
                     assert added["hw"] is False
-                    tool("kdbg_rm")(added["id"])
-                    assert json.loads(tool("kdbg_bps")())["bps"] == []
-                    restored = json.loads(tool("kdbg_mem")(
-                        nt_close, 1
-                    ))["bytes"]
+                    self._result(tool, "kdbg_rm", added["id"])
+                    assert self._result(tool, "kdbg_bps")["bps"] == []
+                    restored = self._result(
+                        tool, "kdbg_mem", nt_close, 1
+                    )["bytes"]
                     assert restored == original
             finally:
-                tool("kdbg_detach")()
+                self._result(tool, "kdbg_detach")
         finally:
             run("kdbg", "stop", expect_ok=False)
         assert _domstate(cfg.vm_name) == "running"
@@ -1311,9 +1347,9 @@ class TestKdbg:
         try:
             # Load symbols against this boot, then move every base underneath
             # them.
-            tool("kdbg_symbols_load")()
+            self._result(tool, "kdbg_symbols_load")
             pid = self._target_pid(tool)
-            tool("kdbg_user_symbols_load")(pid, "winlogon.exe")
+            self._result(tool, "kdbg_user_symbols_load", pid, "winlogon.exe")
         finally:
             run("kdbg", "stop", expect_ok=False)
 
@@ -1333,52 +1369,59 @@ class TestKdbg:
         try:
             # No kdbg_base_refresh, no kdbg_user_symbols_load. Just attach.
             fresh_pid = self._target_pid(tool)
-            session = json.loads(tool("kdbg_attach")(fresh_pid))
+            session = self._result(tool, "kdbg_attach", fresh_pid)
             assert session["target"]["pid"] == fresh_pid
             try:
-                procs = json.loads(tool("kdbg_ps")())
+                procs = self._result(tool, "kdbg_ps")["processes"]
                 assert any(p["name"] == "System" for p in procs), (
                     "walkers still using a stale nt base"
                 )
-                assert "winlogon.exe" in tool("kdbg_user_lm")(fresh_pid)
+                modules = self._result(tool, "kdbg_user_lm", fresh_pid)["modules"]
+                assert any(m["name"].lower() == "winlogon.exe" for m in modules)
             finally:
-                tool("kdbg_detach")()
+                self._result(tool, "kdbg_detach")
         finally:
             run("kdbg", "stop", expect_ok=False)
 
         assert _domstate(cfg.vm_name) == "running"
 
     def test_session_reports_nothing_attached_when_idle(self, tool):
-        assert json.loads(tool("kdbg_session")())["attached"] is False
+        assert self._result(tool, "kdbg_session")["attached"] is False
 
     def test_resume_is_a_noop_on_a_running_vm(self, tool, cfg):
-        tool("kdbg_resume")()
+        self._result(tool, "kdbg_resume")
         assert _domstate(cfg.vm_name) == "running"
 
     def test_user_symbols_load(self, tool, run):
         run("kdbg", "start")
         try:
             pid = self._target_pid(tool)
-            tool("kdbg_attach")(pid)
+            self._result(tool, "kdbg_attach", pid)
             try:
-                out = tool("kdbg_user_symbols_load")(pid, "winlogon.exe")
-                assert "error" not in out.lower() or "symbols" in out.lower()
+                out = self._result(
+                    tool, "kdbg_user_symbols_load", pid, "winlogon.exe"
+                )
+                assert out["module"] == "winlogon" and out["symbol_count"] > 0
             finally:
-                tool("kdbg_detach")()
+                self._result(tool, "kdbg_detach")
         finally:
             run("kdbg", "stop", expect_ok=False)
 
     def test_mcp_stub_lifecycle_tools(self, tool, cfg):
         """The MCP mirrors of `kdbg start/status/stop`."""
-        assert "UserShadowStack=" in tool("kdbg_cet_status")()
-        assert tool("kdbg_prepare")().startswith("refused:")
-        assert tool("kdbg_restore_cet")().startswith("refused:")
-        tool("kdbg_stop")()
-        assert "listening" in tool("kdbg_start")()
+        assert "UserShadowStack=" in self._result(
+            tool, "kdbg_cet_status"
+        )["summary"]
+        refused = tool("kdbg_prepare")()
+        assert refused["ok"] is False and refused["error"]["code"] == "invalid_argument"
+        refused = tool("kdbg_restore_cet")()
+        assert refused["ok"] is False and refused["error"]["code"] == "invalid_argument"
+        self._result(tool, "kdbg_stop")
+        assert "listening" in self._result(tool, "kdbg_start")
         try:
-            assert "listening" in tool("kdbg_status")()
+            assert "listening" in self._result(tool, "kdbg_status")
         finally:
-            assert "stopped" in tool("kdbg_stop")()
+            assert "stopped" in self._result(tool, "kdbg_stop")
         assert _domstate(cfg.vm_name) == "running"
 
     def test_kdbg_cli_surface(self, run, tool, cfg):
@@ -1401,9 +1444,11 @@ class TestKdbg:
             run("kdbg", "session")
 
             pid = str(self._target_pid(tool))
-            loaded = tool("kdbg_user_symbols_load")(int(pid), "ntdll")
-            assert "error" not in loaded.lower(), loaded
-            nt_close = tool("kdbg_sym")("ntdll!NtClose").split()[-1]
+            loaded = self._result(tool, "kdbg_user_symbols_load", int(pid), "ntdll")
+            assert loaded["module"] == "ntdll" and loaded["symbol_count"] > 0
+            nt_close = self._result(
+                tool, "kdbg_sym", "ntdll!NtClose"
+            )["matches"][0].split()[-1]
             run("kdbg", "attach", pid)
             try:
                 run("kdbg", "regs")
@@ -1428,10 +1473,10 @@ class TestKdbg:
                 # been seen to exhaust its DR slots on Server.
                 run("kdbg", "bp", "nt!NtCreateFile", "--mode", "hw",
                     expect_ok=False)
-                if not json.loads(tool("kdbg_bps")())["bps"]:
+                if not self._result(tool, "kdbg_bps")["bps"]:
                     run("kdbg", "bp", "nt!NtCreateFile", "--mode", "soft",
                         expect_ok=False)
-                bps = json.loads(tool("kdbg_bps")())["bps"]
+                bps = self._result(tool, "kdbg_bps")["bps"]
                 assert bps, "no breakpoint mechanism worked from the CLI"
                 run("kdbg", "rm", str(bps[0]["id"]))
             finally:

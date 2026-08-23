@@ -39,7 +39,7 @@ PS C:\Windows\system32>
 
 ## Platform capabilities
 
-- **MCP server** — 70 tools form a bounded, AI-native research control plane
+- **MCP server** — 73 tools form a bounded, AI-native research control plane
   for autonomous agents, covering VM lifecycle, execution, memory, symbols,
   debugging, drivers, IPC, defenses, networking, event logs, and evidence
   collection.
@@ -362,7 +362,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (70):**
+**Available tools (73):**
 
 User-mode primitives:
 
@@ -445,16 +445,23 @@ and requires a reboot.
 
 *Session daemon — long-running debug session (attach once, drive across many tool calls):*
 
+Every `kdbg_*` MCP tool returns structured `winbox.mcp/1` content:
+`{schema, ok, result, error}`. Failures use stable error codes, retryability,
+and bounded recovery hints instead of prose that an agent must parse.
+
 | Tool | Description |
 |------|-------------|
 | `kdbg_attach(pid, port?)` | Fork the session daemon and attach to a target process. VM keeps running; bps stay armed until detach |
 | `kdbg_detach()` | Tear down the session and leave the VM running |
 | `kdbg_session()` | Show current daemon state (target pid, attach time, bp count, halted vs running) |
-| `kdbg_bp(target, mode?, condition?, wp_type?, wp_size?, actions?)` | Install an explicit hardware/software breakpoint or hardware watchpoint. Optional predicates filter fires server-side; actions evaluate expressions, append JSONL trace records, and auto-continue. Hardware execution breakpoints and watchpoints share four DR slots; no implicit `auto` fallback can silently patch code. |
+| `kdbg_bp(target, mode?, condition?, wp_type?, wp_size?, actions?)` | Install an explicit hardware/software breakpoint or hardware watchpoint. Predicates support exact-width `byte`/`word`/`dword`/`qword` reads; actions additionally support bounded `bytes`/`ascii`/`utf16` capture. Action hits append JSONL traces and auto-continue. |
 | `kdbg_bps()` | List installed bps with hit/skip/error counters |
 | `kdbg_bp_trace(bp_id, tail?, from_hit?, limit?, expression?, value?, errors_only?, summary?, top?)` | Bounded backward tail or cursor pagination over action traces, with projection/filtering and AI-sized value/error/distribution summaries |
 | `kdbg_rm(bp_id)` | Remove an installed bp |
 | `kdbg_cont(timeout?)` | Resume; block until next stop in target's CR3 set (KPTI-aware: kernel + user PML4) |
+| `kdbg_cont_start(timeout?)` | Start a durable host-side continue and return a token immediately; survives MCP reloads |
+| `kdbg_cont_poll(token?)` | Poll the current/tokenized continue job and retrieve its bounded terminal stop |
+| `kdbg_cont_cancel(token?)` | Interrupt and cancel the durable continue job |
 | `kdbg_step(over?, out?)` | Single-step, step over calls/syscalls, or step out via a temporary return-address breakpoint |
 | `kdbg_interrupt()` | Halt a running cont via raw `\x03` on the RSP socket |
 | `kdbg_resume(port?)` | Recovery valve for a VM left paused after a debugger/client failure |
@@ -464,8 +471,8 @@ and requires a reboot.
 | `kdbg_context(disasm_count?, stack_qwords?, bt_depth?, memory?)` | Return one stop-epoch-pinned triage bundle with registers, symbolized assembly, stack, heuristic backtrace, breakpoints, and bounded optional memory reads |
 | `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |
-| `kdbg_disasm(addr?, count?)` | Symbol-annotated Capstone disassembly at a target VA or the current RIP |
-| `kdbg_decomp(addr?, symbol?, module?, rva?, cursor?, before?, after?, full?, binary?, timeout?, detail="compact", lines?, assembly="nearby")` | Resolve current RIP, runtime VA, symbol, or module+RVA, verify the exact PE, and return stop-pinned RVA-linked assembly/pseudocode with bounded pagination |
+| `kdbg_disasm(addr?, count?, instruction_bytes?)` | Symbol-annotated Capstone disassembly; raw bytes are opt-in |
+| `kdbg_decomp(addr?, symbol?, module?, rva?, cursor?, before?, after?, full?, binary?, timeout?, detail="compact", lines?, assembly="nearby", instruction_bytes?, runtime_vas?)` | Resolve current RIP, runtime VA, symbol, or module+RVA, verify the exact PE, and return stop-pinned RVA-linked assembly/pseudocode with bounded pagination; repeated VAs and raw bytes are opt-in |
 | `kdbg_decomp_status()` | Report PyGhidra discovery, isolated worker/JVM state, and durable project-cache status without starting the JVM |
 | `kdbg_ghidra_install(pull?)` | Build the checksum-pinned JDK 21 + Ghidra + PyGhidra Docker image |
 | `kdbg_ghidra_run()` | Start and API-check the private, networkless persistent decompilation container |
@@ -481,7 +488,7 @@ The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker pro
 Kali Linux
 ├── winbox control plane
 │   ├── CLI (Python/Click)
-│   └── MCP server (69 bounded agent tools)
+│   └── MCP server (73 bounded agent tools)
 ├── hypervisor research plane
 │   ├── QMP/HMP ────────────> VM + gdbstub lifecycle
 │   ├── persistent RSP ─────> vCPUs, memory, break/watchpoints, stepping

@@ -27,20 +27,24 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 WORKER_API = "4"
 
 
+def protocol_family() -> str:
+    return f"api{WORKER_API}"
+
+
 def runtime_dir(cfg: Config) -> Path:
     return Path(cfg.winbox_dir) / "decomp"
 
 
 def socket_path(cfg: Config) -> Path:
-    return runtime_dir(cfg) / "decomp.sock"
+    return runtime_dir(cfg) / f"decomp-{protocol_family()}.sock"
 
 
 def lock_path(cfg: Config) -> Path:
-    return runtime_dir(cfg) / "decomp.lock"
+    return runtime_dir(cfg) / f"decomp-{protocol_family()}.lock"
 
 
 def session_path(cfg: Config) -> Path:
-    return runtime_dir(cfg) / "decomp.session.json"
+    return runtime_dir(cfg) / f"decomp-{protocol_family()}.session.json"
 
 
 def cache_dir(cfg: Config) -> Path:
@@ -48,7 +52,7 @@ def cache_dir(cfg: Config) -> Path:
 
 
 def log_path(cfg: Config) -> Path:
-    return runtime_dir(cfg) / "decomp.log"
+    return runtime_dir(cfg) / f"decomp-{protocol_family()}.log"
 
 
 def project_dir() -> Path:
@@ -185,8 +189,8 @@ class DecompClient:
                 if result["active_worker_api"] != WORKER_API:
                     result["error"] = (
                         f"worker API {result['active_worker_api'] or 'legacy'} owns "
-                        f"the decomp socket; the next query will migrate it to API "
-                        f"{WORKER_API}"
+                        f"the {protocol_family()} socket; refusing automatic migration. "
+                        "Reload/version-align the client and worker."
                     )
                 else:
                     result["error"] = (
@@ -236,8 +240,8 @@ class DecompClient:
             if result["active_worker_api"] != WORKER_API:
                 result["error"] = (
                     f"worker API {result['active_worker_api'] or 'legacy'} owns "
-                    f"the decomp socket; the next query will migrate it to API "
-                    f"{WORKER_API}"
+                    f"the {protocol_family()} socket; refusing automatic migration. "
+                    "Reload/version-align the client and worker."
                 )
             else:
                 result["error"] = (
@@ -252,9 +256,10 @@ class DecompClient:
         if active is not None and active != selected:
             self._shutdown_conflicting_worker(active, selected)
         elif active is not None and self.active_worker_api() != WORKER_API:
-            self._shutdown_conflicting_worker(
-                f"{active} API {self.active_worker_api() or 'legacy'}",
-                f"{selected} API {WORKER_API}",
+            raise DecompError(
+                f"worker API {self.active_worker_api() or 'legacy'} owns the "
+                f"{protocol_family()} namespace; refusing automatic shutdown or "
+                f"downgrade. Reload/version-align for API {WORKER_API}."
             )
 
     def call(
@@ -279,14 +284,11 @@ class DecompClient:
                 )
             self._shutdown_conflicting_worker(active, selected_backend)
         elif active is not None and self.active_worker_api() != WORKER_API:
-            if not start:
-                raise DecompError(
-                    f"worker API {self.active_worker_api() or 'legacy'} is active "
-                    f"but API {WORKER_API} is required"
-                )
-            self._shutdown_conflicting_worker(
-                f"{active} API {self.active_worker_api() or 'legacy'}",
-                f"{selected_backend} API {WORKER_API}",
+            raise DecompError(
+                f"worker API {self.active_worker_api() or 'legacy'} owns the "
+                f"{protocol_family()} namespace but API {WORKER_API} is required; "
+                "refusing automatic shutdown or downgrade. Reload/version-align "
+                "the client and worker."
             )
         payload = json.dumps(
             {"op": op, "args": args}, separators=(",", ":")

@@ -11,9 +11,11 @@ Grammar::
     and     := cmp ('&&' cmp)*
     cmp     := bitand (CMP bitand)?
     bitand  := atom ('&' atom)*
-    atom    := INT | REG | MEM | POI | '(' or ')'
+    atom    := INT | REG | MEM | POI | TYPED | '(' or ')'
     MEM     := '[' (REG | INT) (('+' | '-') INT)? ']'   # qword little-endian
     POI     := 'poi' '(' atom (('+' | '-') INT)? ')'    # chained qword deref
+    TYPED   := ('byte'|'word'|'dword'|'qword') '(' atom (('+' | '-') INT)? ')'
+    CAPTURE := ('bytes'|'ascii'|'utf16') '(' atom ',' INT ')' # actions only
     REG     := rax|rbx|rcx|rdx|rsi|rdi|rbp|rsp|r8..r15|rip|eflags
     INT     := 0x[0-9a-fA-F]+ | [0-9]+
     CMP     := == | != | < | <= | > | >=
@@ -22,13 +24,17 @@ All values are 64-bit unsigned. Comparisons return 0/1. ``&&``/``||``
 short-circuit. ``poi(expr)`` reads a qword at the address ``expr``
 evaluates to, enabling chained pointer chases:
 ``poi(poi(rcx+0x10)+0x8) == 0x1234``.
+
+Buffer captures are accepted only when ``parse(..., allow_capture=True)`` and
+must be the complete action expression. Their length is a literal so bounds
+are enforced at breakpoint-install time, never after an untrusted hit.
 """
 
 from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 
 # ── Errors ──────────────────────────────────────────────────────────────
@@ -142,6 +148,67 @@ class Poi:
 
 
 @dataclass(frozen=True)
+class TypedRead:
+    """Little-endian scalar read with an explicit 1/2/4/8-byte width."""
+
+    inner: object
+    offset: int
+    width: int
+    name: str
+
+    def eval(self, regs: bytes, mem: Callable[..., Any]) -> int:
+        addr = (self.inner.eval(regs, mem) + self.offset) & 0xFFFFFFFFFFFFFFFF
+        try:
+            value = mem(addr, self.width)
+        except PredicateRuntimeError:
+            raise
+        except Exception as e:
+            raise PredicateRuntimeError(
+                f"{self.name} read at 0x{addr:x} failed: {type(e).__name__}: {e}"
+            ) from e
+        return int(value) & ((1 << (self.width * 8)) - 1)
+
+
+@dataclass(frozen=True)
+class CaptureValue:
+    kind: str
+    address: int
+    data: bytes
+
+
+@dataclass(frozen=True)
+class CaptureRead:
+    """Bounded action-only buffer capture; never valid in a condition."""
+
+    inner: object
+    length: int
+    kind: str
+
+    @property
+    def capture_length(self) -> int:
+        return self.length
+
+    def eval(self, regs: bytes, mem: Callable[..., Any]) -> CaptureValue:
+        addr = self.inner.eval(regs, mem) & 0xFFFFFFFFFFFFFFFF
+        try:
+            data = mem(addr, self.length, raw=True)
+        except PredicateRuntimeError:
+            raise
+        except Exception as e:
+            raise PredicateRuntimeError(
+                f"{self.kind} capture at 0x{addr:x} failed: "
+                f"{type(e).__name__}: {e}"
+            ) from e
+        if not isinstance(data, bytes) or len(data) != self.length:
+            got = len(data) if isinstance(data, bytes) else type(data).__name__
+            raise PredicateRuntimeError(
+                f"short {self.kind} capture at 0x{addr:x}: got {got}, "
+                f"expected {self.length} bytes"
+            )
+        return CaptureValue(self.kind, addr, data)
+
+
+@dataclass(frozen=True)
 class BitAnd:
     left: object
     right: object
@@ -216,6 +283,8 @@ def _tokenize(src: str) -> list[tuple]:
             out.append(("PLUS",)); i += 1; continue
         if c == "-":
             out.append(("MINUS",)); i += 1; continue
+        if c == ",":
+            out.append(("COMMA",)); i += 1; continue
         # Two-char ops first.
         two = src[i:i+2]
         if two in ("==", "!=", "<=", ">=", "&&", "||"):
@@ -272,10 +341,15 @@ def _tokenize(src: str) -> list[tuple]:
             ident = src[i:j].lower()
             if ident == "poi":
                 out.append(("POI",))
+            elif ident in ("byte", "word", "dword", "qword"):
+                out.append(("TYPED", ident))
+            elif ident in ("bytes", "ascii", "utf16"):
+                out.append(("CAPTURE", ident))
             elif ident not in _REG_OFFSETS:
                 raise PredicateSyntaxError(
                     f"unknown identifier {ident!r} at offset {i} "
-                    f"(allowed: poi, {sorted(_REG_OFFSETS)})"
+                    f"(allowed: poi, byte, word, dword, qword, "
+                    f"bytes, ascii, utf16, {sorted(_REG_OFFSETS)})"
                 )
             else:
                 out.append(("REG", ident))
@@ -302,9 +376,10 @@ _MAX_TOKENS = 500
 
 
 class _Parser:
-    def __init__(self, toks: list[tuple]) -> None:
+    def __init__(self, toks: list[tuple], *, allow_capture: bool = False) -> None:
         self.toks = toks
         self.pos = 0
+        self.allow_capture = allow_capture
         # Tracks currently-open '(' / '[' nesting. Bumped on entry,
         # decremented on exit. Capped to keep recursive-descent off the
         # Python recursion limit (which would raise RecursionError, not
@@ -327,7 +402,14 @@ class _Parser:
         return self._eat()
 
     def parse(self):
-        node = self._or()
+        if self._peek() is not None and self._peek()[0] == "CAPTURE":
+            if not self.allow_capture:
+                raise PredicateSyntaxError(
+                    "buffer captures are action-only; conditions must remain scalar"
+                )
+            node = self._capture()
+        else:
+            node = self._or()
         if self._peek() is not None:
             raise PredicateSyntaxError(f"trailing tokens: {self.toks[self.pos:]!r}")
         return node
@@ -406,6 +488,20 @@ class _Parser:
                 return self._poi()
             finally:
                 self.depth -= 1
+        if t[0] == "TYPED":
+            self.depth += 1
+            if self.depth > _MAX_PAREN_DEPTH:
+                raise PredicateSyntaxError(
+                    f"expression too deep (max nesting {_MAX_PAREN_DEPTH})"
+                )
+            try:
+                return self._typed()
+            finally:
+                self.depth -= 1
+        if t[0] == "CAPTURE":
+            raise PredicateSyntaxError(
+                "buffer capture must be the complete action expression"
+            )
         raise PredicateSyntaxError(f"unexpected token {t!r}")
 
     def _mem(self):
@@ -453,11 +549,52 @@ class _Parser:
         self._expect("RP")
         return Poi(inner, offset)
 
+    def _typed(self):
+        token = self._expect("TYPED")
+        name = token[1]
+        self._expect("LP")
+        inner = self._atom()
+        offset = self._offset("inside typed read")
+        self._expect("RP")
+        width = {"byte": 1, "word": 2, "dword": 4, "qword": 8}[name]
+        return TypedRead(inner, offset, width, name)
+
+    def _capture(self):
+        token = self._expect("CAPTURE")
+        kind = token[1]
+        self._expect("LP")
+        inner = self._atom()
+        self._expect("COMMA")
+        length = self._expect("INT")[1]
+        self._expect("RP")
+        if not 1 <= length <= 256:
+            raise PredicateSyntaxError(
+                f"{kind} capture length must be between 1 and 256 bytes"
+            )
+        if kind == "utf16" and length % 2:
+            raise PredicateSyntaxError("utf16 capture length must be even")
+        return CaptureRead(inner, length, kind)
+
+    def _offset(self, context: str) -> int:
+        offset = 0
+        nxt = self._peek()
+        if nxt is not None and nxt[0] in ("PLUS", "MINUS"):
+            sign = 1 if nxt[0] == "PLUS" else -1
+            self._eat()
+            it = self._peek()
+            if it is None or it[0] != "INT":
+                raise PredicateSyntaxError(
+                    f"expected INT after +/- {context}, got {it!r}"
+                )
+            self._eat()
+            offset = sign * it[1]
+        return offset
+
 
 # ── Public API ─────────────────────────────────────────────────────────
 
 
-def parse(src: str):
+def parse(src: str, *, allow_capture: bool = False):
     """Parse a predicate string into an evaluable AST.
 
     Raises ``PredicateSyntaxError`` for malformed input. The returned
@@ -475,4 +612,4 @@ def parse(src: str):
         raise PredicateSyntaxError(
             f"predicate too long: {len(toks)} tokens (max {_MAX_TOKENS})"
         )
-    return _Parser(toks).parse()
+    return _Parser(toks, allow_capture=allow_capture).parse()

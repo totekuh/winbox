@@ -40,9 +40,32 @@ the last two remove repeated agent round-trips and address arithmetic.
 | 4 | **63 — RVA/symbol inputs and decomp pagination** | 4 | 5 | Completed with API 4 continuation caching. |
 | 5 | **54 — one bounded stop-triage response** | 4 | 5 | Completed in daemon, CLI, and MCP. |
 
-Items 64 (compact/structured MCP responses), 53 (typed trace reads), and 62
-(verified PDB enrichment) are the next tier: all have high payoff, but either
-touch more public contracts or require deeper Ghidra/PDB integration.
+### Completed second top-five batch (2026-08-23)
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **67 — machine-safe lifecycle JSON** | 5 | 3 | Completed with narrow-terminal coverage. |
+| 2 | **64 — structured, compact MCP evidence** | 4 | 5 | Completed across every `kdbg_*` MCP tool. |
+| 3 | **60 — worker API isolation** | 4 | 4 | Completed with protocol-family namespaces. |
+| 4 | **53 — typed reads and bounded captures** | 3 | 5 | Completed in predicates/actions and trace metadata. |
+| 5 | **41 — durable asynchronous continue** | 3 | 5 | Completed in CLI/MCP with process/socket integration coverage. |
+
+Verification: the complete default suite passes (`2424 passed, 5 skipped`),
+and the real detached Unix-socket worker passed six consecutive process-boundary
+runs. Live Server 2025 validation against `services.exe` captured 1,270 action
+hits with exact-width scalar, raw-byte, ASCII, and UTF-16 values; a durable
+continue was started, polled, cancelled, and recovered through MCP; and the
+original `services!RQueryServiceStatus` hardware breakpoint was restored.
+The API-4 Docker worker reused the cached exact binary and returned decomp
+schema 5 with mapped lines, RVAs, omitted bytes/VAs by default, and explicit
+opt-in coordinates. Post-reload MCP calls returned native structured content,
+bounded classified errors, and correctly labelled an invalid timeout as a
+non-retryable `invalid_argument`.
+
+Items 62 (verified PDB enrichment), 66 (truthful runtime verification), and 58
+(build-keyed PE publication) are now the highest-value correctness/quality
+tier. Items 61 and 65 remain the main hostile-input and long-session resource
+management work.
 
 ### 56. Completed — guest-derived module path hardening
 
@@ -125,7 +148,7 @@ undecoded gaps return nearest before/after instructions with an explicit label.
 Oversized-code, gaps, cap boundaries, later lines, shared instructions, and all
 response detail contracts are covered.
 
-### 60. Worker API migration is unsafe across concurrently installed clients
+### 60. Completed — worker API migration is isolated across installed clients
 
 Any `DecompClient` whose expected worker API differs from the lock owner sends
 `shutdown` and starts its selected version. A stale MCP process can therefore
@@ -138,6 +161,14 @@ package protocol family), and garbage-collect old idle versions explicitly.
 At minimum, refuse automatic downgrades and return an actionable reload/version
 error. Test old/new clients in both call orders and during an active request.
 Small-to-moderate effort, high rollout stability payoff.
+
+Implemented protocol-family namespacing for worker sockets, locks, session
+records, logs, Docker lifecycle locks, and container names. Old/new API clients
+now start independently and preserve one another's JVM/in-flight work. A
+worker declaring the wrong API inside a namespace is refused; it is never
+automatically shut down or downgraded. Container ownership includes the worker
+API label. Immutable binary copies remain full-SHA keyed and durable Ghidra
+projects remain Ghidra-version/full-SHA keyed across ordinary worker restarts.
 
 ### 61. The Ghidra service lacks resource limits, cancellation, and request liveness
 
@@ -199,7 +230,7 @@ pages avoid another `decompileFunction` call while still revalidating live
 identity. Malformed/oversized/forged/stale cursors and coordinate conflicts are
 covered.
 
-### 64. MCP responses waste tokens and errors are not machine-actionable
+### 64. Completed — compact structured MCP responses and actionable errors
 
 A live 68-line mapped response occupied 21,443 bytes. Compact JSON plus omission
 of repeated per-instruction `va` and `bytes` fields was 9,973 bytes, a 53.5%
@@ -209,11 +240,11 @@ time, success is JSON but failure is a prose string prefixed with `error:`.
 Agents cannot reliably distinguish missing prerequisites, worker busy, stale
 stop, identity mismatch, timeout, or corrupt cache.
 
-Use compact MCP serialization/structured content, make bytes and repeated VAs
-opt-in, and version a common `{ok,result,error}` envelope whose error contains
-`code`, `message`, `retryable`, and bounded recovery hints. Preserve readable
-pretty JSON in interactive CLI output only. Small-to-moderate contract change,
-high context-efficiency and autonomous-recovery payoff.
+Every `kdbg_*` MCP tool now returns a versioned `winbox.mcp/1`
+`{schema,ok,result,error}` structured object. Errors have stable codes,
+retryability, operation names, bounded messages, and at most three recovery
+hints. Decomp schema 5 omits raw instruction bytes and repeated runtime VAs by
+default; both remain explicit opt-ins. Interactive CLI output stays readable.
 
 ### 65. Analysis caches grow without visibility or eviction and one open slot thrashes
 
@@ -247,32 +278,32 @@ host PE once before parsing and hashing. A later enhancement can compare all
 function bytes while masking verified PE base relocations, producing bounded
 changed ranges. Moderate effort, high evidence-honesty payoff.
 
-### 67. New Ghidra status CLI commands corrupt JSON at narrow terminal widths
+### 67. Completed — Ghidra lifecycle JSON is pipe-safe at narrow widths
 
 `winbox kdbg decomp-status` and `winbox kdbg ghidra status` serialize JSON and
 then send it through Rich. At `COLUMNS=40`, both reproduced
 `Invalid control character` when piped into `python -m json.tool`, because Rich
 wraps inside JSON string values. `kdbg decomp` already fixed this exact defect.
 
-Emit lifecycle/status JSON with `click.echo` and add narrow-width pipe tests for
-every JSON-producing kdbg CLI surface. Tiny effort, immediate scripting UX
-payoff.
+All decompiler lifecycle/status JSON now bypasses Rich wrapping through
+`click.echo`. Pipe tests run at `COLUMNS=20` with long string values and cover
+decomp status plus Ghidra install, run, stop, and status.
 
-### 53. Predicates/actions need typed reads and bounded buffer capture
+### 53. Completed — typed reads and bounded action-only buffer capture
 
 The expression language reads only unsigned little-endian qwords. Masking a
 qword can approximate a byte/dword, but it is wrong at page boundaries and
 cannot capture the buffers, strings, lengths, and narrow fields that dominate
 IOCTL/RPC/parser research.
 
-Add scalar `byte()`, `word()`, `dword()`, and `qword()` reads first, preserving
-short-circuiting, batching, candidate retry, unmapped counters, and exact CR3
-restore semantics. Then add action-only bounded `bytes(addr,len)`, ASCII, and
-UTF-16 capture with strict per-hit/per-trace size caps. Conditions must remain
-scalar and side-effect free. Moderate implementation effort, broad research
-payoff.
+Predicates/actions now support exact-width `byte()`, `word()`, `dword()`, and
+`qword()` reads. Actions additionally support `bytes()`, `ascii()`, and
+`utf16()` captures with a 256-byte expression cap, 1024 raw bytes per hit,
+16 MiB per trace, and 16 actions per breakpoint. Captures are rejected in
+conditions and nested scalar expressions; batching, candidate retry,
+short-circuiting, and page-boundary behavior remain covered.
 
-### 41. `kdbg_cont` is a blocking MCP operation
+### 41. Completed — durable asynchronous continue jobs
 
 The cont tool blocks for up to `timeout` seconds. The daemon already services
 `interrupt` and `status` through `_pump_client`, but the initiating MCP request
@@ -280,13 +311,12 @@ remains occupied. That is especially awkward for an AI agent waiting on a rare
 breakpoint: it cannot naturally poll progress, inspect accumulating action
 traces, or survive an MCP transport restart.
 
-The smallest robust design is a durable host-side cont worker:
-`kdbg_cont_start` records a session token and returns immediately,
-`kdbg_cont_poll` reads a bounded persisted result/status, and interrupt/detach
-cancel it. The worker talks to the existing daemon protocol, so the RSP state
-machine does not need to become multithreaded. Guard concurrent starts, stale
-workers, daemon death, detach, and MCP restart. Moderate effort and the highest
-orchestration payoff for autonomous research.
+`kdbg_cont_start` now launches a detached host worker and immediately returns a
+durable token; `kdbg_cont_poll` and `kdbg_cont_cancel` can be used by a newly
+started MCP process. Jobs pin the daemon session, persist bounded mode-0600
+state atomically, reject concurrent starts, detect dead workers, and handle
+cancel/completion and spawn/exec races. Interrupt and detach cancel active jobs
+before operating on the daemon.
 
 ### 54. Completed — bounded one-call stop triage
 

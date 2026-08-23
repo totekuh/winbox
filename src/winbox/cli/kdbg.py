@@ -1053,6 +1053,54 @@ def kdbg_cont(ctx: click.Context, timeout: float) -> None:
     _print_stop(result.get("reason", "?"), result)
 
 
+@kdbg.command("cont-start")
+@click.option(
+    "--timeout", default=300.0, show_default=True, type=float,
+    help="Wall-clock budget for the detached continue operation.",
+)
+@click.pass_context
+def kdbg_cont_start(ctx: click.Context, timeout: float) -> None:
+    """Start a durable continue operation and return immediately as JSON."""
+    import json as _json
+    from winbox.kdbg.debugger.continue_job import ContinueJobError, start_continue
+
+    try:
+        result = start_continue(ctx.obj["cfg"], timeout=timeout)
+    except ContinueJobError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(_json.dumps(result, indent=2))
+
+
+@kdbg.command("cont-poll")
+@click.argument("token", required=False, default="")
+@click.pass_context
+def kdbg_cont_poll(ctx: click.Context, token: str) -> None:
+    """Poll the current durable continue operation as JSON."""
+    import json as _json
+    from winbox.kdbg.debugger.continue_job import ContinueJobError, poll_continue
+
+    try:
+        result = poll_continue(ctx.obj["cfg"], token=token)
+    except ContinueJobError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(_json.dumps(result, indent=2))
+
+
+@kdbg.command("cont-cancel")
+@click.argument("token", required=False, default="")
+@click.pass_context
+def kdbg_cont_cancel(ctx: click.Context, token: str) -> None:
+    """Interrupt and cancel the current durable continue operation."""
+    import json as _json
+    from winbox.kdbg.debugger.continue_job import ContinueJobError, cancel_continue
+
+    try:
+        result = cancel_continue(ctx.obj["cfg"], token=token)
+    except ContinueJobError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(_json.dumps(result, indent=2))
+
+
 @kdbg.command("step")
 @click.option("--over", is_flag=True, default=False,
               help="Step OVER call/syscall — temp hw bp at next instruction.")
@@ -1139,6 +1187,8 @@ def kdbg_regs(ctx: click.Context) -> None:
     show_default=True,
     help="Attach assembly to each selected mapped pseudocode line.",
 )
+@click.option("--instruction-bytes", is_flag=True, help="Include raw instruction bytes.")
+@click.option("--runtime-vas", is_flag=True, help="Include repeated static/runtime VAs.")
 @click.pass_context
 def kdbg_decomp(
     ctx: click.Context,
@@ -1155,6 +1205,8 @@ def kdbg_decomp(
     detail: str,
     lines: str,
     assembly: str,
+    instruction_bytes: bool,
+    runtime_vas: bool,
 ) -> None:
     """Show Ghidra pseudocode at ADDRESS, or at the current RIP.
 
@@ -1183,6 +1235,8 @@ def kdbg_decomp(
             detail=detail,
             lines=lines,
             assembly=assembly,
+            instruction_bytes=instruction_bytes,
+            runtime_vas=runtime_vas,
         )
     except DecompError as exc:
         console.print(f"[red][-][/] {exc}")
@@ -1201,7 +1255,9 @@ def kdbg_decomp_status(ctx: click.Context) -> None:
     from winbox.kdbg.decomp import worker_status
 
     cfg: Config = ctx.obj["cfg"]
-    console.print(_json.dumps(worker_status(cfg), indent=2))
+    # This is an API-like JSON surface. Rich wraps long string values at the
+    # terminal width, which makes redirected output invalid JSON.
+    click.echo(_json.dumps(worker_status(cfg), indent=2))
 
 
 @kdbg.group("ghidra")
@@ -1228,7 +1284,9 @@ def _ghidra_lifecycle(ctx: click.Context, operation: str, **kwargs) -> None:
     except DecompError as exc:
         console.print(f"[red][-][/] {exc}")
         raise SystemExit(1)
-    console.print(_json.dumps(result, indent=2))
+    # Keep every lifecycle command safe to pipe through jq/json.tool even
+    # when COLUMNS is tiny. Human-facing errors above still use Rich.
+    click.echo(_json.dumps(result, indent=2))
 
 
 @kdbg_ghidra.command("install")
@@ -1350,6 +1408,19 @@ def kdbg_detach(ctx: click.Context) -> None:
     if not client.session_alive():
         console.print("[dim]no kdbg session attached[/]")
         return
+    # A durable cont owns the daemon's heavy-operation slot. Interrupt it and
+    # wait briefly so detach is not rejected as BUSY.
+    from winbox.kdbg.debugger.continue_job import (
+        ACTIVE_STATES, ContinueJobError, cancel_continue, poll_continue,
+        wait_continue,
+    )
+    try:
+        job = poll_continue(cfg)
+        if job.get("state") in ACTIVE_STATES:
+            cancel_continue(cfg, token=str(job["token"]))
+            wait_continue(cfg, token=str(job["token"]), timeout=5.0)
+    except ContinueJobError as exc:
+        console.print(f"[yellow][!][/] async continue cleanup: {exc}")
     try:
         client.call("detach")
     except ClientError as e:

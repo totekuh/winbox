@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from winbox.config import Config
-from winbox.kdbg.decomp.client import WORKER_API
+from winbox.kdbg.decomp.client import WORKER_API, protocol_family
 
 
 GHIDRA_VERSION = "12.1.3"
@@ -38,7 +38,7 @@ def _state_id(cfg: Config) -> str:
 
 
 def container_name(cfg: Config) -> str:
-    return f"winbox-ghidra-{os.getuid()}-{_state_id(cfg)}"
+    return f"winbox-ghidra-{os.getuid()}-{_state_id(cfg)}-{protocol_family()}"
 
 
 def project_dir(cfg: Config) -> Path:
@@ -50,7 +50,7 @@ def _lifecycle_lock(cfg: Config):
     root = _state_root(cfg)
     root.mkdir(parents=True, exist_ok=True)
     os.chmod(root, 0o700)
-    with (root / "docker-lifecycle.lock").open("a+b") as handle:
+    with (root / f"docker-lifecycle-{protocol_family()}.lock").open("a+b") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -132,6 +132,7 @@ class DockerManager:
             "io.winbox.component": "pyghidra",
             "io.winbox.state": _state_id(self.cfg),
             "io.winbox.owner-uid": str(os.getuid()),
+            "io.winbox.worker-api": WORKER_API,
         }
         if any(labels.get(key) != value for key, value in expected.items()):
             raise DockerError(
@@ -216,7 +217,10 @@ class DockerManager:
                 f"PyGhidra image is not installed; run `winbox kdbg ghidra install`"
             )
         root = _state_root(self.cfg)
-        socket = root / "decomp.sock"
+        socket_name = f"decomp-{protocol_family()}.sock"
+        session_name = f"decomp-{protocol_family()}.session.json"
+        lock_name = f"decomp-{protocol_family()}.lock"
+        socket = root / socket_name
         existing = self.container_info()
         if (
             existing and existing["running"] and existing["image"] == IMAGE
@@ -253,7 +257,7 @@ class DockerManager:
                 raise DockerError(
                     f"Docker bind-mount path contains an unsupported character: {path}"
                 )
-        for stale in (root / "decomp.sock", root / "decomp.session.json"):
+        for stale in (socket, root / session_name):
             try:
                 stale.unlink()
             except FileNotFoundError:
@@ -265,6 +269,7 @@ class DockerManager:
             "--label", COMPONENT_LABEL,
             "--label", f"io.winbox.state={_state_id(self.cfg)}",
             "--label", f"io.winbox.owner-uid={uid}",
+            "--label", f"io.winbox.worker-api={WORKER_API}",
             "--network", "none", "--read-only", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--pids-limit", "512",
             "--user", f"{uid}:{gid}",
@@ -273,9 +278,9 @@ class DockerManager:
             "--mount", f"type=bind,src={cache},dst=/cache",
             "--mount", f"type=bind,src={projects},dst=/projects",
             IMAGE,
-            "--socket", "/run/winbox/decomp.sock",
-            "--lock", "/run/winbox/decomp.lock",
-            "--session", "/run/winbox/decomp.session.json",
+            "--socket", f"/run/winbox/{socket_name}",
+            "--lock", f"/run/winbox/{lock_name}",
+            "--session", f"/run/winbox/{session_name}",
             "--cache", "/cache", "--projects", "/projects",
             "--ghidra-install-dir", "/opt/ghidra",
             "--backend", "docker",
@@ -306,7 +311,10 @@ class DockerManager:
             self._docker("stop", "--timeout", "20", self.name, timeout=40)
         self._docker("rm", self.name, timeout=30)
         root = _state_root(self.cfg)
-        for stale in (root / "decomp.sock", root / "decomp.session.json"):
+        for stale in (
+            root / f"decomp-{protocol_family()}.sock",
+            root / f"decomp-{protocol_family()}.session.json",
+        ):
             try:
                 stale.unlink()
             except FileNotFoundError:
