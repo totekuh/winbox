@@ -1,8 +1,9 @@
 # winbox — known issues and roadmap
 
-Everything currently known to be wrong, ranked. Each entry says what breaks,
-how it was found, and what fixing it involves. Items are removed when fixed,
-not ticked — `git log` is the record of what was done.
+Everything currently known to be wrong, ranked. Each open entry says what
+breaks, how it was found, and what fixing it involves. Completed entries are
+retained where their design and live evidence are useful context; `git log`
+remains the authoritative implementation record.
 
 Ordering is risk × tractability, not severity alone: an unreproducible crash
 outranks a typo on severity but cannot be worked on, and there is no value in
@@ -15,6 +16,26 @@ a roadmap whose top item nobody can start.
 Items 1-8 have all been worked — `git log` is the record. Item 8 is addressed
 at its source (below) but stays listed as *Watching* because it is intermittent
 by nature.
+
+The major kdbg execution, symbol, decompilation, x64 unwind, and ordinary
+WoW64 x86 unwind paths are implemented and live-verified. Two capability items
+remain: automatic exact-binary staging for deeper user traces (69), followed
+by build-sensitive x86/x64 transition-stack stitching (70). Item 26 is an
+accepted minor trade-off rather than scheduled work, and item 8 remains a
+watch condition rather than an active implementation item.
+
+### Current actionable backlog (2026-08-24)
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **69 — automatic exact-binary staging** | 4 | 5 | Next. Remove the preload requirement with an immutable attach-time manifest or non-contending staging broker. |
+| 2 | **70 — mixed-mode WoW64 transition-stack stitching** | 1 | 3 | Backlog. Valuable for stops inside the WoW64 transition layer; normal x86 application traces already work. |
+
+Latest verification after item 68: complete default suite `2512 passed, 5
+skipped, 140 deselected`; all 11 direct QEMU RSP integrations; all three live
+walk integrations; and reloaded-MCP validation against SysWOW64 `PING.EXE`,
+including x86 context, stack, nine-frame unwind, step-over, step-out, detach,
+and VM resume. Commit `775b2c8` is the implementation baseline.
 
 One finding from the breakpoint work is worth keeping, because it shapes any
 future kdbg change: **neither breakpoint mechanism installs on both images.**
