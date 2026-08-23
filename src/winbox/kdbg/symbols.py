@@ -20,9 +20,12 @@ import os
 import secrets
 import shutil
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
+
+import pefile
 
 _log = logging.getLogger(__name__)
 
@@ -32,6 +35,7 @@ from winbox.kdbg.memory import read_virt_cr3
 from winbox.kdbg.pdb import (
     NT_DEFAULT_TYPES,
     build_type_map,
+    load_fpo,
     load_publics_metadata,
     load_section_headers,
     load_types,
@@ -167,6 +171,9 @@ def copy_user_module(
     ga: GuestAgent,
     vm_path: str,
     cached_name: str,
+    *,
+    architecture: str = "auto",
+    expected_size: int | None = None,
 ) -> Path:
     """Copy any user-mode binary out of the VM into the symbol cache.
 
@@ -174,7 +181,56 @@ def copy_user_module(
     ``C:\\Windows\\System32\\notepad.exe``). ``cached_name`` is the
     filename to store under (e.g. ``notepad.exe``).
     """
-    return _copy_via_share(cfg, ga, vm_path, cached_name)
+    if architecture not in {"auto", "x86", "x64"}:
+        raise SymbolLoadError(f"unsupported module architecture: {architecture!r}")
+
+    candidates = [vm_path]
+    if architecture == "x86":
+        # A 32-bit process sees System32 through WOW64 file-system
+        # redirection, but qemu-ga launches 64-bit PowerShell and therefore
+        # resolves the exact same loader string to the native x64 file.
+        # Translate only Windows' redirected system directory; arbitrary
+        # application paths remain byte-for-byte loader controlled.
+        redirected = re.sub(
+            r"(?i)(\\windows\\)system32(?=\\)",
+            r"\1SysWOW64",
+            vm_path,
+            count=1,
+        )
+        if redirected != vm_path:
+            candidates.insert(0, redirected)
+
+    expected_machine = {"x86": 0x014C, "x64": 0x8664}.get(architecture)
+    failures: list[str] = []
+    for candidate in candidates:
+        try:
+            copied = _copy_via_share(cfg, ga, candidate, cached_name)
+            pe = None
+            try:
+                pe = pefile.PE(str(copied), fast_load=True)
+                machine = int(pe.FILE_HEADER.Machine)
+                image_size = int(pe.OPTIONAL_HEADER.SizeOfImage)
+            except (OSError, pefile.PEFormatError, AttributeError) as exc:
+                raise SymbolLoadError(
+                    f"copied module is not a valid PE: {exc}"
+                ) from exc
+            finally:
+                if pe is not None:
+                    pe.close()
+            if expected_machine is not None and machine != expected_machine:
+                raise SymbolLoadError(
+                    f"copied {candidate} has PE machine 0x{machine:04x}; "
+                    f"expected {architecture} (0x{expected_machine:04x})"
+                )
+            if expected_size is not None and image_size != expected_size:
+                raise SymbolLoadError(
+                    f"copied {candidate} has SizeOfImage 0x{image_size:x}; "
+                    f"live loader reports 0x{expected_size:x}"
+                )
+            return copied
+        except SymbolLoadError as exc:
+            failures.append(str(exc))
+    raise SymbolLoadError("; ".join(failures))
 
 
 # ── nt-specific base resolver ───────────────────────────────────────────
@@ -275,10 +331,24 @@ def load_module(
     ref = read_pdb_ref(pe_path)
     pdb_path = fetch_pdb(ref, cfg.symbols_dir)
 
+    parsed_pe = None
+    try:
+        parsed_pe = pefile.PE(str(pe_path), fast_load=True)
+        machine = int(parsed_pe.FILE_HEADER.Machine)
+    except (OSError, pefile.PEFormatError, AttributeError) as exc:
+        raise SymbolLoadError(f"cannot identify PE architecture: {exc}") from exc
+    finally:
+        if parsed_pe is not None:
+            parsed_pe.close()
+
     sections = load_section_headers(pdb_path)
     publics = load_publics_metadata(pdb_path, sections)
     symbols = publics.symbols
     types = build_type_map(pdb_path, wanted=wanted_types) if wanted_types else {}
+    frame_data = (
+        [record.to_json() for record in load_fpo(pdb_path)]
+        if machine == 0x014C else []
+    )
 
     store.save(
         module=module_name,
@@ -288,7 +358,9 @@ def load_module(
         types=types,
         base=base,
         size_of_image=ref.size_of_image,
+        architecture="x86" if machine == 0x014C else "x64",
         function_symbols=sorted(publics.functions),
+        frame_data=frame_data,
         pe_path=str(pe_path),
         pe_sha256=_sha256(pe_path),
     )
@@ -435,7 +507,9 @@ def ensure_types_loaded(
         types=have,
         base=data.get("base"),
         size_of_image=data.get("size_of_image"),
+        architecture=data.get("architecture"),
         function_symbols=data.get("function_symbols"),
+        frame_data=data.get("frame_data"),
         pe_path=data.get("pe_path"),
         pe_sha256=data.get("pe_sha256"),
     )

@@ -657,7 +657,11 @@ def kdbg_user_symbols(
 
     with console.status(f"[blue]Copying {match.name}, fetching PDB, parsing..."):
         try:
-            pe_path = copy_user_module(cfg, ga, match.full_path, cached_basename)
+            pe_path = copy_user_module(
+                cfg, ga, match.full_path, cached_basename,
+                architecture=match.architecture,
+                expected_size=match.size,
+            )
             info = load_module(
                 cfg, store,
                 pe_path=pe_path,
@@ -1396,15 +1400,16 @@ def kdbg_mem(ctx: click.Context, address: str, length: int) -> None:
 @click.argument("n", type=int, default=16)
 @click.pass_context
 def kdbg_stack(ctx: click.Context, n: int) -> None:
-    """Show N qwords starting at RSP."""
+    """Show N native words starting at RSP/ESP."""
     cfg: Config = ctx.obj["cfg"]
     try:
         result = _client(cfg).call("stack", n=n)
     except ClientError as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
-    console.print(f"[dim]RSP = {result['rsp']}[/]")
-    for entry in result["qwords"]:
+    register = result.get("stack_register", "rsp").upper()
+    console.print(f"[dim]{register} = {result.get('sp', result['rsp'])}[/]")
+    for entry in result.get("entries", result.get("qwords", [])):
         console.print(f"  {entry['offset']}: {entry['value']}")
 
 
@@ -1435,7 +1440,7 @@ def kdbg_context(
 @click.option("-n", "--depth", type=int, default=8, show_default=True)
 @click.pass_context
 def kdbg_bt(ctx: click.Context, depth: int) -> None:
-    """Unwind the live Windows x64 stack from PE .pdata metadata."""
+    """Unwind the live Windows x64 or WoW64 x86 stack."""
     cfg: Config = ctx.obj["cfg"]
     try:
         result = _client(cfg).call("bt", depth=depth)

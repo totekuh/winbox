@@ -115,6 +115,19 @@ def test_local_snapshot_collects_all_cr3_and_kernel_gs_candidates():
     )
 
 
+def test_local_snapshot_read_in_active_cr3_restores_without_g_packet():
+    """Redundant G at a WoW64 stop destroys QEMU's hidden CS mode state."""
+    rsp = FakeRsp()
+    snap = _LocalRspSnapshot(
+        "vm", rsp, StopReply(2, "01", None, "T02thread:01;"),
+    )
+
+    assert snap.read_virtual(0x111000, 0x1000, 2) == b"\x00\x01"
+    snap.restore()
+
+    assert rsp.writes == []
+
+
 def test_local_snapshot_reuses_masqueraded_cr3_and_restores_exact_registers():
     rsp = FakeRsp()
     snap = _LocalRspSnapshot(

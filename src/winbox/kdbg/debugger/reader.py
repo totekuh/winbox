@@ -223,6 +223,7 @@ class _LocalRspSnapshot(DebugSnapshot):
         self._active_cr3 = self.current_cr3
         self._physical = False
         self._poisoned = False
+        self._registers_dirty = False
 
     def _set_cr3(self, cr3: int) -> None:
         if self._physical:
@@ -235,6 +236,7 @@ class _LocalRspSnapshot(DebugSnapshot):
         if reply != b"OK":
             raise ReaderError(f"gdbstub rejected CR3 0x{cr3:x}: {reply!r}")
         self._active_cr3 = cr3
+        self._registers_dirty = True
 
     def _set_physical(self, enabled: bool) -> None:
         if self._physical == enabled:
@@ -257,10 +259,18 @@ class _LocalRspSnapshot(DebugSnapshot):
         try:
             if self._physical:
                 self._set_physical(False)
-            reply = self.rsp.write_registers(self._original_regs)
-            if reply != b"OK":
-                raise ReaderError(f"gdbstub rejected register restore: {reply!r}")
+            # QEMU's x86-64 G handler can lose hidden CS compatibility-mode
+            # state even when handed the exact blob returned by g. A
+            # read-only snapshot in the already-active CR3 has nothing to
+            # restore, so never issue that dangerous redundant G packet.
+            if self._registers_dirty:
+                reply = self.rsp.write_registers(self._original_regs)
+                if reply != b"OK":
+                    raise ReaderError(
+                        f"gdbstub rejected register restore: {reply!r}"
+                    )
             self._active_cr3 = self.current_cr3
+            self._registers_dirty = False
         except BaseException:
             self._poisoned = True
             raise

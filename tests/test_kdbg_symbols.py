@@ -365,6 +365,163 @@ def test_copy_via_share_propagates_powershell_failure_without_artifacts(tmp_path
     assert not list(cfg.symbols_dir.glob("*.part"))
 
 
+class _FakePe:
+    def __init__(self, machine: int, size: int) -> None:
+        self.FILE_HEADER = SimpleNamespace(Machine=machine)
+        self.OPTIONAL_HEADER = SimpleNamespace(SizeOfImage=size)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_copy_user_module_redirects_system32_for_x86_and_validates_identity(
+    tmp_path, monkeypatch,
+):
+    cfg = _CopyCfg(tmp_path)
+    copied = tmp_path / "ntdll.dll"
+    copied.write_bytes(b"MZ")
+    sources: list[str] = []
+
+    def fake_copy(_cfg, _ga, source, _name):
+        sources.append(source)
+        return copied
+
+    parsed = _FakePe(0x014C, 0x1A0000)
+    monkeypatch.setattr(symbols, "_copy_via_share", fake_copy)
+    monkeypatch.setattr(symbols.pefile, "PE", lambda *_a, **_k: parsed)
+
+    result = symbols.copy_user_module(
+        cfg, object(), r"C:\Windows\System32\ntdll.dll", "ntdll.dll",
+        architecture="x86", expected_size=0x1A0000,
+    )
+
+    assert result == copied
+    assert sources == [r"C:\Windows\SysWOW64\ntdll.dll"]
+    assert parsed.closed is True
+
+
+def test_copy_user_module_rejects_wrong_machine_and_live_size(
+    tmp_path, monkeypatch,
+):
+    cfg = _CopyCfg(tmp_path)
+    copied = tmp_path / "module.dll"
+    copied.write_bytes(b"MZ")
+    monkeypatch.setattr(
+        symbols, "_copy_via_share", lambda *_args, **_kwargs: copied,
+    )
+    monkeypatch.setattr(
+        symbols.pefile, "PE", lambda *_a, **_k: _FakePe(0x8664, 0x2000),
+    )
+
+    with pytest.raises(SymbolLoadError, match="expected x86"):
+        symbols.copy_user_module(
+            cfg, object(), r"C:\app\module.dll", "module.dll",
+            architecture="x86", expected_size=0x2000,
+        )
+
+    monkeypatch.setattr(
+        symbols.pefile, "PE", lambda *_a, **_k: _FakePe(0x014C, 0x3000),
+    )
+    with pytest.raises(SymbolLoadError, match="live loader reports"):
+        symbols.copy_user_module(
+            cfg, object(), r"C:\app\module.dll", "module.dll",
+            architecture="x86", expected_size=0x2000,
+        )
+
+
+@pytest.mark.parametrize("architecture", ["arm64", "X86", ""])
+def test_copy_user_module_rejects_unknown_architecture(
+    tmp_path, architecture,
+):
+    with pytest.raises(SymbolLoadError, match="unsupported module architecture"):
+        symbols.copy_user_module(
+            _CopyCfg(tmp_path), object(), r"C:\app\module.dll", "module.dll",
+            architecture=architecture,
+        )
+
+
+def test_load_module_persists_x86_fpo_and_function_starts(
+    tmp_path, monkeypatch,
+):
+    """Integration boundary: PE/PDB parser outputs reach the durable store."""
+    from winbox.kdbg.pe import PdbRef
+
+    pe_path = tmp_path / "sample.dll"
+    pdb_path = tmp_path / "sample_BUILD.pdb"
+    pe_path.write_bytes(b"MZ-x86-exact-build")
+    pdb_path.write_bytes(b"pdb")
+    store = SymbolStore(tmp_path / "store")
+    cfg = _FakeCfg(tmp_path)
+
+    monkeypatch.setattr(
+        symbols, "read_pdb_ref",
+        lambda _path: PdbRef("sample.pdb", "BUILD", 0x5000),
+    )
+    monkeypatch.setattr(symbols, "fetch_pdb", lambda *_args: pdb_path)
+    monkeypatch.setattr(symbols, "load_section_headers", lambda _path: {1: 0x1000})
+    monkeypatch.setattr(
+        symbols, "load_publics_metadata",
+        lambda *_args: SimpleNamespace(
+            symbols={"Exported": 0x1100}, functions={"Exported"},
+        ),
+    )
+    frame = SimpleNamespace(to_json=lambda: {
+        "rva": 0x1100, "code_size": 0x20, "recipe": "fpo-stack",
+        "source": "pdb-old-fpo", "locals_size": 0,
+        "saved_regs_size": 0, "params_size": 0,
+    })
+    monkeypatch.setattr(symbols, "load_fpo", lambda _path: [frame])
+    monkeypatch.setattr(
+        symbols.pefile, "PE", lambda *_a, **_k: _FakePe(0x014C, 0x5000),
+    )
+
+    info = symbols.load_module(
+        cfg, store, pe_path=pe_path, module_name="sample_x86", base=0x10000000,
+    )
+
+    data = store.load("sample_x86")
+    assert info.symbol_count == 1
+    assert data["function_symbols"] == ["Exported"]
+    assert data["frame_data"][0]["recipe"] == "fpo-stack"
+    assert data["pe_sha256"] == hashlib.sha256(pe_path.read_bytes()).hexdigest()
+
+
+def test_load_module_does_not_request_fpo_for_x64(tmp_path, monkeypatch):
+    from winbox.kdbg.pe import PdbRef
+
+    pe_path = tmp_path / "sample64.dll"
+    pdb_path = tmp_path / "sample64_BUILD.pdb"
+    pe_path.write_bytes(b"MZ-x64")
+    pdb_path.write_bytes(b"pdb")
+    store = SymbolStore(tmp_path / "store")
+    monkeypatch.setattr(
+        symbols, "read_pdb_ref",
+        lambda _path: PdbRef("sample64.pdb", "BUILD", 0x5000),
+    )
+    monkeypatch.setattr(symbols, "fetch_pdb", lambda *_args: pdb_path)
+    monkeypatch.setattr(symbols, "load_section_headers", lambda _path: {})
+    monkeypatch.setattr(
+        symbols, "load_publics_metadata",
+        lambda *_args: SimpleNamespace(symbols={}, functions=set()),
+    )
+    monkeypatch.setattr(
+        symbols, "load_fpo", lambda _path: (_ for _ in ()).throw(
+            AssertionError("x64 must not parse FPO")
+        ),
+    )
+    monkeypatch.setattr(
+        symbols.pefile, "PE", lambda *_a, **_k: _FakePe(0x8664, 0x5000),
+    )
+
+    symbols.load_module(
+        _FakeCfg(tmp_path), store, pe_path=pe_path,
+        module_name="sample64", base=0x180000000,
+    )
+
+    assert store.load("sample64")["frame_data"] == []
+
+
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 

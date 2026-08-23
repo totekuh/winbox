@@ -370,6 +370,15 @@ class RspClient:
     def query_halt_reason(self) -> StopReply:
         """``?`` — return the current stop reason without resuming."""
         resp = self._exchange(b"?")
+        if not resp:
+            # QEMU can return a valid empty packet on the first connection
+            # after a previous long-lived gdb client detached, even though
+            # the new client needs a concrete stop before register access.
+            # Convert that one-shot transition into an explicit interrupt and
+            # consume its real stop reply. This also makes reader startup
+            # self-healing instead of leaving libvirt paused on an EOF.
+            self.interrupt()
+            return self.wait_for_stop(timeout=5.0)
         return self._parse_stop_reply(resp)
 
     def list_threads(self) -> list[str]:

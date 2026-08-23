@@ -1215,7 +1215,8 @@ class DaemonSession:
 
         try:
             import capstone
-            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+            mode = capstone.CS_MODE_32 if self._is_x86_stop() else capstone.CS_MODE_64
+            md = capstone.Cs(capstone.CS_ARCH_X86, mode)
             insn = next(md.disasm(raw, rip), None)
         except ImportError:
             raise RuntimeError("capstone not installed; step_over needs it for disasm")
@@ -1241,8 +1242,9 @@ class DaemonSession:
         if self.stop is None:
             raise RuntimeError("not halted; cont first")
         rsp_va = struct.unpack_from("<Q", self.stop.raw_regs, 7 * 8)[0]
-        ret_bytes = self.rsp.read_memory(rsp_va, 8)
-        ret_addr = struct.unpack("<Q", ret_bytes)[0]
+        width = 4 if self._is_x86_stop() else 8
+        ret_bytes = self.rsp.read_memory(rsp_va, width)
+        ret_addr = int.from_bytes(ret_bytes, "little")
         if ret_addr == 0:
             raise RuntimeError("return address at [rsp] is 0 — stack may be corrupt")
         return self._run_to(ret_addr, timeout=timeout,
@@ -1367,9 +1369,18 @@ class DaemonSession:
         self._select_thread(vcpu)
         regs = self.rsp.read_registers()
 
-        data = self._cr3_masqueraded_call(
-            vcpu, regs, lambda: self.rsp.read_memory(va, length)
-        )
+        if self.stop is not None and self.stop.cr3 in self.target.cr3_set:
+            # At an in-target stop the selected CPU already owns the exact
+            # live address space.  Besides avoiding two full G packets, this
+            # is required for WoW64 compatibility-mode stops: rewriting an
+            # otherwise-identical x86-64 register blob through QEMU's G
+            # handler can lose hidden segment/mode state and make subsequent
+            # virtual reads resolve against nonsense mappings.
+            data = self.rsp.read_memory(va, length)
+        else:
+            data = self._cr3_masqueraded_call(
+                vcpu, regs, lambda: self.rsp.read_memory(va, length)
+            )
 
         return {"va": f"0x{va:x}", "bytes": data.hex()}
 
@@ -1401,37 +1412,49 @@ class DaemonSession:
         self._select_thread(vcpu)
         regs = self.rsp.read_registers()
 
-        # gdb ``M addr,len:hex`` writes payload bytes at addr.
-        self._cr3_masqueraded_call(
-            vcpu, regs, lambda: self.rsp.write_memory(va, payload)
-        )
+        # gdb ``M addr,len:hex`` writes payload bytes at addr. As with reads,
+        # never rewrite the full register block at an already in-target WoW64
+        # stop; QEMU can lose compatibility-mode state in its G handler.
+        if self.stop is not None and self.stop.cr3 in self.target.cr3_set:
+            self.rsp.write_memory(va, payload)
+        else:
+            self._cr3_masqueraded_call(
+                vcpu, regs, lambda: self.rsp.write_memory(va, payload)
+            )
 
         return {"va": f"0x{va:x}", "length": len(payload)}
 
     def op_stack(self, n: int = 16) -> dict[str, Any]:
-        """N qwords starting at RSP, with RSP-relative offset labels."""
+        """N architecture-sized stack words with RSP-relative labels."""
         if self.stop is None:
             raise RuntimeError("not halted; cont first")
         n = max(1, min(int(n), 256))
         rsp_va = struct.unpack_from("<Q", self.stop.raw_regs, 7 * 8)[0]
-        result = self.op_mem(rsp_va, n * 8)
+        width = 4 if self._is_x86_stop() else 8
+        result = self.op_mem(rsp_va, n * width)
         raw = bytes.fromhex(result["bytes"])
-        return {
+        stack_register = "esp" if width == 4 else "rsp"
+        entries = [
+            {
+                "offset": f"{stack_register}+0x{i:02x}",
+                "va": f"0x{rsp_va + i:x}",
+                "value": f"0x{int.from_bytes(raw[i:i + width], 'little'):0{width * 2}x}",
+            }
+            for i in range(0, n * width, width)
+        ]
+        output = {
             "rsp": f"0x{rsp_va:x}",
-            "qwords": [
-                {
-                    "offset": f"rsp+0x{i:02x}",
-                    "va": f"0x{rsp_va + i:x}",
-                    "value": "0x{:016x}".format(
-                        int.from_bytes(raw[i:i+8], "little")
-                    ),
-                }
-                for i in range(0, n * 8, 8)
-            ],
+            "sp": f"0x{rsp_va:x}",
+            "stack_register": stack_register,
+            "architecture": "x86" if width == 4 else "x64",
+            "word_size": width,
+            "entries": entries,
         }
+        output["dwords" if width == 4 else "qwords"] = entries
+        return output
 
     def op_bt(self, depth: int = 8) -> dict[str, Any]:
-        """Unwind a Windows x64 call chain from live PE ``.pdata``/xdata."""
+        """Unwind x64 PE metadata or a WoW64 x86 hybrid call chain."""
         if self.stop is None:
             raise RuntimeError("not halted; cont first")
         depth = max(1, min(int(depth), 64))
@@ -1439,6 +1462,8 @@ class DaemonSession:
 
     def _unwind_backtrace(self, depth: int) -> dict[str, Any]:
         """Epoch-stable, bounded live-image unwind implementation."""
+        if self._is_x86_stop():
+            return self._unwind_x86_backtrace(depth)
         from winbox.kdbg.unwind import PeX64Unwinder, UnwindError
 
         stop = self._require_stop_epoch()
@@ -1654,6 +1679,138 @@ class DaemonSession:
             result["error"] = error
         return result
 
+    def _is_x86_stop(self) -> bool:
+        """True for the Windows WoW64 compatibility-mode code selector."""
+        if self.stop is None or len(self.stop.raw_regs) < 144:
+            return False
+        cs = struct.unpack_from("<I", self.stop.raw_regs, 140)[0] & 0xFFFF
+        return cs == 0x23
+
+    def _unwind_x86_backtrace(self, depth: int) -> dict[str, Any]:
+        """Unwind a WoW64 stack without requiring the native kernel view."""
+        from winbox.kdbg.x86_unwind import X86HybridUnwinder, X86Module
+
+        stop = self._require_stop_epoch()
+        epoch = {"session_id": self.session_id, "stop_id": self.stop_id}
+        eip = stop.rip & 0xFFFFFFFF
+        esp = struct.unpack_from("<Q", stop.raw_regs, 7 * 8)[0] & 0xFFFFFFFF
+        ebp = struct.unpack_from("<Q", stop.raw_regs, 6 * 8)[0] & 0xFFFFFFFF
+        ebx = struct.unpack_from("<Q", stop.raw_regs, 1 * 8)[0] & 0xFFFFFFFF
+        pages: dict[int, bytes] = {}
+
+        def live_read(va: int, length: int) -> bytes:
+            if va < 0 or length < 0 or va + length > (1 << 32):
+                raise RuntimeError(
+                    f"x86 live read outside uint32: 0x{va:x}+0x{length:x}"
+                )
+            output = bytearray()
+            while length:
+                page = va & ~0xFFF
+                offset = va - page
+                take = min(length, 0x1000 - offset)
+                if page not in pages:
+                    pages[page] = bytes.fromhex(
+                        self.op_mem(page, 0x1000, **epoch)["bytes"]
+                    )
+                chunk = pages[page][offset:offset + take]
+                if len(chunk) != take:
+                    raise RuntimeError(f"short x86 live page at 0x{page:x}")
+                output.extend(chunk)
+                va += take
+                length -= take
+            return bytes(output)
+
+        try:
+            store_names = self.store.list_modules()
+        except Exception as exc:
+            return {
+                "rsp": f"0x{esp:x}", "method": "windows-x86-hybrid",
+                "complete": False, "frames": [], "candidates": [],
+                "error": f"x86 symbol inventory failed: {exc}",
+            }
+
+        modules: list[X86Module] = []
+        relevant_errors: list[str] = []
+        for store_name in store_names:
+            relevant = False
+            try:
+                from winbox.kdbg.decomp.identity import (
+                    IdentityError,
+                    parse_live_pe,
+                    parse_static_pe,
+                    sha256_file,
+                    validate_identity,
+                )
+                record = self.store.load(store_name)
+                _, architecture = _stored_module_identity(store_name, record)
+                if architecture != "x86":
+                    continue
+                base = int(record.get("base") or 0)
+                size = int(record.get("size_of_image") or 0)
+                relevant = base <= eip < base + size
+                if (
+                    base <= 0 or size <= 0 or base > 0xFFFFFFFF
+                    or base + size > (1 << 32)
+                ):
+                    raise RuntimeError("symbol store has invalid x86 base/size")
+                path_value = record.get("pe_path")
+                expected_sha = record.get("pe_sha256")
+                if not path_value or not expected_sha:
+                    raise RuntimeError("symbol store has no hash-bound PE")
+                path = Path(path_value).resolve(strict=True)
+                if sha256_file(path).lower() != str(expected_sha).lower():
+                    raise RuntimeError("cached PE hash mismatch")
+                static = parse_static_pe(path)
+                try:
+                    live = parse_live_pe(live_read, base)
+                except IdentityError:
+                    live = parse_live_pe(live_read, base, include_pdb=False)
+                stem, _ = _stored_module_identity(store_name, record)
+                display_name = stem + path.suffix.lower()
+                confidence = validate_identity(
+                    live, static, module_name=display_name,
+                    live_module_size=size,
+                )
+                if static.machine != 0x014C:
+                    raise RuntimeError(
+                        f"cached PE machine 0x{static.machine:04x} is not x86"
+                    )
+                raw_frames = record.get("frame_data") or ()
+                frame_data = tuple(raw_frames) if isinstance(raw_frames, list) else ()
+                if not isinstance(raw_frames, (list, tuple)):
+                    relevant_errors.append(
+                        f"{store_name}: frame_data store field is not a list"
+                    )
+                names = set(record.get("function_symbols") or [])
+                symbols = record.get("symbols") or {}
+                starts: set[int] = set()
+                for name in names:
+                    try:
+                        value = int(symbols[name])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if 0 <= value < size:
+                        starts.add(value)
+                modules.append(X86Module(
+                    name=display_name, base=base, size=size,
+                    frame_data=frame_data,
+                    function_starts=tuple(sorted(starts)),
+                    metadata=f"verified-pdb:{confidence}",
+                ))
+            except Exception as exc:
+                if relevant:
+                    relevant_errors.append(f"{store_name}: {exc}")
+
+        unwinder = X86HybridUnwinder(
+            modules, live_read, self._best_symbol_for_va,
+        )
+        result = unwinder.unwind(eip, esp, ebp, ebx, depth)
+        if relevant_errors:
+            result["metadata_errors"] = relevant_errors[:16]
+            if not result["frames"]:
+                result["error"] = "; ".join(relevant_errors[:4])
+        return result
+
     def op_context(
         self,
         disasm_count: int = 8,
@@ -1703,7 +1860,11 @@ class DaemonSession:
                 raw = bytes.fromhex(self.op_mem(
                     stop.rip, min(15 * disasm_count, 480), **epoch
                 )["bytes"])
-                md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+                mode = (
+                    capstone.CS_MODE_32 if self._is_x86_stop()
+                    else capstone.CS_MODE_64
+                )
+                md = capstone.Cs(capstone.CS_ARCH_X86, mode)
                 md.detail = True
                 for instruction in md.disasm(raw, stop.rip):
                     item = {
@@ -1730,29 +1891,43 @@ class DaemonSession:
         response["assembly"] = assembly
 
         rsp_va = struct.unpack_from("<Q", stop.raw_regs, 7 * 8)[0]
+        stack_width = 4 if self._is_x86_stop() else 8
         scan_qwords = stack_qwords
         stack_raw = b""
         if scan_qwords:
             try:
                 stack_raw = bytes.fromhex(self.op_mem(
-                    rsp_va, scan_qwords * 8, **epoch
+                    rsp_va, scan_qwords * stack_width, **epoch
                 )["bytes"])
             except Exception as exc:
                 response["stack_error"] = str(exc)
+        stack_register = "esp" if stack_width == 4 else "rsp"
+        stack_entries = [
+            {
+                "offset": f"{stack_register}+0x{offset:02x}",
+                "va": f"0x{rsp_va + offset:x}",
+                "value": f"0x{int.from_bytes(stack_raw[offset:offset + stack_width], 'little'):0{stack_width * 2}x}",
+            }
+            for offset in range(
+                0, min(len(stack_raw), stack_qwords * stack_width), stack_width
+            )
+        ]
         response["stack"] = {
             "rsp": f"0x{rsp_va:x}",
-            "qwords": [
-                {
-                    "offset": f"rsp+0x{offset:02x}",
-                    "va": f"0x{rsp_va + offset:x}",
-                    "value": f"0x{int.from_bytes(stack_raw[offset:offset + 8], 'little'):016x}",
-                }
-                for offset in range(0, min(len(stack_raw), stack_qwords * 8), 8)
-            ],
+            "sp": f"0x{rsp_va:x}",
+            "stack_register": stack_register,
+            "architecture": "x86" if stack_width == 4 else "x64",
+            "word_size": stack_width,
+            "entries": stack_entries,
         }
+        response["stack"]["dwords" if stack_width == 4 else "qwords"] = stack_entries
         response["backtrace"] = (
             self._unwind_backtrace(bt_depth) if bt_depth else {
-                "rsp": f"0x{rsp_va:x}", "method": "windows-x64-pdata",
+                "rsp": f"0x{rsp_va:x}",
+                "method": (
+                    "windows-x86-hybrid" if self._is_x86_stop()
+                    else "windows-x64-pdata"
+                ),
                 "complete": False, "frames": [],
             }
         )
@@ -2776,6 +2951,22 @@ def _normalize_module_name(name: str) -> str:
     return n
 
 
+def _stored_module_identity(name: str, data: dict) -> tuple[str, str]:
+    """Return a loader basename and architecture for one store entry.
+
+    Older records predate the explicit architecture field. x86 user modules
+    have always used the ``_x86`` suffix, so that convention is a safe
+    migration fallback and prevents native/WoW64 basename collisions.
+    """
+    architecture = str(data.get("architecture") or "").lower()
+    stem = name
+    if architecture not in {"x86", "x64"}:
+        architecture = "x86" if name.lower().endswith("_x86") else "x64"
+    if architecture == "x86" and stem.lower().endswith("_x86"):
+        stem = stem[:-4]
+    return _normalize_module_name(stem), architecture
+
+
 def _looks_like_timeout(err: Exception) -> bool:
     """A stalled gdbstub read, as opposed to the stub refusing outright."""
     text = str(err).lower()
@@ -2852,7 +3043,7 @@ def _validate_module_bases(
 
     Strategy:
       - For ``nt``: re-derive live base via ``resolve_nt_base``; compare.
-      - Walk target's PEB.Ldr once → {normalized_name: base}.
+      - Walk target's PEB.Ldr once → {(normalized_name, architecture): base}.
       - For each cached user-mode module: look it up in the target's
         loaded set. Found + mismatch → stale. Not found → skip silently.
 
@@ -2906,7 +3097,7 @@ def _validate_module_bases(
                     )
 
     # ── Step 2: collect user-mode candidates with cached bases ──
-    candidates: list[tuple[str, int]] = []
+    candidates: list[tuple[str, int, tuple[str, str]]] = []
     for mod_name in modules:
         if mod_name == "nt":
             continue
@@ -2917,7 +3108,9 @@ def _validate_module_bases(
         base = data.get("base")
         if not base:
             continue
-        candidates.append((mod_name, base))
+        candidates.append(
+            (mod_name, base, _stored_module_identity(mod_name, data))
+        )
 
     if not candidates:
         return  # Nothing user-mode to check; skip the PEB.Ldr walk.
@@ -2950,14 +3143,17 @@ def _validate_module_bases(
         return
 
     # Build normalized lookup of currently loaded modules in target.
-    target_loaded: dict[str, int] = {
-        _normalize_module_name(m.name): m.base for m in loaded
+    target_loaded: dict[tuple[str, str], int] = {
+        (
+            _normalize_module_name(m.name),
+            str(getattr(m, "architecture", "x64")).lower(),
+        ): m.base
+        for m in loaded
     }
 
     stale: list[tuple[str, int, int]] = []  # (cached_name, cached_base, current_base)
-    for mod_name, cached_base in candidates:
-        norm = _normalize_module_name(mod_name)
-        actual_base = target_loaded.get(norm)
+    for mod_name, cached_base, identity in candidates:
+        actual_base = target_loaded.get(identity)
         if actual_base is None:
             # Not loaded in this target — store entry is from a
             # different process. Skip without complaint.

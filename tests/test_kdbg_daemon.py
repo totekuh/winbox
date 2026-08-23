@@ -372,6 +372,37 @@ def test_context_preserves_other_evidence_when_code_and_stack_are_unreadable():
     assert result["backtrace"]["frames"] == []
 
 
+def test_context_decodes_wow64_as_x86_and_returns_dwords():
+    rip = 0x77CA8750
+    esp = 0x006CEF54
+    blob = _blob(rip=rip, rsp=esp, cr3=0x4D6BB000, cs=0x23)
+    code = b"\xb8\x34\x00\x06\x00\xba\x20\xfa\xcd\x77\xff\xd2\xc2\x08\x00"
+    stack = struct.pack("<II", 0x77CC2849, 1)
+
+    class WowRsp(FakeRsp):
+        def read_memory(self, va, length):
+            if va == rip:
+                return (code + b"\x90" * length)[:length]
+            if va == esp:
+                return stack[:length]
+            return b"\x00" * length
+
+    session = _make_session(rsp=WowRsp(regs_blob=blob))
+    session.stop = StopState(
+        vcpu="03", rip=rip, cr3=0x4D6BB000, signal=5, raw_regs=blob,
+    )
+    session.run_state = "halted"
+
+    result = session.op_context(disasm_count=3, stack_qwords=2, bt_depth=0)
+
+    assert [item["mnemonic"] for item in result["assembly"]] == ["mov", "mov", "call"]
+    assert result["assembly"][2]["op_str"] == "edx"
+    assert result["stack"]["word_size"] == 4
+    assert result["stack"]["dwords"][0]["value"] == "0x77cc2849"
+    assert "qwords" not in result["stack"]
+    assert result["backtrace"]["method"] == "windows-x86-hybrid"
+
+
 @pytest.mark.parametrize(
     "kwargs,message",
     [
@@ -1543,9 +1574,10 @@ class _StoreForValidation:
 
 class _FakeUserModule:
     """Mimics walk.UserModuleRecord shape for tests."""
-    def __init__(self, name: str, base: int) -> None:
+    def __init__(self, name: str, base: int, architecture: str = "x64") -> None:
         self.name = name
         self.base = base
+        self.architecture = architecture
         self.size = 0x100000
         self.full_path = f"C:\\Windows\\{name}"
         self.entry = 0
@@ -1608,6 +1640,42 @@ def test_validate_refreshes_a_stale_user_module_base(monkeypatch):
     _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
 
     assert store.rebased == [("ntdll", 0x7ff_99999000)]
+
+
+def test_validate_keeps_native_and_wow64_same_basename_separate(monkeypatch):
+    """A WoW64 PEB has two ntdll.dll images; basename-only keys collide."""
+    from winbox.kdbg.debugger.daemon import _validate_module_bases
+
+    native = 0x00007FF900000000
+    wow64 = 0x77250000
+    _patch_validator(monkeypatch, [
+        _FakeUserModule("ntdll.dll", native, "x64"),
+        _FakeUserModule("ntdll.dll", wow64, "x86"),
+    ])
+    store = _StoreForValidation({
+        "ntdll": {"base": native, "architecture": "x64"},
+        "ntdll_x86": {"base": wow64, "architecture": "x86"},
+    })
+
+    _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
+
+    assert store.rebased == []
+
+
+def test_validate_architecture_identity_migrates_legacy_store_records(monkeypatch):
+    from winbox.kdbg.debugger.daemon import _validate_module_bases
+
+    _patch_validator(monkeypatch, [
+        _FakeUserModule("ntdll.dll", 0x77250000, "x86"),
+    ])
+    store = _StoreForValidation({
+        # No architecture field: the historical suffix is authoritative.
+        "ntdll_x86": {"base": 0x77100000},
+    })
+
+    _validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
+
+    assert store.rebased == [("ntdll_x86", 0x77250000)]
 
 
 def test_validate_raises_when_it_cannot_refresh(monkeypatch):
@@ -2518,6 +2586,34 @@ def test_op_mem_uses_stop_vcpu_when_set():
     assert "01" not in selected
 
 
+def test_op_mem_at_in_target_wow64_stop_avoids_full_register_rewrite():
+    """QEMU's G packet can destroy hidden compatibility-mode state."""
+    target_dtb = 0x4D6BB000
+
+    class TrackingRsp(FakeRsp):
+        def __init__(self):
+            super().__init__(regs_blob=_blob(cr3=target_dtb, cs=0x23))
+            self.g_packets = 0
+
+        def _exchange(self, body, *, timeout=None):
+            if body.startswith(b"G"):
+                self.g_packets += 1
+            return super()._exchange(body, timeout=timeout)
+
+    rsp = TrackingRsp()
+    session = _make_session(
+        rsp=rsp,
+        target=TargetInfo(pid=4584, dtb=target_dtb, name="wow.exe"),
+    )
+    session.stop = StopState(
+        vcpu="01", rip=0x77CA8750, cr3=target_dtb, signal=5,
+        raw_regs=_blob(rip=0x77CA8750, cr3=target_dtb, cs=0x23),
+    )
+
+    assert session.op_mem(0x1000, 4)["bytes"] == "90" * 4
+    assert rsp.g_packets == 0
+
+
 def test_op_mem_falls_back_to_threads0_pre_stop():
     """When no stop is recorded, op_mem falls back to threads[0]."""
     rsp = FakeRsp(threads=("05", "06"))
@@ -2683,6 +2779,113 @@ def test_op_stack_returns_offset_labeled_qwords():
     assert result["qwords"][1]["value"] == "0x00000000cafebabe"
 
 
+def test_op_stack_returns_x86_dwords_at_wow64_stop():
+    rsp_val = 0x006CEF54
+    blob = _blob(rsp=rsp_val, rip=0x77CA8750, cr3=0x4D6BB000, cs=0x23)
+    stack_bytes = struct.pack("<II", 0x77CC2849, 0x12345678)
+
+    class StackRsp(FakeRsp):
+        def read_memory(self, va, length):
+            assert va == rsp_val
+            assert length == 8
+            return stack_bytes
+
+    session = _make_session(rsp=StackRsp(regs_blob=blob))
+    session.stop = StopState(
+        vcpu="03", rip=0x77CA8750, cr3=0x4D6BB000,
+        signal=5, raw_regs=blob,
+    )
+
+    result = session.op_stack(n=2)
+
+    assert result["word_size"] == 4
+    assert result["stack_register"] == "esp"
+    assert result["entries"] is result["dwords"]
+    assert result["dwords"][0]["value"] == "0x77cc2849"
+    assert result["dwords"][1]["offset"] == "esp+0x04"
+    assert "qwords" not in result
+
+
+def test_wow64_backtrace_uses_verified_store_without_live_loader_walk(
+    monkeypatch, tmp_path,
+):
+    from types import SimpleNamespace
+    import winbox.kdbg.decomp.identity as identity
+
+    target_dtb = 0x4D6BB000
+    rip = 0x10000110
+    caller = 0x10000700
+    esp = 0x00100000
+    ebp = esp + 0x20
+    blob = _blob(rip=rip, rsp=esp, rbp=ebp, cr3=target_dtb, cs=0x23)
+
+    class PageRsp(FakeRsp):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.g_packets = 0
+
+        def _exchange(self, body, *, timeout=None):
+            if body.startswith(b"G"):
+                self.g_packets += 1
+            return super()._exchange(body, timeout=timeout)
+
+        def read_memory(self, va, length):
+            page = bytearray(length)
+            if va <= ebp and ebp + 8 <= va + length:
+                off = ebp - va
+                struct.pack_into("<II", page, off, ebp + 0x20, caller)
+            return bytes(page)
+
+    pe_path = tmp_path / "sample.dll"
+    pe_path.write_bytes(b"exact")
+
+    class X86Store(FakeStore):
+        def list_modules(self):
+            return ["sample_x86"]
+
+        def load(self, name):
+            assert name == "sample_x86"
+            return {
+                "module": name, "architecture": "x86", "base": 0x10000000,
+                "size_of_image": 0x10000, "pe_path": str(pe_path),
+                "pe_sha256": "exact-sha", "frame_data": [],
+                "function_symbols": [], "symbols": {},
+            }
+
+    rsp = PageRsp(regs_blob=blob)
+    session = _make_session(
+        rsp=rsp,
+        store=X86Store(),
+        target=TargetInfo(
+            pid=4584, dtb=target_dtb ^ 0x1000, user_dtb=target_dtb,
+            name="wow.exe",
+        ),
+    )
+    session.stop = StopState(
+        vcpu="03", rip=rip, cr3=target_dtb, signal=5, raw_regs=blob,
+    )
+    session.run_state = "halted"
+    monkeypatch.setattr(
+        session, "_live_modules",
+        lambda _kind: (_ for _ in ()).throw(AssertionError("must not walk PEB")),
+    )
+    monkeypatch.setattr(session, "_best_symbol_for_va", lambda va: f"sample!{va:x}")
+    monkeypatch.setattr(identity, "sha256_file", lambda _path: "exact-sha")
+    monkeypatch.setattr(
+        identity, "parse_static_pe", lambda _path: SimpleNamespace(machine=0x014C),
+    )
+    monkeypatch.setattr(identity, "parse_live_pe", lambda *_a, **_k: object())
+    monkeypatch.setattr(identity, "validate_identity", lambda *_a, **_k: "exact")
+
+    result = session.op_bt(depth=1)
+
+    assert result["method"] == "windows-x86-hybrid"
+    assert result["frames"][0]["architecture"] == "x86"
+    assert result["frames"][0]["unwind"] == "ebp-chain"
+    assert "metadata_errors" not in result
+    assert rsp.g_packets == 0
+
+
 def test_op_stack_requires_halt():
     session = _make_session()
     with pytest.raises(RuntimeError, match="not halted"):
@@ -2774,6 +2977,35 @@ class TestStepOver:
 
         assert result["reason"] == "step"
         assert rsp.stepped > 0
+
+    def test_step_over_decodes_wow64_indirect_call_as_32_bit(self):
+        from winbox.kdbg.debugger.rsp import StopReply
+
+        call_rip = 0x77CA875A
+        next_rip = call_rip + 2
+
+        class WowCallRsp(FakeRsp):
+            def read_memory(self, va, length):
+                return (b"\xff\xd2" + b"\x90" * 15)[:length]
+
+            def wait_for_stop(self, *, timeout=None):
+                return StopReply(5, "01", "hwbreak", "T05")
+
+            def read_registers(self):
+                return _blob(rip=next_rip, cr3=0x1AE000, cs=0x23)
+
+        rsp = WowCallRsp()
+        session = self._halted_session(rsp=rsp, rip=call_rip)
+        session.stop = StopState(
+            vcpu="01", rip=call_rip, cr3=0x1AE000, signal=5,
+            raw_regs=_blob(rip=call_rip, cr3=0x1AE000, cs=0x23),
+        )
+
+        result = session.op_step_over()
+
+        assert result["reason"] == "step_over"
+        assert result["stepped_over"] == "call"
+        assert (next_rip, 1, True, None) in rsp.bps_inserted
 
     def test_step_over_requires_halt(self):
         session = _make_session()
@@ -2888,6 +3120,37 @@ class TestStepOut:
         assert result["reason"] == "step_out"
         assert ret_addr in rsp.bps_inserted
         assert ret_addr in rsp.bps_removed
+
+    def test_step_out_reads_four_byte_return_at_wow64_stop(self):
+        from winbox.kdbg.debugger.rsp import StopReply
+
+        rsp_val = 0x006CEF54
+        ret_addr = 0x77CC2849
+
+        class WowStepOutRsp(FakeRsp):
+            def read_memory(self, va, length):
+                assert (va, length) == (rsp_val, 4)
+                return struct.pack("<I", ret_addr)
+
+            def wait_for_stop(self, *, timeout=None):
+                return StopReply(5, "01", "hwbreak", "T05")
+
+            def read_registers(self):
+                return _blob(rip=ret_addr, cr3=0x1AE000, cs=0x23)
+
+        rsp = WowStepOutRsp()
+        session = self._halted_session(rsp=rsp, rip=0x77CA8750, rsp_val=rsp_val)
+        session.stop = StopState(
+            vcpu="01", rip=0x77CA8750, cr3=0x1AE000, signal=5,
+            raw_regs=_blob(
+                rip=0x77CA8750, rsp=rsp_val, cr3=0x1AE000, cs=0x23,
+            ),
+        )
+
+        result = session.op_step_out()
+
+        assert result["reason"] == "step_out"
+        assert (ret_addr, 1, True, None) in rsp.bps_inserted
 
     def test_step_out_requires_halt(self):
         session = _make_session()

@@ -3321,7 +3321,11 @@ def kdbg_user_symbols_load(
     cached_basename = match.name
 
     try:
-        pe_path = _kdbg_copy_user_module(cfg, ga, match.full_path, cached_basename)
+        pe_path = _kdbg_copy_user_module(
+            cfg, ga, match.full_path, cached_basename,
+            architecture=match.architecture,
+            expected_size=match.size,
+        )
         info = _kdbg_load_module(
             cfg, store,
             pe_path=pe_path,
@@ -4267,15 +4271,16 @@ def kdbg_context(
 ) -> dict[str, Any]:
     """Return one bounded triage bundle for the current halted stop.
 
-    The response pins registers, symbolized nearby assembly, stack qwords,
-    candidate backtrace frames, active breakpoints, and up to four optional
+    The response pins registers, architecture-correct nearby assembly, native
+    stack words, metadata-driven backtrace frames, active breakpoints, and up to four optional
     memory reads to one debugger ``stop_id``. This is the preferred first
     call after a breakpoint because it avoids mixing evidence across stops.
 
     Args:
         disasm_count: Instructions at RIP (0..32).
-        stack_qwords: Stack qwords to return (0..32).
-        bt_depth: Candidate return addresses to return (0..16).
+        stack_qwords: Native stack words to return (0..32). The name is kept
+            for API compatibility; WoW64 stops return 4-byte dwords.
+        bt_depth: Backtrace frames to return (0..16).
         memory: Optional list of up to four ``{va, length}`` reads; each is
             capped at 256 bytes and their combined size at 1024 bytes.
     """
@@ -4294,20 +4299,20 @@ def kdbg_context(
 
 @mcp.tool()
 def kdbg_stack(n: int = 16) -> dict[str, Any]:
-    """Read N qwords starting at RSP (current halt's stack pointer).
+    """Read N native words starting at RSP/ESP at the current halt.
 
     Reads target's address space via CR3 masquerade, so this works
     even if the firing vCPU isn't currently in target context (rare
     but possible mid-step).
 
     Args:
-        n: Number of 8-byte qwords to read (1..256).
+        n: Number of words to read (1..256): 8-byte qwords in x64 code or
+            4-byte dwords at a WoW64 x86 stop.
 
     Returns:
-        JSON ``{rsp, qwords}`` where each qword is
-        ``{offset, va, value}`` — offset is RSP-relative
-        (``rsp+0x00``), va is the absolute address, value is
-        the little-endian-decoded 64-bit hex.
+        JSON ``{sp, stack_register, architecture, word_size, entries}`` where
+        each entry is ``{offset, va, value}``. Compatibility aliases ``rsp``
+        and either ``qwords`` or ``dwords`` are also returned.
     """
     cfg = _kdbg_cfg_only()
     try:
@@ -4318,20 +4323,23 @@ def kdbg_stack(n: int = 16) -> dict[str, Any]:
 
 @mcp.tool()
 def kdbg_bt(depth: int = 8) -> dict[str, Any]:
-    """Unwind the live Windows x64 stack through PE .pdata/xdata.
+    """Unwind the live Windows x64 or WoW64 x86 stack.
 
-    Uses RUNTIME_FUNCTION metadata, including unwind-v2 epilogs, chained
+    x64 uses RUNTIME_FUNCTION metadata, including unwind-v2 epilogs, chained
     records, nonvolatile restores, and machine frames. Metadata provenance is
     explicit: live image pages are preferred; Windows-discarded pages may use
     only an exact hash/identity-verified cached PE. Stack values always come
-    from the pinned live stop. Malformed, missing, or x86 metadata returns a
-    truthful partial trace with an error instead of guessed stack candidates.
+    from the pinned live stop. WoW64 x86 uses exact-build PDB old-FPO/frame
+    records, then strict EBP chains and bounded straight-line prologue analysis.
+    Speculative stack hits are kept in a separate ``candidates`` array and are
+    never promoted to frames unless a PDB recipe explicitly requires a return
+    search. Malformed or missing metadata returns a truthful partial trace.
 
     Args:
         depth: Max frames to return (1..64).
 
     Returns:
-        JSON ``{rsp, method, complete, frames, error?}``; frames include
+        JSON ``{rsp, method, complete, frames, candidates?, error?}``; frames include
         address, RSP, module/RVA, symbol, unwind operations, and metadata source.
     """
     cfg = _kdbg_cfg_only()

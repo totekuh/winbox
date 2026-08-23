@@ -151,6 +151,20 @@ def test_handshake_falls_back_when_noack_rejected():
     assert cli._noack is False
 
 
+def test_empty_halt_reason_interrupts_and_waits_for_concrete_stop():
+    cli, sock = _client([
+        _frame(b""),
+        _frame(b"T05thread:03;"),
+    ])
+
+    stop = cli.query_halt_reason()
+
+    assert stop.signal == 5
+    assert stop.thread == "03"
+    assert b"$?#3f" in bytes(sock.sent)
+    assert b"\x03" in bytes(sock.sent)
+
+
 # ── breakpoint commands ─────────────────────────────────────────────────
 
 

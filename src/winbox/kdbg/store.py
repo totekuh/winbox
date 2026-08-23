@@ -129,7 +129,9 @@ class SymbolStore:
         base: int | None = None,
         size_of_image: int | None = None,
         filename: str | None = None,
+        architecture: str | None = None,
         function_symbols: list[str] | None = None,
+        frame_data: list[dict[str, Any]] | None = None,
         pe_path: str | None = None,
         pe_sha256: str | None = None,
     ) -> Path:
@@ -155,9 +157,11 @@ class SymbolStore:
             "image": image,
             "base": base,
             "size_of_image": size_of_image,
+            "architecture": architecture,
             "symbols": symbols,
             "types": types,
             "function_symbols": sorted(set(function_symbols or [])),
+            "frame_data": frame_data or [],
             "pe_path": pe_path,
             "pe_sha256": pe_sha256,
         }

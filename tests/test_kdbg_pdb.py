@@ -10,10 +10,85 @@ from __future__ import annotations
 import pytest
 
 from winbox.kdbg.pdb import (
+    PdbError,
+    parse_fpo,
     parse_publics,
     parse_section_headers,
     parse_types,
 )
+
+
+# ── x86 FPO / frame data ──────────────────────────────────────────────────────
+
+
+FPO_FIXTURE = """
+                        Old FPO Data
+============================================================
+  RVA    | Code | Locals | Params | Prolog | Saved Regs | Use BP | Has SEH | Frame Type
+00001000 |   31 |      2 |      3 |      4 |          1 |  false |    true |       FPO
+00001100 |   16 |      0 |      0 |      3 |          0 |   true |   false |    NonFPO
+00001200 |   16 |      0 |      0 |      3 |          0 |  false |   false |       Trap
+
+                        New FPO Data
+============================================================
+  RVA    | Code | Locals | Params | Stack | Prolog | Saved Regs | Has SEH | Has C++EH | Start | Program
+00002000 |   64 |     24 |      8 |     0 |      6 |          4 |   false |     false |  true | $T0 $ebp = $eip $T0 4 + ^ = $ebp $T0 ^ = $esp $T0 8 + =
+00002100 |   32 |      0 |      0 |     0 |      0 |          0 |   false |     false | false | $T1 .raSearch = $eip $T1 ^ = $esp $T1 4 + = 16 @ =
+"""
+
+
+def test_parse_fpo_normalizes_old_dword_counts_and_modern_recipes():
+    records = parse_fpo(FPO_FIXTURE)
+
+    assert len(records) == 5
+    old = records[0]
+    assert old.rva == 0x1000
+    assert old.locals_size == 8
+    assert old.params_size == 12
+    assert old.saved_regs_size == 4
+    assert old.recipe == "fpo-stack"
+    assert old.has_seh is True
+    assert records[1].recipe == "ebp-frame"
+    assert records[2].recipe == "unsupported"
+
+    modern = records[3]
+    assert modern.locals_size == 24  # modern records are already bytes
+    assert modern.params_size == 8
+    assert modern.recipe == "ebp-frame"
+    assert modern.source == "pdb-frame-data"
+    assert records[4].recipe == "ra-search"
+    assert records[4].alignment == 16
+
+
+@pytest.mark.parametrize("alignment", [3, 8192])
+def test_parse_fpo_classifies_unsafe_alignment_recipe_as_unsupported(alignment):
+    row = (
+        "00002000 | 1 | 0 | 0 | 0 | 0 | 0 | false | false | true | "
+        f"$T1 .raSearch = $T1 4 - {alignment} @ ="
+    )
+    assert parse_fpo("New FPO Data\n" + row)[0].recipe == "unsupported"
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "00001000 | 31 | 0 | 0 | 0 | 0 | maybe | false | FPO",
+        "00001000 | 31 | 0 | 0 | 0 | 0 | false | false",
+        "00001000 | nope | 0 | 0 | 0 | 0 | false | false | FPO",
+    ],
+)
+def test_parse_fpo_rejects_malformed_old_rows(row):
+    with pytest.raises(PdbError, match="malformed old FPO row"):
+        parse_fpo("Old FPO Data\n" + row)
+
+
+def test_parse_fpo_rejects_oversized_program():
+    row = (
+        "00002000 | 1 | 0 | 0 | 0 | 0 | 0 | false | false | true | "
+        + "x" * 4097
+    )
+    with pytest.raises(PdbError, match="exceeds 4096"):
+        parse_fpo("New FPO Data\n" + row)
 
 
 # ── Section headers ─────────────────────────────────────────────────────

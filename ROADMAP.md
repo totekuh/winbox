@@ -379,8 +379,9 @@ round-trips waste time and context, and agents frequently omit one of the
 pieces needed to reason about the stop.
 
 `kdbg_context` now returns an epoch-pinned target/stop, registers, symbolized
-RIP and branch targets, nearby assembly, labelled stack, Windows x64
-metadata-driven backtrace, and bounded breakpoint metadata. Callers may request at most four
+RIP and branch targets, architecture-correct nearby assembly and stack, Windows
+x64 metadata or WoW64 x86 hybrid backtrace, and bounded breakpoint metadata.
+Callers may request at most four
 memory follows, 256 bytes each and 1024 bytes total. Zero-sized components,
 bad integer/bool inputs, missing stop state, unreadable evidence, and every cap
 are covered in daemon/MCP/CLI tests.
@@ -454,13 +455,36 @@ now temporarily removes that exact hardware execution breakpoint, steps once,
 and reinstalls it; live RIP advanced from `services+0xfae0` to `+0xfae5` on
 vCPU 3 and the breakpoint remained installed with its hit count intact.
 
-### 68. WoW64 x86 call-stack unwinding remains unsupported
+### 68. Completed — conservative WoW64 x86 hybrid unwinding
 
-The module, symbol, address, and decompilation paths now distinguish x86 from
-x64, but the new unwinder deliberately stops when RIP enters an x86 module.
-Trustworthy 32-bit unwinding needs frame-pointer/FPO data and x86-specific
-epilog rules rather than applying x64 `.pdata` semantics. This is the remaining
-WoW64 capability gap for crash/exploitability triage.
+`kdbg_bt`, `kdbg_context`, stack display, disassembly, step-over, and step-out
+now switch to x86 semantics at a compatibility-mode (`CS=0x23`) stop. Exact
+build PDB old-FPO and modern frame-data records are extracted with
+`llvm-pdbutil`, persisted with their original programs, and classified into a
+finite safe recipe set. The walker prefers those records, then strict monotonic
+EBP chains, then bounded straight-line prologue simulation. A PDB-directed
+return search is bounded and call-site validated; ordinary stack hits remain a
+separate `confidence=candidate` list and are never silently promoted to frames.
+
+Live testing found and fixed three prerequisites: 64-bit PowerShell bypassed
+WoW64 redirection and copied the x64 System32 image, so x86 loads now translate
+System32 to SysWOW64 and verify PE machine plus live SizeOfImage; QEMU's
+full-register `G` packet loses hidden compatibility-mode state, so active-CR3
+reads and unchanged snapshot restores issue no redundant `G`; and attach-time
+ASLR validation keys same-name native/x86 modules by architecture rather than
+letting two `ntdll.dll` images overwrite one another's bases.
+
+Live Server 2025 validation stopped SysWOW64 `PING.EXE` at
+`ntdll_x86!_NtDelayExecution@8` on vCPU 3 and produced nine repeatable frames:
+`NtDelayExecution` → `RtlDelayExecution` → `SleepEx` → `Sleep` → two
+`PING!wmain` frames → `BaseThreadInitThunk` → two `RtlUserThreadStart` frames.
+The trace combined old FPO, modern frame data, EBP, and verified PDB identity;
+it stopped truthfully at the zero root and exposed only two residual stack
+candidates. Repeated context/stack/backtrace reads stayed stable, x86
+step-over crossed `call edx`, x86 step-out reached its caller, and the original
+hardware breakpoint remained installed. Final verification passed the complete
+default suite (`2512 passed, 5 skipped, 140 deselected`), all eleven direct
+QEMU RSP integrations, and all three repeated/parallel live walk integrations.
 
 ### 69. User unwind depth depends on pre-staged exact binaries
 
@@ -471,6 +495,17 @@ metadata nor a hash-bound cached PE exists. Preloading symbols/binaries solves
 it (live RPCRT4 depth grew from two to thirteen frames), but agent UX would be
 better with an attach-time immutable binary manifest or a separate broker that
 can stage exact module artifacts without contending for the gdbstub.
+
+### 70. Mixed-mode WoW64 transition-stack stitching remains unsupported
+
+Dispatch is truthful for a stop in either x86 compatibility code or ordinary
+x64 code, but one trace does not yet cross an active x86 ↔ x64 WoW64 CPU
+transition (for example, a stop inside `wow64cpu.dll` while both stack domains
+are live). Implementing that requires validated knowledge of the current
+Windows build's transition/context records; guessing across the boundary would
+be worse than the present explicit partial trace. Normal x86 application
+call-chain research, including syscall stubs stopped before or after the
+transition, is covered by item 68.
 
 ---
 
@@ -485,8 +520,8 @@ stop-generation gap now tracked as item 57; that does not reopen the original
 timeout fix, but the old heading's broader "halt state tracking" claim was too
 strong.
 
-**10.** `kdbg_stack` returns `{offset, va, value}` per qword. `kdbg_mem`
-gained `decode='qwords'`. See commit `9009a49`.
+**10.** `kdbg_stack` returns `{offset, va, value}` per native word (x64 qword
+or WoW64 x86 dword). `kdbg_mem` gained `decode='qwords'`. See commit `9009a49`.
 
 **11 (auto mode).** `mode='auto'` removed entirely. Breakpoints must carry
 their type explicitly — only `mode='hw'` and `mode='soft'` accepted.
