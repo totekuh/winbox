@@ -10,7 +10,7 @@ current RIP / runtime VA / symbol / module+RVA / continuation cursor
   -> fresh kernel or target PEB loader walk
   -> live module base + bounded PE/CodeView identity read
   -> RVA = runtime VA - live module base
-  -> exact cached PE identity check
+  -> cached PE build-identity check + immutable content snapshot
   -> Ghidra address = program image base + RVA
   -> containing function + address-provenance tokens
   -> focused pseudocode, nearby static instructions, live-byte comparison
@@ -21,7 +21,7 @@ and often between processes; the RVA remains the invariant. A filename is not
 treated as identity. The bridge refuses concrete machine, `SizeOfImage`, PE
 timestamp, or CodeView GUID+age disagreements before Ghidra is queried. When
 both live and static CodeView records exist, the response reports
-`identity.confidence = "pdb-guid-age"`; stripped binaries can use the weaker
+`verified.identity_method = "pdb-guid-age"`; stripped binaries can use the weaker
 `"pe-headers"` fallback only when their timestamp is nonzero.
 
 ## Setup and lifecycle
@@ -44,7 +44,7 @@ Unix socket under `~/.winbox/decomp/`. Sockets, locks, session records, logs,
 Docker lifecycle locks, and container names include `apiN`, so concurrently
 installed old/new clients cannot shut down or downgrade one another. An API
 mismatch inside a namespace is refused with reload/version guidance. Immutable
-full-SHA binary copies and Ghidra-versioned
+full-SHA binary copies and Ghidra-version/profile-keyed
 projects live in mode-0700 `cache/` and `projects/` directories there.
 
 For local worker development only, `WINBOX_DECOMP_BACKEND=host` restores the
@@ -77,6 +77,8 @@ kdbg_decomp(addr="", symbol="", module="", rva="", cursor="", before=3,
             lines="", assembly="nearby", instruction_bytes=false,
             runtime_vas=false)
 kdbg_decomp_status()
+kdbg_decomp_cache()
+kdbg_decomp_cache_prune(max_bytes=0, older_than_days=0, dry_run=true)
 kdbg_ghidra_install(pull=true)
 kdbg_ghidra_run()
 kdbg_ghidra_stop()
@@ -92,7 +94,15 @@ The first request for a binary starts the container/JVM lazily and runs Ghidra
 analysis, which can take minutes for a kernel image. Later queries reuse the
 open program; worker restarts reuse its durable SHA-256-and-Ghidra-version keyed
 project. Requests are serialized because Ghidra projects and decompiler APIs
-are not safely concurrent.
+are not safely concurrent. The warm-program LRU defaults to two entries and is
+bounded to four via `WINBOX_GHIDRA_OPEN_PROGRAMS`. Docker defaults to 4 GiB and
+2 CPUs with bounded logs; `WINBOX_GHIDRA_MEMORY` and `WINBOX_GHIDRA_CPUS` tune
+those limits.
+
+Use `winbox kdbg ghidra cache` to inspect content-keyed usage and
+`winbox kdbg ghidra prune --older-than-days 30` to preview reclamation. Add
+`--apply` only after stopping the worker. MCP pruning is likewise a dry-run
+unless `dry_run=false` is explicit.
 
 Every live read is pinned to the daemon's random `session_id` and monotonic
 `stop_id`. Resuming immediately clears the current stop; a query fails as stale
@@ -216,11 +226,18 @@ software breakpoint (`0xCC`), hotpatch, runtime hook, relocation, unpacked code,
 or self-modification. JIT/private executable pages and addresses outside loader
 modules are rejected because no trustworthy PE+RVA identity exists yet.
 
+Compact verification deliberately distinguishes proof scopes:
+`build_identity_match` covers PE/CodeView identity,
+`analyzed_file_sha256` identifies the immutable host content, and
+`current_instruction_match` is `match`, `mismatch`, or `not_checked`. It does
+not claim that every runtime byte in the function equals the file.
+
 ## Isolation and recovery
 
 The JVM is never loaded into the MCP server or kdbg daemon. The container owns
 it through the Unix socket, re-verifies the staged SHA-256 to close file-change
-races, keeps at most one large program open, and serializes requests. A JVM or
+races, keeps a bounded configurable LRU (two programs by default), and
+serializes requests. A JVM or
 container crash therefore cannot corrupt debugger RSP state; the next request
 recreates the service and reopens the durable project. Image/container labels
 and a state-root fingerprint prevent lifecycle commands from touching an

@@ -105,7 +105,7 @@ address/module snapshot, and final stop revalidation. Failed recovery clears
 stale evidence. Mid-cont status, stale reads, stop changes, invalid coordinates,
 and recovery failures are covered.
 
-### 58. PE/symbol caching is basename-keyed and non-atomic across builds
+### 58. Completed — build-keyed, atomic PE/symbol publication
 
 User binaries are published as `symbols/<BaseDllName>`, and decomp binary
 resolution searches primarily by basename. A second Windows build, snapshot,
@@ -120,7 +120,12 @@ persist that PE identity/path beside each symbol-store build, and select it
 from the fresh loader identity rather than the filename. Preserve a convenient
 basename index only as a lookup hint. Cover same-name/different-build modules,
 two snapshots, concurrent publication, interrupted copies, and rollback.
-Moderate effort, high correctness and multi-target research payoff.
+Implemented atomic `symbols/pe/<basename>/<CodeView-build>_<SHA-256>` publication
+(full SHA-256 for stripped inputs), build-record PE path/hash and function
+metadata, and lock-serialized symbol indexing. Decomp now selects same-name
+candidates against live identity and snapshots the winner into immutable
+content-addressed storage before parsing and hashing. Concurrent publication
+and source replacement are covered.
 
 ### 59. Completed — truthful decomp source/assembly edge behavior
 
@@ -170,7 +175,7 @@ automatically shut down or downgraded. Container ownership includes the worker
 API label. Immutable binary copies remain full-SHA keyed and durable Ghidra
 projects remain Ghidra-version/full-SHA keyed across ordinary worker restarts.
 
-### 61. The Ghidra service lacks resource limits, cancellation, and request liveness
+### 61. Completed — bounded resources and request liveness
 
 The container sets a PID cap but no memory, swap, CPU, or Docker log-rotation
 limits. Inspection found all compute/memory limits unset; the warm worker used
@@ -190,7 +195,13 @@ Ghidra permits it, and deduplication by binary/function/options. Make forced
 termination and corrupt-project recovery explicit and tested. Moderate effort,
 high stability payoff for hostile-input research.
 
-### 62. Verified PDB data is underused and synthetic recovery provenance decays
+Worker API 5 now correlates request IDs, bounds half-open reads to five seconds,
+publishes active operation/elapsed time, records client-timeout cancellation,
+and bounds a configurable open-program LRU. Docker defaults to 4 GiB RAM, an
+equal swap ceiling, 2 CPUs, rotating 10 MiB logs, and a bounded stop timeout.
+Protocol, timeout, cancellation, and configuration edges are covered.
+
+### 62. Completed — verified PDB enrichment and durable provenance
 
 The PDB currently proves identity and supplies one nearest-public hint; it is
 not imported into Ghidra and does not enrich function/global names, prototypes,
@@ -210,6 +221,11 @@ persist winbox recovery provenance in program properties or a sidecar, and
 include the analysis-profile version in project cache keys. Never present a
 synthetic boundary as native analysis on reuse. Moderate-to-large effort, very
 high decompiler-quality payoff.
+
+PDB parsing now retains the exact-build `function` flag. Only verified function
+publics may create missed boundaries; agent output prefers their verified names
+while retaining the Ghidra name/source. Synthetic recovery provenance persists
+across reopen/restart, and analysis profile v2 is part of project identity.
 
 ### 63. Completed — direct coordinates and stop-bound continuation
 
@@ -246,7 +262,7 @@ retryability, operation names, bounded messages, and at most three recovery
 hints. Decomp schema 5 omits raw instruction bytes and repeated runtime VAs by
 default; both remain explicit opt-ins. Interactive CLI output stays readable.
 
-### 65. Analysis caches grow without visibility or eviction and one open slot thrashes
+### 65. Completed — cache inventory, dry-run pruning, and configurable LRU
 
 There is no cache inventory, byte count, age, pruning, or size policy. The live
 validation cache contains three projects totaling 268 MiB, including one
@@ -260,7 +276,12 @@ LRU. Replace the fixed one-program slot with a configurable memory-aware LRU;
 keep one as the safe low-memory default. Moderate effort, medium-to-high
 long-session efficiency payoff.
 
-### 66. The verification contract overstates runtime equivalence
+CLI/MCP inventory now reports SHA, original name, project/profile, Ghidra
+version, size, presence, and LRU order. Age/size pruning previews by default,
+validates exact paths, and refuses selected deletion while the worker is live.
+The warm-program LRU defaults to two and is bounded from one through four.
+
+### 66. Completed — truthful build and instruction verification
 
 Compact output hardcodes `verified.exact_binary=true`. What is actually proven
 is a matching CodeView build (or weaker machine/timestamp/image-size tuple), a
@@ -277,6 +298,11 @@ Rename the claims to `build_identity_match`, `analyzed_file_sha256`, and
 host PE once before parsing and hashing. A later enhancement can compare all
 function bytes while masking verified PE base relocations, producing bounded
 changed ranges. Moderate effort, high evidence-honesty payoff.
+
+Schema 5 now reports `build_identity_match`, `identity_method`,
+`analyzed_file_sha256`, and three-state `current_instruction_match`; it no
+longer claims whole-binary runtime equality. Inputs are snapshotted once into
+immutable content-addressed storage before PE parsing and hashing.
 
 ### 67. Completed — Ghidra lifecycle JSON is pipe-safe at narrow widths
 

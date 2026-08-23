@@ -252,7 +252,8 @@ def test_query_decomp_composes_rva_identity_and_worker(monkeypatch, tmp_path):
     assert result["schema"] == "winbox.kdbg-decomp/5"
     assert result["detail"] == "compact"
     assert result["location"]["rva"] == "0x1000"
-    assert result["verified"]["identity"] == "pdb-guid-age"
+    assert result["verified"]["identity_method"] == "pdb-guid-age"
+    assert result["verified"]["build_identity_match"] is True
     assert result["assembly_fields"] == {
         "instruction_bytes": False, "runtime_vas": False,
     }
@@ -472,7 +473,7 @@ def test_response_detail_levels_keep_diagnostics_opt_in():
             "confidence": "pdb-guid-age",
             "live": {"pdb_key": "LIVE1"},
             "static": {"pdb_key": "LIVE1", "sha256": "a" * 64},
-            "live_bytes_match": True,
+            "current_instruction_match": "match",
         },
         "runtime_symbol": "x!focus+0x0",
         "symbol_hint": {"name": "focus", "rva": 0x1000},
@@ -525,7 +526,8 @@ def test_response_detail_levels_keep_diagnostics_opt_in():
     assert compact["assembly_mode"] == "mapped"
     assert compact["line_selection"]["requested"] == {"start": 1, "end": 2}
     assert compact["rip_mapping"]["kind"] == "exact"
-    assert compact["verified"]["live_bytes_match"] is True
+    assert compact["verified"]["current_instruction_match"] == "match"
+    assert compact["verified"]["analyzed_file_sha256"] == "a" * 64
     assert compact["code"] == "int focus(void) { return 1; }"
     assert "identity" not in compact
     assert "module" not in compact
@@ -557,7 +559,7 @@ def test_compact_formatter_derives_direction_from_worker_api_one_mapping():
             "base": "0x7ff600000000", "runtime_va": "0x7ff600001000",
             "rva": "0x1000",
         },
-        "identity": {"confidence": "pdb-guid-age", "live_bytes_match": True},
+        "identity": {"confidence": "pdb-guid-age", "current_instruction_match": "match"},
         "runtime_symbol": "old!entry+0x0",
         "ghidra_image_base": "0x140000000",
         "function": {"name": "entry", "rva": "0x1000", "offset": "0x0"},
@@ -887,6 +889,7 @@ def test_symbol_hint_normalizes_kernel_name_and_is_distance_bounded(tmp_path):
     )
     assert _nearest_symbol_hint(store, "ntoskrnl.exe", 0x1010) == {
         "module": "nt", "name": "Near", "rva": 0x1000, "offset": 0x10,
+        "is_function": False,
     }
     assert _nearest_symbol_hint(store, "ntoskrnl.exe", 0x20000) is None
 

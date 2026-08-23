@@ -19,6 +19,7 @@ import logging
 import os
 import secrets
 import shutil
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
@@ -31,7 +32,7 @@ from winbox.kdbg.memory import read_virt_cr3
 from winbox.kdbg.pdb import (
     NT_DEFAULT_TYPES,
     build_type_map,
-    load_publics,
+    load_publics_metadata,
     load_section_headers,
     load_types,
 )
@@ -136,6 +137,18 @@ def _copy_via_share(
             )
         shutil.copyfile(staging, temporary)
         os.chmod(temporary, 0o600)
+        content_sha = _sha256(temporary)
+        try:
+            build = read_pdb_ref(temporary).build_key
+            published_key = f"{build}_{content_sha}"
+        except Exception:
+            # Stripped/third-party PEs can lack CodeView. They may not support
+            # PDB loading, but still deserve immutable, collision-free storage.
+            published_key = content_sha
+        module_dir = cfg.symbols_dir / "pe" / cached_name.lower()
+        module_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(module_dir, 0o700)
+        cached = module_dir / f"{published_key}{suffix.lower()}"
         os.replace(temporary, cached)
     finally:
         staging.unlink(missing_ok=True)
@@ -263,7 +276,8 @@ def load_module(
     pdb_path = fetch_pdb(ref, cfg.symbols_dir)
 
     sections = load_section_headers(pdb_path)
-    symbols = load_publics(pdb_path, sections)
+    publics = load_publics_metadata(pdb_path, sections)
+    symbols = publics.symbols
     types = build_type_map(pdb_path, wanted=wanted_types) if wanted_types else {}
 
     store.save(
@@ -274,6 +288,9 @@ def load_module(
         types=types,
         base=base,
         size_of_image=ref.size_of_image,
+        function_symbols=sorted(publics.functions),
+        pe_path=str(pe_path),
+        pe_sha256=_sha256(pe_path),
     )
     info = store.info(module_name)
     return LoadedModule(
@@ -300,8 +317,15 @@ def load_nt(
     Windows Update). Default is False; the extra ~1s Copy-Item is the
     right trade-off vs surprising the user with bad symbols.
     """
-    cached_pe = cfg.symbols_dir / "ntoskrnl.exe"
-    if reuse_cached_pe and cached_pe.exists():
+    cached_pe = None
+    try:
+        stored = store.load("nt").get("pe_path")
+        candidate = Path(str(stored)) if stored else None
+        if candidate and candidate.is_file():
+            cached_pe = candidate
+    except Exception:
+        pass
+    if reuse_cached_pe and cached_pe is not None:
         pe_path = cached_pe
     else:
         pe_path = copy_ntoskrnl(cfg, ga)
@@ -411,7 +435,18 @@ def ensure_types_loaded(
         types=have,
         base=data.get("base"),
         size_of_image=data.get("size_of_image"),
+        function_symbols=data.get("function_symbols"),
+        pe_path=data.get("pe_path"),
+        pe_sha256=data.get("pe_sha256"),
     )
+
+
+def _sha256(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            value.update(chunk)
+    return value.hexdigest()
 
 
 def ensure_nt_base_current(cfg: Config, store: SymbolStore) -> bool:

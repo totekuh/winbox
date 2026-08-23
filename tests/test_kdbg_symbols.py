@@ -10,6 +10,7 @@ suite — no need to re-mock llvm-pdbutil here.
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -323,7 +324,10 @@ def test_copy_via_share_uses_unique_staging_for_concurrent_same_name(tmp_path):
             )
         )
 
-    assert results == [cfg.symbols_dir / "same.dll"] * 2
+    expected = cfg.symbols_dir / "pe" / "same.dll" / (
+        hashlib.sha256(b"same-build").hexdigest() + ".dll"
+    )
+    assert results == [expected] * 2
     assert results[0].read_bytes() == b"same-build"
     destinations = []
     for script in ga.scripts:

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import base64
+import fcntl
+import hashlib
 import json
+import os
+import secrets
 from pathlib import Path
 from typing import Any
 
 from winbox.config import Config
-from winbox.kdbg.decomp.client import DecompClient, DecompError
+from winbox.kdbg.decomp.client import DecompClient, DecompError, cache_dir
 from winbox.kdbg.decomp.identity import (
     IdentityError,
     parse_live_pe,
@@ -174,8 +178,6 @@ def query_decomp(
             f"(size 0x{module_size:x})"
         )
 
-    binary_path = _resolve_binary(cfg, str(module.get("name", "")), binary)
-
     def live_read(address: int, length: int) -> bytes:
         if length < 0 or length > (1 << 20):
             raise IdentityError(f"invalid live read length: {length}")
@@ -198,24 +200,23 @@ def query_decomp(
         return b"".join(chunks)
 
     try:
-        static_identity = parse_static_pe(binary_path)
         live_identity = parse_live_pe(live_read, module_base)
-        identity_confidence = validate_identity(
-            live_identity,
-            static_identity,
-            module_name=str(module.get("name") or binary_path.name),
-            live_module_size=module_size,
+        binary_path, static_identity, identity_confidence = _resolve_verified_binary(
+            cfg, str(module.get("name", "")), binary, live_identity, module_size,
         )
     except IdentityError as exc:
         raise DecompError(str(exc)) from exc
 
     runtime_symbol = symbolicate_va(store, runtime_va)
-    symbol_hint = _nearest_symbol_hint(store, str(module.get("name", "")), rva)
+    symbol_hint = _nearest_symbol_hint(
+        store, str(module.get("name", "")), rva, build=live_identity.pdb_key,
+    )
 
     result = worker.call(
         "decompile",
         timeout=float(timeout) + 840.0,
         binary=str(binary_path),
+        binary_name=str(module.get("name") or binary_path.name),
         sha256=static_identity.sha256,
         rva=rva,
         before=before,
@@ -267,7 +268,7 @@ def query_decomp(
         warnings.append(
             "mapped assembly was truncated at the bounded response limit"
         )
-    live_bytes_match: bool | None = None
+    instruction_match = "not_checked"
     current = next(
         (item for item in result.get("instructions", []) if item.get("current")),
         None,
@@ -289,8 +290,8 @@ def query_decomp(
             live_instruction = live_read(
                 module_base + instruction_rva, len(static_instruction)
             )
-            live_bytes_match = live_instruction == static_instruction
-            if not live_bytes_match:
+            instruction_match = "match" if live_instruction == static_instruction else "mismatch"
+            if instruction_match == "mismatch":
                 warnings.append(
                     "live instruction bytes differ from the exact cached PE "
                     "(software breakpoint, hotpatch, runtime patch, or relocation)"
@@ -324,7 +325,7 @@ def query_decomp(
             "confidence": identity_confidence,
             "live": live_identity.public(),
             "static": static_identity.public(),
-            "live_bytes_match": live_bytes_match,
+            "current_instruction_match": instruction_match,
         },
         "runtime_symbol": runtime_symbol,
         "symbol_hint": symbol_hint,
@@ -443,7 +444,9 @@ def _format_result(
             "rva": module.get("rva"),
         },
         "function": {
-            "name": function.get("name"),
+            "name": function.get("verified_name") or function.get("name"),
+            "ghidra_name": function.get("name"),
+            "name_source": function.get("name_source") or "ghidra",
             "signature": function.get("signature"),
             "entry_rva": function.get("rva"),
             "offset": function.get("offset"),
@@ -468,9 +471,10 @@ def _format_result(
             "reason": _mapping_reason(kind),
         },
         "verified": {
-            "exact_binary": True,
-            "identity": identity.get("confidence"),
-            "live_bytes_match": identity.get("live_bytes_match"),
+            "build_identity_match": True,
+            "identity_method": identity.get("confidence"),
+            "analyzed_file_sha256": (identity.get("static") or {}).get("sha256"),
+            "current_instruction_match": identity.get("current_instruction_match"),
         },
         "cache_hit": result.get("cache_hit"),
         "decompile_cache_hit": result.get("decompile_cache_hit"),
@@ -520,6 +524,10 @@ def _format_instruction(
         if static_target is None or ghidra_base is None:
             continue
         target_rva = static_target - ghidra_base
+        if target_rva < 0:
+            # Ghidra external/import address spaces use small synthetic offsets,
+            # not image VAs. Presenting those as negative PE RVAs is misleading.
+            continue
         target_item = {"rva": f"0x{target_rva:x}"}
         if runtime_vas:
             target_item["static_va"] = f"0x{static_target:x}"
@@ -665,12 +673,12 @@ def _annotate_flow_symbols(
             instruction["flow_target_symbols"] = symbols
 
 
-def _resolve_binary(cfg: Config, module_name: str, explicit: str) -> Path:
+def _binary_candidates(cfg: Config, module_name: str, explicit: str) -> list[Path]:
     if explicit and explicit.strip():
         path = Path(explicit).expanduser().resolve()
         if not path.is_file():
             raise DecompError(f"binary does not exist or is not a regular file: {path}")
-        return path
+        return [path]
 
     root = Path(cfg.symbols_dir)
     resolved_root = root.resolve()
@@ -686,7 +694,11 @@ def _resolve_binary(cfg: Config, module_name: str, explicit: str) -> Path:
         )
     except OSError:
         pass
+    build_root = root / "pe" / Path(module_name).name.lower()
+    if build_root.is_dir():
+        candidates.extend(sorted(build_root.iterdir(), reverse=True))
     seen: set[Path] = set()
+    result = []
     for candidate in candidates:
         try:
             resolved = candidate.resolve()
@@ -696,12 +708,70 @@ def _resolve_binary(cfg: Config, module_name: str, explicit: str) -> Path:
             continue
         seen.add(resolved)
         if resolved.is_relative_to(resolved_root) and resolved.is_file():
-            return resolved
+            result.append(resolved)
+    if result:
+        return result
     raise DecompError(
         f"no cached PE for live module {module_name!r}. Before attaching, run "
         "`kdbg_user_symbols_load` for that module, or pass `binary` as the "
         "exact host-side PE path."
     )
+
+
+def _resolve_binary(cfg: Config, module_name: str, explicit: str) -> Path:
+    """Compatibility helper returning the first eligible path before verification."""
+    return _binary_candidates(cfg, module_name, explicit)[0]
+
+
+def _snapshot_binary(cfg: Config, source: Path) -> Path:
+    """Copy from one opened file into an immutable content-addressed input."""
+    root = cache_dir(cfg) / "verified-binaries"
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    temporary = root / f".{os.getpid()}.{secrets.token_hex(8)}.part"
+    digest = hashlib.sha256()
+    try:
+        with source.open("rb") as src, temporary.open("xb") as dst:
+            for chunk in iter(lambda: src.read(1 << 20), b""):
+                digest.update(chunk)
+                dst.write(chunk)
+            dst.flush()
+            os.fsync(dst.fileno())
+        suffix = source.suffix.lower()
+        if len(suffix) > 16 or any(c not in ".abcdefghijklmnopqrstuvwxyz0123456789" for c in suffix):
+            suffix = ".bin"
+        target = root / f"{digest.hexdigest()}{suffix}"
+        lock = root / f"{digest.hexdigest()}.lock"
+        with lock.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            if not target.exists():
+                os.chmod(temporary, 0o600)
+                os.replace(temporary, target)
+        return target
+    except OSError as exc:
+        raise DecompError(f"could not snapshot binary {source}: {exc}") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _resolve_verified_binary(
+    cfg: Config, module_name: str, explicit: str, live_identity,
+    module_size: int,
+) -> tuple[Path, Any, str]:
+    failures = []
+    for candidate in _binary_candidates(cfg, module_name, explicit):
+        try:
+            snapshot = _snapshot_binary(cfg, candidate)
+            static = parse_static_pe(snapshot)
+            confidence = validate_identity(
+                live_identity, static, module_name=module_name or candidate.name,
+                live_module_size=module_size,
+            )
+            return snapshot, static, confidence
+        except (DecompError, IdentityError) as exc:
+            failures.append(f"{candidate.name}: {exc}")
+    detail = failures[-1] if failures else "no candidate"
+    raise DecompError(f"no cached PE matches live {module_name!r}: {detail}")
 
 
 def _bounded_int(name: str, value: int, minimum: int, maximum: int) -> int:
@@ -747,7 +817,7 @@ def _assembly_mode(value: str) -> str:
 
 
 def _nearest_symbol_hint(
-    store: SymbolStore, module_name: str, rva: int
+    store: SymbolStore, module_name: str, rva: int, *, build: str | None = None,
 ) -> dict[str, object] | None:
     """Return a bounded PDB-public hint for Ghidra's missed-function case."""
     normalized = module_name.lower()
@@ -757,7 +827,9 @@ def _nearest_symbol_hint(
         keys = [Path(normalized).stem, normalized]
     for key in keys:
         try:
-            symbols = store.load(key).get("symbols", {})
+            data = store.load_build(key, build) if build else store.load(key)
+            symbols = data.get("symbols", {})
+            function_symbols = set(data.get("function_symbols") or [])
         except Exception:
             continue
         best_name = None
@@ -777,5 +849,6 @@ def _nearest_symbol_hint(
             "name": best_name,
             "rva": best_rva,
             "offset": offset,
+            "is_function": best_name in function_symbols,
         }
     return None

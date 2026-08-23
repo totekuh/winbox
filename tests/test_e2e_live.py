@@ -1238,13 +1238,15 @@ class TestKdbg:
             lifecycle = self._result(tool, "kdbg_ghidra_run")
             assert lifecycle["api"]["worker_pid"] == 1
             assert self._result(tool, "kdbg_decomp_status")["image_installed"]
+            cache = self._result(tool, "kdbg_decomp_cache")
+            assert cache["schema"] == "winbox.decomp-cache/1"
             decomp = self._result(
                 tool, "kdbg_decomp", nt_close, before=1, after=2
             )
             assert decomp["schema"] == "winbox.kdbg-decomp/5"
             assert decomp["detail"] == "compact"
             assert decomp["target"]["name"]
-            assert decomp["verified"]["identity"] == "pdb-guid-age"
+            assert decomp["verified"]["identity_method"] == "pdb-guid-age"
             assert decomp["rip_mapping"]["kind"] in {
                 "exact", "range", "nearest-forward", "nearest-backward",
                 "ambiguous", "unmapped",
@@ -1432,6 +1434,7 @@ class TestKdbg:
         assert "--confirm" in run("kdbg", "restore-cet", expect_ok=False).output
         run("kdbg", "ghidra", "run")
         assert "image_installed" in run("kdbg", "ghidra", "status").output
+        assert "total_bytes" in run("kdbg", "ghidra", "cache").output
         run("kdbg", "ghidra", "stop")
         run("kdbg", "start")
         try:

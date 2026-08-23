@@ -10,6 +10,7 @@ import pytest
 
 from winbox.config import Config
 from winbox.kdbg.decomp.client import DecompClient
+from winbox.kdbg.decomp.cache import cache_inventory
 from winbox.kdbg.decomp.docker import DockerError, DockerManager
 
 
@@ -67,6 +68,13 @@ def test_persistent_pyghidra_worker_decompiles_and_reuses_project(tmp_path, requ
     assert any(line.get("assembly") for line in first["mapping"]["excerpt"])
     assert second["cache_hit"] is True
     assert second["decompile_cache_hit"] is True
+    worker_status = client.status()
+    assert worker_status["active_worker_api"] == "5"
+    assert worker_status["max_open_programs"] == 2
+    assert worker_status["container_info"]["resources"]["memory_bytes"] == 4 * 1024**3
+    inventory = cache_inventory(cfg)
+    assert inventory["entry_count"] == 1
+    assert inventory["entries"][0]["analysis_profile"] == "winbox-pdb-public-v2"
     assert first["mapping"]["selection"]["total_lines"] >= 1
     assert second["mapping"]["confidence"] in {"exact", "nearest"}
     assert second["mapping"]["kind"] in {

@@ -189,7 +189,7 @@ def test_docker_decompile_translates_path_before_transport(monkeypatch, tmp_path
 
     def exchange(payload, **kwargs):
         captured.update(json.loads(payload))
-        return {"ok": True, "result": {"fine": True}}
+        return {"ok": True, "request_id": captured["request_id"], "result": {"fine": True}}
 
     monkeypatch.setattr(client, "_exchange", exchange)
     assert client.call("decompile", binary=str(binary), sha256=digest)["fine"]
@@ -216,7 +216,9 @@ def test_legacy_host_worker_is_migrated_before_docker_start(monkeypatch, tmp_pat
 
     monkeypatch.setattr(client, "_exchange", exchange)
     client.ensure_selected_backend()
-    assert exchanges == [{"op": "shutdown", "args": {}}]
+    assert exchanges[0]["op"] == "shutdown"
+    assert exchanges[0]["args"] == {}
+    assert len(exchanges[0]["request_id"]) == 32
 
 
 def test_stale_worker_api_is_refused_without_shutdown(monkeypatch, tmp_path):

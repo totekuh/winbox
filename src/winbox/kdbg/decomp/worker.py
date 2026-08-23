@@ -20,6 +20,7 @@ import shutil
 import signal
 import socket
 import sys
+import threading
 import time
 import traceback
 import re
@@ -29,11 +30,12 @@ from pathlib import Path
 MAX_REQUEST = 64 * 1024
 MAX_CODE = 256 * 1024
 MAX_CONTEXT_LINES = 20
-MAX_OPEN_PROGRAMS = 1
+DEFAULT_MAX_OPEN_PROGRAMS = 1
 MAX_LINE_BATCH = 100
 MAX_MAPPED_INSTRUCTION_ASSOCIATIONS = 512
-WORKER_API = "4"
-ANALYSIS_PROFILE = "winbox-default-v1"
+WORKER_API = "5"
+ANALYSIS_PROFILE = "winbox-pdb-public-v2"
+REQUEST_READ_TIMEOUT = 5.0
 
 
 class WorkerError(RuntimeError):
@@ -66,7 +68,10 @@ class OpenProgram:
 
 
 class Worker:
-    def __init__(self, cache: Path, projects: Path, ghidra_install_dir: str | None):
+    def __init__(
+        self, cache: Path, projects: Path, ghidra_install_dir: str | None,
+        *, max_open_programs: int = DEFAULT_MAX_OPEN_PROGRAMS,
+    ):
         self.cache = cache
         self.projects = projects
         self.ghidra_install_dir = ghidra_install_dir
@@ -77,6 +82,7 @@ class Worker:
             collections.OrderedDict()
         )
         self.shutdown = False
+        self.max_open_programs = max(1, min(int(max_open_programs), 4))
 
     def start_ghidra(self) -> None:
         if self.started:
@@ -113,6 +119,7 @@ class Worker:
                 "ghidra_version": self.ghidra_version,
                 "worker_pid": os.getpid(),
                 "open_programs": len(self.programs),
+                "max_open_programs": self.max_open_programs,
                 "cached_programs": _count_projects(self.projects),
             }
         if op == "shutdown":
@@ -149,7 +156,10 @@ class Worker:
         if assembly_mode not in {"nearby", "mapped"}:
             raise WorkerError("assembly must be 'nearby' or 'mapped'")
 
+        request_id = str(args.get("_request_id") or "")
+        self._check_cancelled(request_id)
         opened, cache_hit = self._open(binary, expected_sha)
+        self._check_cancelled(request_id)
         program = opened.program
         image_base = int(program.getImageBase().getOffset())
         target_value = image_base + rva
@@ -174,13 +184,38 @@ class Worker:
             raise WorkerError(f"no analyzed function contains RVA 0x{rva:x}{suffix}")
 
         entry = int(function.getEntryPoint().getOffset())
+        function_rva = entry - image_base
+        persisted_source = self._recovery_provenance(expected_sha, function_rva)
+        if function_source == "analysis" and persisted_source:
+            function_source = persisted_source
+        elif function_source.startswith("pdb-public-"):
+            self._record_recovery_provenance(
+                expected_sha, function_rva, function_source, args.get("symbol_hint"),
+            )
         result = opened.decompile_cache.pop(entry, None)
         decompile_cache_hit = result is not None
         if result is None:
             from ghidra.util.task import ConsoleTaskMonitor
-            result = opened.decompiler.decompileFunction(
-                function, timeout, ConsoleTaskMonitor()
-            )
+            monitor = ConsoleTaskMonitor()
+            finished = threading.Event()
+            watcher = None
+            if request_id:
+                marker = self.cache / "cancel" / request_id
+                def watch_cancel():
+                    while not finished.wait(0.1):
+                        if marker.exists():
+                            with contextlib.suppress(Exception):
+                                monitor.cancel()
+                            return
+                watcher = threading.Thread(target=watch_cancel, daemon=True)
+                watcher.start()
+            try:
+                result = opened.decompiler.decompileFunction(function, timeout, monitor)
+            finally:
+                finished.set()
+                if watcher is not None:
+                    watcher.join(timeout=1.0)
+        self._check_cancelled(request_id)
         if result is None or not result.decompileCompleted():
             message = result.getErrorMessage() if result is not None else "no result"
             raise WorkerError(
@@ -207,6 +242,9 @@ class Worker:
         instructions, instruction_location = _nearby_instructions(
             program, function, address
         )
+        verified_name = _verified_function_name(
+            args.get("symbol_hint"), entry - image_base,
+        )
         response = {
             "cache_hit": cache_hit,
             "decompile_cache_hit": decompile_cache_hit,
@@ -216,6 +254,8 @@ class Worker:
             "ghidra_address": f"0x{target_value:x}",
             "function": {
                 "name": str(function.getName()),
+                "verified_name": verified_name,
+                "name_source": "verified-pdb-public" if verified_name else "ghidra",
                 "entry": f"0x{entry:x}",
                 "rva": f"0x{entry - image_base:x}",
                 "offset": f"0x{target_value - entry:x}",
@@ -236,7 +276,67 @@ class Worker:
         }
         if full:
             response["code"] = returned_code
+        self._record_metadata(
+            expected_sha, str(args.get("binary_name") or binary.name),
+            project_name=_project_name(self.ghidra_version, expected_sha),
+        )
         return response
+
+    def _check_cancelled(self, request_id: str) -> None:
+        if not request_id:
+            return
+        marker = self.cache / "cancel" / request_id
+        if marker.exists():
+            with contextlib.suppress(OSError):
+                marker.unlink()
+            raise WorkerError(f"request {request_id} was cancelled by its client")
+
+    def _record_metadata(self, digest: str, binary_name: str, *, project_name: str) -> None:
+        root = self.cache / "metadata"
+        root.mkdir(parents=True, exist_ok=True)
+        value = {
+            "schema": "winbox.decomp-cache/1", "sha256": digest,
+            "binary_name": binary_name[:260], "project_name": project_name,
+            "ghidra_version": self.ghidra_version,
+            "analysis_profile": ANALYSIS_PROFILE, "last_used": time.time(),
+        }
+        temporary = root / f".{digest}.{os.getpid()}.tmp"
+        temporary.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, root / f"{digest}.json")
+
+    def _provenance_path(self, digest: str) -> Path:
+        return self.cache / "provenance" / f"{ANALYSIS_PROFILE}_{digest}.json"
+
+    def _recovery_provenance(self, digest: str, function_rva: int) -> str | None:
+        try:
+            value = json.loads(self._provenance_path(digest).read_text(encoding="utf-8"))
+            entry = value.get(str(function_rva))
+            source = entry.get("source") if isinstance(entry, dict) else None
+            return str(source) if source else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _record_recovery_provenance(
+        self, digest: str, function_rva: int, source: str, hint,
+    ) -> None:
+        path = self._provenance_path(digest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                value = {}
+        except (OSError, ValueError):
+            value = {}
+        hint_name = hint.get("name") if isinstance(hint, dict) else ""
+        value[str(function_rva)] = {
+            "source": source, "symbol": str(hint_name or "")[:512],
+            "recorded_at": time.time(),
+        }
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
 
     def _open(self, binary: Path, digest: str) -> tuple[OpenProgram, bool]:
         self.start_ghidra()
@@ -258,13 +358,10 @@ class Worker:
                 raise WorkerError("binary changed while copying into analysis cache")
             os.replace(temp, cached_binary)
 
-        safe_version = "".join(
-            c if c.isalnum() else "_" for c in str(self.ghidra_version)
-        )
         # Full digest, not a display-length prefix: binaries are attacker-
         # controlled and a project collision would silently reuse analysis of
         # the wrong content even though the immutable copy itself was exact.
-        project_name = f"p_{safe_version}_{digest}"
+        project_name = _project_name(self.ghidra_version, digest)
         program_name = f"binary_{digest}{cached_binary.suffix}"
         project_exists = (self.projects / f"{project_name}.gpr").exists()
         context = self.pyghidra.open_program(
@@ -286,7 +383,7 @@ class Worker:
             context.__exit__(*sys.exc_info())
             raise
         self.programs[digest] = opened
-        while len(self.programs) > MAX_OPEN_PROGRAMS:
+        while len(self.programs) > self.max_open_programs:
             _, evicted = self.programs.popitem(last=False)
             evicted.close()
         return opened, project_exists
@@ -311,7 +408,7 @@ def _walk_tokens(node):
 
 def _recover_function(api, program, address, rva: int, hint):
     """Create one missed function only from a close, verified PDB public RVA."""
-    if not isinstance(hint, dict):
+    if not isinstance(hint, dict) or hint.get("is_function") is not True:
         return None, "none"
     try:
         hint_rva = int(hint["rva"])
@@ -686,6 +783,24 @@ def _count_projects(path: Path) -> int:
         return 0
 
 
+def _project_name(version: object, digest: str) -> str:
+    safe = "".join(c if c.isalnum() else "_" for c in str(version))
+    profile = "".join(c if c.isalnum() else "_" for c in ANALYSIS_PROFILE)
+    return f"p_{safe}_{profile}_{digest}"
+
+
+def _verified_function_name(hint, function_rva: int) -> str | None:
+    if not isinstance(hint, dict) or hint.get("is_function") is not True:
+        return None
+    try:
+        if int(hint.get("rva")) != function_rva:
+            return None
+    except (TypeError, ValueError):
+        return None
+    value = str(hint.get("name") or "").strip()
+    return value[:512] or None
+
+
 def _read_request(conn: socket.socket) -> dict:
     data = bytearray()
     while True:
@@ -708,7 +823,20 @@ def _read_request(conn: socket.socket) -> dict:
     args = value.get("args") or {}
     if not isinstance(args, dict):
         raise WorkerError("request args must be an object")
-    return {"op": value["op"], "args": args}
+    request_id = value.get("request_id")
+    if (
+        not isinstance(request_id, str) or not 1 <= len(request_id) <= 64
+        or any(c not in "0123456789abcdef" for c in request_id)
+    ):
+        raise WorkerError("request_id must be 1-64 lowercase hexadecimal characters")
+    return {"op": value["op"], "args": args, "request_id": request_id}
+
+
+def _write_session(path: Path, value: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, separators=(",", ":")), encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
 
 
 def _serve(args) -> int:
@@ -728,7 +856,10 @@ def _serve(args) -> int:
         os.close(lock_fd)
         return 0
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    worker = Worker(args.cache, args.projects, args.ghidra_install_dir)
+    worker = Worker(
+        args.cache, args.projects, args.ghidra_install_dir,
+        max_open_programs=args.max_open_programs,
+    )
     try:
         with contextlib.suppress(FileNotFoundError):
             args.socket.unlink()
@@ -736,13 +867,15 @@ def _serve(args) -> int:
         os.chmod(args.socket, 0o600)
         listener.listen(16)
         listener.settimeout(0.5)
-        args.session.write_text(json.dumps({
+        session_state = {
             "pid": os.getpid(),
             "backend": args.backend,
             "worker_api": WORKER_API,
             "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "socket": str(args.socket),
-        }, indent=2) + "\n", encoding="utf-8")
+            "current_operation": None,
+        }
+        _write_session(args.session, session_state)
 
         def stop(_signum, _frame):
             worker.shutdown = True
@@ -759,13 +892,31 @@ def _serve(args) -> int:
                     break
                 raise
             with conn:
+                request = None
                 try:
+                    conn.settimeout(REQUEST_READ_TIMEOUT)
                     request = _read_request(conn)
+                    request["args"]["_request_id"] = request["request_id"]
+                    session_state["current_operation"] = {
+                        "request_id": request["request_id"], "op": request["op"],
+                        "started_at": time.time(),
+                    }
+                    _write_session(args.session, session_state)
                     result = worker.handle(request["op"], request["args"])
-                    reply = {"ok": True, "result": result}
+                    reply = {
+                        "ok": True, "result": result,
+                        "request_id": request["request_id"],
+                    }
                 except Exception as exc:
                     traceback.print_exc(file=sys.stderr)
-                    reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                    reply = {
+                        "ok": False, "error": f"{type(exc).__name__}: {exc}",
+                        "request_id": request.get("request_id") if request else None,
+                    }
+                finally:
+                    session_state["current_operation"] = None
+                    with contextlib.suppress(OSError):
+                        _write_session(args.session, session_state)
                 encoded = json.dumps(reply, separators=(",", ":")).encode("utf-8") + b"\n"
                 with contextlib.suppress(OSError):
                     conn.sendall(encoded)
@@ -790,6 +941,7 @@ def main() -> int:
     parser.add_argument("--projects", type=Path, required=True)
     parser.add_argument("--ghidra-install-dir")
     parser.add_argument("--backend", choices=("docker", "host"), default="host")
+    parser.add_argument("--max-open-programs", type=int, default=1)
     return _serve(parser.parse_args())
 
 

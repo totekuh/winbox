@@ -4018,6 +4018,34 @@ def kdbg_decomp_status() -> dict[str, Any]:
 
 
 @mcp.tool()
+def kdbg_decomp_cache() -> dict[str, Any]:
+    """List Ghidra content-cache entries, sizes, profiles, and LRU timestamps."""
+    from winbox.kdbg.decomp import cache_inventory
+    return _research_ok(cache_inventory(_kdbg_cfg_only()))
+
+
+@mcp.tool()
+def kdbg_decomp_cache_prune(
+    max_bytes: int = 0, older_than_days: float = 0.0, dry_run: bool = True,
+) -> dict[str, Any]:
+    """Preview or prune cold Ghidra caches; dry-run is the safe default.
+
+    Args:
+        max_bytes: Reduce aggregate cache usage to this many bytes; zero disables.
+        older_than_days: Select entries unused for this many days; zero disables.
+        dry_run: Preview only. Set false explicitly to delete while worker is stopped.
+    """
+    from winbox.kdbg.decomp import DecompError, prune_cache
+    try:
+        return _research_ok(prune_cache(
+            _kdbg_cfg_only(), max_bytes=int(max_bytes),
+            older_than_days=float(older_than_days), dry_run=bool(dry_run),
+        ))
+    except (DecompError, TypeError, ValueError) as exc:
+        return _research_error(exc, operation="kdbg_decomp_cache_prune")
+
+
+@mcp.tool()
 def kdbg_ghidra_install(pull: bool = True) -> dict[str, Any]:
     """Build the pinned, self-contained headless Ghidra Docker image.
 

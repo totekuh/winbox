@@ -39,7 +39,7 @@ PS C:\Windows\system32>
 
 ## Platform capabilities
 
-- **MCP server** — 73 tools form a bounded, AI-native research control plane
+- **MCP server** — 75 tools form a bounded, AI-native research control plane
   for autonomous agents, covering VM lifecycle, execution, memory, symbols,
   debugging, drivers, IPC, defenses, networking, event logs, and evidence
   collection.
@@ -362,7 +362,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (73):**
+**Available tools (75):**
 
 User-mode primitives:
 
@@ -472,8 +472,10 @@ and bounded recovery hints instead of prose that an agent must parse.
 | `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |
 | `kdbg_disasm(addr?, count?, instruction_bytes?)` | Symbol-annotated Capstone disassembly; raw bytes are opt-in |
-| `kdbg_decomp(addr?, symbol?, module?, rva?, cursor?, before?, after?, full?, binary?, timeout?, detail="compact", lines?, assembly="nearby", instruction_bytes?, runtime_vas?)` | Resolve current RIP, runtime VA, symbol, or module+RVA, verify the exact PE, and return stop-pinned RVA-linked assembly/pseudocode with bounded pagination; repeated VAs and raw bytes are opt-in |
+| `kdbg_decomp(addr?, symbol?, module?, rva?, cursor?, before?, after?, full?, binary?, timeout?, detail="compact", lines?, assembly="nearby", instruction_bytes?, runtime_vas?)` | Resolve current RIP, runtime VA, symbol, or module+RVA, verify PE build identity, snapshot exact host content, and return stop-pinned RVA-linked assembly/pseudocode with bounded pagination; repeated VAs and raw bytes are opt-in |
 | `kdbg_decomp_status()` | Report PyGhidra discovery, isolated worker/JVM state, and durable project-cache status without starting the JVM |
+| `kdbg_decomp_cache()` | List content-keyed binary/project sizes, analysis profiles, and LRU timestamps |
+| `kdbg_decomp_cache_prune(max_bytes?, older_than_days?, dry_run?)` | Dry-run-first LRU pruning; applying requires the worker to be stopped |
 | `kdbg_ghidra_install(pull?)` | Build the checksum-pinned JDK 21 + Ghidra + PyGhidra Docker image |
 | `kdbg_ghidra_run()` | Start and API-check the private, networkless persistent decompilation container |
 | `kdbg_ghidra_stop()` | Stop/remove the labelled container while preserving analyzed projects and binary cache |
@@ -488,7 +490,7 @@ The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker pro
 Kali Linux
 ├── winbox control plane
 │   ├── CLI (Python/Click)
-│   └── MCP server (73 bounded agent tools)
+│   └── MCP server (75 bounded agent tools)
 ├── hypervisor research plane
 │   ├── QMP/HMP ────────────> VM + gdbstub lifecycle
 │   ├── persistent RSP ─────> vCPUs, memory, break/watchpoints, stepping

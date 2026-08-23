@@ -1318,6 +1318,37 @@ def kdbg_ghidra_status(ctx: click.Context) -> None:
     _ghidra_lifecycle(ctx, "status")
 
 
+@kdbg_ghidra.command("cache")
+@click.pass_context
+def kdbg_ghidra_cache(ctx: click.Context) -> None:
+    """List content-keyed binary/project cache usage and LRU age."""
+    import json as _json
+    from winbox.kdbg.decomp import cache_inventory
+    click.echo(_json.dumps(cache_inventory(ctx.obj["cfg"]), indent=2))
+
+
+@kdbg_ghidra.command("prune")
+@click.option("--max-bytes", type=click.IntRange(min=0), default=0)
+@click.option("--older-than-days", type=click.FloatRange(min=0), default=0.0)
+@click.option("--apply", is_flag=True, help="Delete selected entries; default is dry-run.")
+@click.pass_context
+def kdbg_ghidra_prune(
+    ctx: click.Context, max_bytes: int, older_than_days: float, apply: bool,
+) -> None:
+    """Preview or apply bounded LRU cache pruning."""
+    import json as _json
+    from winbox.kdbg.decomp import DecompError, prune_cache
+    try:
+        result = prune_cache(
+            ctx.obj["cfg"], max_bytes=max_bytes,
+            older_than_days=older_than_days, dry_run=not apply,
+        )
+    except DecompError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    click.echo(_json.dumps(result, indent=2))
+
+
 @kdbg.command("mem")
 @click.argument("address", metavar="VA")
 @click.argument("length", type=int, default=64)

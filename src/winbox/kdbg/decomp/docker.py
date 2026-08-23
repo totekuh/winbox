@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from winbox.config import Config
-from winbox.kdbg.decomp.client import WORKER_API, protocol_family
+from winbox.kdbg.decomp.client import WORKER_API, open_program_limit, protocol_family
 
 
 GHIDRA_VERSION = "12.1.3"
@@ -23,6 +23,20 @@ PYGHIDRA_VERSION = "3.1.0"
 PLATFORM = "linux/amd64"
 IMAGE = f"winbox-pyghidra:{GHIDRA_VERSION}-{PYGHIDRA_VERSION}-api{WORKER_API}"
 COMPONENT_LABEL = "io.winbox.component=pyghidra"
+
+
+def resource_limits() -> tuple[str, str]:
+    memory = os.environ.get("WINBOX_GHIDRA_MEMORY", "4g").strip().lower()
+    if not memory[:-1].isdigit() or memory[-1:] not in {"m", "g"} or int(memory[:-1]) < 1:
+        raise DockerError("WINBOX_GHIDRA_MEMORY must be a positive Docker size such as 4g")
+    cpus = os.environ.get("WINBOX_GHIDRA_CPUS", "2.0").strip()
+    try:
+        parsed = float(cpus)
+    except ValueError as exc:
+        raise DockerError("WINBOX_GHIDRA_CPUS must be numeric") from exc
+    if not 0.25 <= parsed <= 64:
+        raise DockerError("WINBOX_GHIDRA_CPUS must be between 0.25 and 64")
+    return memory, cpus
 
 
 class DockerError(RuntimeError):
@@ -139,6 +153,7 @@ class DockerManager:
                 f"refusing to manage unowned container with reserved name {self.name}"
             )
         state = info.get("State") or {}
+        host = info.get("HostConfig") or {}
         return {
             "id": str(info.get("Id") or "")[:12],
             "image_id": info.get("Image"),
@@ -146,6 +161,12 @@ class DockerManager:
             "status": state.get("Status"),
             "started_at": state.get("StartedAt"),
             "image": (info.get("Config") or {}).get("Image"),
+            "resources": {
+                "memory_bytes": host.get("Memory"),
+                "nano_cpus": host.get("NanoCpus"),
+                "pids_limit": host.get("PidsLimit"),
+                "log_config": host.get("LogConfig"),
+            },
         }
 
     def status(self) -> dict[str, Any]:
@@ -264,6 +285,7 @@ class DockerManager:
                 pass
 
         uid, gid = os.getuid(), os.getgid()
+        memory, cpus = resource_limits()
         command = [
             "run", "--detach", "--platform", PLATFORM, "--name", self.name,
             "--label", COMPONENT_LABEL,
@@ -272,6 +294,9 @@ class DockerManager:
             "--label", f"io.winbox.worker-api={WORKER_API}",
             "--network", "none", "--read-only", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--pids-limit", "512",
+            "--memory", memory, "--memory-swap", memory, "--cpus", cpus,
+            "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
+            "--stop-timeout", "30",
             "--user", f"{uid}:{gid}",
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,mode=1777,size=512m",
             "--mount", f"type=bind,src={root},dst=/run/winbox",
@@ -284,6 +309,7 @@ class DockerManager:
             "--cache", "/cache", "--projects", "/projects",
             "--ghidra-install-dir", "/opt/ghidra",
             "--backend", "docker",
+            "--max-open-programs", str(open_program_limit()),
         ]
         self._docker(*command, timeout=60)
         deadline = time.monotonic() + max(1.0, wait_seconds)

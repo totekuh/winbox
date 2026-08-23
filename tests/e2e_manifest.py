@@ -171,6 +171,8 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg ghidra install": (EXCLUDED, "one-time 570 MB network image build; covered by the dedicated real Docker integration"),
     "kdbg ghidra run": (LIVE, "start and API-check the private container"),
     "kdbg ghidra status": (LIVE, "read-only image/container/API status"),
+    "kdbg ghidra cache": (LIVE, "read-only content-cache inventory"),
+    "kdbg ghidra prune": (EXCLUDED, "destructive apply requires explicit policy; unit-tested dry-run and deletion"),
     "kdbg ghidra stop": (LIVE, "stop container while preserving caches"),
     "kdbg mem": (LIVE, ""),
     "kdbg stack": (LIVE, ""),
@@ -267,6 +269,8 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg_disasm": (LIVE, ""),
     "kdbg_decomp": (LIVE, "exact cached ntdll mapped from a live target VA"),
     "kdbg_decomp_status": (LIVE, "read-only Docker/API/cache status"),
+    "kdbg_decomp_cache": (LIVE, "read-only content-cache inventory"),
+    "kdbg_decomp_cache_prune": (EXCLUDED, "destructive apply requires explicit policy; unit-tested dry-run and deletion"),
     "kdbg_ghidra_install": (EXCLUDED, "one-time 570 MB network image build; covered by the dedicated real Docker integration"),
     "kdbg_ghidra_run": (LIVE, "start and API-check the private container"),
     "kdbg_ghidra_stop": (LIVE, "stop container while preserving caches"),
@@ -317,6 +321,7 @@ CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "kdbg interrupt": "tests/test_kdbg_daemon.py",
     "kdbg context": "tests/test_kdbg_daemon.py",
     "kdbg ghidra install": "tests/test_kdbg_decomp_docker.py",
+    "kdbg ghidra prune": "tests/test_kdbg_decomp_hardening.py",
 }
 
 MCP_EXCLUSION_UNIT_TESTS: dict[str, str] = {
@@ -329,4 +334,5 @@ MCP_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "kdbg_interrupt": "tests/test_mcp.py",
     "kdbg_bp_trace": "tests/test_kdbg_trace.py",
     "kdbg_ghidra_install": "tests/test_kdbg_decomp_docker.py",
+    "kdbg_decomp_cache_prune": "tests/test_kdbg_decomp_hardening.py",
 }

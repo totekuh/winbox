@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -24,7 +25,18 @@ class DecompError(RuntimeError):
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-WORKER_API = "4"
+WORKER_API = "5"
+
+
+def open_program_limit() -> int:
+    raw = os.environ.get("WINBOX_GHIDRA_OPEN_PROGRAMS", "2")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise DecompError("WINBOX_GHIDRA_OPEN_PROGRAMS must be an integer") from exc
+    if not 1 <= value <= 4:
+        raise DecompError("WINBOX_GHIDRA_OPEN_PROGRAMS must be between 1 and 4")
+    return value
 
 
 def protocol_family() -> str:
@@ -174,6 +186,7 @@ class DecompClient:
                 "cache_dir": str(cache_dir(self.cfg)),
                 "project_dir": str(docker_projects(self.cfg)),
             })
+            result.update(self._session_liveness())
             if (
                 result["running"]
                 and result["active_backend"] in {None, "docker"}
@@ -219,6 +232,7 @@ class DecompClient:
             "cache_dir": str(cache_dir(self.cfg)),
             "project_dir": str(project_dir()),
         }
+        result.update(self._session_liveness())
         if discovery_error:
             result["error"] = discovery_error
         if (
@@ -271,8 +285,10 @@ class DecompClient:
         **args: Any,
     ) -> dict[str, Any]:
         selected_backend = backend()
+        request_id = secrets.token_hex(16)
         if op == "decompile" and selected_backend == "docker":
             args = dict(args)
+            args.setdefault("binary_name", Path(str(args.get("binary", ""))).name)
             args["binary"] = self._stage_binary(
                 Path(str(args.get("binary", ""))), str(args.get("sha256", ""))
             )
@@ -291,7 +307,7 @@ class DecompClient:
                 "the client and worker."
             )
         payload = json.dumps(
-            {"op": op, "args": args}, separators=(",", ":")
+            {"request_id": request_id, "op": op, "args": args}, separators=(",", ":")
         ).encode("utf-8") + b"\n"
         if len(payload) > MAX_REQUEST_BYTES:
             raise DecompError(f"decomp request exceeds {MAX_REQUEST_BYTES} bytes")
@@ -304,12 +320,16 @@ class DecompClient:
             try:
                 reply = self._exchange(payload, timeout=timeout)
             except (OSError, DecompError) as exc:
+                if op == "decompile":
+                    self._cancel_request(request_id)
                 last = exc
                 # A stale socket or worker crash is recoverable once.  Do not
                 # blindly retry an application-level reply, only transport.
                 if attempt == 0 and not self.worker_alive():
                     continue
                 raise DecompError(f"PyGhidra worker communication failed: {exc}") from exc
+            if reply.get("request_id") != request_id:
+                raise DecompError("PyGhidra worker returned a mismatched request id")
             if not reply.get("ok"):
                 raise DecompError(str(reply.get("error") or "PyGhidra worker failed"))
             result = reply.get("result")
@@ -323,9 +343,11 @@ class DecompClient:
         raise DecompError(f"PyGhidra worker unavailable: {last}")
 
     def _shutdown_conflicting_worker(self, active: str, selected: str) -> None:
+        request_id = secrets.token_hex(16)
         try:
             reply = self._exchange(
-                b'{"op":"shutdown","args":{}}\n', timeout=10.0
+                json.dumps({"request_id": request_id, "op": "shutdown", "args": {}},
+                           separators=(",", ":")).encode() + b"\n", timeout=10.0
             )
         except (OSError, DecompError) as exc:
             raise DecompError(
@@ -359,6 +381,7 @@ class DecompClient:
         return reply
 
     def _start_worker(self) -> None:
+        self._enforce_cache_budget()
         if backend() == "docker":
             from winbox.kdbg.decomp.docker import DockerError, DockerManager
 
@@ -368,6 +391,18 @@ class DecompClient:
                 raise DecompError(str(exc)) from exc
             return
         self._start_host_worker()
+
+    def _enforce_cache_budget(self) -> None:
+        raw = os.environ.get("WINBOX_GHIDRA_CACHE_MAX_BYTES", "0").strip()
+        try:
+            maximum = int(raw)
+        except ValueError as exc:
+            raise DecompError("WINBOX_GHIDRA_CACHE_MAX_BYTES must be an integer") from exc
+        if maximum < 0:
+            raise DecompError("WINBOX_GHIDRA_CACHE_MAX_BYTES must not be negative")
+        if maximum:
+            from winbox.kdbg.decomp.cache import prune_cache
+            prune_cache(self.cfg, max_bytes=maximum, dry_run=False)
 
     def _start_host_worker(self) -> None:
         root = runtime_dir(self.cfg)
@@ -382,6 +417,7 @@ class DecompClient:
             "--session", str(session_path(self.cfg)),
             "--cache", str(cache_dir(self.cfg)),
             "--projects", str(project_dir()),
+            "--max-open-programs", str(open_program_limit()),
         ]
         ghidra_dir = os.environ.get("GHIDRA_INSTALL_DIR")
         if ghidra_dir:
@@ -401,8 +437,10 @@ class DecompClient:
         while time.monotonic() < deadline:
             if self.worker_alive() and socket_path(self.cfg).exists():
                 try:
+                    request_id = secrets.token_hex(16)
                     self._exchange(
-                        b'{"op":"status","args":{}}\n', timeout=1.0
+                        json.dumps({"request_id": request_id, "op": "status", "args": {}},
+                                   separators=(",", ":")).encode() + b"\n", timeout=1.0
                     )
                     return
                 except (OSError, DecompError):
@@ -415,6 +453,38 @@ class DecompClient:
             pass
         detail = f"; worker log tail: {tail.strip()}" if tail.strip() else ""
         raise DecompError(f"PyGhidra worker did not become ready within 30s{detail}")
+
+    def _cancel_request(self, request_id: str) -> None:
+        root = cache_dir(self.cfg) / "cancel"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            os.chmod(root, 0o700)
+            now = time.time()
+            markers = sorted(root.iterdir(), key=lambda p: p.stat().st_mtime)
+            excess = max(0, len(markers) - 1023)
+            for index, old in enumerate(markers):
+                if old.is_file() and not old.is_symlink() and (
+                    now - old.stat().st_mtime > 86400 or index < excess
+                ):
+                    old.unlink(missing_ok=True)
+            marker = root / request_id
+            marker.write_text(str(now), encoding="ascii")
+            os.chmod(marker, 0o600)
+        except OSError:
+            pass
+
+    def _session_liveness(self) -> dict[str, Any]:
+        try:
+            value = json.loads(session_path(self.cfg).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return {"current_operation": None}
+        current = value.get("current_operation")
+        if not isinstance(current, dict):
+            return {"current_operation": None}
+        started = current.get("started_at")
+        if isinstance(started, (int, float)):
+            current = {**current, "elapsed_seconds": max(0.0, time.time() - started)}
+        return {"current_operation": current}
 
     def _stage_binary(self, source: Path, expected_sha: str) -> str:
         """Atomically copy one verified input into the container's read/write cache."""

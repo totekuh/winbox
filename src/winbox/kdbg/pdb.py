@@ -80,6 +80,12 @@ class StructLayout:
         }
 
 
+@dataclass
+class PublicSymbols:
+    symbols: dict[str, int]
+    functions: set[str]
+
+
 def _run_dump(pdb_path: Path, *args: str, timeout: int = 300) -> str:
     """Invoke ``llvm-pdbutil dump`` and return stdout as text.
 
@@ -141,7 +147,7 @@ _PUB_RE = re.compile(r"S_PUB32 \[size = \d+\] `([^`]+)`")
 _ADDR_RE = re.compile(r"addr\s*=\s*(\d+):(\d+)")
 
 
-def parse_publics(text: str, sections: dict[int, int]) -> dict[str, int]:
+def parse_publics_metadata(text: str, sections: dict[int, int]) -> PublicSymbols:
     """Turn ``--publics`` dump text into ``{name: rva}``.
 
     llvm-pdbutil prints each symbol on two lines::
@@ -156,6 +162,7 @@ def parse_publics(text: str, sections: dict[int, int]) -> dict[str, int]:
     don't misalign the rest of the stream.
     """
     out: dict[str, int] = {}
+    functions: set[str] = set()
     pending_name: str | None = None
     dropped = 0
     for line in text.splitlines():
@@ -174,6 +181,8 @@ def parse_publics(text: str, sections: dict[int, int]) -> dict[str, int]:
                 # Publics with spurious C++ literal names crowd the table; we
                 # keep them since filtering would hide legitimate entries.
                 out[pending_name] = sec_va + sec_off
+                if re.search(r"\bfunction\b", line, re.IGNORECASE):
+                    functions.add(pending_name)
             else:
                 # Section index not in the headers map. Common causes:
                 # truncated llvm-pdbutil output (timeout mid-stream),
@@ -204,11 +213,19 @@ def parse_publics(text: str, sections: dict[int, int]) -> dict[str, int]:
             "is incomplete",
             dropped, dropped + len(out),
         )
-    return out
+    return PublicSymbols(out, functions)
+
+
+def parse_publics(text: str, sections: dict[int, int]) -> dict[str, int]:
+    return parse_publics_metadata(text, sections).symbols
 
 
 def load_publics(pdb_path: Path, sections: dict[int, int]) -> dict[str, int]:
     return parse_publics(_run_dump(pdb_path, "--publics"), sections)
+
+
+def load_publics_metadata(pdb_path: Path, sections: dict[int, int]) -> PublicSymbols:
+    return parse_publics_metadata(_run_dump(pdb_path, "--publics"), sections)
 
 
 # ── Types (structures) ──────────────────────────────────────────────────

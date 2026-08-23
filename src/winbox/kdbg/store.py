@@ -29,6 +29,7 @@ an LLM context would be ruinous.
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 import tempfile
 from dataclasses import dataclass
@@ -128,6 +129,9 @@ class SymbolStore:
         base: int | None = None,
         size_of_image: int | None = None,
         filename: str | None = None,
+        function_symbols: list[str] | None = None,
+        pe_path: str | None = None,
+        pe_sha256: str | None = None,
     ) -> Path:
         """Write a module file and register it in the index as current.
 
@@ -153,16 +157,29 @@ class SymbolStore:
             "size_of_image": size_of_image,
             "symbols": symbols,
             "types": types,
+            "function_symbols": sorted(set(function_symbols or [])),
+            "pe_path": pe_path,
+            "pe_sha256": pe_sha256,
         }
         path = self.root / fname
         _atomic_write_text(
             path,
             json.dumps(data, indent=2, sort_keys=True),
         )
-        index = self._read_index()
-        index[module] = fname
-        self._write_index(index)
+        lock_path = self.root / ".index.lock"
+        with lock_path.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            index = self._read_index()
+            index[module] = fname
+            self._write_index(index)
         return path
+
+    def load_build(self, module: str, build: str) -> dict[str, Any]:
+        """Load one immutable build record without following the active index."""
+        path = self.root / f"{module}_{build}.json"
+        if not path.resolve().is_relative_to(self.root.resolve()) or not path.is_file():
+            raise SymbolStoreError(f"symbol build not loaded: {module}!{build}")
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def set_base(self, module: str, base: int) -> None:
         """Update the cached module base without rewriting symbols."""
