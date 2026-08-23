@@ -464,7 +464,7 @@ and requires a reboot.
 | `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |
 | `kdbg_disasm(addr?, count?)` | Symbol-annotated Capstone disassembly at a target VA or the current RIP |
-| `kdbg_decomp(addr?, before?, after?, full?, binary?, timeout?, detail="compact")` | Resolve a live VA/current RIP through the fresh loader list, verify the exact PE, and return compact RVA-linked assembly/pseudocode; request `standard` or `diagnostic` only when provenance detail is needed |
+| `kdbg_decomp(addr?, before?, after?, full?, binary?, timeout?, detail="compact", lines?, assembly="nearby")` | Resolve a live VA/current RIP through the fresh loader list, verify the exact PE, and return compact RVA-linked assembly/pseudocode; `lines="1-22", assembly="mapped"` batches source lines with their corresponding instructions |
 | `kdbg_decomp_status()` | Report PyGhidra discovery, isolated worker/JVM state, and durable project-cache status without starting the JVM |
 | `kdbg_ghidra_install(pull?)` | Build the checksum-pinned JDK 21 + Ghidra + PyGhidra Docker image |
 | `kdbg_ghidra_run()` | Start and API-check the private, networkless persistent decompilation container |

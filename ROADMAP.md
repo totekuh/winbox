@@ -310,8 +310,12 @@ every address-bearing pseudocode line; direction and byte distance prevent a
 compiler prologue from being falsely presented as a current C statement. Full
 PE/PDB identities, loader records, hashes, Ghidra internals, and cache evidence
 are returned only with `detail=standard` or `detail=diagnostic`. `full=true`
-remains independent and controls only complete-function pseudocode. Worker API
-2 prevents a stale Docker image from serving the old mapping contract.
+remains independent and controls only complete-function pseudocode.
+`lines="N-M", assembly="mapped"` returns up to 100 absolute pseudocode lines
+with bounded corresponding instructions nested per line, preserving disjoint
+ranges, shared optimized instructions, unmapped declarations, clamped function
+ends, and explicit truncation warnings. Worker API 3 prevents a stale Docker
+image from serving the older mapping/batch contract.
 
 PyGhidra now runs in a pinned, persistent Docker service rather than requiring
 host Java/Ghidra or entering the MCP/debugger processes. Install/run/stop/status
@@ -339,6 +343,17 @@ only the byte comparison fail with the intended patch warning; removal restored
 the original bytes. A wrong 32-bit PE and an unmapped VA failed before Ghidra.
 Eight concurrent end-to-end queries serialized cleanly in 0.61 seconds, and a
 SIGKILLed worker restarted and reopened its durable project on the next query.
+
+Batch-mapping live validation on 2026-08-23 kept Server 2025
+`services.exe` halted at the hardware breakpoint on
+`services!RQueryServiceStatus`. `lines="1-22", assembly="mapped"` returned all
+22 requested pseudocode lines, nested 12 corresponding instructions beneath
+seven address-bearing lines, preserved the `nearest-forward` prologue mapping
+at a 21-byte distance, matched the exact PDB-guid-age identity and live bytes,
+and emitted no warnings or truncation. Worker API 2 migrated automatically to
+API 3 with its durable project warm, the real Docker integration passed in
+12.58 seconds, and installed CLI JSON remained parseable without terminal-width
+workarounds.
 
 Docker validation on the same date built Ghidra 12.1.3/PyGhidra 3.1.0 from the
 pinned artifacts and inspected the actual runtime hardening. A compiled-binary

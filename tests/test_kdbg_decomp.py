@@ -12,6 +12,7 @@ from winbox.config import Config
 from winbox.kdbg.decomp.client import (
     DecompClient,
     DecompError,
+    WORKER_API,
     discover_pyghidra_python,
 )
 from winbox.kdbg.decomp.identity import (
@@ -22,8 +23,17 @@ from winbox.kdbg.decomp.identity import (
     static_bytes_at_rva,
     validate_identity,
 )
-from winbox.kdbg.decomp.service import _format_result, _nearest_symbol_hint, query_decomp
-from winbox.kdbg.decomp.worker import _map_source
+from winbox.kdbg.decomp.service import (
+    _format_result,
+    _line_range,
+    _nearest_symbol_hint,
+    query_decomp,
+)
+from winbox.kdbg.decomp.worker import (
+    WorkerError,
+    _attach_mapped_assembly,
+    _map_source,
+)
 from winbox.kdbg.debugger.daemon import DaemonSession, StopState, TargetInfo
 from winbox.kdbg.debugger.reader import ReaderError
 from winbox.kdbg.store import SymbolStore
@@ -93,7 +103,7 @@ def test_worker_status_reports_busy_lock_as_alive(monkeypatch, tmp_path):
     client = DecompClient(Config(winbox_dir=tmp_path))
     monkeypatch.setattr(client, "worker_alive", lambda: True)
     monkeypatch.setattr(client, "active_backend", lambda: "host")
-    monkeypatch.setattr(client, "active_worker_api", lambda: "2")
+    monkeypatch.setattr(client, "active_worker_api", lambda: WORKER_API)
     monkeypatch.setattr(
         client, "call", lambda *a, **k: (_ for _ in ()).throw(DecompError("timed out"))
     )
@@ -192,7 +202,10 @@ class _FakeWorker:
                 "address": "0x140001000", "bytes": "90", "text": "NOP",
                 "current": True,
             }],
-            "mapping": {"confidence": "exact", "line": 7, "excerpt": []},
+            "mapping": {
+                "confidence": "exact", "line": 7, "excerpt": [],
+                "assembly_truncated": True,
+            },
             "function": {"name": "focus"},
             "analysis": {},
         }
@@ -213,18 +226,25 @@ def test_query_decomp_composes_rva_identity_and_worker(monkeypatch, tmp_path):
     cfg = Config(winbox_dir=tmp_path)
 
     result = query_decomp(
-        cfg, binary=str(binary), daemon_client=daemon, decomp_client=worker
+        cfg, binary=str(binary), lines="1-22", assembly="mapped",
+        daemon_client=daemon, decomp_client=worker,
     )
 
-    assert result["schema"] == "winbox.kdbg-decomp/2"
+    assert result["schema"] == "winbox.kdbg-decomp/3"
     assert result["detail"] == "compact"
     assert result["location"]["rva"] == "0x1000"
     assert result["verified"]["identity"] == "pdb-guid-age"
+    assert "mapped assembly was truncated at the bounded response limit" in result[
+        "warnings"
+    ]
     assert "identity" not in result
     assert "module" not in result
     assert worker.args[0] == "decompile"
     assert worker.args[1]["rva"] == 0x1000
     assert worker.args[1]["sha256"] == "a" * 64
+    assert worker.args[1]["line_start"] == 1
+    assert worker.args[1]["line_end"] == 22
+    assert worker.args[1]["assembly"] == "mapped"
 
 
 def test_query_decomp_rejects_bad_context_before_touching_daemon(tmp_path):
@@ -243,6 +263,35 @@ def test_query_decomp_rejects_bad_detail_before_touching_daemon(tmp_path):
 
     with pytest.raises(DecompError, match="detail must be one of"):
         query_decomp(Config(winbox_dir=tmp_path), detail="everything", daemon_client=Never())
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        ({"lines": "0-4"}, "positive ascending"),
+        ({"lines": "4-2"}, "positive ascending"),
+        ({"lines": "1-2-3"}, "must be N or N-M"),
+        ({"lines": "1-101"}, "at most 100"),
+        ({"assembly": "everything"}, "assembly must be one of"),
+    ],
+)
+def test_query_decomp_rejects_bad_batch_options_before_daemon(
+    tmp_path, kwargs, message
+):
+    class Never:
+        def call(self, *args, **values):
+            raise AssertionError("daemon must not be called")
+
+    with pytest.raises(DecompError, match=message):
+        query_decomp(Config(winbox_dir=tmp_path), daemon_client=Never(), **kwargs)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [("1", (1, 1)), ("1-22", (1, 22)), (" 7 - 9 ", (7, 9)), ("", None)],
+)
+def test_line_range_parser(value, expected):
+    assert _line_range(value) == expected
 
 
 def test_response_detail_levels_keep_diagnostics_opt_in():
@@ -272,11 +321,20 @@ def test_response_detail_levels_keep_diagnostics_opt_in():
         "mapping": {
             "confidence": "exact", "kind": "exact", "line": 2,
             "candidate_lines": [2], "distance_bytes": 0, "direction": "overlap",
+            "selection": {
+                "mode": "lines", "requested": {"start": 1, "end": 2},
+                "start": 1, "end": 2, "truncated": False,
+            },
             "excerpt": [{
                 "line": 2, "text": "return 1;", "relation": "exact",
                 "address_ranges": [{"start": "0x140001000", "end": "0x140001000"}],
+                "assembly": [{
+                    "address": "0x140001000", "bytes": "b801000000",
+                    "text": "MOV EAX,0x1",
+                }],
             }],
         },
+        "assembly_mode": "mapped",
         "instructions": [{
             "address": "0x140001000", "bytes": "b801000000",
             "text": "MOV EAX,0x1", "current": True,
@@ -292,6 +350,9 @@ def test_response_detail_levels_keep_diagnostics_opt_in():
     assert compact["pseudocode"][0]["rva_ranges"] == [
         {"start": "0x1000", "end": "0x1000"}
     ]
+    assert compact["pseudocode"][0]["assembly"][0]["rva"] == "0x1000"
+    assert compact["assembly_mode"] == "mapped"
+    assert compact["line_selection"]["requested"] == {"start": 1, "end": 2}
     assert compact["rip_mapping"]["kind"] == "exact"
     assert compact["verified"]["live_bytes_match"] is True
     assert compact["code"] == "int focus(void) { return 1; }"
@@ -418,6 +479,108 @@ def test_source_mapping_reports_unmapped_without_fake_current_line():
     assert all("relation" not in line for line in result["excerpt"])
 
 
+def test_source_mapping_absolute_lines_override_context_and_clamp_end():
+    markup = _FakeMarkup(_FakeToken(0x1000, 0x1000, 2))
+    result = _map_source(
+        markup, _FakeAddress(0x1000), "one\ntwo\nthree", 0, 0,
+        line_start=1, line_end=22,
+    )
+    assert [line["line"] for line in result["excerpt"]] == [1, 2, 3]
+    assert result["selection"] == {
+        "mode": "lines",
+        "requested": {"start": 1, "end": 22},
+        "start": 1,
+        "end": 3,
+        "truncated": True,
+    }
+
+
+def test_source_mapping_rejects_start_beyond_function():
+    with pytest.raises(WorkerError, match="exceeds function length"):
+        _map_source(
+            _FakeMarkup(), _FakeAddress(0x1000), "one\ntwo", 0, 0,
+            line_start=3, line_end=4,
+        )
+
+
+class _FakeInstruction:
+    def __init__(self, address, raw, text):
+        self.address = address
+        self.raw = raw
+        self.text = text
+
+    def getAddress(self):
+        return _FakeAddress(self.address)
+
+    def getLength(self):
+        return len(self.raw)
+
+    def getBytes(self):
+        return self.raw
+
+    def __str__(self):
+        return self.text
+
+
+class _FakeListing:
+    def __init__(self, instructions):
+        self.instructions = instructions
+
+    def getInstructions(self, body, forward):
+        return iter(self.instructions)
+
+
+class _FakeProgram:
+    def __init__(self, instructions):
+        self.listing = _FakeListing(instructions)
+
+    def getListing(self):
+        return self.listing
+
+
+class _FakeFunction:
+    def getBody(self):
+        return object()
+
+
+def test_mapped_assembly_groups_shared_instructions_and_unmapped_lines():
+    instruction = _FakeInstruction(0x1000, b"\x90", "NOP")
+    mapping = {"excerpt": [
+        {"line": 1, "text": "a();", "address_ranges": [
+            {"start": "0x1000", "end": "0x1000"}
+        ]},
+        {"line": 2, "text": "b();", "address_ranges": [
+            {"start": "0x1000", "end": "0x1000"}
+        ]},
+        {"line": 3, "text": "}"},
+    ]}
+    assert _attach_mapped_assembly(
+        _FakeProgram([instruction]), _FakeFunction(), mapping
+    ) is False
+    assert mapping["excerpt"][0]["assembly"][0]["address"] == "0x1000"
+    assert mapping["excerpt"][1]["assembly"][0]["address"] == "0x1000"
+    assert "assembly" not in mapping["excerpt"][2]
+
+
+def test_mapped_assembly_enforces_association_cap(monkeypatch):
+    import winbox.kdbg.decomp.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "MAX_MAPPED_INSTRUCTION_ASSOCIATIONS", 1)
+    instructions = [
+        _FakeInstruction(0x1000, b"\x90", "NOP"),
+        _FakeInstruction(0x1001, b"\x90", "NOP"),
+    ]
+    mapping = {"excerpt": [{
+        "line": 1, "text": "work();", "address_ranges": [
+            {"start": "0x1000", "end": "0x1001"}
+        ],
+    }]}
+    assert _attach_mapped_assembly(
+        _FakeProgram(instructions), _FakeFunction(), mapping
+    ) is True
+    assert len(mapping["excerpt"][0]["assembly"]) == 1
+
+
 def test_symbol_hint_normalizes_kernel_name_and_is_distance_bounded(tmp_path):
     store = SymbolStore(tmp_path / "symbols")
     store.save(
@@ -444,8 +607,12 @@ def test_mcp_decomp_serializes_result_and_surfaces_error(monkeypatch, tmp_path):
         return {"ok": 1}
 
     monkeypatch.setattr(package, "query_decomp", query)
-    assert json.loads(mcp_module.kdbg_decomp(detail="diagnostic")) == {"ok": 1}
+    assert json.loads(mcp_module.kdbg_decomp(
+        detail="diagnostic", lines="1-22", assembly="mapped"
+    )) == {"ok": 1}
     assert captured["detail"] == "diagnostic"
+    assert captured["lines"] == "1-22"
+    assert captured["assembly"] == "mapped"
 
     def fail(*args, **kwargs):
         raise DecompError("wrong build")
@@ -463,6 +630,30 @@ def test_mcp_decomp_status_does_not_require_session(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_module, "_kdbg_cfg_only", lambda: cfg)
     monkeypatch.setattr(package, "worker_status", lambda value: {"running": False})
     assert json.loads(mcp_module.kdbg_decomp_status()) == {"running": False}
+
+
+def test_cli_decomp_emits_machine_safe_unwrapped_json(monkeypatch, tmp_path):
+    import json
+    import winbox.kdbg.decomp as package
+    from click.testing import CliRunner
+    from winbox.cli import cli
+
+    cfg = Config(winbox_dir=tmp_path)
+    monkeypatch.setattr("winbox.cli.Config.load", lambda: cfg)
+    captured = {}
+
+    def query(*args, **kwargs):
+        captured.update(kwargs)
+        return {"pseudocode": [{"line": 1, "text": "x" * 500}]}
+
+    monkeypatch.setattr(package, "query_decomp", query)
+    result = CliRunner().invoke(
+        cli, ["kdbg", "decomp", "--lines", "1-22", "--assembly", "mapped"]
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["pseudocode"][0]["text"] == "x" * 500
+    assert captured["lines"] == "1-22"
+    assert captured["assembly"] == "mapped"
 
 
 class _Rsp:

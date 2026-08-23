@@ -143,7 +143,7 @@ def test_install_builds_only_bundled_assets_and_verifies_image(monkeypatch, tmp_
     assert result["installed"] is True
     assert "GHIDRA_SHA256=" in observed["dockerfile"]
     assert "PYGHIDRA_SHA256=" in observed["dockerfile"]
-    assert 'io.winbox.worker-api="2"' in observed["dockerfile"]
+    assert f'io.winbox.worker-api="{WORKER_API}"' in observed["dockerfile"]
     assert f'WORKER_API = "{WORKER_API}"' in observed["worker"]
     assert "Persistent, serialized PyGhidra worker" in observed["worker"]
 

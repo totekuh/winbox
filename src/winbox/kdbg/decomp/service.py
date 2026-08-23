@@ -21,7 +21,9 @@ from winbox.kdbg.store import SymbolStore
 
 MAX_CONTEXT_LINES = 20
 MAX_LIVE_READ = 64 * 1024
+MAX_LINE_BATCH = 100
 DETAIL_LEVELS = {"compact", "standard", "diagnostic"}
+ASSEMBLY_MODES = {"nearby", "mapped"}
 
 
 def worker_status(cfg: Config) -> dict[str, Any]:
@@ -79,6 +81,8 @@ def query_decomp(
     binary: str = "",
     timeout: int = 60,
     detail: str = "compact",
+    lines: str = "",
+    assembly: str = "nearby",
     daemon_client: DaemonClient | None = None,
     decomp_client: DecompClient | None = None,
 ) -> dict[str, Any]:
@@ -92,6 +96,8 @@ def query_decomp(
     after = _bounded_int("after", after, 0, MAX_CONTEXT_LINES)
     timeout = _bounded_int("timeout", timeout, 5, 300)
     detail = _detail_level(detail)
+    line_range = _line_range(lines)
+    assembly = _assembly_mode(assembly)
     daemon = daemon_client or DaemonClient(cfg)
     worker = decomp_client or DecompClient(cfg)
 
@@ -170,9 +176,16 @@ def query_decomp(
         full=bool(full),
         decompile_timeout=timeout,
         symbol_hint=symbol_hint,
+        line_start=line_range[0] if line_range else None,
+        line_end=line_range[1] if line_range else None,
+        assembly=assembly,
     )
 
     warnings: list[str] = []
+    if (result.get("mapping") or {}).get("assembly_truncated"):
+        warnings.append(
+            "mapped assembly was truncated at the bounded response limit"
+        )
     live_bytes_match: bool | None = None
     current = next(
         (item for item in result.get("instructions", []) if item.get("current")),
@@ -249,21 +262,11 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
         else None
     )
 
-    assembly: list[dict[str, Any]] = []
+    nearby_assembly: list[dict[str, Any]] = []
     for instruction in result.get("instructions") or []:
-        address = _hex_int(instruction.get("address"))
-        item: dict[str, Any] = {
-            "bytes": instruction.get("bytes"),
-            "text": instruction.get("text"),
-        }
-        if address is not None and ghidra_base is not None:
-            instruction_rva = address - ghidra_base
-            item["rva"] = f"0x{instruction_rva:x}"
-            if module_base is not None:
-                item["va"] = f"0x{module_base + instruction_rva:x}"
-        if instruction.get("current"):
-            item["current"] = True
-        assembly.append(item)
+        nearby_assembly.append(
+            _format_instruction(instruction, ghidra_base, module_base)
+        )
 
     kind, direction, distance = _mapping_relation(mapping, requested_static)
     selected_line = mapping.get("line")
@@ -279,7 +282,7 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
         }
         ranges = source_line.get("address_ranges") or []
         if not ranges and source_line.get("line") == selected_line:
-            # Compatibility with worker API 1 diagnostic responses. API 2
+            # Compatibility with worker API 1 diagnostic responses. API 2+
             # supplies per-line ranges directly.
             addresses = [
                 value for value in (
@@ -305,10 +308,16 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
             relation = kind
         if relation:
             item["relation"] = relation
+        mapped = source_line.get("assembly") or []
+        if mapped:
+            item["assembly"] = [
+                _format_instruction(instruction, ghidra_base, module_base)
+                for instruction in mapped
+            ]
         pseudocode.append(item)
 
     compact: dict[str, Any] = {
-        "schema": "winbox.kdbg-decomp/2",
+        "schema": "winbox.kdbg-decomp/3",
         "detail": detail,
         "target": result.get("target"),
         "location": {
@@ -323,8 +332,10 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
             "offset": function.get("offset"),
             "source": function.get("source"),
         },
-        "assembly": assembly,
+        "assembly_mode": result.get("assembly_mode") or "nearby",
+        "assembly": nearby_assembly,
         "pseudocode": pseudocode,
+        "line_selection": mapping.get("selection"),
         "rip_mapping": {
             "kind": kind,
             "pseudocode_line": selected_line,
@@ -356,6 +367,26 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
             "analysis": result.get("analysis") or {},
         })
     return compact
+
+
+def _format_instruction(
+    instruction: dict[str, Any],
+    ghidra_base: int | None,
+    module_base: int | None,
+) -> dict[str, Any]:
+    address = _hex_int(instruction.get("address"))
+    item: dict[str, Any] = {
+        "bytes": instruction.get("bytes"),
+        "text": instruction.get("text"),
+    }
+    if address is not None and ghidra_base is not None:
+        instruction_rva = address - ghidra_base
+        item["rva"] = f"0x{instruction_rva:x}"
+        if module_base is not None:
+            item["va"] = f"0x{module_base + instruction_rva:x}"
+    if instruction.get("current"):
+        item["current"] = True
+    return item
 
 
 def _mapping_relation(
@@ -458,6 +489,30 @@ def _detail_level(value: str) -> str:
     if normalized not in DETAIL_LEVELS:
         choices = ", ".join(sorted(DETAIL_LEVELS))
         raise DecompError(f"detail must be one of: {choices}")
+    return normalized
+
+
+def _line_range(value: str) -> tuple[int, int] | None:
+    raw = str(value).strip()
+    if not raw:
+        return None
+    parts = [part.strip() for part in raw.split("-")]
+    if len(parts) not in {1, 2} or any(not part.isdigit() for part in parts):
+        raise DecompError("lines must be N or N-M (for example, 1-22)")
+    start = int(parts[0])
+    end = int(parts[-1])
+    if start < 1 or end < start:
+        raise DecompError("lines must be a positive ascending range")
+    if end - start + 1 > MAX_LINE_BATCH:
+        raise DecompError(f"lines may select at most {MAX_LINE_BATCH} lines")
+    return start, end
+
+
+def _assembly_mode(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in ASSEMBLY_MODES:
+        choices = ", ".join(sorted(ASSEMBLY_MODES))
+        raise DecompError(f"assembly must be one of: {choices}")
     return normalized
 
 

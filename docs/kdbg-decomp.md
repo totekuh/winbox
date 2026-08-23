@@ -58,13 +58,15 @@ winbox kdbg attach 1234
 winbox kdbg cont --timeout 30
 winbox kdbg decomp                             # current RIP
 winbox kdbg decomp 0x7ff712341234 --before 5 --after 8
+winbox kdbg decomp --lines 1-22 --assembly mapped
 winbox kdbg decomp --full --binary /path/to/exact.exe
 ```
 
 The MCP equivalents are:
 
 ```text
-kdbg_decomp(addr="", before=3, after=5, full=false, binary="", timeout=60, detail="compact")
+kdbg_decomp(addr="", before=3, after=5, full=false, binary="", timeout=60,
+            detail="compact", lines="", assembly="nearby")
 kdbg_decomp_status()
 kdbg_ghidra_install(pull=true)
 kdbg_ghidra_run()
@@ -96,6 +98,31 @@ Larger evidence is opt-in:
 `full=true` controls pseudocode scope only; it does not silently enable verbose
 metadata. This keeps normal agent calls token-efficient while preserving every
 identity and cache diagnostic when explicitly requested.
+
+### Batch source/assembly mapping
+
+Use `lines="N-M"` with `assembly="mapped"` to retrieve an absolute pseudocode
+line batch with corresponding instructions nested under every address-bearing
+source line:
+
+```text
+kdbg_decomp(lines="1-22", assembly="mapped")
+```
+
+`lines` accepts `N` or an ascending `N-M` range and overrides the relative
+`before`/`after` excerpt. A request may contain at most 100 pseudocode lines;
+an end beyond the function is safely clamped and reported by
+`line_selection.truncated`, while a start beyond the function is rejected.
+Mapped assembly is bounded to 512 source-line/instruction associations and
+reports a warning if truncated. Braces, declarations, and other lines without
+machine-code provenance simply omit `assembly`. An optimized instruction may
+legitimately appear beneath more than one pseudocode line.
+
+The small top-level `assembly` window remains anchored at RIP in both modes.
+With `assembly="mapped"`, selected pseudocode entries additionally carry an
+`assembly` array whose instruction RVAs use the same coordinate as their
+`rva_ranges`. This preserves immediate debugger context while making multi-line
+static/dynamic review possible in one bounded call.
 
 Decompiler statements are not one-to-one with machine instructions. Mapping
 uses Ghidra's decompiler token address provenance and labels the actual

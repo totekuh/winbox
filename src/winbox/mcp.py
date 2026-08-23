@@ -3750,6 +3750,8 @@ def kdbg_decomp(
     binary: str = "",
     timeout: int = 60,
     detail: str = "compact",
+    lines: str = "",
+    assembly: str = "nearby",
 ) -> str:
     """Return focused Ghidra pseudocode for ADDR or the current RIP.
 
@@ -3775,6 +3777,10 @@ def kdbg_decomp(
         binary: Exact host-side PE path. Empty uses the winbox symbols cache.
         timeout: Per-function Ghidra decompilation timeout (5..300 seconds).
         detail: Response detail: compact (default), standard, or diagnostic.
+        lines: Absolute pseudocode line or range (for example ``1-22``).
+            Empty uses ``before``/``after`` context around the mapped RIP.
+        assembly: ``nearby`` (default) or ``mapped`` to attach corresponding
+            assembly to every address-bearing selected pseudocode line.
     """
     from winbox.kdbg.decomp import DecompError, query_decomp
 
@@ -3789,6 +3795,8 @@ def kdbg_decomp(
             binary=binary,
             timeout=timeout,
             detail=detail,
+            lines=lines,
+            assembly=assembly,
         )
     except DecompError as exc:
         return f"error: {exc}"

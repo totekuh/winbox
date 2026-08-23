@@ -51,7 +51,7 @@ def test_persistent_pyghidra_worker_decompiles_and_reuses_project(tmp_path, requ
     first = client.call(
         "decompile", binary=str(binary), sha256=digest,
         rva=address - 0x400000, before=1, after=2, full=True,
-        decompile_timeout=30,
+        decompile_timeout=30, line_start=1, line_end=20, assembly="mapped",
     )
     warm_started = time.monotonic()
     second = client.call(
@@ -62,6 +62,9 @@ def test_persistent_pyghidra_worker_decompiles_and_reuses_project(tmp_path, requ
     warm_elapsed = time.monotonic() - warm_started
     assert first["function"]["name"] == "focus_me"
     assert "* 3" in first["code"] or "*3" in first["code"]
+    assert first["assembly_mode"] == "mapped"
+    assert first["mapping"]["selection"]["mode"] == "lines"
+    assert any(line.get("assembly") for line in first["mapping"]["excerpt"])
     assert second["cache_hit"] is True
     assert second["mapping"]["confidence"] in {"exact", "nearest"}
     assert second["mapping"]["kind"] in {

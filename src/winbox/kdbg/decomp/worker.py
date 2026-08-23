@@ -30,7 +30,9 @@ MAX_REQUEST = 64 * 1024
 MAX_CODE = 256 * 1024
 MAX_CONTEXT_LINES = 20
 MAX_OPEN_PROGRAMS = 1
-WORKER_API = "2"
+MAX_LINE_BATCH = 100
+MAX_MAPPED_INSTRUCTION_ASSOCIATIONS = 512
+WORKER_API = "3"
 
 
 class WorkerError(RuntimeError):
@@ -137,6 +139,10 @@ class Worker:
         after = max(0, min(int(args.get("after", 5)), MAX_CONTEXT_LINES))
         full = bool(args.get("full", False))
         timeout = max(5, min(int(args.get("decompile_timeout", 60)), 300))
+        line_start, line_end = _requested_lines(args)
+        assembly_mode = str(args.get("assembly", "nearby")).strip().lower()
+        if assembly_mode not in {"nearby", "mapped"}:
+            raise WorkerError("assembly must be 'nearby' or 'mapped'")
 
         opened, cache_hit = self._open(binary, expected_sha)
         program = opened.program
@@ -182,7 +188,14 @@ class Worker:
         else:
             code_truncated = False
 
-        mapping = _map_source(result.getCCodeMarkup(), address, code, before, after)
+        mapping = _map_source(
+            result.getCCodeMarkup(), address, code, before, after,
+            line_start=line_start, line_end=line_end,
+        )
+        if assembly_mode == "mapped":
+            mapping["assembly_truncated"] = _attach_mapped_assembly(
+                program, function, mapping
+            )
         instructions = _nearby_instructions(program, function, address)
         entry = int(function.getEntryPoint().getOffset())
         response = {
@@ -201,6 +214,7 @@ class Worker:
                 "contains_requested_address": True,
             },
             "mapping": mapping,
+            "assembly_mode": assembly_mode,
             "instructions": instructions,
             "analysis": {
                 "binary_sha256": expected_sha,
@@ -361,7 +375,16 @@ def _recover_function(api, program, address, rva: int, hint):
     return None, "none"
 
 
-def _map_source(markup, address, code: str, before: int, after: int) -> dict:
+def _map_source(
+    markup,
+    address,
+    code: str,
+    before: int,
+    after: int,
+    *,
+    line_start: int | None = None,
+    line_end: int | None = None,
+) -> dict:
     target = int(address.getOffset())
     addressed: list[tuple[int, int, int]] = []
     for token in _walk_tokens(markup):
@@ -438,8 +461,30 @@ def _map_source(markup, address, code: str, before: int, after: int) -> dict:
 
     lines = code.splitlines()
     selected = max(1, min(selected, max(1, len(lines))))
-    start = max(1, selected - before)
-    end = min(len(lines), selected + after)
+    if line_start is not None and line_end is not None:
+        if line_start > len(lines):
+            raise WorkerError(
+                f"requested pseudocode line {line_start} exceeds function length "
+                f"({len(lines)} lines)"
+            )
+        start = line_start
+        end = min(line_end, len(lines))
+        selection = {
+            "mode": "lines",
+            "requested": {"start": line_start, "end": line_end},
+            "start": start,
+            "end": end,
+            "truncated": end != line_end,
+        }
+    else:
+        start = max(1, selected - before)
+        end = min(len(lines), selected + after)
+        selection = {
+            "mode": "context",
+            "start": start,
+            "end": end,
+            "truncated": False,
+        }
     excerpt = []
     for number in range(start, end + 1):
         item = {"line": number, "text": lines[number - 1]}
@@ -461,6 +506,7 @@ def _map_source(markup, address, code: str, before: int, after: int) -> dict:
         "candidate_lines": candidate_lines,
         "distance_bytes": distance,
         "direction": direction,
+        "selection": selection,
         # Retain the old flat field in diagnostic output for clients that only
         # understand confidence/line/addresses. New clients should use the
         # explicit ranges and mapping kind above.
@@ -469,6 +515,68 @@ def _map_source(markup, address, code: str, before: int, after: int) -> dict:
         ),
         "excerpt": excerpt,
     }
+
+
+def _requested_lines(args: dict) -> tuple[int | None, int | None]:
+    start_raw = args.get("line_start")
+    end_raw = args.get("line_end")
+    if start_raw is None and end_raw is None:
+        return None, None
+    if start_raw is None or end_raw is None:
+        raise WorkerError("line_start and line_end must be supplied together")
+    try:
+        start = int(start_raw)
+        end = int(end_raw)
+    except (TypeError, ValueError) as exc:
+        raise WorkerError("line_start and line_end must be integers") from exc
+    if start < 1 or end < start:
+        raise WorkerError("line range must be positive and ascending")
+    if end - start + 1 > MAX_LINE_BATCH:
+        raise WorkerError(f"line range may contain at most {MAX_LINE_BATCH} lines")
+    return start, end
+
+
+def _attach_mapped_assembly(program, function, mapping: dict) -> bool:
+    """Attach bounded instruction lists to every address-bearing source line."""
+    listing = program.getListing()
+    instructions = []
+    for instruction in listing.getInstructions(function.getBody(), True):
+        start = int(instruction.getAddress().getOffset())
+        end = start + int(instruction.getLength()) - 1
+        instructions.append((start, end, instruction))
+
+    associations = 0
+    truncated = False
+    for source_line in mapping.get("excerpt") or []:
+        ranges = []
+        for address_range in source_line.get("address_ranges") or []:
+            try:
+                ranges.append((
+                    int(str(address_range["start"]), 0),
+                    int(str(address_range["end"]), 0),
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not ranges:
+            continue
+        mapped = []
+        seen: set[int] = set()
+        for start, end, instruction in instructions:
+            if not any(start <= high and end >= low for low, high in ranges):
+                continue
+            if start in seen:
+                continue
+            if associations >= MAX_MAPPED_INSTRUCTION_ASSOCIATIONS:
+                truncated = True
+                break
+            seen.add(start)
+            mapped.append(_instruction_payload(instruction))
+            associations += 1
+        if mapped:
+            source_line["assembly"] = mapped
+        if truncated:
+            break
+    return truncated
 
 
 def _nearby_instructions(program, function, address) -> list[dict]:
@@ -492,15 +600,20 @@ def _nearby_instructions(program, function, address) -> list[dict]:
     selected = list(before) + ([current] if current is not None else []) + after
     output = []
     for instruction in selected:
-        raw = bytes((int(value) & 0xFF) for value in instruction.getBytes())
-        addr = int(instruction.getAddress().getOffset())
-        output.append({
-            "address": f"0x{addr:x}",
-            "bytes": raw.hex(),
-            "text": str(instruction),
-            "current": instruction is current,
-        })
+        item = _instruction_payload(instruction)
+        item["current"] = instruction is current
+        output.append(item)
     return output
+
+
+def _instruction_payload(instruction) -> dict:
+    raw = bytes((int(value) & 0xFF) for value in instruction.getBytes())
+    address = int(instruction.getAddress().getOffset())
+    return {
+        "address": f"0x{address:x}",
+        "bytes": raw.hex(),
+        "text": str(instruction),
+    }
 
 
 def _count_projects(path: Path) -> int:

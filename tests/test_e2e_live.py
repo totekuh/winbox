@@ -1206,7 +1206,7 @@ class TestKdbg:
             assert lifecycle["api"]["worker_pid"] == 1
             assert json.loads(tool("kdbg_decomp_status")())["image_installed"]
             decomp = json.loads(tool("kdbg_decomp")(nt_close, 1, 2))
-            assert decomp["schema"] == "winbox.kdbg-decomp/2"
+            assert decomp["schema"] == "winbox.kdbg-decomp/3"
             assert decomp["detail"] == "compact"
             assert decomp["target"]["name"]
             assert decomp["verified"]["identity"] == "pdb-guid-age"

@@ -1122,6 +1122,19 @@ def kdbg_regs(ctx: click.Context) -> None:
     show_default=True,
     help="Response evidence level.",
 )
+@click.option(
+    "--lines",
+    default="",
+    metavar="N[-M]",
+    help="Absolute pseudocode line or range; overrides before/after context.",
+)
+@click.option(
+    "--assembly",
+    type=click.Choice(["nearby", "mapped"]),
+    default="nearby",
+    show_default=True,
+    help="Attach assembly to each selected mapped pseudocode line.",
+)
 @click.pass_context
 def kdbg_decomp(
     ctx: click.Context,
@@ -1132,6 +1145,8 @@ def kdbg_decomp(
     binary: Path | None,
     timeout: int,
     detail: str,
+    lines: str,
+    assembly: str,
 ) -> None:
     """Show Ghidra pseudocode at ADDRESS, or at the current RIP.
 
@@ -1154,11 +1169,16 @@ def kdbg_decomp(
             binary=str(binary) if binary else "",
             timeout=timeout,
             detail=detail,
+            lines=lines,
+            assembly=assembly,
         )
     except DecompError as exc:
         console.print(f"[red][-][/] {exc}")
         raise SystemExit(1)
-    console.print(_json.dumps(result, indent=2))
+    # Rich wraps long strings at terminal width, which can insert literal
+    # newlines inside JSON string values and corrupt piped output. This command
+    # is an API-like evidence surface, so emit the serialized bytes verbatim.
+    click.echo(_json.dumps(result, indent=2))
 
 
 @kdbg.command("decomp-status")
