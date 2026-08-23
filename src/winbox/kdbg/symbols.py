@@ -75,6 +75,8 @@ def _copy_via_share(
     ga: GuestAgent,
     src_in_vm: str,
     cached_name: str,
+    *,
+    max_file_size: int | None = None,
 ) -> Path:
     """Copy a file out of the VM via the VirtIO-FS share.
 
@@ -139,6 +141,12 @@ def _copy_via_share(
             raise SymbolLoadError(
                 f"{src_basename} did not appear on the share after Copy-Item"
             )
+        staged_size = staging.stat().st_size
+        if max_file_size is not None and staged_size > max_file_size:
+            raise SymbolLoadError(
+                f"{src_basename} is {staged_size} bytes; attach staging cap is "
+                f"{max_file_size} bytes"
+            )
         shutil.copyfile(staging, temporary)
         os.chmod(temporary, 0o600)
         content_sha = _sha256(temporary)
@@ -174,6 +182,7 @@ def copy_user_module(
     *,
     architecture: str = "auto",
     expected_size: int | None = None,
+    max_file_size: int | None = None,
 ) -> Path:
     """Copy any user-mode binary out of the VM into the symbol cache.
 
@@ -204,7 +213,13 @@ def copy_user_module(
     failures: list[str] = []
     for candidate in candidates:
         try:
-            copied = _copy_via_share(cfg, ga, candidate, cached_name)
+            copy_kwargs = (
+                {"max_file_size": max_file_size}
+                if max_file_size is not None else {}
+            )
+            copied = _copy_via_share(
+                cfg, ga, candidate, cached_name, **copy_kwargs,
+            )
             pe = None
             try:
                 pe = pefile.PE(str(copied), fast_load=True)

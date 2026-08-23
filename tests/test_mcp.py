@@ -52,6 +52,7 @@ def mock_mcp(cfg):
     cleaning up its temp files in a finally block.
     """
     import winbox.mcp as mcp_mod
+    import winbox.kdbg.staging as staging_mod
 
     ga = MagicMock()
     ga.ping.return_value = True
@@ -70,6 +71,7 @@ def mock_mcp(cfg):
 
     original_exec_python = mcp_mod._exec_python
     original_debug_snapshot = mcp_mod._kdbg_debug_snapshot
+    original_prepare_manifest = staging_mod.prepare_user_module_manifest
 
     def capturing_exec_python(code, timeout=300, args=None):
         ga.captured_code = code
@@ -81,11 +83,22 @@ def mock_mcp(cfg):
     # dedicated tests in test_kdbg_snapshot.py; individual MCP tests can
     # override this stub when asserting the operation boundary.
     mcp_mod._kdbg_debug_snapshot = lambda _cfg: nullcontext()
+    staging_mod.prepare_user_module_manifest = lambda _cfg, _ga, _store, pid, **_kw: SimpleNamespace(
+        pid=pid,
+        summary=lambda: {
+            "schema": "winbox.kdbg-user-manifest/1", "pid": pid,
+            "discovered": 2, "staged": 2, "symbol_enriched": 2,
+            "symbol_failed": 0, "symbol_warning_count": 0, "failed": 0,
+            "total_file_bytes": 4096, "symbol_failures": [],
+            "symbol_warnings": [], "failures": [],
+        },
+    )
 
     yield ga, vm, cfg
 
     mcp_mod._exec_python = original_exec_python
     mcp_mod._kdbg_debug_snapshot = original_debug_snapshot
+    staging_mod.prepare_user_module_manifest = original_prepare_manifest
     mcp_mod._cfg = None
     mcp_mod._vm = None
     mcp_mod._ga = None
@@ -3162,6 +3175,23 @@ class TestKdbgDaemonTools:
         assert ff.call_args[0][1] == 4584
         out = _mcp_result(result)
         assert out["daemon_pid"] == 1234
+        assert out["auto_stage"]["staged"] == 2
+        assert ff.call_args.kwargs["module_manifest"].pid == 4584
+
+    def test_attach_surfaces_manifest_failure_before_taking_gdbstub(self, mock_mcp):
+        from winbox.mcp import kdbg_attach
+        from winbox.kdbg.staging import StagingError
+
+        client = self._client_with(alive=False)
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch(
+                 "winbox.kdbg.staging.prepare_user_module_manifest",
+                 side_effect=StagingError("loader inventory corrupt"),
+             ), \
+             patch("winbox.mcp._fork_daemon") as ff:
+            result = kdbg_attach(4584)
+        ff.assert_not_called()
+        assert "loader inventory corrupt" in _mcp_error(result)["message"]
 
     def test_attach_refuses_when_session_already_alive(self, mock_mcp):
         from winbox.mcp import kdbg_attach

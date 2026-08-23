@@ -453,14 +453,25 @@ At a WoW64 compatibility-mode stop, the daemon uses 32-bit disassembly,
 native-width stack entries, and a conservative hybrid call-chain walker.
 Exact-build PDB FPO/frame records are preferred, followed by validated EBP
 chains and bounded prologue simulation. Raw module-looking stack values remain
-separate speculative candidates. Load x86 dependencies with
-`kdbg_user_symbols_load(..., architecture="x86")` before attaching for the
-deepest trace; the loader verifies SysWOW64 PE machine, live image size, hash,
-and PDB identity before trusting unwind metadata.
+separate speculative candidates. Attach now freezes every native and x86
+loader entry into a bounded content-addressed manifest before the daemon takes
+QEMU's one RSP connection. PE machine, live image size, hash, and PDB identity
+are verified before unwind metadata is trusted; manual per-DLL preloading is
+no longer required.
+
+At an active native WoW64 transition stop, `kdbg_bt` additionally derives the
+CPU-area/context offsets from the exact `wow64cpu.dll` instruction stream and
+PDB public symbols. A validated saved x86 context is stitched after the x64
+transition frames, producing one explicitly marked `windows-wow64-mixed`
+trace. An unrecognized build or invalid context remains a truthful native
+partial trace with `transition_error` rather than guessed frames.
+At an arbitrary x86 stop, QEMU does not expose the suspended native stack
+anchor, so kdbg returns the ordinary x86 trace instead of scanning the native
+TEB stack range for a guessed boundary.
 
 | Tool | Description |
 |------|-------------|
-| `kdbg_attach(pid, port?)` | Fork the session daemon and attach to a target process. VM keeps running; bps stay armed until detach |
+| `kdbg_attach(pid, port?)` | Snapshot and symbol-enrich exact user binaries, then fork the session daemon and attach. Returns bounded `auto_stage` counts/failures |
 | `kdbg_detach()` | Tear down the session and leave the VM running |
 | `kdbg_session()` | Show current daemon state (target pid, attach time, bp count, halted vs running) |
 | `kdbg_bp(target, mode?, condition?, wp_type?, wp_size?, actions?)` | Install an explicit hardware/software breakpoint or hardware watchpoint. Predicates support exact-width `byte`/`word`/`dword`/`qword` reads; actions additionally support bounded `bytes`/`ascii`/`utf16` capture. Action hits append JSONL traces and auto-continue. |
@@ -476,7 +487,7 @@ and PDB identity before trusting unwind metadata.
 | `kdbg_resume(port?)` | Recovery valve for a VM left paused after a debugger/client failure |
 | `kdbg_regs()` | Dump GPRs + control regs from the firing vCPU |
 | `kdbg_stack(n?)` | Hex-dump the top `n` native stack words (x64 qwords or WoW64 x86 dwords) |
-| `kdbg_bt(depth?)` | Windows x64 `.pdata`/xdata or WoW64 x86 PDB-FPO/EBP/prologue hybrid backtrace, with explicit provenance and speculative candidates kept separate |
+| `kdbg_bt(depth?)` | Windows x64 `.pdata`, WoW64 x86 hybrid, or exact-build validated mixed x64→x86 transition backtrace, with explicit provenance and speculative candidates kept separate |
 | `kdbg_context(disasm_count?, stack_qwords?, bt_depth?, memory?)` | Return one stop-epoch-pinned triage bundle with registers, symbolized assembly, stack, metadata-driven backtrace, breakpoints, and bounded optional memory reads |
 | `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |

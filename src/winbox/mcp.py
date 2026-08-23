@@ -3469,7 +3469,10 @@ def _kdbg_cfg_only():
 def kdbg_attach(pid: int, port: int = 1234) -> dict[str, Any]:
     """Attach a kdbg debugging session to a Windows process via the gdbstub.
 
-    Forks a long-running daemon that holds the gdb connection alive
+    Before taking QEMU's single RSP connection, freezes the target's native
+    and WoW64 loader entries into a bounded, content-addressed exact-binary
+    manifest and enriches matching PDB metadata when available. Then forks a
+    long-running daemon that holds the gdb connection alive
     across subsequent MCP tool calls. Only one session can be active at
     a time (fcntl-locked); call ``kdbg_detach`` before re-attaching.
 
@@ -3481,7 +3484,8 @@ def kdbg_attach(pid: int, port: int = 1234) -> dict[str, Any]:
         port: gdbstub TCP port the daemon should connect to.
 
     Returns:
-        The common envelope with daemon PID, target, and gdbstub metadata.
+        The common envelope with daemon PID, target, gdbstub metadata, and
+        bounded ``auto_stage`` counts/failures.
     """
     cfg, vm, ga = _ensure_vm_ready()
     client = _kdbg_client(cfg)
@@ -3493,6 +3497,20 @@ def kdbg_attach(pid: int, port: int = 1234) -> dict[str, Any]:
             f"daemon_pid={info.get('daemon_pid', '?')}); call kdbg_detach first",
             operation="kdbg_attach",
         )
+
+    # Freeze exact user binaries while the guest agent and background RSP
+    # reader are both available. Once the daemon owns QEMU's one gdb client it
+    # is too late to discover and copy a decommitted unwind dependency.
+    from winbox.kdbg.staging import (
+        StagingError as _KdbgStagingError,
+        prepare_user_module_manifest as _kdbg_prepare_manifest,
+    )
+    try:
+        manifest = _kdbg_prepare_manifest(
+            cfg, ga, _kdbg_get_store(), pid, enrich_symbols=True,
+        )
+    except (_KdbgStagingError, _KdbgStoreError, _KdbgSymbolLoadError) as e:
+        return _research_error(e, operation="kdbg_attach")
 
     # Transfer ownership from the background read broker to the interactive
     # debugger daemon without tearing down the listening gdbserver.
@@ -3506,7 +3524,9 @@ def kdbg_attach(pid: int, port: int = 1234) -> dict[str, Any]:
         )
 
     try:
-        daemon_pid = _fork_daemon(cfg, pid, gdbstub_port=port)
+        daemon_pid = _fork_daemon(
+            cfg, pid, gdbstub_port=port, module_manifest=manifest,
+        )
     except _DaemonError as e:
         return _research_error(e, operation="kdbg_attach")
     info = client.session_info() or {}
@@ -3518,6 +3538,7 @@ def kdbg_attach(pid: int, port: int = 1234) -> dict[str, Any]:
             "name": info.get("target_name", "?"),
         },
         "gdbstub_port": info.get("gdbstub_port", port),
+        "auto_stage": manifest.summary(),
     }
 
     # Warn if HVCI is on — kernel breakpoints will not fire.
@@ -4333,7 +4354,10 @@ def kdbg_bt(depth: int = 8) -> dict[str, Any]:
     records, then strict EBP chains and bounded straight-line prologue analysis.
     Speculative stack hits are kept in a separate ``candidates`` array and are
     never promoted to frames unless a PDB recipe explicitly requires a return
-    search. Malformed or missing metadata returns a truthful partial trace.
+    search. At a native active WoW64 bridge, exact-build instruction-derived
+    CPU-area offsets recover the saved x86 context and return one
+    ``windows-wow64-mixed`` trace. Malformed or missing metadata returns a
+    truthful partial trace.
 
     Args:
         depth: Max frames to return (1..64).

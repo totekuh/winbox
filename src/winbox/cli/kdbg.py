@@ -888,20 +888,15 @@ def kdbg_attach(ctx: click.Context, pid: int, port: int) -> None:
     Requires:
       - VM running, gdbstub started (``winbox kdbg start``)
       - nt symbols loaded (``winbox kdbg symbols``)
+
+    Exact user binaries and available PDB metadata are staged automatically
+    before the daemon takes ownership of QEMU's single RSP connection.
     """
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     if vm.state() != VMState.RUNNING:
         console.print(f"[red][-][/] VM not running ({vm.state().value})")
         raise SystemExit(1)
-    # Hand the one-client gdbstub from the background read broker to the
-    # interactive daemon. The listener remains up; only its RSP client exits.
-    stop_reader(cfg)
-    if not probe_port("127.0.0.1", port):
-        console.print(f"[red][-][/] gdbstub not listening on 127.0.0.1:{port}")
-        console.print("    run [bold]winbox kdbg start[/] first")
-        raise SystemExit(1)
-
     client = _client(cfg)
     if client.session_alive():
         info = client.session_info() or {}
@@ -913,8 +908,28 @@ def kdbg_attach(ctx: click.Context, pid: int, port: int) -> None:
         )
         raise SystemExit(1)
 
+    ga = GuestAgent(cfg)
     try:
-        daemon_pid = fork_daemon(cfg, pid, gdbstub_port=port)
+        from winbox.kdbg.staging import prepare_user_module_manifest
+        manifest = prepare_user_module_manifest(
+            cfg, ga, SymbolStore(cfg.symbols_dir), pid, enrich_symbols=True,
+        )
+    except Exception as e:
+        console.print(f"[red][-][/] automatic module staging failed: {e}")
+        raise SystemExit(1)
+
+    # Hand the one-client gdbstub from the background read broker to the
+    # interactive daemon only after the immutable artifact snapshot exists.
+    stop_reader(cfg)
+    if not probe_port("127.0.0.1", port):
+        console.print(f"[red][-][/] gdbstub not listening on 127.0.0.1:{port}")
+        console.print("    run [bold]winbox kdbg start[/] first")
+        raise SystemExit(1)
+
+    try:
+        daemon_pid = fork_daemon(
+            cfg, pid, gdbstub_port=port, module_manifest=manifest,
+        )
     except DaemonError as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
@@ -928,11 +943,18 @@ def kdbg_attach(ctx: click.Context, pid: int, port: int) -> None:
         f"daemon_pid={daemon_pid}"
     )
     console.print(f"    [dim]bp / cont / regs / mem / stack / bt / detach[/]")
+    summary = manifest.summary()
+    console.print(
+        f"    [dim]auto-staged {summary['staged']} exact module(s), "
+        f"{summary['symbol_enriched']} symbol-enriched, "
+        f"{summary['symbol_failed']} PDB miss(es), "
+        f"{summary['symbol_warning_count']} symbol warning(s), "
+        f"{summary['failed']} failed[/]"
+    )
 
     # Warn if HVCI is on — kernel breakpoints will not fire.
     try:
         from winbox import hvci as _hvci
-        ga = GuestAgent(cfg)
         if _hvci.status(ga).hvci_enabled:
             console.print(
                 "[yellow][!][/] HVCI is enabled — kernel breakpoints will not work. "

@@ -82,6 +82,7 @@ from winbox.kdbg.debugger.trace import (
     MAX_TRACE_RESULTS,
     query_trace,
 )
+from winbox.kdbg.staging import UserModuleManifest
 
 
 # ── Filesystem layout ───────────────────────────────────────────────────
@@ -289,11 +290,13 @@ class DaemonSession:
         rsp: RspClient,
         target: TargetInfo,
         store: SymbolStore,
+        module_manifest: UserModuleManifest | None = None,
     ) -> None:
         self.cfg = cfg
         self.rsp = rsp
         self.target = target
         self.store = store
+        self.module_manifest = module_manifest
 
         self.bps: dict[int, Breakpoint] = {}
         # va -> bp_id index for O(1) lookup on the cont/predicate hot
@@ -465,7 +468,7 @@ class DaemonSession:
     # ── ops ─────────────────────────────────────────────────────────────
 
     def op_status(self) -> dict[str, Any]:
-        return {
+        result = {
             "target": {
                 "pid": self.target.pid,
                 "dtb": f"0x{self.target.dtb:x}",
@@ -480,6 +483,9 @@ class DaemonSession:
             "uptime_s": time.monotonic() - self.attach_time,
             "daemon_pid": os.getpid(),
         }
+        if self.module_manifest is not None:
+            result["auto_stage"] = self.module_manifest.summary()
+        return result
 
     _VALID_WP_TYPES = frozenset({"write", "read", "access"})
     _VALID_WP_SIZES = frozenset({1, 2, 4, 8})
@@ -1511,20 +1517,33 @@ class DaemonSession:
                 validate_identity,
             )
 
-            stem = str(module.name).rsplit(".", 1)[0].lower()
-            if stem.startswith("ntoskrnl") or stem.startswith("ntkrnl"):
-                store_name = "nt"
+            if self.module_manifest is not None:
+                manifest_entry = self.module_manifest.by_base(
+                    module.base, getattr(module, "architecture", "x64"),
+                )
+                if manifest_entry is None:
+                    raise UnwindError(
+                        f"{module.name} has no exact attach-manifest artifact"
+                    )
+                raw_path = manifest_entry.pe_path
+                expected_sha = manifest_entry.pe_sha256
+                artifact_source = "attach-manifest"
             else:
-                store_name = stem
-                if getattr(module, "architecture", "x64") == "x86":
-                    store_name += "_x86"
-            record = self.store.load(store_name)
-            raw_path = record.get("pe_path")
-            expected_sha = record.get("pe_sha256")
+                stem = str(module.name).rsplit(".", 1)[0].lower()
+                if stem.startswith("ntoskrnl") or stem.startswith("ntkrnl"):
+                    store_name = "nt"
+                else:
+                    store_name = stem
+                    if getattr(module, "architecture", "x64") == "x86":
+                        store_name += "_x86"
+                record = self.store.load(store_name)
+                raw_path = record.get("pe_path")
+                expected_sha = record.get("pe_sha256")
+                artifact_source = "symbol-store"
             if not raw_path or not expected_sha:
                 raise UnwindError(
-                    f"live unwind metadata is unavailable and {store_name} "
-                    "has no hash-bound cached PE"
+                    f"live unwind metadata is unavailable and {module.name} "
+                    "has no hash-bound exact PE"
                 )
             path = Path(raw_path).resolve(strict=True)
             digest = sha256_file(path)
@@ -1580,13 +1599,13 @@ class DaemonSession:
                     raise UnwindError(f"short cached PE read: {len(data)}/{length}")
                 return data
 
-            return read_static, confidence, identity_warning
+            return read_static, confidence, identity_warning, artifact_source
 
         try:
             modules = [
                 (module, "kernel") for module in self._live_modules("kernel")
             ] + [
-                (module, "user") for module in self._live_modules("user")
+                (module, "user") for module in self._unwind_user_modules()
             ]
         except Exception as exc:
             return {
@@ -1640,13 +1659,15 @@ class DaemonSession:
                         )
                         metadata_source = "live-image"
                     except (UnwindError, RuntimeError) as live_exc:
-                        static_read, confidence, identity_warning = (
+                        static_read, confidence, identity_warning, artifact_source = (
                             verified_static_reader(module)
                         )
                         unwinder = PeX64Unwinder(
                             module.base, module.size, static_read,
                         )
-                        metadata_source = f"verified-static:{confidence}"
+                        metadata_source = (
+                            f"verified-static:{confidence}:{artifact_source}"
+                        )
                         frame["live_metadata_error"] = str(live_exc)
                         if identity_warning:
                             frame["identity_warning"] = identity_warning
@@ -1677,6 +1698,10 @@ class DaemonSession:
         }
         if error:
             result["error"] = error
+        if self.module_manifest is not None and len(frames) < depth:
+            self._stitch_wow64_x86(
+                result, depth=depth, live_read=live_read,
+            )
         return result
 
     def _is_x86_stop(self) -> bool:
@@ -1686,10 +1711,105 @@ class DaemonSession:
         cs = struct.unpack_from("<I", self.stop.raw_regs, 140)[0] & 0xFFFF
         return cs == 0x23
 
+    def _stitch_wow64_x86(
+        self, result: dict[str, Any], *, depth: int, live_read,
+    ) -> None:
+        """Append a validated saved x86 chain at an active native bridge stop."""
+        frames = result.get("frames") or []
+        if not any(
+            _normalize_module_name(str(frame.get("module", ""))) == "wow64cpu"
+            for frame in frames
+        ):
+            return
+        assert self.module_manifest is not None
+        bridge_entries = [
+            entry for entry in self.module_manifest.modules
+            if entry.architecture == "x64"
+            and _normalize_module_name(entry.name) == "wow64cpu"
+        ]
+        if len(bridge_entries) != 1:
+            result["transition_error"] = (
+                "attach manifest does not contain one exact x64 wow64cpu.dll"
+            )
+            return
+        bridge = bridge_entries[0]
+        try:
+            from winbox.kdbg.decomp.identity import sha256_file
+            from winbox.kdbg.wow64_transition import (
+                Wow64TransitionError,
+                derive_transition_layout,
+                recover_x86_context,
+            )
+
+            path = Path(bridge.pe_path).resolve(strict=True)
+            if sha256_file(path).lower() != bridge.pe_sha256.lower():
+                raise Wow64TransitionError("exact wow64cpu PE hash changed after attach")
+            if not bridge.store_build:
+                raise Wow64TransitionError("exact wow64cpu PDB was not enriched")
+            record = self.store.load_build(bridge.store_name, bridge.store_build)
+            if (
+                str(record.get("pe_sha256") or "").lower()
+                != bridge.pe_sha256.lower()
+            ):
+                raise Wow64TransitionError("wow64cpu PDB record is not bound to PE")
+            layout = derive_transition_layout(path, record.get("symbols") or {})
+            x86_ranges = [
+                (entry.base, entry.base + entry.size)
+                for entry in self.module_manifest.modules
+                if entry.architecture == "x86"
+            ]
+            context = recover_x86_context(
+                layout, self._require_stop_epoch().raw_regs, live_read,
+                lambda address: any(start <= address < end for start, end in x86_ranges),
+            )
+            remaining = depth - len(frames)
+            x86_result = self._unwind_x86_context(
+                context.eip, context.esp, context.ebp, context.ebx,
+                remaining, live_read,
+            )
+            x86_frames = x86_result.get("frames") or []
+            if not x86_frames:
+                raise Wow64TransitionError(
+                    x86_result.get("error") or "saved x86 unwind returned no frames"
+                )
+        except Exception as exc:
+            result["transition_error"] = f"{type(exc).__name__}: {exc}"
+            return
+
+        native_error = result.pop("error", None)
+        first_x86_index = len(frames)
+        for frame in x86_frames:
+            copied = dict(frame)
+            copied["index"] = len(frames)
+            if copied["index"] == first_x86_index:
+                copied["boundary"] = "wow64-x64-to-x86"
+            frames.append(copied)
+        result["method"] = "windows-wow64-mixed"
+        result["architecture"] = "mixed-x64-x86"
+        result["complete"] = bool(x86_result.get("complete"))
+        result["transition"] = {
+            "direction": "x64-to-x86",
+            "module": bridge.name,
+            "build": bridge.store_build,
+            "layout": layout.derivation,
+            "context_source": context.source,
+            "context_va": f"0x{context.context_va:x}",
+            "saved_eip": f"0x{context.eip:x}",
+            "saved_esp": f"0x{context.esp:x}",
+            "native_frame_count": len(frames) - len(x86_frames),
+            "x86_frame_count": len(x86_frames),
+        }
+        if native_error:
+            result["native_error"] = native_error
+        if x86_result.get("error"):
+            result["error"] = x86_result["error"]
+        if x86_result.get("candidates"):
+            result["candidates"] = x86_result["candidates"]
+        if x86_result.get("metadata_errors"):
+            result["metadata_errors"] = x86_result["metadata_errors"]
+
     def _unwind_x86_backtrace(self, depth: int) -> dict[str, Any]:
         """Unwind a WoW64 stack without requiring the native kernel view."""
-        from winbox.kdbg.x86_unwind import X86HybridUnwinder, X86Module
-
         stop = self._require_stop_epoch()
         epoch = {"session_id": self.session_id, "stop_id": self.stop_id}
         eip = stop.rip & 0xFFFFFFFF
@@ -1720,18 +1840,66 @@ class DaemonSession:
                 length -= take
             return bytes(output)
 
-        try:
-            store_names = self.store.list_modules()
-        except Exception as exc:
-            return {
-                "rsp": f"0x{esp:x}", "method": "windows-x86-hybrid",
-                "complete": False, "frames": [], "candidates": [],
-                "error": f"x86 symbol inventory failed: {exc}",
-            }
+        return self._unwind_x86_context(
+            eip, esp, ebp, ebx, depth, live_read,
+        )
+
+    def _unwind_x86_context(
+        self, eip: int, esp: int, ebp: int, ebx: int, depth: int, live_read,
+    ) -> dict[str, Any]:
+        """Unwind one saved x86 context through exact manifest artifacts."""
+        from winbox.kdbg.x86_unwind import X86HybridUnwinder, X86Module
+
+        sources: list[tuple[str, Any, dict[str, Any]]] = []
+        if self.module_manifest is not None:
+            for entry in self.module_manifest.modules:
+                if entry.architecture != "x86":
+                    continue
+                record: dict[str, Any] = {}
+                if entry.store_build:
+                    try:
+                        candidate = self.store.load_build(
+                            entry.store_name, entry.store_build,
+                        )
+                        if (
+                            str(candidate.get("pe_sha256") or "").lower()
+                            == entry.pe_sha256.lower()
+                        ):
+                            record = candidate
+                    except Exception:
+                        pass
+                sources.append((entry.store_name, entry, record))
+        else:
+            try:
+                store_names = self.store.list_modules()
+            except Exception as exc:
+                return {
+                    "rsp": f"0x{esp:x}", "method": "windows-x86-hybrid",
+                    "complete": False, "frames": [], "candidates": [],
+                    "error": f"x86 symbol inventory failed: {exc}",
+                }
+            from types import SimpleNamespace
+            for store_name in store_names:
+                try:
+                    record = self.store.load(store_name)
+                except Exception:
+                    continue
+                _, architecture = _stored_module_identity(store_name, record)
+                if architecture != "x86":
+                    continue
+                path_value = str(record.get("pe_path") or "")
+                sources.append((store_name, SimpleNamespace(
+                    name=_stored_module_identity(store_name, record)[0]
+                    + Path(path_value).suffix.lower(),
+                    base=int(record.get("base") or 0),
+                    size=int(record.get("size_of_image") or 0),
+                    pe_path=path_value,
+                    pe_sha256=str(record.get("pe_sha256") or ""),
+                ), record))
 
         modules: list[X86Module] = []
         relevant_errors: list[str] = []
-        for store_name in store_names:
+        for store_name, entry, record in sources:
             relevant = False
             try:
                 from winbox.kdbg.decomp.identity import (
@@ -1741,20 +1909,16 @@ class DaemonSession:
                     sha256_file,
                     validate_identity,
                 )
-                record = self.store.load(store_name)
-                _, architecture = _stored_module_identity(store_name, record)
-                if architecture != "x86":
-                    continue
-                base = int(record.get("base") or 0)
-                size = int(record.get("size_of_image") or 0)
+                base = int(entry.base)
+                size = int(entry.size)
                 relevant = base <= eip < base + size
                 if (
                     base <= 0 or size <= 0 or base > 0xFFFFFFFF
                     or base + size > (1 << 32)
                 ):
                     raise RuntimeError("symbol store has invalid x86 base/size")
-                path_value = record.get("pe_path")
-                expected_sha = record.get("pe_sha256")
+                path_value = entry.pe_path
+                expected_sha = entry.pe_sha256
                 if not path_value or not expected_sha:
                     raise RuntimeError("symbol store has no hash-bound PE")
                 path = Path(path_value).resolve(strict=True)
@@ -1765,8 +1929,7 @@ class DaemonSession:
                     live = parse_live_pe(live_read, base)
                 except IdentityError:
                     live = parse_live_pe(live_read, base, include_pdb=False)
-                stem, _ = _stored_module_identity(store_name, record)
-                display_name = stem + path.suffix.lower()
+                display_name = str(entry.name)
                 confidence = validate_identity(
                     live, static, module_name=display_name,
                     live_module_size=size,
@@ -1795,7 +1958,12 @@ class DaemonSession:
                     name=display_name, base=base, size=size,
                     frame_data=frame_data,
                     function_starts=tuple(sorted(starts)),
-                    metadata=f"verified-pdb:{confidence}",
+                    metadata=(
+                        f"verified-pdb:{confidence}:attach-manifest"
+                        if record else f"verified-pe:{confidence}:attach-manifest"
+                    ) if self.module_manifest is not None else (
+                        f"verified-pdb:{confidence}"
+                    ),
                 ))
             except Exception as exc:
                 if relevant:
@@ -1957,6 +2125,23 @@ class DaemonSession:
         if reads:
             response["memory"] = reads
         return response
+
+    def _unwind_user_modules(self):
+        """Use the immutable attach inventory for unwind when available."""
+        if self.module_manifest is None:
+            return self._live_modules("user")
+        from types import SimpleNamespace
+        return [
+            SimpleNamespace(
+                name=module.name,
+                base=module.base,
+                size=module.size,
+                full_path=module.full_path,
+                entry=0,
+                architecture=module.architecture,
+            )
+            for module in self.module_manifest.loader_modules()
+        ]
 
     def _live_modules(self, kind: str):
         """Return one fresh loader inventory while preserving RSP state."""
@@ -3196,6 +3381,7 @@ def fork_daemon(
     target_pid: int,
     *,
     gdbstub_port: int = 1234,
+    module_manifest: UserModuleManifest | None = None,
 ) -> int:
     """Fork off a session daemon. Parent returns the daemon pid; child
     never returns from this function (it enters serve_forever).
@@ -3208,6 +3394,12 @@ def fork_daemon(
     The parent waits on a status pipe for the child to either say "OK"
     (everything wired) or "ERR: ..." (and exits with that error).
     """
+    if module_manifest is not None and module_manifest.pid != target_pid:
+        raise DaemonError(
+            f"module manifest pid {module_manifest.pid} does not match "
+            f"target pid {target_pid}"
+        )
+
     # Fail closed before attaching QEMU's gdbstub. Repeated RSP stop/resume is
     # known to corrupt CET shadow-stack state on affected QEMU/KVM builds.
     from winbox.kdbg.cet import CetSafetyError, require_safe
@@ -3340,8 +3532,14 @@ def fork_daemon(
             "daemon_pid": os.getpid(),
             "gdbstub_port": gdbstub_port,
             "attach_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "auto_stage": (
+                module_manifest.summary() if module_manifest is not None else None
+            ),
         })
-        session = DaemonSession(cfg=cfg, rsp=rsp, target=target, store=store)
+        session = DaemonSession(
+            cfg=cfg, rsp=rsp, target=target, store=store,
+            module_manifest=module_manifest,
+        )
         session._capture_stop(initial_sr)
         _validate_register_layout(session.stop.raw_regs)
         _install_signal_handlers(session)

@@ -17,25 +17,31 @@ Items 1-8 have all been worked — `git log` is the record. Item 8 is addressed
 at its source (below) but stays listed as *Watching* because it is intermittent
 by nature.
 
-The major kdbg execution, symbol, decompilation, x64 unwind, and ordinary
-WoW64 x86 unwind paths are implemented and live-verified. Two capability items
-remain: automatic exact-binary staging for deeper user traces (69), followed
-by build-sensitive x86/x64 transition-stack stitching (70). Item 26 is an
-accepted minor trade-off rather than scheduled work, and item 8 remains a
-watch condition rather than an active implementation item.
+The major kdbg execution, symbol, decompilation, exact-artifact staging, x64
+unwind, ordinary WoW64 x86 unwind, and native-to-x86 transition stitching paths
+are implemented and live-verified. No major capability item is currently open.
+Item 26 is an accepted minor trade-off rather than scheduled work, and item 8
+remains a watch condition rather than an active implementation item.
 
-### Current actionable backlog (2026-08-24)
+### Completed final unwind batch (2026-08-24)
 
 | Rank | Item | Ease | ROI | Status |
 |---:|---|---:|---:|---|
-| 1 | **69 — automatic exact-binary staging** | 4 | 5 | Next. Remove the preload requirement with an immutable attach-time manifest or non-contending staging broker. |
-| 2 | **70 — mixed-mode WoW64 transition-stack stitching** | 1 | 3 | Backlog. Valuable for stops inside the WoW64 transition layer; normal x86 application traces already work. |
+| 1 | **69 — automatic exact-binary staging** | 4 | 5 | Completed and live-verified with all 17 PING loader entries. |
+| 2 | **70 — mixed-mode WoW64 transition-stack stitching** | 1 | 3 | Completed for exact-build validated native x64→saved x86 transitions. |
 
-Latest verification after item 68: complete default suite `2512 passed, 5
-skipped, 140 deselected`; all 11 direct QEMU RSP integrations; all three live
-walk integrations; and reloaded-MCP validation against SysWOW64 `PING.EXE`,
-including x86 context, stack, nine-frame unwind, step-over, step-out, detach,
-and VM resume. Commit `775b2c8` is the implementation baseline.
+Final verification for items 69-70: complete default suite `2534
+passed, 5 skipped, 141 deselected`; all 11 direct QEMU RSP integrations; all
+three live walk integrations; and the dedicated real-daemon mixed WoW64 test.
+That live test automatically staged `PING.EXE`, hit
+`wow64cpu!CpupSyscallStub`, returned two identical mixed x64→x86 traces,
+detached, and confirmed VM resume. After installing the workspace build and
+reloading MCP, the actual endpoints discovered/staged/symbol-enriched all 17
+modules with zero warnings or failures, returned the same 19-frame trace (nine
+x64 plus ten x86), preserved the explicit boundary and exact build provenance,
+and omitted the transition truthfully at depth four. A subsequent x86
+`NtDelayExecution` stop retained the established nine-frame hybrid trace.
+Detach left no daemon, the gdbstub listening, and qemu-ga responsive.
 
 One finding from the breakpoint work is worth keeping, because it shapes any
 future kdbg change: **neither breakpoint mechanism installs on both images.**
@@ -507,26 +513,55 @@ hardware breakpoint remained installed. Final verification passed the complete
 default suite (`2512 passed, 5 skipped, 140 deselected`), all eleven direct
 QEMU RSP integrations, and all three repeated/parallel live walk integrations.
 
-### 69. User unwind depth depends on pre-staged exact binaries
+### 69. Completed — immutable automatic exact-binary staging
 
-Windows may decommit `.pdata` and even the RSDS page after registering a user
-image. An attached daemon cannot safely invoke the guest agent to copy a newly
-encountered dependency, so the trace stops explicitly when neither live
-metadata nor a hash-bound cached PE exists. Preloading symbols/binaries solves
-it (live RPCRT4 depth grew from two to thirteen frames), but agent UX would be
-better with an attach-time immutable binary manifest or a separate broker that
-can stage exact module artifacts without contending for the gdbstub.
+Before the debugger daemon takes QEMU's single RSP connection, attach now walks
+both loader views, bounds module count/per-image/aggregate size, copies each PE
+through inert base64/`LiteralPath` handling, verifies architecture and live
+SizeOfImage, and freezes content-addressed path/hash/build provenance. Matching
+PDB publics and x86 frame data are enriched automatically; missing PDBs leave a
+usable exact PE and a bounded per-module warning instead of failing attach.
+Copy failures also remain in the immutable loader inventory, allowing live
+metadata to keep working without pretending an exact static artifact exists.
+The daemon uses that inventory for user unwind and exact staged artifacts for
+discarded `.pdata`, while live headers/CodeView still validate that the mapped
+image is the same artifact. Summary counts remain exact while failure and
+warning detail arrays and strings are capped.
 
-### 70. Mixed-mode WoW64 transition-stack stitching remains unsupported
+Live SysWOW64 `PING.EXE` staging captured all 17 native/x86 loader entries,
+symbol-enriched all 17, copied 11.3 MB, and reported zero failures. The cold
+path took 36 seconds while fetching previously absent PDBs; the fully warm,
+revalidated path took 11 seconds. Newly discovered NSI/IPHLPAPI artifacts then
+contributed real frames without any manual `kdbg_user_symbols_load` call.
 
-Dispatch is truthful for a stop in either x86 compatibility code or ordinary
-x64 code, but one trace does not yet cross an active x86 ↔ x64 WoW64 CPU
-transition (for example, a stop inside `wow64cpu.dll` while both stack domains
-are live). Implementing that requires validated knowledge of the current
-Windows build's transition/context records; guessing across the boundary would
-be worse than the present explicit partial trace. Normal x86 application
-call-chain research, including syscall stubs stopped before or after the
-transition, is covered by item 68.
+### 70. Completed — exact-build native-to-x86 WoW64 transition stitching
+
+The bridge does not trust a fixed Windows-build offset table. It requires the
+exact manifest/PDB pair for `wow64cpu.dll`, locates `RunSimulatedCode` and
+`CpupReturnFromSimulatedCode`, decodes their x64 instruction streams, and
+derives the TEB CPU-area pointer, context bias, saved EIP/ESP/EBP/EBX fields,
+and native/x86 stack exchange relationship. Live recovery accepts R13 or a
+TEB64 self-pointer-validated CPU area, then requires a module-backed EIP and a
+bounded aligned ESP before invoking the existing conservative x86 walker. A
+changed build/pattern/context preserves the native trace and reports
+`transition_error` rather than fabricating a boundary.
+
+Live Server 2025 validation stopped at `wow64cpu!CpupSyscallStub` and produced
+one repeatable 19-frame `windows-wow64-mixed` trace: nine x64 frames through
+wow64cpu/wow64/native ntdll, followed by ten x86 frames through
+`NtDeviceIoControlFile`, NSI, IPHLPAPI, PING, kernel32, and x86 ntdll. The
+transition record named exact build `359FC42CD05DC3DAEF1A6B476716FB481`,
+instruction-derived layout, R13 context `0x70fc00`, saved EIP `0x772c846c`,
+and saved ESP `0x74eec8`. Repeated traces were identical; bounded depth omitted
+the bridge truthfully; ordinary x86 `NtDelayExecution` unwinding remained
+unchanged afterward.
+
+The supported stitch direction is a native x64 transition stop into its saved
+x86 callers. At an arbitrary compatibility-mode stop, QEMU's RSP `G` packet
+and HMP monitor both expose only the 32-bit register file, not the suspended
+native R14/RSP anchor. TEB64 reveals native stack bounds but not the exact
+suspended stack pointer; scanning that range would be speculative, so such
+stops deliberately remain the truthful ordinary x86 trace from item 68.
 
 ---
 

@@ -149,12 +149,13 @@ class FakeCfg:
     vm_name = "winbox"
 
 
-def _make_session(rsp=None, store=None, target=None) -> DaemonSession:
+def _make_session(rsp=None, store=None, target=None, manifest=None) -> DaemonSession:
     return DaemonSession(
         cfg=FakeCfg(),
         rsp=rsp or FakeRsp(),
         target=target or TargetInfo(pid=4584, dtb=0x4d6bb000, name="notepad.exe"),
         store=store or FakeStore({"notepad!Save": 0x7ff6e289eabc}),
+        module_manifest=manifest,
     )
 
 
@@ -401,6 +402,84 @@ def test_context_decodes_wow64_as_x86_and_returns_dwords():
     assert result["stack"]["dwords"][0]["value"] == "0x77cc2849"
     assert "qwords" not in result["stack"]
     assert result["backtrace"]["method"] == "windows-x86-hybrid"
+
+
+def test_native_wow64_bridge_stitches_validated_saved_x86_frames(
+    tmp_path, monkeypatch,
+):
+    from winbox.kdbg.staging import StagedUserModule, UserModuleManifest
+    from winbox.kdbg.wow64_transition import (
+        Wow64TransitionLayout,
+        Wow64X86Context,
+    )
+
+    bridge_path = tmp_path / "wow64cpu.dll"
+    bridge_path.write_bytes(b"exact")
+    bridge = StagedUserModule(
+        "wow64cpu.dll", r"C:\Windows\System32\wow64cpu.dll", "x64",
+        0x77240000, 0xA000, str(bridge_path), "a" * 64,
+        "wow64cpu", store_build="BUILD",
+    )
+    x86 = StagedUserModule(
+        "ntdll.dll", r"C:\Windows\SysWOW64\ntdll.dll", "x86",
+        0x77250000, 0x1B8000, str(tmp_path / "ntdll.dll"), "b" * 64,
+        "ntdll_x86", store_build="X86BUILD",
+    )
+    manifest = UserModuleManifest(4584, (bridge, x86))
+
+    class Store(FakeStore):
+        def load_build(self, name, build):
+            assert (name, build) == ("wow64cpu", "BUILD")
+            return {"pe_sha256": "a" * 64, "symbols": {"RunSimulatedCode": 1}}
+
+    session = _make_session(store=Store(), manifest=manifest)
+    session.stop = StopState(
+        vcpu="03", rip=0x77241F70, cr3=0x4D6BB000, signal=5,
+        raw_regs=_blob(rip=0x77241F70, r13=0x70000080),
+    )
+    session.run_state = "halted"
+    layout = Wow64TransitionLayout(0x1920, 0x1A38, 0x1488, 0x80, 0x3C, 0x48, 0x38, 0x28)
+    context = Wow64X86Context(0x772C875C, 0x74EFAC, 0x74EFCC, 0, 0x70000080, "r13")
+    monkeypatch.setattr("winbox.kdbg.decomp.identity.sha256_file", lambda _p: "a" * 64)
+    monkeypatch.setattr("winbox.kdbg.wow64_transition.derive_transition_layout", lambda *_a: layout)
+    monkeypatch.setattr("winbox.kdbg.wow64_transition.recover_x86_context", lambda *_a: context)
+    monkeypatch.setattr(session, "_unwind_x86_context", lambda *_a, **_k: {
+        "method": "windows-x86-hybrid", "complete": False,
+        "frames": [
+            {"index": 0, "addr": "0x772c875c", "module": "ntdll.dll", "architecture": "x86"},
+            {"index": 1, "addr": "0x772e2849", "module": "ntdll.dll", "architecture": "x86"},
+        ],
+        "error": "truthful x86 root",
+    })
+    result = {
+        "method": "windows-x64-pdata", "complete": False,
+        "frames": [{"index": 0, "addr": "0x77241f70", "module": "wow64cpu.dll", "architecture": "x64"}],
+        "error": "native root",
+    }
+
+    session._stitch_wow64_x86(result, depth=8, live_read=lambda *_a: b"\0" * 8)
+
+    assert result["method"] == "windows-wow64-mixed"
+    assert result["architecture"] == "mixed-x64-x86"
+    assert [frame["index"] for frame in result["frames"]] == [0, 1, 2]
+    assert result["frames"][1]["boundary"] == "wow64-x64-to-x86"
+    assert "boundary" not in result["frames"][2]
+    assert result["transition"]["saved_eip"] == "0x772c875c"
+    assert result["native_error"] == "native root"
+    assert result["error"] == "truthful x86 root"
+
+
+def test_native_wow64_bridge_failure_is_explicit_and_preserves_native_trace():
+    from winbox.kdbg.staging import UserModuleManifest
+
+    session = _make_session(manifest=UserModuleManifest(4584, ()))
+    result = {
+        "method": "windows-x64-pdata", "complete": False,
+        "frames": [{"index": 0, "module": "wow64cpu.dll"}],
+    }
+    session._stitch_wow64_x86(result, depth=8, live_read=lambda *_a: b"")
+    assert result["method"] == "windows-x64-pdata"
+    assert "one exact x64 wow64cpu.dll" in result["transition_error"]
 
 
 @pytest.mark.parametrize(

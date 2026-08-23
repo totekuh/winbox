@@ -365,6 +365,19 @@ def test_copy_via_share_propagates_powershell_failure_without_artifacts(tmp_path
     assert not list(cfg.symbols_dir.glob("*.part"))
 
 
+def test_copy_via_share_enforces_file_cap_before_host_publication(tmp_path):
+    cfg = _CopyCfg(tmp_path)
+    ga = _ShareGA(cfg, b"X" * 17)
+
+    with pytest.raises(SymbolLoadError, match="attach staging cap"):
+        symbols._copy_via_share(
+            cfg, ga, r"C:\oversized.dll", "oversized.dll", max_file_size=16,
+        )
+
+    assert not list(cfg.shared_dir.iterdir())
+    assert not (cfg.symbols_dir / "pe" / "oversized.dll").exists()
+
+
 class _FakePe:
     def __init__(self, machine: int, size: int) -> None:
         self.FILE_HEADER = SimpleNamespace(Machine=machine)

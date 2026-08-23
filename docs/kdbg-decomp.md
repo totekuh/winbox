@@ -53,12 +53,14 @@ old external-interpreter path; `WINBOX_PYGHIDRA_PYTHON` and
 
 ## Use
 
-Prepare the exact module binary before attaching. Kernel symbol loading already
-caches `ntoskrnl.exe`; `kdbg_user_symbols_load(pid, module)` caches a user DLL.
-An exact host path can be supplied explicitly for private binaries.
+`kdbg_attach` automatically walks both native and WoW64 loader views before it
+takes the gdbstub, copies every bounded user image into content-addressed
+storage, and enriches exact PDB metadata when available. Manual
+`kdbg_user_symbols_load(pid, module)` is now optional prewarming or an explicit
+single-module lookup. An exact host path can still be supplied for a private
+binary that is not present in the live loader inventory.
 
 ```bash
-winbox kdbg user-symbols 1234 ntdll.dll        # before attach, if needed
 winbox kdbg attach 1234
 winbox kdbg cont --timeout 30
 winbox kdbg decomp                             # current RIP
@@ -117,6 +119,11 @@ and optional caller-selected memory in one stop-pinned response. Disassembly is
 capped at 32 instructions, stack at 32 native words, backtrace at 16 frames,
 and optional memory at four reads of 256
 bytes each/1024 bytes combined.
+
+At a native stop inside an active WoW64 transition, the same response can carry
+a `windows-wow64-mixed` backtrace. Its `transition` object identifies the exact
+`wow64cpu` build, instruction-derived layout, saved-context source and x86
+EIP/ESP; the first x86 frame has `boundary=wow64-x64-to-x86`.
 
 For rare breakpoints, prefer `kdbg_cont_start(timeout)`. It launches a tiny
 detached host client, atomically persists a token and daemon session identity,
