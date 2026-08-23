@@ -1305,6 +1305,87 @@ class DaemonSession:
                 break
         return {"rsp": f"0x{rsp_va:x}", "frames": frames}
 
+    def op_module_at(self, va: int | str) -> dict[str, Any]:
+        """Resolve a live VA against a fresh loader-list snapshot.
+
+        This operation exists for the static/dynamic decompilation bridge.
+        It deliberately walks the live PEB/kernel list instead of trusting
+        symbol-store bases: ASLR, unload/reload, and same-named modules make a
+        stale cached base unsafe. The walk borrows this daemon's already
+        halted RSP connection and restores the complete selected-vCPU register
+        blob before returning.
+        """
+        if isinstance(va, str):
+            try:
+                va = int(va, 0)
+            except ValueError as exc:
+                raise ValueError(f"invalid virtual address: {va!r}") from exc
+        if va < 0 or va >= (1 << 64):
+            raise ValueError(f"virtual address outside uint64 range: {va}")
+
+        from types import SimpleNamespace
+        from winbox.kdbg.debugger.reader import use_local_rsp
+        from winbox.kdbg.memory import WalkCache
+        from winbox.kdbg.walk import ProcessRecord, list_modules, list_user_modules
+
+        vcpu = self._pick_vcpu()
+        stop = SimpleNamespace(thread=vcpu)
+        target = ProcessRecord(
+            pid=self.target.pid,
+            name=self.target.name,
+            eprocess=self.target.eprocess,
+            directory_table_base=self.target.dtb,
+            user_directory_table_base=self.target.user_dtb,
+        )
+        walk_completed = False
+        try:
+            with use_local_rsp(self.cfg.vm_name, self.rsp, stop):
+                cache = WalkCache()
+                if (va >> 47) == 0x1FFFF:
+                    modules = list_modules(
+                        self.cfg.vm_name, self.store, cache=cache,
+                    )
+                    kind = "kernel"
+                else:
+                    modules = list_user_modules(
+                        self.cfg.vm_name, self.store, target, cache=cache,
+                    )
+                    kind = "user"
+                walk_completed = True
+        except Exception as exc:
+            # A rejected full-register restore has the same safety impact as
+            # the normal CR3 masquerade failure: never resume this session.
+            # ``walk_completed`` means the body succeeded and the exception
+            # came from use_local_rsp's restore-only __exit__ path, regardless
+            # of whether RSP surfaced ReaderError, RspError, or OSError.
+            if walk_completed:
+                self._cr3_corrupted = True
+            raise RuntimeError(f"live module walk failed: {exc}") from exc
+        finally:
+            # use_local_rsp selects every vCPU directly; invalidate the Hg
+            # cache even on failure so a later debugger op always reselects.
+            self._last_selected_vcpu = None
+
+        matches = [m for m in modules if m.base <= va < m.base + m.size]
+        if not matches:
+            raise RuntimeError(
+                f"0x{va:x} is not inside any live {kind} module "
+                f"({len(modules)} loader entries checked)"
+            )
+        # Loader mappings should not overlap. Smallest is deterministic and
+        # least permissive if corrupt guest metadata says that they do.
+        module = min(matches, key=lambda item: item.size)
+        return {
+            "name": module.name,
+            "base": f"0x{module.base:x}",
+            "size": module.size,
+            "rva": f"0x{va - module.base:x}",
+            "kind": kind,
+            "full_path": getattr(module, "full_path", ""),
+            "loader_entry": f"0x{module.entry:x}",
+            "inventory": "fresh",
+        }
+
     def op_detach(self) -> dict[str, Any]:
         """Clean shutdown. Removes bps, detaches gdb (which resumes VM),
         signals the serve loop to exit. The connection that called this

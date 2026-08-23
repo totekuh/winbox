@@ -38,6 +38,7 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "domain": (GROUP, ""),
     "hosts": (GROUP, ""),
     "iso": (GROUP, ""),
+    "kdbg ghidra": (GROUP, ""),
     "jobs": (GROUP, ""),
     "kdbg": (GROUP, ""),
     "net": (GROUP, ""),
@@ -161,6 +162,12 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg user-symbols": (LIVE, ""),
     "kdbg read-va": (LIVE, ""),
     "kdbg regs": (LIVE, "requires an attached session"),
+    "kdbg decomp": (LIVE, "exact cached ntdll mapped from a live target VA"),
+    "kdbg decomp-status": (LIVE, "read-only Docker/API/cache status"),
+    "kdbg ghidra install": (EXCLUDED, "one-time 570 MB network image build; covered by the dedicated real Docker integration"),
+    "kdbg ghidra run": (LIVE, "start and API-check the private container"),
+    "kdbg ghidra status": (LIVE, "read-only image/container/API status"),
+    "kdbg ghidra stop": (LIVE, "stop container while preserving caches"),
     "kdbg mem": (LIVE, ""),
     "kdbg stack": (LIVE, ""),
     "kdbg bt": (LIVE, ""),
@@ -249,6 +256,11 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     ),
     "kdbg_rm": (LIVE, ""),
     "kdbg_disasm": (LIVE, ""),
+    "kdbg_decomp": (LIVE, "exact cached ntdll mapped from a live target VA"),
+    "kdbg_decomp_status": (LIVE, "read-only Docker/API/cache status"),
+    "kdbg_ghidra_install": (EXCLUDED, "one-time 570 MB network image build; covered by the dedicated real Docker integration"),
+    "kdbg_ghidra_run": (LIVE, "start and API-check the private container"),
+    "kdbg_ghidra_stop": (LIVE, "stop container while preserving caches"),
     "kdbg_write_mem": (EXCLUDED, "writes into live kernel memory; a wrong "
                                  "address or a misparsed read-back would "
                                  "destabilize the guest mid-suite for no "
@@ -288,6 +300,7 @@ CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "kdbg cont": "tests/test_kdbg_daemon.py",
     "kdbg step": "tests/test_kdbg_daemon.py",
     "kdbg interrupt": "tests/test_kdbg_daemon.py",
+    "kdbg ghidra install": "tests/test_kdbg_decomp_docker.py",
 }
 
 MCP_EXCLUSION_UNIT_TESTS: dict[str, str] = {
@@ -299,4 +312,5 @@ MCP_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "kdbg_step": "tests/test_mcp.py",
     "kdbg_interrupt": "tests/test_mcp.py",
     "kdbg_bp_trace": "tests/test_kdbg_trace.py",
+    "kdbg_ghidra_install": "tests/test_kdbg_decomp_docker.py",
 }

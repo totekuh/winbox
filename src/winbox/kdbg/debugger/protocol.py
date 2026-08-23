@@ -46,6 +46,7 @@ OPS: frozenset[str] = frozenset({
     "write_mem",    # write hex bytes to memory in target's CR3
     "stack",        # read N qwords from RSP
     "bt",           # basic backtrace
+    "module_at",    # resolve a live VA through fresh loader-list walks
     "detach",       # graceful shutdown
 })
 

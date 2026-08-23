@@ -296,6 +296,68 @@ pass captured 104 hits across two distinct live handle values: `top=1`
 returned one bucket with `top_values_complete=false`, while exact counts and
 min/max still covered the full trace.
 
+**55.** Live kdbg state now composes with headless Ghidra through
+`kdbg_decomp`: current RIP or an explicit runtime VA is resolved against a
+fresh target PEB/kernel loader walk, converted to an ASLR-independent RVA, and
+accepted only after the cached PE matches live machine, loader/header image
+size, timestamp, and (when present) CodeView GUID+age. Same-named wrong builds
+fail closed. Ghidra token provenance returns a bounded statement-level excerpt
+with honest `exact`/`nearest`/`function-only` confidence, containing function
+metadata, nearby instructions, and a live-vs-static instruction-byte warning.
+
+PyGhidra now runs in a pinned, persistent Docker service rather than requiring
+host Java/Ghidra or entering the MCP/debugger processes. Install/run/stop/status
+lifecycle commands and MCP tools manage an exactly labelled current-UID
+container; its mode-0600 Unix API has no published port, runtime networking is
+disabled, every capability is dropped, `no-new-privileges` and a read-only root
+are enforced, and only private cache/project/runtime mounts are writable.
+Artifacts are version-pinned and checksum-verified during build. Full-SHA
+atomic binary staging, a second worker SHA check, Ghidra-versioned durable
+projects, one-program memory bound, concurrent serialization, image-ID-aware
+upgrade/restart handling, and full-register restore poisoning keep the JVM
+outside safety-critical RSP state. Unit coverage exercises malformed/bounded PE
+parsing, identity mismatches, stripped images, RVA/file bounds, address/context
+validation, user/kernel/overlapping/unmapped loader entries, and restore
+poisoning. A real PyGhidra integration compiles and analyzes a binary, checks
+focused/full output, concurrent requests, bad-request survival, warm reuse,
+worker shutdown races, container restart, and durable project reuse. See
+`docs/kdbg-decomp.md`.
+
+Final live validation on 2026-08-23 used Server 2025 and winlogon. User-mode
+`ntdll!NtClose` mapped from `0x7ffe1f99efd0` to RVA `0x15efd0`, matched the
+live/static CodeView key `219D0663E9DBAD581E64D9EC8618F5421`, decompiled as
+`NtClose`, and matched live instruction bytes. A real software breakpoint made
+only the byte comparison fail with the intended patch warning; removal restored
+the original bytes. A wrong 32-bit PE and an unmapped VA failed before Ghidra.
+Eight concurrent end-to-end queries serialized cleanly in 0.61 seconds, and a
+SIGKILLed worker restarted and reopened its durable project on the next query.
+
+Docker validation on the same date built Ghidra 12.1.3/PyGhidra 3.1.0 from the
+pinned artifacts and inspected the actual runtime hardening. A compiled-binary
+integration exercised cold/focused/full decompilation, eight concurrent calls,
+malformed-request survival, immediate shutdown/restart, and durable reuse in
+11.66 seconds. Live Docker `ntdll!NtClose` analysis took 48.066 seconds cold;
+the next mid-instruction lookup took 0.124 seconds with exact identity and
+matching bytes. Docker kernel `nt!NtCreateFile` analysis took 623.329 seconds
+cold and 0.165 seconds warm with exact identity/bytes. Current-RIP
+`nt!HalProcessorIdle+0xf` exercised explicitly labelled PDB split recovery in
+0.173 seconds. A real software breakpoint produced the intended byte-divergence
+warning, and removal restored an exact match. Direct current-code MCP
+status/run/decomp/stop/restart/reopen calls all passed; final cleanup left zero
+breakpoints, detached/stopped the debugger, kept the VM/guest agent healthy,
+and found no System 1001/41/6008 events in the previous hour.
+
+Kernel `nt!NtCreateFile` independently mapped to RVA `0x9409b0`, matched
+CodeView key `953A8DE880B0818C32DA2DEC1D79C2D91`, decompiled as
+`NtCreateFile`, and matched live bytes. Its multi-minute first analysis became
+a 0.28-second warm query. Default-RIP lookup at `nt!HalProcessorIdle+0xf`
+exercised the missed-function edge: the bounded PDB-guided split recovery was
+explicitly labeled, mapped the recovered `return` token exactly, and matched
+live bytes. Direct MCP wrapper calls passed without restarting the configured
+server. Cleanup left zero breakpoints, detached the daemon, stopped the
+gdbstub, kept the VM/guest agent healthy, and found no System 1001/41/6008
+events in the previous hour.
+
 **21.** Private user-mode software breakpoint removal now records the exact
 CR3 used by `install_user_breakpoint` and re-enters that CR3 before sending
 `z0`; legacy tracked breakpoints without the recorded value retain safe

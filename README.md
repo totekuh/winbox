@@ -6,7 +6,7 @@ winbox turns a headless Windows VM (Server Core 2022/2025 or Windows 11) into
 an automation, instrumentation, and analysis environment controlled from
 Kali. Execute tools, drive a PDB-aware hypervisor debugger, inspect protected
 memory, exercise drivers and IPC, change security posture, contain malware,
-and collect evidence through one CLI and a 64-tool MCP surface.
+and collect evidence through one CLI and a 69-tool MCP surface.
 
 Transparent execution is still the shortest path in: type
 `winbox exec SharpHound.exe -c All -d corp.local` and winbox boots the VM,
@@ -39,14 +39,15 @@ PS C:\Windows\system32>
 
 ## Platform capabilities
 
-- **MCP server** — 64 tools form a bounded, AI-native research control plane
+- **MCP server** — 69 tools form a bounded, AI-native research control plane
   for autonomous agents, covering VM lifecycle, execution, memory, symbols,
   debugging, drivers, IPC, defenses, networking, event logs, and evidence
   collection.
 - **Hypervisor instrumentation** — a persistent QMP/RSP transport, PDB-backed
   symbols and Windows structure walks, CR3-aware reads/writes, breakpoints,
-  watchpoints, stepping, disassembly, predicates, and action traces operate
-  below the guest and across PPL boundaries.
+  watchpoints, stepping, disassembly, exact-binary live decompilation,
+  predicates, and action traces operate below the guest and across PPL
+  boundaries.
 - **Target interaction** — send IOCTLs, inspect and hold named pipes, manage
   services/registry/Defender/HVCI/AppLocker, run tools as SYSTEM or alternate
   local users, and keep long-running jobs observable.
@@ -85,6 +86,10 @@ Required:
 Optional:
 - `sshpass` — auto-auth for `winbox ssh` (falls back to manual password entry)
 - `virt-manager` — required for `winbox vnc` (VM display — plain VNC, no clipboard/resize)
+- Docker — optional; `winbox kdbg ghidra install` builds the pinned, isolated
+  headless Ghidra/PyGhidra service used by kdbg's live address-to-pseudocode
+  bridge. No host Java or Ghidra install is needed. See
+  [docs/kdbg-decomp.md](docs/kdbg-decomp.md).
 
 ## Installation
 
@@ -357,7 +362,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (64):**
+**Available tools (69):**
 
 User-mode primitives:
 
@@ -459,6 +464,11 @@ and requires a reboot.
 | `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |
 | `kdbg_disasm(addr?, count?)` | Symbol-annotated Capstone disassembly at a target VA or the current RIP |
+| `kdbg_decomp(addr?, before?, after?, full?, binary?, timeout?)` | Resolve a live VA/current RIP through the fresh loader list, verify the exact PE, map by RVA, and return focused PyGhidra pseudocode with provenance and nearby instructions |
+| `kdbg_decomp_status()` | Report PyGhidra discovery, isolated worker/JVM state, and durable project-cache status without starting the JVM |
+| `kdbg_ghidra_install(pull?)` | Build the checksum-pinned JDK 21 + Ghidra + PyGhidra Docker image |
+| `kdbg_ghidra_run()` | Start and API-check the private, networkless persistent decompilation container |
+| `kdbg_ghidra_stop()` | Stop/remove the labelled container while preserving analyzed projects and binary cache |
 
 The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker process per session (spawned as DETACHED_PROCESS | CREATE_NO_WINDOW inside the VM). IPC happens via `cmd.json`/`result.json` files on the VirtIO-FS share, so there's no VM round-trip on the polling path. This matters for protocols where a write on one handle must be answered on the same handle (stateless `send`/`recv` open fresh handles and never see each other's messages).
 
@@ -470,11 +480,12 @@ The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker pro
 Kali Linux
 ├── winbox control plane
 │   ├── CLI (Python/Click)
-│   └── MCP server (64 bounded agent tools)
+│   └── MCP server (69 bounded agent tools)
 ├── hypervisor research plane
 │   ├── QMP/HMP ────────────> VM + gdbstub lifecycle
 │   ├── persistent RSP ─────> vCPUs, memory, break/watchpoints, stepping
-│   └── PDB/symbol store ───> Windows types, processes, modules, disassembly
+│   ├── PDB/symbol store ───> Windows types, processes, modules, disassembly
+│   └── Docker PyGhidra ────> private Unix API + exact RVA-focused pseudocode
 ├── guest interaction plane
 │   ├── virtio-serial ──────> QEMU Guest Agent (execution + management)
 │   ├── VirtIO-FS ──────────> ~/.winbox/shared/ <=> Z:\ in VM
@@ -528,6 +539,10 @@ VIRTIO_ISO_URL=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
 ```
 ~/.winbox/
 ├── config                              # user config overrides (optional)
+├── decomp/                             # private Docker/PyGhidra API state
+│   ├── cache/binaries/                 # immutable full-SHA-256 PE copies
+│   ├── projects/                       # durable version+SHA Ghidra projects
+│   └── docker-build.log                # image-build diagnostics
 ├── jobs.json                           # background job state (cleared on winbox destroy)
 ├── .setup.lock                         # fcntl lock — serializes concurrent winbox setup
 ├── id_ed25519 / .pub                   # SSH keypair (generated during setup)

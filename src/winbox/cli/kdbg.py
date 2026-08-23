@@ -1105,6 +1105,120 @@ def kdbg_regs(ctx: click.Context) -> None:
             console.print(f"  {k.upper():6s}= {result[k]}")
 
 
+@kdbg.command("decomp")
+@click.argument("address", required=False, default="")
+@click.option("--before", type=click.IntRange(0, 20), default=3, show_default=True)
+@click.option("--after", type=click.IntRange(0, 20), default=5, show_default=True)
+@click.option("--full", is_flag=True, help="Include the complete containing function.")
+@click.option(
+    "--binary", type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    default=None, help="Exact host-side PE; otherwise use the symbols cache.",
+)
+@click.option("--timeout", type=click.IntRange(5, 300), default=60, show_default=True)
+@click.pass_context
+def kdbg_decomp(
+    ctx: click.Context,
+    address: str,
+    before: int,
+    after: int,
+    full: bool,
+    binary: Path | None,
+    timeout: int,
+) -> None:
+    """Show Ghidra pseudocode at ADDRESS, or at the current RIP.
+
+    Resolves the live loaded module, converts the runtime VA to an RVA,
+    verifies the cached PE against live CodeView/PE identity, and queries an
+    isolated persistent PyGhidra worker. The first request for a binary runs
+    Ghidra analysis; later requests reuse its project cache.
+    """
+    import json as _json
+    from winbox.kdbg.decomp import DecompError, query_decomp
+
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        result = query_decomp(
+            cfg,
+            addr=address,
+            before=before,
+            after=after,
+            full=full,
+            binary=str(binary) if binary else "",
+            timeout=timeout,
+        )
+    except DecompError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    console.print(_json.dumps(result, indent=2))
+
+
+@kdbg.command("decomp-status")
+@click.pass_context
+def kdbg_decomp_status(ctx: click.Context) -> None:
+    """Show Docker/PyGhidra API, JVM, and project-cache status."""
+    import json as _json
+    from winbox.kdbg.decomp import worker_status
+
+    cfg: Config = ctx.obj["cfg"]
+    console.print(_json.dumps(worker_status(cfg), indent=2))
+
+
+@kdbg.group("ghidra")
+def kdbg_ghidra() -> None:
+    """Install and manage the isolated headless Ghidra service."""
+    pass
+
+
+def _ghidra_lifecycle(ctx: click.Context, operation: str, **kwargs) -> None:
+    import json as _json
+    from winbox.kdbg.decomp import (
+        DecompError, install_service, start_service, stop_service, worker_status,
+    )
+
+    cfg: Config = ctx.obj["cfg"]
+    actions = {
+        "install": lambda: install_service(cfg, **kwargs),
+        "run": lambda: start_service(cfg),
+        "stop": lambda: stop_service(cfg),
+        "status": lambda: worker_status(cfg),
+    }
+    try:
+        result = actions[operation]()
+    except DecompError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    console.print(_json.dumps(result, indent=2))
+
+
+@kdbg_ghidra.command("install")
+@click.option("--pull/--no-pull", default=True, help="Refresh the pinned base image.")
+@click.pass_context
+def kdbg_ghidra_install(ctx: click.Context, pull: bool) -> None:
+    """Build the pinned Ghidra + PyGhidra Docker image."""
+    _ghidra_lifecycle(ctx, "install", pull=pull)
+
+
+@kdbg_ghidra.command("run")
+@click.pass_context
+def kdbg_ghidra_run(ctx: click.Context) -> None:
+    """Start the persistent local decompilation API."""
+    _ghidra_lifecycle(ctx, "run")
+
+
+@kdbg_ghidra.command("stop")
+@click.pass_context
+def kdbg_ghidra_stop(ctx: click.Context) -> None:
+    """Stop and remove the managed service container."""
+    _ghidra_lifecycle(ctx, "stop")
+
+
+@kdbg_ghidra.command("status")
+@click.pass_context
+def kdbg_ghidra_status(ctx: click.Context) -> None:
+    """Show image, container, API, JVM, and cache status."""
+    _ghidra_lifecycle(ctx, "status")
+
+
 @kdbg.command("mem")
 @click.argument("address", metavar="VA")
 @click.argument("length", type=int, default=64)

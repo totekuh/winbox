@@ -1188,6 +1188,9 @@ class TestKdbg:
         run("kdbg", "start")
         try:
             pid = self._target_pid(tool)
+            loaded = tool("kdbg_user_symbols_load")(pid, "ntdll")
+            assert "error" not in loaded.lower(), loaded
+            nt_close = tool("kdbg_sym")("ntdll!NtClose").split()[-1]
             session = json.loads(tool("kdbg_attach")(pid))
             assert session["target"]["pid"] == pid
 
@@ -1199,10 +1202,18 @@ class TestKdbg:
             tool("kdbg_bt")()
             tool("kdbg_mem")("0x7FFE0000", 16)
             tool("kdbg_disasm")("", 4)
+            lifecycle = json.loads(tool("kdbg_ghidra_run")())
+            assert lifecycle["api"]["worker_pid"] == 1
+            assert json.loads(tool("kdbg_decomp_status")())["image_installed"]
+            decomp = json.loads(tool("kdbg_decomp")(nt_close, 1, 2))
+            assert decomp["module"]["name"].lower() == "ntdll.dll"
+            assert decomp["identity"]["confidence"] == "pdb-guid-age"
+            assert decomp["function"]["name"]
             assert json.loads(tool("kdbg_bps")())["bps"] == []
 
             tool("kdbg_detach")()
             assert json.loads(tool("kdbg_session")())["attached"] is False
+            assert json.loads(tool("kdbg_ghidra_stop")())["stopped"]
         finally:
             run("kdbg", "stop", expect_ok=False)
 
@@ -1367,6 +1378,9 @@ class TestKdbg:
         assert "UserShadowStack=" in run("kdbg", "cet-status").output
         assert "--confirm" in run("kdbg", "prepare", expect_ok=False).output
         assert "--confirm" in run("kdbg", "restore-cet", expect_ok=False).output
+        run("kdbg", "ghidra", "run")
+        assert "image_installed" in run("kdbg", "ghidra", "status").output
+        run("kdbg", "ghidra", "stop")
         run("kdbg", "start")
         try:
             run("kdbg", "symbols")
@@ -1378,9 +1392,18 @@ class TestKdbg:
             run("kdbg", "session")
 
             pid = str(self._target_pid(tool))
+            loaded = tool("kdbg_user_symbols_load")(int(pid), "ntdll")
+            assert "error" not in loaded.lower(), loaded
+            nt_close = tool("kdbg_sym")("ntdll!NtClose").split()[-1]
             run("kdbg", "attach", pid)
             try:
                 run("kdbg", "regs")
+                decomp_status = run("kdbg", "decomp-status")
+                assert "image_installed" in decomp_status.output
+                decomp = run("kdbg", "decomp", nt_close,
+                    "--before", "1", "--after", "2",
+                )
+                assert "pdb-guid-age" in decomp.output
                 run("kdbg", "mem", "0x7FFE0000", "16")
                 # stack/bt read the halted context; an attached-but-running
                 # target has none, and refusing is the correct answer.

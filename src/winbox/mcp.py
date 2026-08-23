@@ -32,7 +32,8 @@ mcp = FastMCP(
         "Isolated Windows vulnerability-research platform for AI agents. "
         "Manage a QEMU/KVM Windows lab; execute and instrument targets; "
         "debug from the hypervisor with PDB symbols, breakpoints, and memory "
-        "access; exercise drivers and IPC; control defenses and networking; "
+        "access; combine live stops with exact-binary static decompilation; "
+        "exercise drivers and IPC; control defenses and networking; "
         "and collect bounded evidence."
     ),
 )
@@ -3738,6 +3739,120 @@ def kdbg_disasm(addr: str = "", count: int = 8) -> str:
         "base": f"0x{addr_int:x}",
         "instructions": insns,
     }, indent=2)
+
+
+@mcp.tool()
+def kdbg_decomp(
+    addr: str = "",
+    before: int = 3,
+    after: int = 5,
+    full: bool = False,
+    binary: str = "",
+    timeout: int = 60,
+) -> str:
+    """Return focused Ghidra pseudocode for ADDR or the current RIP.
+
+    Combines live debugger state with static analysis safely: resolves ADDR
+    through a fresh target/kernel loader walk, computes an ASLR-independent
+    RVA, verifies the host PE against the live module's CodeView GUID+age and
+    PE headers, then asks an isolated persistent PyGhidra worker to decompile
+    only the containing function. A stale or same-named wrong binary is
+    refused. The JVM never runs inside the MCP server or kdbg daemon.
+
+    The first query for a binary may take minutes while Ghidra analyzes and
+    caches it; subsequent lookups reuse that project and process. The response
+    includes the live VA/base/RVA, exact binary identity, function signature
+    and offset, focused source lines, address-mapping confidence, nearby static
+    instructions, live-byte comparison, warnings, and optionally full code.
+
+    Args:
+        addr: Runtime VA as hex/decimal. Empty (default) means current RIP.
+        before: Source context lines before the mapped line (0..20).
+        after: Source context lines after the mapped line (0..20).
+        full: Include the whole containing function (bounded to 256 KiB).
+        binary: Exact host-side PE path. Empty uses the winbox symbols cache.
+        timeout: Per-function Ghidra decompilation timeout (5..300 seconds).
+    """
+    from winbox.kdbg.decomp import DecompError, query_decomp
+
+    cfg = _kdbg_cfg_only()
+    try:
+        result = query_decomp(
+            cfg,
+            addr=addr,
+            before=before,
+            after=after,
+            full=full,
+            binary=binary,
+            timeout=timeout,
+        )
+    except DecompError as exc:
+        return f"error: {exc}"
+    return _json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def kdbg_decomp_status() -> str:
+    """Show Docker/PyGhidra API, worker/JVM state, and analysis-cache status.
+
+    This is safe without an attached debugger and does not start the JVM.
+    ``running=false`` is normal before the first ``kdbg_decomp`` request.
+    """
+    from winbox.kdbg.decomp import worker_status
+
+    return _json.dumps(worker_status(_kdbg_cfg_only()), indent=2)
+
+
+@mcp.tool()
+def kdbg_ghidra_install(pull: bool = True) -> str:
+    """Build the pinned, self-contained headless Ghidra Docker image.
+
+    This is the one-time dependency installation for ``kdbg_decomp``. It
+    downloads checksum-pinned Ghidra/PyGhidra artifacts during the Docker
+    build; normal analysis containers subsequently run with networking off.
+
+    Args:
+        pull: Refresh the pinned JDK base image before building.
+    """
+    from winbox.kdbg.decomp import DecompError, install_service
+
+    try:
+        return _json.dumps(
+            install_service(_kdbg_cfg_only(), pull=bool(pull)), indent=2
+        )
+    except DecompError as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def kdbg_ghidra_run() -> str:
+    """Start and verify the private persistent headless Ghidra API.
+
+    No TCP port is exposed. The current-UID container communicates through a
+    mode-0600 Unix socket and stays warm for low-latency repeated queries.
+    ``kdbg_decomp`` also starts it lazily when the image is installed.
+    """
+    from winbox.kdbg.decomp import DecompError, start_service
+
+    try:
+        return _json.dumps(start_service(_kdbg_cfg_only()), indent=2)
+    except DecompError as exc:
+        return f"error: {exc}"
+
+
+@mcp.tool()
+def kdbg_ghidra_stop() -> str:
+    """Stop and remove only the labelled winbox headless Ghidra container.
+
+    Analyzed projects and immutable binary caches remain on the host so the
+    next service start does not repeat Ghidra auto-analysis.
+    """
+    from winbox.kdbg.decomp import DecompError, stop_service
+
+    try:
+        return _json.dumps(stop_service(_kdbg_cfg_only()), indent=2)
+    except DecompError as exc:
+        return f"error: {exc}"
 
 
 @mcp.tool()
