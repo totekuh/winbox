@@ -302,8 +302,16 @@ fresh target PEB/kernel loader walk, converted to an ASLR-independent RVA, and
 accepted only after the cached PE matches live machine, loader/header image
 size, timestamp, and (when present) CodeView GUID+age. Same-named wrong builds
 fail closed. Ghidra token provenance returns a bounded statement-level excerpt
-with honest `exact`/`nearest`/`function-only` confidence, containing function
-metadata, nearby instructions, and a live-vs-static instruction-byte warning.
+with honest `exact`/`range`/`nearest-forward`/`nearest-backward`/`ambiguous`/
+`unmapped` relationships, containing function metadata, nearby instructions,
+and a live-vs-static instruction-byte warning. The agent-facing response is
+compact by default and uses RVA as the common coordinate between assembly and
+every address-bearing pseudocode line; direction and byte distance prevent a
+compiler prologue from being falsely presented as a current C statement. Full
+PE/PDB identities, loader records, hashes, Ghidra internals, and cache evidence
+are returned only with `detail=standard` or `detail=diagnostic`. `full=true`
+remains independent and controls only complete-function pseudocode. Worker API
+2 prevents a stale Docker image from serving the old mapping contract.
 
 PyGhidra now runs in a pinned, persistent Docker service rather than requiring
 host Java/Ghidra or entering the MCP/debugger processes. Install/run/stop/status

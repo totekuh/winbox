@@ -3749,6 +3749,7 @@ def kdbg_decomp(
     full: bool = False,
     binary: str = "",
     timeout: int = 60,
+    detail: str = "compact",
 ) -> str:
     """Return focused Ghidra pseudocode for ADDR or the current RIP.
 
@@ -3760,10 +3761,11 @@ def kdbg_decomp(
     refused. The JVM never runs inside the MCP server or kdbg daemon.
 
     The first query for a binary may take minutes while Ghidra analyzes and
-    caches it; subsequent lookups reuse that project and process. The response
-    includes the live VA/base/RVA, exact binary identity, function signature
-    and offset, focused source lines, address-mapping confidence, nearby static
-    instructions, live-byte comparison, warnings, and optionally full code.
+    caches it; subsequent lookups reuse that project and process. Compact
+    output is the default: it returns the live location, nearby assembly,
+    focused pseudocode, explicit RVA-based assembly-to-pseudocode mapping,
+    concise verification, and warnings. Standard or diagnostic evidence is
+    available only when explicitly requested.
 
     Args:
         addr: Runtime VA as hex/decimal. Empty (default) means current RIP.
@@ -3772,6 +3774,7 @@ def kdbg_decomp(
         full: Include the whole containing function (bounded to 256 KiB).
         binary: Exact host-side PE path. Empty uses the winbox symbols cache.
         timeout: Per-function Ghidra decompilation timeout (5..300 seconds).
+        detail: Response detail: compact (default), standard, or diagnostic.
     """
     from winbox.kdbg.decomp import DecompError, query_decomp
 
@@ -3785,6 +3788,7 @@ def kdbg_decomp(
             full=full,
             binary=binary,
             timeout=timeout,
+            detail=detail,
         )
     except DecompError as exc:
         return f"error: {exc}"

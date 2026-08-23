@@ -30,6 +30,7 @@ MAX_REQUEST = 64 * 1024
 MAX_CODE = 256 * 1024
 MAX_CONTEXT_LINES = 20
 MAX_OPEN_PROGRAMS = 1
+WORKER_API = "2"
 
 
 class WorkerError(RuntimeError):
@@ -100,6 +101,7 @@ class Worker:
     def handle(self, op: str, args: dict) -> dict:
         if op == "status":
             return {
+                "worker_api": WORKER_API,
                 "jvm_started": self.started,
                 "ghidra_version": self.ghidra_version,
                 "worker_pid": os.getpid(),
@@ -362,7 +364,6 @@ def _recover_function(api, program, address, rva: int, hint):
 def _map_source(markup, address, code: str, before: int, after: int) -> dict:
     target = int(address.getOffset())
     addressed: list[tuple[int, int, int]] = []
-    exact_lines: set[int] = set()
     for token in _walk_tokens(markup):
         try:
             minimum = token.getMinAddress()
@@ -376,42 +377,96 @@ def _map_source(markup, address, code: str, before: int, after: int) -> dict:
         except Exception:
             continue
         addressed.append((lo, hi, line))
-        if lo <= target <= hi:
-            exact_lines.add(line)
 
+    by_line: dict[int, set[tuple[int, int]]] = {}
+    for lo, hi, line in addressed:
+        by_line.setdefault(line, set()).add((lo, hi))
+
+    exact_lines = sorted(
+        line
+        for line, ranges in by_line.items()
+        if any(lo <= target <= hi for lo, hi in ranges)
+    )
+    candidate_lines: list[int]
+    direction: str | None
+    distance: int | None
     if exact_lines:
-        selected = min(exact_lines)
+        selected = exact_lines[0]
+        candidate_lines = exact_lines
+        direction = "overlap"
+        distance = 0
+        if len(exact_lines) > 1:
+            kind = "ambiguous"
+        elif any(
+            lo == target == hi for lo, hi in by_line.get(selected, set())
+        ):
+            kind = "exact"
+        else:
+            kind = "range"
         confidence = "exact"
-        mapped_addresses = sorted(
-            {f"0x{lo:x}" for lo, hi, line in addressed if line == selected}
-        )
     elif addressed:
-        lo, hi, selected = min(
-            addressed,
-            key=lambda item: 0 if item[0] <= target <= item[1]
-            else min(abs(target - item[0]), abs(target - item[1])),
+        def gap(item: tuple[int, int, int]) -> int:
+            lo, hi, _ = item
+            if target < lo:
+                return lo - target
+            if target > hi:
+                return target - hi
+            return 0
+
+        distance = min(gap(item) for item in addressed)
+        nearest = [item for item in addressed if gap(item) == distance]
+        candidate_lines = sorted({line for _, _, line in nearest})
+        selected = candidate_lines[0]
+        directions = {
+            "forward" if target < lo else "backward" if target > hi else "overlap"
+            for lo, hi, _ in nearest
+        }
+        direction = next(iter(directions)) if len(directions) == 1 else "mixed"
+        kind = (
+            "ambiguous"
+            if len(candidate_lines) > 1
+            else f"nearest-{direction}"
         )
         confidence = "nearest"
-        mapped_addresses = sorted(
-            {f"0x{x:x}" for a, b, line in addressed if line == selected for x in (a, b)}
-        )
     else:
         selected = 1
+        candidate_lines = []
+        direction = None
+        distance = None
+        kind = "unmapped"
         confidence = "function-only"
-        mapped_addresses = []
 
     lines = code.splitlines()
     selected = max(1, min(selected, max(1, len(lines))))
     start = max(1, selected - before)
     end = min(len(lines), selected + after)
-    excerpt = [
-        {"line": number, "text": lines[number - 1], "current": number == selected}
-        for number in range(start, end + 1)
-    ]
+    excerpt = []
+    for number in range(start, end + 1):
+        item = {"line": number, "text": lines[number - 1]}
+        ranges = sorted(by_line.get(number, set()))
+        if ranges:
+            item["address_ranges"] = [
+                {"start": f"0x{lo:x}", "end": f"0x{hi:x}"}
+                for lo, hi in ranges
+            ]
+        if kind != "unmapped" and number in candidate_lines:
+            item["relation"] = kind
+        excerpt.append(item)
+
+    selected_ranges = sorted(by_line.get(selected, set()))
     return {
         "confidence": confidence,
-        "line": selected,
-        "addresses": mapped_addresses,
+        "kind": kind,
+        "line": None if kind == "unmapped" else selected,
+        "candidate_lines": candidate_lines,
+        "distance_bytes": distance,
+        "direction": direction,
+        # Retain the old flat field in diagnostic output for clients that only
+        # understand confidence/line/addresses. New clients should use the
+        # explicit ranges and mapping kind above.
+        "addresses": sorted(
+            {f"0x{x:x}" for lo, hi in selected_ranges for x in (lo, hi)}
+        ),
         "excerpt": excerpt,
     }
 
@@ -508,6 +563,7 @@ def _serve(args) -> int:
         args.session.write_text(json.dumps({
             "pid": os.getpid(),
             "backend": args.backend,
+            "worker_api": WORKER_API,
             "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "socket": str(args.socket),
         }, indent=2) + "\n", encoding="utf-8")

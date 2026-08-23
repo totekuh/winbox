@@ -1206,8 +1206,14 @@ class TestKdbg:
             assert lifecycle["api"]["worker_pid"] == 1
             assert json.loads(tool("kdbg_decomp_status")())["image_installed"]
             decomp = json.loads(tool("kdbg_decomp")(nt_close, 1, 2))
-            assert decomp["module"]["name"].lower() == "ntdll.dll"
-            assert decomp["identity"]["confidence"] == "pdb-guid-age"
+            assert decomp["schema"] == "winbox.kdbg-decomp/2"
+            assert decomp["detail"] == "compact"
+            assert decomp["target"]["name"]
+            assert decomp["verified"]["identity"] == "pdb-guid-age"
+            assert decomp["rip_mapping"]["kind"] in {
+                "exact", "range", "nearest-forward", "nearest-backward",
+                "ambiguous", "unmapped",
+            }
             assert decomp["function"]["name"]
             assert json.loads(tool("kdbg_bps")())["bps"] == []
 

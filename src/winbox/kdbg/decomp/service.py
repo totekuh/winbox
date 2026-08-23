@@ -21,6 +21,7 @@ from winbox.kdbg.store import SymbolStore
 
 MAX_CONTEXT_LINES = 20
 MAX_LIVE_READ = 64 * 1024
+DETAIL_LEVELS = {"compact", "standard", "diagnostic"}
 
 
 def worker_status(cfg: Config) -> dict[str, Any]:
@@ -77,6 +78,7 @@ def query_decomp(
     full: bool = False,
     binary: str = "",
     timeout: int = 60,
+    detail: str = "compact",
     daemon_client: DaemonClient | None = None,
     decomp_client: DecompClient | None = None,
 ) -> dict[str, Any]:
@@ -89,6 +91,7 @@ def query_decomp(
     before = _bounded_int("before", before, 0, MAX_CONTEXT_LINES)
     after = _bounded_int("after", after, 0, MAX_CONTEXT_LINES)
     timeout = _bounded_int("timeout", timeout, 5, 300)
+    detail = _detail_level(detail)
     daemon = daemon_client or DaemonClient(cfg)
     worker = decomp_client or DecompClient(cfg)
 
@@ -201,7 +204,7 @@ def query_decomp(
         except (IdentityError, KeyError, TypeError, ValueError):
             warnings.append("could not compare live and static instruction bytes")
 
-    return {
+    composed = {
         "target": {"pid": target.get("pid"), "name": target.get("name")},
         "module": {
             **module,
@@ -220,6 +223,186 @@ def query_decomp(
         **result,
         "warnings": warnings,
     }
+    return _format_result(composed, detail)
+
+
+def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
+    """Apply the public response envelope without weakening verification.
+
+    The diagnostic form is the internal evidence record. Compact/standard
+    forms retain the operational answer and truthful source mapping while
+    avoiding repeated PE/PDB/cache provenance on every agent query.
+    """
+    if detail == "diagnostic":
+        return result
+
+    module = result.get("module") or {}
+    identity = result.get("identity") or {}
+    function = result.get("function") or {}
+    mapping = result.get("mapping") or {}
+    ghidra_base = _hex_int(result.get("ghidra_image_base"))
+    module_base = _hex_int(module.get("base"))
+    requested_rva = _hex_int(module.get("rva"))
+    requested_static = (
+        ghidra_base + requested_rva
+        if ghidra_base is not None and requested_rva is not None
+        else None
+    )
+
+    assembly: list[dict[str, Any]] = []
+    for instruction in result.get("instructions") or []:
+        address = _hex_int(instruction.get("address"))
+        item: dict[str, Any] = {
+            "bytes": instruction.get("bytes"),
+            "text": instruction.get("text"),
+        }
+        if address is not None and ghidra_base is not None:
+            instruction_rva = address - ghidra_base
+            item["rva"] = f"0x{instruction_rva:x}"
+            if module_base is not None:
+                item["va"] = f"0x{module_base + instruction_rva:x}"
+        if instruction.get("current"):
+            item["current"] = True
+        assembly.append(item)
+
+    kind, direction, distance = _mapping_relation(mapping, requested_static)
+    selected_line = mapping.get("line")
+    candidate_lines = list(mapping.get("candidate_lines") or [])
+    if not candidate_lines and selected_line is not None:
+        candidate_lines = [selected_line]
+
+    pseudocode: list[dict[str, Any]] = []
+    for source_line in mapping.get("excerpt") or []:
+        item = {
+            "line": source_line.get("line"),
+            "text": source_line.get("text"),
+        }
+        ranges = source_line.get("address_ranges") or []
+        if not ranges and source_line.get("line") == selected_line:
+            # Compatibility with worker API 1 diagnostic responses. API 2
+            # supplies per-line ranges directly.
+            addresses = [
+                value for value in (
+                    _hex_int(address) for address in mapping.get("addresses") or []
+                ) if value is not None
+            ]
+            if addresses:
+                ranges = [{"start": min(addresses), "end": max(addresses)}]
+        rva_ranges: list[dict[str, str]] = []
+        for address_range in ranges:
+            start = _hex_int(address_range.get("start"))
+            end = _hex_int(address_range.get("end"))
+            if start is None or end is None or ghidra_base is None:
+                continue
+            rva_ranges.append({
+                "start": f"0x{start - ghidra_base:x}",
+                "end": f"0x{end - ghidra_base:x}",
+            })
+        if rva_ranges:
+            item["rva_ranges"] = rva_ranges
+        relation = source_line.get("relation")
+        if relation is None and source_line.get("line") in candidate_lines:
+            relation = kind
+        if relation:
+            item["relation"] = relation
+        pseudocode.append(item)
+
+    compact: dict[str, Any] = {
+        "schema": "winbox.kdbg-decomp/2",
+        "detail": detail,
+        "target": result.get("target"),
+        "location": {
+            "symbol": result.get("runtime_symbol"),
+            "va": module.get("runtime_va"),
+            "rva": module.get("rva"),
+        },
+        "function": {
+            "name": function.get("name"),
+            "signature": function.get("signature"),
+            "entry_rva": function.get("rva"),
+            "offset": function.get("offset"),
+            "source": function.get("source"),
+        },
+        "assembly": assembly,
+        "pseudocode": pseudocode,
+        "rip_mapping": {
+            "kind": kind,
+            "pseudocode_line": selected_line,
+            "candidate_lines": candidate_lines,
+            "distance_bytes": distance,
+            "direction": direction,
+            "reason": _mapping_reason(kind),
+        },
+        "verified": {
+            "exact_binary": True,
+            "identity": identity.get("confidence"),
+            "live_bytes_match": identity.get("live_bytes_match"),
+        },
+        "cache_hit": result.get("cache_hit"),
+        "warnings": result.get("warnings") or [],
+    }
+    if "code" in result:
+        compact["code"] = result["code"]
+    if detail == "standard":
+        compact.update({
+            "module": module,
+            "identity": identity,
+            "symbol_hint": result.get("symbol_hint"),
+            "ghidra": {
+                "version": result.get("ghidra_version"),
+                "image_base": result.get("ghidra_image_base"),
+                "address": result.get("ghidra_address"),
+            },
+            "analysis": result.get("analysis") or {},
+        })
+    return compact
+
+
+def _mapping_relation(
+    mapping: dict[str, Any], requested_static: int | None
+) -> tuple[str, str | None, int | None]:
+    kind = str(mapping.get("kind") or "")
+    direction = mapping.get("direction")
+    distance = mapping.get("distance_bytes")
+    if kind:
+        return kind, direction, distance
+
+    confidence = mapping.get("confidence")
+    if confidence == "exact":
+        return "exact", "overlap", 0
+    if confidence == "function-only":
+        return "unmapped", None, None
+    addresses = [
+        value for value in (
+            _hex_int(address) for address in mapping.get("addresses") or []
+        ) if value is not None
+    ]
+    if confidence == "nearest" and addresses and requested_static is not None:
+        low, high = min(addresses), max(addresses)
+        if requested_static < low:
+            return "nearest-forward", "forward", low - requested_static
+        if requested_static > high:
+            return "nearest-backward", "backward", requested_static - high
+        return "range", "overlap", 0
+    return "unmapped", None, None
+
+
+def _mapping_reason(kind: str) -> str:
+    return {
+        "exact": "RIP has direct single-address decompiler token provenance",
+        "range": "RIP lies inside an address range contributing to this statement",
+        "nearest-forward": "RIP has no direct pseudocode token; this is the next mapped statement",
+        "nearest-backward": "RIP has no direct pseudocode token; this is the previous mapped statement",
+        "ambiguous": "multiple pseudocode lines have equally valid address provenance",
+        "unmapped": "Ghidra returned no defensible instruction-to-pseudocode mapping",
+    }.get(kind, "mapping relationship reported by the decompiler")
+
+
+def _hex_int(value: Any) -> int | None:
+    try:
+        return int(str(value), 0)
+    except (TypeError, ValueError):
+        return None
 
 
 def _resolve_binary(cfg: Config, module_name: str, explicit: str) -> Path:
@@ -268,6 +451,14 @@ def _bounded_int(name: str, value: int, minimum: int, maximum: int) -> int:
     if not minimum <= parsed <= maximum:
         raise DecompError(f"{name} must be between {minimum} and {maximum}")
     return parsed
+
+
+def _detail_level(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in DETAIL_LEVELS:
+        choices = ", ".join(sorted(DETAIL_LEVELS))
+        raise DecompError(f"detail must be one of: {choices}")
+    return normalized
 
 
 def _nearest_symbol_hint(

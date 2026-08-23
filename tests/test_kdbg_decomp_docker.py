@@ -13,6 +13,7 @@ import pytest
 
 from winbox.config import Config
 from winbox.kdbg.decomp.client import DecompClient, DecompError
+from winbox.kdbg.decomp.client import WORKER_API
 from winbox.kdbg.decomp.docker import (
     IMAGE,
     DockerError,
@@ -142,6 +143,8 @@ def test_install_builds_only_bundled_assets_and_verifies_image(monkeypatch, tmp_
     assert result["installed"] is True
     assert "GHIDRA_SHA256=" in observed["dockerfile"]
     assert "PYGHIDRA_SHA256=" in observed["dockerfile"]
+    assert 'io.winbox.worker-api="2"' in observed["dockerfile"]
+    assert f'WORKER_API = "{WORKER_API}"' in observed["worker"]
     assert "Persistent, serialized PyGhidra worker" in observed["worker"]
 
 
@@ -199,6 +202,26 @@ def test_legacy_host_worker_is_migrated_before_docker_start(monkeypatch, tmp_pat
     monkeypatch.setattr(client, "_exchange", exchange)
     client.ensure_selected_backend()
     assert exchanges == [{"op": "shutdown", "args": {}}]
+
+
+def test_stale_worker_api_is_migrated_before_query(monkeypatch, tmp_path):
+    client = DecompClient(Config(winbox_dir=tmp_path))
+    monkeypatch.setattr(client, "active_backend", lambda: "docker")
+    apis = iter(["1", "1"])
+    monkeypatch.setattr(client, "active_worker_api", lambda: next(apis))
+    migrations = []
+    monkeypatch.setattr(
+        client, "_shutdown_conflicting_worker",
+        lambda active, selected: migrations.append((active, selected)),
+    )
+    monkeypatch.setattr(client, "worker_alive", lambda: True)
+    monkeypatch.setattr(
+        client, "_exchange",
+        lambda *a, **k: {"ok": True, "result": {"worker_api": WORKER_API}},
+    )
+
+    assert client.call("status")["worker_api"] == WORKER_API
+    assert migrations == [("docker API 1", f"docker API {WORKER_API}")]
 
 
 def test_mcp_lifecycle_serializes_results_and_errors(monkeypatch, tmp_path):

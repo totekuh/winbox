@@ -1115,6 +1115,13 @@ def kdbg_regs(ctx: click.Context) -> None:
     default=None, help="Exact host-side PE; otherwise use the symbols cache.",
 )
 @click.option("--timeout", type=click.IntRange(5, 300), default=60, show_default=True)
+@click.option(
+    "--detail",
+    type=click.Choice(["compact", "standard", "diagnostic"]),
+    default="compact",
+    show_default=True,
+    help="Response evidence level.",
+)
 @click.pass_context
 def kdbg_decomp(
     ctx: click.Context,
@@ -1124,6 +1131,7 @@ def kdbg_decomp(
     full: bool,
     binary: Path | None,
     timeout: int,
+    detail: str,
 ) -> None:
     """Show Ghidra pseudocode at ADDRESS, or at the current RIP.
 
@@ -1145,6 +1153,7 @@ def kdbg_decomp(
             full=full,
             binary=str(binary) if binary else "",
             timeout=timeout,
+            detail=detail,
         )
     except DecompError as exc:
         console.print(f"[red][-][/] {exc}")

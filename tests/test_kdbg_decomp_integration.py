@@ -64,6 +64,9 @@ def test_persistent_pyghidra_worker_decompiles_and_reuses_project(tmp_path, requ
     assert "* 3" in first["code"] or "*3" in first["code"]
     assert second["cache_hit"] is True
     assert second["mapping"]["confidence"] in {"exact", "nearest"}
+    assert second["mapping"]["kind"] in {
+        "exact", "range", "nearest-forward", "nearest-backward", "ambiguous"
+    }
     assert warm_elapsed < 5.0
     def query(_):
         return client.call(

@@ -24,6 +24,7 @@ class DecompError(RuntimeError):
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+WORKER_API = "2"
 
 
 def runtime_dir(cfg: Config) -> Path:
@@ -143,6 +144,17 @@ class DecompClient:
         # PID 1.
         return "docker" if value.get("pid") == 1 else "host"
 
+    def active_worker_api(self) -> str | None:
+        """Return the protocol version declared by the lock owner."""
+        if not self.worker_alive():
+            return None
+        try:
+            value = json.loads(session_path(self.cfg).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        declared = value.get("worker_api")
+        return str(declared) if declared is not None else None
+
     def status(self) -> dict[str, Any]:
         selected = backend()
         if selected == "docker":
@@ -153,11 +165,16 @@ class DecompClient:
             result.update({
                 "running": self.worker_alive(),
                 "active_backend": self.active_backend(),
+                "active_worker_api": self.active_worker_api(),
                 "responsive": False,
                 "cache_dir": str(cache_dir(self.cfg)),
                 "project_dir": str(docker_projects(self.cfg)),
             })
-            if result["running"] and result["active_backend"] in {None, "docker"}:
+            if (
+                result["running"]
+                and result["active_backend"] in {None, "docker"}
+                and result["active_worker_api"] == WORKER_API
+            ):
                 try:
                     result.update(self.call("status", start=False, timeout=5.0))
                     result["responsive"] = True
@@ -165,10 +182,17 @@ class DecompClient:
                     result["busy"] = True
                     result["error"] = str(exc)
             elif result["running"]:
-                result["error"] = (
-                    f"a {result['active_backend']} worker owns the decomp socket; "
-                    "the next Docker query will migrate it"
-                )
+                if result["active_worker_api"] != WORKER_API:
+                    result["error"] = (
+                        f"worker API {result['active_worker_api'] or 'legacy'} owns "
+                        f"the decomp socket; the next query will migrate it to API "
+                        f"{WORKER_API}"
+                    )
+                else:
+                    result["error"] = (
+                        f"a {result['active_backend']} worker owns the decomp socket; "
+                        "the next Docker query will migrate it"
+                    )
             return result
 
         try:
@@ -183,6 +207,7 @@ class DecompClient:
             "backend": "host",
             "running": self.worker_alive(),
             "active_backend": self.active_backend(),
+            "active_worker_api": self.active_worker_api(),
             "responsive": False,
             "pyghidra_available": available,
             "pyghidra_python": interpreter,
@@ -192,7 +217,11 @@ class DecompClient:
         }
         if discovery_error:
             result["error"] = discovery_error
-        if result["running"] and result["active_backend"] in {None, "host"}:
+        if (
+            result["running"]
+            and result["active_backend"] in {None, "host"}
+            and result["active_worker_api"] == WORKER_API
+        ):
             try:
                 result.update(self.call("status", start=False, timeout=5.0))
                 result["responsive"] = True
@@ -204,10 +233,17 @@ class DecompClient:
                 result["busy"] = True
                 result["error"] = str(exc)
         elif result["running"]:
-            result["error"] = (
-                f"a {result['active_backend']} worker owns the decomp socket; "
-                "the next host query will migrate it"
-            )
+            if result["active_worker_api"] != WORKER_API:
+                result["error"] = (
+                    f"worker API {result['active_worker_api'] or 'legacy'} owns "
+                    f"the decomp socket; the next query will migrate it to API "
+                    f"{WORKER_API}"
+                )
+            else:
+                result["error"] = (
+                    f"a {result['active_backend']} worker owns the decomp socket; "
+                    "the next host query will migrate it"
+                )
         return result
 
     def ensure_selected_backend(self) -> None:
@@ -215,6 +251,11 @@ class DecompClient:
         active = self.active_backend()
         if active is not None and active != selected:
             self._shutdown_conflicting_worker(active, selected)
+        elif active is not None and self.active_worker_api() != WORKER_API:
+            self._shutdown_conflicting_worker(
+                f"{active} API {self.active_worker_api() or 'legacy'}",
+                f"{selected} API {WORKER_API}",
+            )
 
     def call(
         self,
@@ -237,6 +278,16 @@ class DecompClient:
                     f"{active} worker is active but {selected_backend} backend was selected"
                 )
             self._shutdown_conflicting_worker(active, selected_backend)
+        elif active is not None and self.active_worker_api() != WORKER_API:
+            if not start:
+                raise DecompError(
+                    f"worker API {self.active_worker_api() or 'legacy'} is active "
+                    f"but API {WORKER_API} is required"
+                )
+            self._shutdown_conflicting_worker(
+                f"{active} API {self.active_worker_api() or 'legacy'}",
+                f"{selected_backend} API {WORKER_API}",
+            )
         payload = json.dumps(
             {"op": op, "args": args}, separators=(",", ":")
         ).encode("utf-8") + b"\n"

@@ -64,7 +64,7 @@ winbox kdbg decomp --full --binary /path/to/exact.exe
 The MCP equivalents are:
 
 ```text
-kdbg_decomp(addr="", before=3, after=5, full=false, binary="", timeout=60)
+kdbg_decomp(addr="", before=3, after=5, full=false, binary="", timeout=60, detail="compact")
 kdbg_decomp_status()
 kdbg_ghidra_install(pull=true)
 kdbg_ghidra_run()
@@ -77,20 +77,46 @@ open program; worker restarts reuse its durable SHA-256-and-Ghidra-version keyed
 project. Requests are serialized because Ghidra projects and decompiler APIs
 are not safely concurrent.
 
-## Response and mapping honesty
+## Response detail and mapping honesty
 
-The result includes target PID/name, live module/base/VA/RVA, both identities,
-Ghidra's image address, containing function/signature/offset, a bounded source
-excerpt, nearby instructions, a symbol-store hint, and warnings.
+`detail="compact"` is the default agent response. It includes only the target,
+live symbol/VA/RVA, containing function, a small assembly window, bounded
+pseudocode, explicit assembly-to-pseudocode mapping, concise verification,
+cache state, warnings, and whole-function code when `full=true`. RVAs are the
+shared coordinate: runtime and Ghidra image bases can differ without making the
+assembly/source relationship ambiguous.
+
+Larger evidence is opt-in:
+
+- `detail="standard"` adds module inventory, full live/static identity,
+  symbol hints, Ghidra addresses, and cache-analysis metadata.
+- `detail="diagnostic"` returns the complete internal evidence record for
+  troubleshooting and compatibility with the original response contract.
+
+`full=true` controls pseudocode scope only; it does not silently enable verbose
+metadata. This keeps normal agent calls token-efficient while preserving every
+identity and cache diagnostic when explicitly requested.
 
 Decompiler statements are not one-to-one with machine instructions. Mapping
-uses Ghidra's decompiler token address provenance and labels its confidence:
+uses Ghidra's decompiler token address provenance and labels the actual
+relationship in `rip_mapping.kind`:
 
-- `exact`: a token's address range contains the requested instruction.
-- `nearest`: no token owns the instruction (common for prologues, epilogues,
-  spills, and compiler glue); the closest address-bearing statement is shown.
-- `function-only`: Ghidra provided a containing function but no address-bearing
-source tokens.
+- `exact`: a single-address token directly owns the requested instruction.
+- `range`: the instruction lies within a token address range contributing to
+  the statement.
+- `nearest-forward`: no token owns the instruction; the mapped statement is
+  later in the function (commonly a compiler-generated prologue).
+- `nearest-backward`: no token owns the instruction; the mapped statement is
+  earlier (commonly an epilogue or alignment).
+- `ambiguous`: multiple pseudocode lines have equally valid provenance.
+- `unmapped`: the function decompiled, but no defensible source mapping exists.
+
+Every mapped pseudocode line carries `rva_ranges`; nearby assembly carries an
+`rva`, and `rip_mapping` names the selected/candidate source lines, direction,
+and byte distance. An instruction in a prologue is therefore never mislabeled
+as already executing the first semantic C statement. Diagnostic output retains
+the legacy coarse `mapping.confidence` (`exact`, `nearest`, `function-only`)
+alongside the more precise mapping kind.
 
 `function.source` is normally `analysis`. If Ghidra missed a function that a
 nearby exact PDB public identifies, it may be `pdb-public-existing`,

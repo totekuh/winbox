@@ -15,11 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from winbox.config import Config
+from winbox.kdbg.decomp.client import WORKER_API
 
 
 GHIDRA_VERSION = "12.1.3"
 PYGHIDRA_VERSION = "3.1.0"
-WORKER_API = "1"
 PLATFORM = "linux/amd64"
 IMAGE = f"winbox-pyghidra:{GHIDRA_VERSION}-{PYGHIDRA_VERSION}-api{WORKER_API}"
 COMPONENT_LABEL = "io.winbox.component=pyghidra"

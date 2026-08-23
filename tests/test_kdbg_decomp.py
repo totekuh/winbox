@@ -22,7 +22,8 @@ from winbox.kdbg.decomp.identity import (
     static_bytes_at_rva,
     validate_identity,
 )
-from winbox.kdbg.decomp.service import _nearest_symbol_hint, query_decomp
+from winbox.kdbg.decomp.service import _format_result, _nearest_symbol_hint, query_decomp
+from winbox.kdbg.decomp.worker import _map_source
 from winbox.kdbg.debugger.daemon import DaemonSession, StopState, TargetInfo
 from winbox.kdbg.debugger.reader import ReaderError
 from winbox.kdbg.store import SymbolStore
@@ -91,6 +92,8 @@ def test_worker_status_reports_busy_lock_as_alive(monkeypatch, tmp_path):
     monkeypatch.setenv("WINBOX_DECOMP_BACKEND", "host")
     client = DecompClient(Config(winbox_dir=tmp_path))
     monkeypatch.setattr(client, "worker_alive", lambda: True)
+    monkeypatch.setattr(client, "active_backend", lambda: "host")
+    monkeypatch.setattr(client, "active_worker_api", lambda: "2")
     monkeypatch.setattr(
         client, "call", lambda *a, **k: (_ for _ in ()).throw(DecompError("timed out"))
     )
@@ -213,8 +216,12 @@ def test_query_decomp_composes_rva_identity_and_worker(monkeypatch, tmp_path):
         cfg, binary=str(binary), daemon_client=daemon, decomp_client=worker
     )
 
-    assert result["module"]["rva"] == "0x1000"
-    assert result["identity"]["confidence"] == "pdb-guid-age"
+    assert result["schema"] == "winbox.kdbg-decomp/2"
+    assert result["detail"] == "compact"
+    assert result["location"]["rva"] == "0x1000"
+    assert result["verified"]["identity"] == "pdb-guid-age"
+    assert "identity" not in result
+    assert "module" not in result
     assert worker.args[0] == "decompile"
     assert worker.args[1]["rva"] == 0x1000
     assert worker.args[1]["sha256"] == "a" * 64
@@ -227,6 +234,188 @@ def test_query_decomp_rejects_bad_context_before_touching_daemon(tmp_path):
 
     with pytest.raises(DecompError, match="before must be between"):
         query_decomp(Config(winbox_dir=tmp_path), before=21, daemon_client=Never())
+
+
+def test_query_decomp_rejects_bad_detail_before_touching_daemon(tmp_path):
+    class Never:
+        def call(self, *args, **kwargs):
+            raise AssertionError("daemon must not be called")
+
+    with pytest.raises(DecompError, match="detail must be one of"):
+        query_decomp(Config(winbox_dir=tmp_path), detail="everything", daemon_client=Never())
+
+
+def test_response_detail_levels_keep_diagnostics_opt_in():
+    raw = {
+        "target": {"pid": 7, "name": "x.exe"},
+        "module": {
+            "name": "x.exe", "base": "0x7ff600000000", "size": 0x3000,
+            "runtime_va": "0x7ff600001000", "rva": "0x1000",
+            "binary": "/symbols/x.exe",
+        },
+        "identity": {
+            "confidence": "pdb-guid-age",
+            "live": {"pdb_key": "LIVE1"},
+            "static": {"pdb_key": "LIVE1", "sha256": "a" * 64},
+            "live_bytes_match": True,
+        },
+        "runtime_symbol": "x!focus+0x0",
+        "symbol_hint": {"name": "focus", "rva": 0x1000},
+        "cache_hit": False,
+        "ghidra_version": "12.1.3",
+        "ghidra_image_base": "0x140000000",
+        "ghidra_address": "0x140001000",
+        "function": {
+            "name": "focus", "signature": "int focus(void)",
+            "rva": "0x1000", "offset": "0x0", "source": "analysis",
+        },
+        "mapping": {
+            "confidence": "exact", "kind": "exact", "line": 2,
+            "candidate_lines": [2], "distance_bytes": 0, "direction": "overlap",
+            "excerpt": [{
+                "line": 2, "text": "return 1;", "relation": "exact",
+                "address_ranges": [{"start": "0x140001000", "end": "0x140001000"}],
+            }],
+        },
+        "instructions": [{
+            "address": "0x140001000", "bytes": "b801000000",
+            "text": "MOV EAX,0x1", "current": True,
+        }],
+        "analysis": {"binary_sha256": "a" * 64, "project_cached": True},
+        "code": "int focus(void) { return 1; }",
+        "warnings": [],
+    }
+
+    compact = _format_result(raw, "compact")
+    assert compact["location"]["symbol"] == "x!focus+0x0"
+    assert compact["assembly"][0]["rva"] == "0x1000"
+    assert compact["pseudocode"][0]["rva_ranges"] == [
+        {"start": "0x1000", "end": "0x1000"}
+    ]
+    assert compact["rip_mapping"]["kind"] == "exact"
+    assert compact["verified"]["live_bytes_match"] is True
+    assert compact["code"] == "int focus(void) { return 1; }"
+    assert "identity" not in compact
+    assert "module" not in compact
+
+    standard = _format_result(raw, "standard")
+    assert standard["identity"]["static"]["sha256"] == "a" * 64
+    assert standard["analysis"]["project_cached"] is True
+    assert _format_result(raw, "diagnostic") is raw
+
+
+def test_compact_formatter_derives_direction_from_worker_api_one_mapping():
+    raw = {
+        "target": {"pid": 1, "name": "old.exe"},
+        "module": {
+            "base": "0x7ff600000000", "runtime_va": "0x7ff600001000",
+            "rva": "0x1000",
+        },
+        "identity": {"confidence": "pdb-guid-age", "live_bytes_match": True},
+        "runtime_symbol": "old!entry+0x0",
+        "ghidra_image_base": "0x140000000",
+        "function": {"name": "entry", "rva": "0x1000", "offset": "0x0"},
+        "mapping": {
+            "confidence": "nearest", "line": 4,
+            "addresses": ["0x140001010"],
+            "excerpt": [{"line": 4, "text": "work();", "current": True}],
+        },
+        "instructions": [],
+        "warnings": [],
+    }
+    compact = _format_result(raw, "compact")
+    assert compact["rip_mapping"] == {
+        "kind": "nearest-forward",
+        "pseudocode_line": 4,
+        "candidate_lines": [4],
+        "distance_bytes": 0x10,
+        "direction": "forward",
+        "reason": "RIP has no direct pseudocode token; this is the next mapped statement",
+    }
+    assert compact["pseudocode"][0]["relation"] == "nearest-forward"
+
+
+class _FakeAddress:
+    def __init__(self, value):
+        self.value = value
+
+    def getOffset(self):
+        return self.value
+
+
+class _FakeLine:
+    def __init__(self, number):
+        self.number = number
+
+    def getLineNumber(self):
+        return self.number
+
+
+class _FakeToken:
+    def __init__(self, low, high, line):
+        self.low = low
+        self.high = high
+        self.line = line
+
+    def numChildren(self):
+        return 0
+
+    def getMinAddress(self):
+        return _FakeAddress(self.low) if self.low is not None else None
+
+    def getMaxAddress(self):
+        return _FakeAddress(self.high) if self.high is not None else None
+
+    def getLineParent(self):
+        return _FakeLine(self.line)
+
+
+class _FakeMarkup:
+    def __init__(self, *tokens):
+        self.tokens = tokens
+
+    def numChildren(self):
+        return len(self.tokens)
+
+    def Child(self, index):
+        return self.tokens[index]
+
+
+@pytest.mark.parametrize(
+    "target,tokens,expected,direction,distance",
+    [
+        (0x1000, [(0x1000, 0x1000, 2)], "exact", "overlap", 0),
+        (0x1002, [(0x1000, 0x1004, 2)], "range", "overlap", 0),
+        (0x1000, [(0x1010, 0x1014, 2)], "nearest-forward", "forward", 0x10),
+        (0x1020, [(0x1010, 0x1014, 2)], "nearest-backward", "backward", 0xC),
+        (
+            0x1000,
+            [(0x1000, 0x1002, 2), (0x1000, 0x1004, 3)],
+            "ambiguous", "overlap", 0,
+        ),
+    ],
+)
+def test_source_mapping_reports_truthful_relationships(
+    target, tokens, expected, direction, distance
+):
+    markup = _FakeMarkup(*(_FakeToken(*token) for token in tokens))
+    result = _map_source(
+        markup, _FakeAddress(target), "one\ntwo\nthree\nfour", 1, 1
+    )
+    assert result["kind"] == expected
+    assert result["direction"] == direction
+    assert result["distance_bytes"] == distance
+    assert all("current" not in line for line in result["excerpt"])
+
+
+def test_source_mapping_reports_unmapped_without_fake_current_line():
+    result = _map_source(
+        _FakeMarkup(), _FakeAddress(0x1000), "one\ntwo", 1, 1
+    )
+    assert result["kind"] == "unmapped"
+    assert result["line"] is None
+    assert result["candidate_lines"] == []
+    assert all("relation" not in line for line in result["excerpt"])
 
 
 def test_symbol_hint_normalizes_kernel_name_and_is_distance_bounded(tmp_path):
@@ -248,8 +437,15 @@ def test_mcp_decomp_serializes_result_and_surfaces_error(monkeypatch, tmp_path):
 
     cfg = Config(winbox_dir=tmp_path)
     monkeypatch.setattr(mcp_module, "_kdbg_cfg_only", lambda: cfg)
-    monkeypatch.setattr(package, "query_decomp", lambda *a, **k: {"ok": 1})
-    assert json.loads(mcp_module.kdbg_decomp()) == {"ok": 1}
+    captured = {}
+
+    def query(*args, **kwargs):
+        captured.update(kwargs)
+        return {"ok": 1}
+
+    monkeypatch.setattr(package, "query_decomp", query)
+    assert json.loads(mcp_module.kdbg_decomp(detail="diagnostic")) == {"ok": 1}
+    assert captured["detail"] == "diagnostic"
 
     def fail(*args, **kwargs):
         raise DecompError("wrong build")
