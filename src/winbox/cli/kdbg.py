@@ -1107,6 +1107,10 @@ def kdbg_regs(ctx: click.Context) -> None:
 
 @kdbg.command("decomp")
 @click.argument("address", required=False, default="")
+@click.option("--symbol", default="", help="Loaded module!symbol to decompile.")
+@click.option("--module", default="", help="Live module name (requires --rva).")
+@click.option("--rva", default="", help="Module-relative address (requires --module).")
+@click.option("--cursor", default="", help="Continuation cursor from a prior page.")
 @click.option("--before", type=click.IntRange(0, 20), default=3, show_default=True)
 @click.option("--after", type=click.IntRange(0, 20), default=5, show_default=True)
 @click.option("--full", is_flag=True, help="Include the complete containing function.")
@@ -1139,6 +1143,10 @@ def kdbg_regs(ctx: click.Context) -> None:
 def kdbg_decomp(
     ctx: click.Context,
     address: str,
+    symbol: str,
+    module: str,
+    rva: str,
+    cursor: str,
     before: int,
     after: int,
     full: bool,
@@ -1163,6 +1171,10 @@ def kdbg_decomp(
         result = query_decomp(
             cfg,
             addr=address,
+            symbol=symbol,
+            module=module,
+            rva=rva,
+            cursor=cursor,
             before=before,
             after=after,
             full=full,
@@ -1283,6 +1295,29 @@ def kdbg_stack(ctx: click.Context, n: int) -> None:
     console.print(f"[dim]RSP = {result['rsp']}[/]")
     for entry in result["qwords"]:
         console.print(f"  {entry['offset']}: {entry['value']}")
+
+
+@kdbg.command("context")
+@click.option("--disasm-count", type=click.IntRange(0, 32), default=8)
+@click.option("--stack-qwords", type=click.IntRange(0, 32), default=16)
+@click.option("--bt-depth", type=click.IntRange(0, 16), default=8)
+@click.pass_context
+def kdbg_context(
+    ctx: click.Context, disasm_count: int, stack_qwords: int, bt_depth: int
+) -> None:
+    """Emit a bounded JSON triage bundle for the current stop."""
+    import json as _json
+
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        result = _client(cfg).call(
+            "context", disasm_count=disasm_count,
+            stack_qwords=stack_qwords, bt_depth=bt_depth,
+        )
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    click.echo(_json.dumps(result, indent=2))
 
 
 @kdbg.command("bt")

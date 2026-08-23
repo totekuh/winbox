@@ -66,6 +66,8 @@ def test_persistent_pyghidra_worker_decompiles_and_reuses_project(tmp_path, requ
     assert first["mapping"]["selection"]["mode"] == "lines"
     assert any(line.get("assembly") for line in first["mapping"]["excerpt"])
     assert second["cache_hit"] is True
+    assert second["decompile_cache_hit"] is True
+    assert first["mapping"]["selection"]["total_lines"] >= 1
     assert second["mapping"]["confidence"] in {"exact", "nearest"}
     assert second["mapping"]["kind"] in {
         "exact", "range", "nearest-forward", "nearest-backward", "ambiguous"

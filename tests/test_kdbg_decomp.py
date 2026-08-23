@@ -24,15 +24,20 @@ from winbox.kdbg.decomp.identity import (
     validate_identity,
 )
 from winbox.kdbg.decomp.service import (
+    _decode_cursor,
+    _format_instruction,
     _format_result,
     _line_range,
     _nearest_symbol_hint,
+    _resolve_binary,
     query_decomp,
 )
 from winbox.kdbg.decomp.worker import (
     WorkerError,
     _attach_mapped_assembly,
+    _bounded_code_payload,
     _map_source,
+    _nearby_instructions,
 )
 from winbox.kdbg.debugger.daemon import DaemonSession, StopState, TargetInfo
 from winbox.kdbg.debugger.reader import ReaderError
@@ -174,7 +179,21 @@ class _FakeDaemon:
     def call(self, op, **args):
         self.calls.append((op, args))
         if op == "status":
-            return {"target": {"pid": 44, "name": "sample.exe"}}
+            return {
+                "target": {"pid": 44, "name": "sample.exe"},
+                "state": "halted", "session_id": "session-a", "stop_id": 7,
+            }
+        if op == "decomp_snapshot":
+            return {
+                "target": {"pid": 44, "name": "sample.exe"},
+                "runtime_va": "0x7ff600001000",
+                "session_id": "session-a", "stop_id": 7,
+                "module": {
+                    "name": "sample.exe", "base": "0x7ff600000000",
+                    "size": 0x5000, "kind": "user",
+                    "full_path": "C:\\sample.exe", "inventory": "fresh",
+                },
+            }
         if op == "regs":
             return {"rip": "0x7ff600001000"}
         if op == "module_at":
@@ -230,7 +249,7 @@ def test_query_decomp_composes_rva_identity_and_worker(monkeypatch, tmp_path):
         daemon_client=daemon, decomp_client=worker,
     )
 
-    assert result["schema"] == "winbox.kdbg-decomp/3"
+    assert result["schema"] == "winbox.kdbg-decomp/4"
     assert result["detail"] == "compact"
     assert result["location"]["rva"] == "0x1000"
     assert result["verified"]["identity"] == "pdb-guid-age"
@@ -245,6 +264,94 @@ def test_query_decomp_composes_rva_identity_and_worker(monkeypatch, tmp_path):
     assert worker.args[1]["line_start"] == 1
     assert worker.args[1]["line_end"] == 22
     assert worker.args[1]["assembly"] == "mapped"
+
+    SymbolStore(cfg.symbols_dir).save(
+        "sample", "build", image="sample.pdb", symbols={"focus": 0x1000},
+        types={}, base=0x7FF600000000, size_of_image=0x5000,
+    )
+    query_decomp(
+        cfg, symbol="sample!focus", binary=str(binary),
+        daemon_client=daemon, decomp_client=worker,
+    )
+    snapshot_calls = [args for op, args in daemon.calls if op == "decomp_snapshot"]
+    assert snapshot_calls[-1] == {"module": "sample", "rva": "0x1000"}
+
+
+def test_query_decomp_cursor_pages_and_is_bound_to_stop_and_binary(
+    monkeypatch, tmp_path
+):
+    image, key = _live_pe()
+    binary = tmp_path / "sample.exe"
+    binary.write_bytes(b"fixture")
+    static = PeIdentity(
+        0x8664, 0x12345678, 0x5000, 0x140000000, key,
+        sha256="b" * 64, file_size=binary.stat().st_size,
+        sections=(SectionIdentity(".text", 0x1000, 0x1000, 0, 1),),
+    )
+    monkeypatch.setattr("winbox.kdbg.decomp.service.parse_static_pe", lambda _: static)
+    daemon = _FakeDaemon(image)
+
+    class PagingWorker(_FakeWorker):
+        def call(self, op, **args):
+            self.args = (op, args)
+            start = args.get("line_start") or 1
+            end = args.get("line_end") or 2
+            return {
+                "ghidra_version": "12.1.3",
+                "analysis_profile": "winbox-default-v1",
+                "ghidra_image_base": "0x140000000",
+                "instructions": [],
+                "mapping": {
+                    "confidence": "exact", "line": 1, "excerpt": [],
+                    "selection": {
+                        "mode": "lines", "start": start, "end": end,
+                        "total_lines": 10, "has_more": end < 10,
+                        "next_start": end + 1 if end < 10 else None,
+                    },
+                },
+                "function": {"name": "focus", "rva": "0x1000"},
+                "analysis": {},
+            }
+
+    worker = PagingWorker()
+    cfg = Config(winbox_dir=tmp_path)
+    first = query_decomp(
+        cfg, binary=str(binary), lines="1-2",
+        daemon_client=daemon, decomp_client=worker,
+    )
+    assert first["line_selection"]["total_lines"] == 10
+    assert first["next_cursor"]
+
+    second = query_decomp(
+        cfg, binary=str(binary), cursor=first["next_cursor"],
+        daemon_client=daemon, decomp_client=worker,
+    )
+    assert worker.args[1]["line_start"] == 3
+    assert worker.args[1]["line_end"] == 4
+    assert second["next_cursor"] != first["next_cursor"]
+    snapshot_calls = [args for op, args in daemon.calls if op == "decomp_snapshot"]
+    assert snapshot_calls[-1] == {"module": "sample.exe", "rva": "4096"}
+
+
+def test_query_decomp_rejects_cursor_after_stop_changes(monkeypatch, tmp_path):
+    # Cursor validation happens before any expensive static work once the
+    # daemon reports a different epoch.
+    from winbox.kdbg.decomp.service import _encode_cursor
+
+    cursor = _encode_cursor({
+        "module": "sample.exe", "function_rva": 0x1000,
+        "next_start": 3, "page_size": 2, "session_id": "old",
+        "stop_id": 6, "binary_sha256": "a" * 64,
+        "ghidra_version": "12.1.3",
+        "analysis_profile": "winbox-default-v1",
+    })
+    image, _ = _live_pe()
+    daemon = _FakeDaemon(image)
+    # Snapshot is stop 7; binary lookup then fails unless the epoch is checked
+    # immediately. The public error must still identify the stale continuation.
+    cfg = Config(winbox_dir=tmp_path)
+    with pytest.raises(DecompError, match="no longer matches"):
+        query_decomp(cfg, cursor=cursor, daemon_client=daemon, decomp_client=_FakeWorker())
 
 
 def test_query_decomp_rejects_bad_context_before_touching_daemon(tmp_path):
@@ -287,6 +394,59 @@ def test_query_decomp_rejects_bad_batch_options_before_daemon(
 
 
 @pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        ({"addr": "0x1", "symbol": "nt!X"}, "mutually exclusive"),
+        ({"module": "nt"}, "supplied together"),
+        ({"rva": "0x10"}, "supplied together"),
+        ({"module": "   ", "rva": "0x10"}, "must not be blank"),
+        ({"cursor": "%%%"}, "invalid continuation cursor"),
+        ({"cursor": "x" * 4097}, "oversized"),
+    ],
+)
+def test_query_decomp_rejects_invalid_navigation_before_daemon(
+    tmp_path, kwargs, message
+):
+    class Never:
+        def call(self, *_args, **_kwargs):
+            raise AssertionError("daemon must not be called")
+
+    with pytest.raises(DecompError, match=message):
+        query_decomp(
+            Config(winbox_dir=tmp_path), daemon_client=Never(),
+            decomp_client=Never(), **kwargs,
+        )
+
+
+def test_resolve_binary_never_accepts_guest_path_outside_cache(tmp_path):
+    cfg = Config(winbox_dir=tmp_path / "state")
+    outside = tmp_path / "outside.exe"
+    outside.write_bytes(b"MZ")
+    with pytest.raises(DecompError, match="no cached PE"):
+        _resolve_binary(cfg, str(outside), "")
+
+    cfg.symbols_dir.mkdir(parents=True)
+    (cfg.symbols_dir / "escape.exe").symlink_to(outside)
+    with pytest.raises(DecompError, match="no cached PE"):
+        _resolve_binary(cfg, "escape.exe", "")
+
+
+def test_cursor_decoder_rejects_bool_integer_fields():
+    import base64
+    import json
+
+    payload = {
+        "module": "x.exe", "function_rva": True, "next_start": 2,
+        "page_size": 1, "session_id": "s", "stop_id": 1,
+        "binary_sha256": "a" * 64, "ghidra_version": "11",
+        "analysis_profile": "winbox-default-v1",
+    }
+    cursor = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    with pytest.raises(DecompError, match="function_rva"):
+        _decode_cursor(cursor)
+
+
+@pytest.mark.parametrize(
     "value,expected",
     [("1", (1, 1)), ("1-22", (1, 22)), (" 7 - 9 ", (7, 9)), ("", None)],
 )
@@ -297,6 +457,7 @@ def test_line_range_parser(value, expected):
 def test_response_detail_levels_keep_diagnostics_opt_in():
     raw = {
         "target": {"pid": 7, "name": "x.exe"},
+        "stop_epoch": {"session_id": "s", "stop_id": 2},
         "module": {
             "name": "x.exe", "base": "0x7ff600000000", "size": 0x3000,
             "runtime_va": "0x7ff600001000", "rva": "0x1000",
@@ -339,13 +500,18 @@ def test_response_detail_levels_keep_diagnostics_opt_in():
             "address": "0x140001000", "bytes": "b801000000",
             "text": "MOV EAX,0x1", "current": True,
         }],
-        "analysis": {"binary_sha256": "a" * 64, "project_cached": True},
+        "analysis": {
+            "binary_sha256": "a" * 64, "project_cached": True,
+            "code_truncated": True,
+        },
         "code": "int focus(void) { return 1; }",
         "warnings": [],
     }
 
     compact = _format_result(raw, "compact")
     assert compact["location"]["symbol"] == "x!focus+0x0"
+    assert compact["stop_epoch"] == {"session_id": "s", "stop_id": 2}
+    assert compact["code_truncated"] is True
     assert compact["assembly"][0]["rva"] == "0x1000"
     assert compact["pseudocode"][0]["rva_ranges"] == [
         {"start": "0x1000", "end": "0x1000"}
@@ -358,6 +524,10 @@ def test_response_detail_levels_keep_diagnostics_opt_in():
     assert compact["code"] == "int focus(void) { return 1; }"
     assert "identity" not in compact
     assert "module" not in compact
+
+    no_full_payload = dict(raw)
+    no_full_payload.pop("code")
+    assert "code_truncated" not in _format_result(no_full_payload, "compact")
 
     standard = _format_result(raw, "standard")
     assert standard["identity"]["static"]["sha256"] == "a" * 64
@@ -492,6 +662,9 @@ def test_source_mapping_absolute_lines_override_context_and_clamp_end():
         "start": 1,
         "end": 3,
         "truncated": True,
+        "total_lines": 3,
+        "has_more": False,
+        "next_start": None,
     }
 
 
@@ -503,11 +676,39 @@ def test_source_mapping_rejects_start_beyond_function():
         )
 
 
+def test_oversized_full_code_is_bounded_without_changing_mapping_input(monkeypatch):
+    import winbox.kdbg.decomp.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "MAX_CODE", 16)
+    complete = "one\ntwo\nthree\nfour\nfive\n"
+    returned, stats = _bounded_code_payload(complete, full=True)
+    mapping = _map_source(
+        _FakeMarkup(_FakeToken(0x1000, 0x1000, 5)),
+        _FakeAddress(0x1000), complete, 0, 0,
+    )
+
+    assert len(returned.encode()) <= 16
+    assert stats == {
+        "code_truncated": True,
+        "code_bytes": len(complete.encode()),
+        "code_lines": 5,
+        "returned_code_bytes": len(returned.encode()),
+        "returned_code_lines": len(returned.splitlines()),
+    }
+    assert mapping["line"] == 5
+    assert mapping["excerpt"] == [{
+        "line": 5, "text": "five", "address_ranges": [
+            {"start": "0x1000", "end": "0x1000"}
+        ], "relation": "exact",
+    }]
+
+
 class _FakeInstruction:
-    def __init__(self, address, raw, text):
+    def __init__(self, address, raw, text, flows=()):
         self.address = address
         self.raw = raw
         self.text = text
+        self.flows = flows
 
     def getAddress(self):
         return _FakeAddress(self.address)
@@ -517,6 +718,9 @@ class _FakeInstruction:
 
     def getBytes(self):
         return self.raw
+
+    def getFlows(self):
+        return [_FakeAddress(value) for value in self.flows]
 
     def __str__(self):
         return self.text
@@ -560,6 +764,8 @@ def test_mapped_assembly_groups_shared_instructions_and_unmapped_lines():
     assert mapping["excerpt"][0]["assembly"][0]["address"] == "0x1000"
     assert mapping["excerpt"][1]["assembly"][0]["address"] == "0x1000"
     assert "assembly" not in mapping["excerpt"][2]
+    assert mapping["excerpt"][0]["assembly_complete"] is True
+    assert mapping["excerpt"][1]["assembly_complete"] is True
 
 
 def test_mapped_assembly_enforces_association_cap(monkeypatch):
@@ -579,6 +785,83 @@ def test_mapped_assembly_enforces_association_cap(monkeypatch):
         _FakeProgram(instructions), _FakeFunction(), mapping
     ) is True
     assert len(mapping["excerpt"][0]["assembly"]) == 1
+    assert mapping["excerpt"][0]["assembly_complete"] is False
+    assert mapping["assembly_truncation"] == {
+        "first_line": 1,
+        "last_line": 1,
+        "association_limit": 1,
+    }
+
+
+def test_mapped_assembly_marks_every_later_addressed_line_incomplete(monkeypatch):
+    import winbox.kdbg.decomp.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "MAX_MAPPED_INSTRUCTION_ASSOCIATIONS", 1)
+    instructions = [
+        _FakeInstruction(0x1000, b"\x90", "NOP"),
+        _FakeInstruction(0x1001, b"\x90", "NOP"),
+        _FakeInstruction(0x1002, b"\x90", "NOP"),
+    ]
+    mapping = {"excerpt": [
+        {"line": line, "text": "work();", "address_ranges": [
+            {"start": f"0x{address:x}", "end": f"0x{address:x}"}
+        ]}
+        for line, address in [(1, 0x1000), (2, 0x1001), (3, 0x1002)]
+    ]}
+
+    assert _attach_mapped_assembly(
+        _FakeProgram(instructions), _FakeFunction(), mapping
+    ) is True
+    assert [line["assembly_complete"] for line in mapping["excerpt"]] == [
+        True, False, False
+    ]
+    assert mapping["assembly_truncation"]["first_line"] == 2
+    assert mapping["assembly_truncation"]["last_line"] == 3
+
+
+def test_nearby_instructions_reports_undecoded_gap_without_returning_tail():
+    instructions = [
+        _FakeInstruction(0x1000, b"\x90", "NOP"),
+        _FakeInstruction(0x1001, b"\x90", "NOP"),
+        _FakeInstruction(0x1010, b"\x90", "NOP"),
+        _FakeInstruction(0x1011, b"\x90", "NOP"),
+        _FakeInstruction(0x1020, b"\x90", "RET"),
+    ]
+
+    nearby, location = _nearby_instructions(
+        _FakeProgram(instructions), _FakeFunction(), _FakeAddress(0x1008)
+    )
+
+    assert [item["address"] for item in nearby] == [
+        "0x1000", "0x1001", "0x1010", "0x1011"
+    ]
+    assert all(item["current"] is False for item in nearby)
+    assert location == {
+        "requested_address": "0x1008",
+        "decoded": False,
+        "kind": "undecoded-gap",
+        "previous_address": "0x1001",
+        "next_address": "0x1010",
+    }
+
+
+def test_instruction_flow_targets_have_explicit_static_runtime_coordinates():
+    from winbox.kdbg.decomp.worker import _instruction_payload
+
+    payload = _instruction_payload(_FakeInstruction(
+        0x140001000, b"\xe8\x00\x00\x00\x00", "CALL 0x140002000",
+        flows=(0x140002000,),
+    ))
+    payload["flow_target_symbols"] = {"0x140002000": "sample!callee"}
+
+    formatted = _format_instruction(payload, 0x140000000, 0x7FF600000000)
+
+    assert formatted["flow_targets"] == [{
+        "rva": "0x2000",
+        "static_va": "0x140002000",
+        "runtime_va": "0x7ff600002000",
+        "symbol": "sample!callee",
+    }]
 
 
 def test_symbol_hint_normalizes_kernel_name_and_is_distance_bounded(tmp_path):
@@ -608,8 +891,11 @@ def test_mcp_decomp_serializes_result_and_surfaces_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(package, "query_decomp", query)
     assert json.loads(mcp_module.kdbg_decomp(
-        detail="diagnostic", lines="1-22", assembly="mapped"
+        symbol="sample!focus", cursor="opaque", detail="diagnostic",
+        lines="1-22", assembly="mapped"
     )) == {"ok": 1}
+    assert captured["symbol"] == "sample!focus"
+    assert captured["cursor"] == "opaque"
     assert captured["detail"] == "diagnostic"
     assert captured["lines"] == "1-22"
     assert captured["assembly"] == "mapped"
@@ -648,12 +934,70 @@ def test_cli_decomp_emits_machine_safe_unwrapped_json(monkeypatch, tmp_path):
 
     monkeypatch.setattr(package, "query_decomp", query)
     result = CliRunner().invoke(
-        cli, ["kdbg", "decomp", "--lines", "1-22", "--assembly", "mapped"]
+        cli, [
+            "kdbg", "decomp", "--module", "sample.exe", "--rva", "0x1000",
+            "--lines", "1-22", "--assembly", "mapped",
+        ]
     )
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["pseudocode"][0]["text"] == "x" * 500
     assert captured["lines"] == "1-22"
     assert captured["assembly"] == "mapped"
+    assert captured["module"] == "sample.exe"
+    assert captured["rva"] == "0x1000"
+
+
+def test_mcp_context_forwards_bounded_evidence_options(monkeypatch, tmp_path):
+    import json
+    import winbox.mcp as mcp_module
+
+    cfg = Config(winbox_dir=tmp_path)
+    captured = {}
+
+    class Client:
+        def call(self, op, **kwargs):
+            captured.update(op=op, **kwargs)
+            return {"schema": "winbox.kdbg-context/1"}
+
+    monkeypatch.setattr(mcp_module, "_kdbg_cfg_only", lambda: cfg)
+    monkeypatch.setattr(mcp_module, "_kdbg_client", lambda _cfg: Client())
+    result = json.loads(mcp_module.kdbg_context(
+        disasm_count=4, stack_qwords=5, bt_depth=2,
+        memory=[{"va": "0x1000", "length": 8}],
+    ))
+    assert result["schema"] == "winbox.kdbg-context/1"
+    assert captured == {
+        "op": "context", "disasm_count": 4, "stack_qwords": 5,
+        "bt_depth": 2, "memory": [{"va": "0x1000", "length": 8}],
+    }
+
+
+def test_cli_context_emits_machine_safe_json(monkeypatch, tmp_path):
+    import json
+    from click.testing import CliRunner
+    from winbox.cli import cli
+    import winbox.cli.kdbg as cli_kdbg
+
+    cfg = Config(winbox_dir=tmp_path)
+    captured = {}
+
+    class Client:
+        def call(self, op, **kwargs):
+            captured.update(op=op, **kwargs)
+            return {"schema": "winbox.kdbg-context/1", "value": "x" * 500}
+
+    monkeypatch.setattr("winbox.cli.Config.load", lambda: cfg)
+    monkeypatch.setattr(cli_kdbg, "_client", lambda _cfg: Client())
+    result = CliRunner().invoke(cli, [
+        "kdbg", "context", "--disasm-count", "3",
+        "--stack-qwords", "4", "--bt-depth", "2",
+    ])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["value"] == "x" * 500
+    assert captured == {
+        "op": "context", "disasm_count": 3,
+        "stack_qwords": 4, "bt_depth": 2,
+    }
 
 
 class _Rsp:

@@ -5,7 +5,8 @@ and reverse-engineering round trips: “what pseudocode corresponds to the
 instruction where this target is halted?”
 
 ```text
-current RIP / supplied runtime VA
+current RIP / runtime VA / symbol / module+RVA / continuation cursor
+  -> atomic halted-session + stop_id snapshot
   -> fresh kernel or target PEB loader walk
   -> live module base + bounded PE/CodeView identity read
   -> RVA = runtime VA - live module base
@@ -58,6 +59,8 @@ winbox kdbg attach 1234
 winbox kdbg cont --timeout 30
 winbox kdbg decomp                             # current RIP
 winbox kdbg decomp 0x7ff712341234 --before 5 --after 8
+winbox kdbg decomp --symbol 'services!RQueryServiceStatus'
+winbox kdbg decomp --module services.exe --rva 0xfae0
 winbox kdbg decomp --lines 1-22 --assembly mapped
 winbox kdbg decomp --full --binary /path/to/exact.exe
 ```
@@ -65,8 +68,9 @@ winbox kdbg decomp --full --binary /path/to/exact.exe
 The MCP equivalents are:
 
 ```text
-kdbg_decomp(addr="", before=3, after=5, full=false, binary="", timeout=60,
-            detail="compact", lines="", assembly="nearby")
+kdbg_decomp(addr="", symbol="", module="", rva="", cursor="", before=3,
+            after=5, full=false, binary="", timeout=60, detail="compact",
+            lines="", assembly="nearby")
 kdbg_decomp_status()
 kdbg_ghidra_install(pull=true)
 kdbg_ghidra_run()
@@ -78,6 +82,19 @@ analysis, which can take minutes for a kernel image. Later queries reuse the
 open program; worker restarts reuse its durable SHA-256-and-Ghidra-version keyed
 project. Requests are serialized because Ghidra projects and decompiler APIs
 are not safely concurrent.
+
+Every live read is pinned to the daemon's random `session_id` and monotonic
+`stop_id`. Resuming immediately clears the current stop; a query fails as stale
+if another client continues, steps, detaches, or reaches a different stop while
+Ghidra is working. It never combines loader/register evidence from one halt
+with bytes from another.
+
+For the first look at any halt, use `kdbg_context()` (or `winbox kdbg
+context`). It returns registers, symbolized nearby assembly, labelled stack,
+heuristic backtrace, active breakpoints, and optional caller-selected memory in
+one stop-pinned response. Disassembly is capped at 32 instructions, stack at 32
+qwords, backtrace at 16 candidates, and optional memory at four reads of 256
+bytes each/1024 bytes combined.
 
 ## Response detail and mapping honesty
 
@@ -118,6 +135,13 @@ reports a warning if truncated. Braces, declarations, and other lines without
 machine-code provenance simply omit `assembly`. An optimized instruction may
 legitimately appear beneath more than one pseudocode line.
 
+`line_selection` also returns `total_lines`, `has_more`, and `next_start`.
+When more lines exist, `next_cursor` is an opaque bounded continuation tied to
+the binary SHA-256, Ghidra version, analysis profile, function RVA, debugger
+session, and stop. Passing it back as `cursor` selects the next equal-sized
+page, revalidates live evidence, and reuses the worker's in-memory decompile
+result. It is mutually exclusive with other locations and `lines`.
+
 The small top-level `assembly` window remains anchored at RIP in both modes.
 With `assembly="mapped"`, selected pseudocode entries additionally carry an
 `assembly` array whose instruction RVAs use the same coordinate as their
@@ -144,6 +168,13 @@ and byte distance. An instruction in a prologue is therefore never mislabeled
 as already executing the first semantic C statement. Diagnostic output retains
 the legacy coarse `mapping.confidence` (`exact`, `nearest`, `function-only`)
 alongside the more precise mapping kind.
+
+Call and branch targets are emitted as explicit `rva`, `static_va`, and
+`runtime_va` coordinates, with a nearest verified module symbol when available.
+Addressed lines report `assembly_complete`; if the global mapping cap is hit,
+the response identifies the affected pseudocode line range. An address in an
+undecoded function gap is labelled `undecoded-gap` and shows the nearest
+preceding/following instructions instead of incorrectly returning the tail.
 
 `function.source` is normally `analysis`. If Ghidra missed a function that a
 nearby exact PDB public identifies, it may be `pdb-public-existing`,
@@ -183,3 +214,5 @@ On the reference Server 2025 lab, Dockerized Ghidra 12.1.3 analyzed ntdll in
 queries returned in 0.12–0.17 seconds; eight concurrent compiled-binary calls
 serialized successfully. `cache_hit` and `analysis.project_cached` let agents
 distinguish cold import from normal interactive operation.
+`decompile_cache_hit` distinguishes a reused in-memory function result, which
+is expected on continuation pages.

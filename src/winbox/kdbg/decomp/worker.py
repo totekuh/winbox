@@ -32,7 +32,8 @@ MAX_CONTEXT_LINES = 20
 MAX_OPEN_PROGRAMS = 1
 MAX_LINE_BATCH = 100
 MAX_MAPPED_INSTRUCTION_ASSOCIATIONS = 512
-WORKER_API = "3"
+WORKER_API = "4"
+ANALYSIS_PROFILE = "winbox-default-v1"
 
 
 class WorkerError(RuntimeError):
@@ -53,6 +54,9 @@ class OpenProgram:
         self.api = api
         self.program = api.getCurrentProgram()
         self.decompiler = decompiler
+        self.decompile_cache: collections.OrderedDict[int, object] = (
+            collections.OrderedDict()
+        )
 
     def close(self) -> None:
         with contextlib.suppress(Exception):
@@ -104,6 +108,7 @@ class Worker:
         if op == "status":
             return {
                 "worker_api": WORKER_API,
+                "analysis_profile": ANALYSIS_PROFILE,
                 "jvm_started": self.started,
                 "ghidra_version": self.ghidra_version,
                 "worker_pid": os.getpid(),
@@ -168,39 +173,45 @@ class Worker:
             suffix = " (instruction exists but no containing function)" if instruction else ""
             raise WorkerError(f"no analyzed function contains RVA 0x{rva:x}{suffix}")
 
-        from ghidra.util.task import ConsoleTaskMonitor
-        result = opened.decompiler.decompileFunction(
-            function, timeout, ConsoleTaskMonitor()
-        )
+        entry = int(function.getEntryPoint().getOffset())
+        result = opened.decompile_cache.pop(entry, None)
+        decompile_cache_hit = result is not None
+        if result is None:
+            from ghidra.util.task import ConsoleTaskMonitor
+            result = opened.decompiler.decompileFunction(
+                function, timeout, ConsoleTaskMonitor()
+            )
         if result is None or not result.decompileCompleted():
             message = result.getErrorMessage() if result is not None else "no result"
             raise WorkerError(
                 f"Ghidra could not decompile {function.getName()}: {message}"
             )
+        opened.decompile_cache[entry] = result
+        while len(opened.decompile_cache) > 32:
+            opened.decompile_cache.popitem(last=False)
         decompiled = result.getDecompiledFunction()
         code = decompiled.getC() if decompiled is not None else None
         if code is None:
             raise WorkerError(f"Ghidra returned no C for {function.getName()}")
-        if len(code.encode("utf-8")) > MAX_CODE:
-            encoded = code.encode("utf-8")[:MAX_CODE]
-            code = encoded.decode("utf-8", errors="ignore")
-            code_truncated = True
-        else:
-            code_truncated = False
+        full_code = code
+        returned_code, code_stats = _bounded_code_payload(full_code, full=full)
 
         mapping = _map_source(
-            result.getCCodeMarkup(), address, code, before, after,
+            result.getCCodeMarkup(), address, full_code, before, after,
             line_start=line_start, line_end=line_end,
         )
         if assembly_mode == "mapped":
             mapping["assembly_truncated"] = _attach_mapped_assembly(
                 program, function, mapping
             )
-        instructions = _nearby_instructions(program, function, address)
-        entry = int(function.getEntryPoint().getOffset())
+        instructions, instruction_location = _nearby_instructions(
+            program, function, address
+        )
         response = {
             "cache_hit": cache_hit,
+            "decompile_cache_hit": decompile_cache_hit,
             "ghidra_version": self.ghidra_version,
+            "analysis_profile": ANALYSIS_PROFILE,
             "ghidra_image_base": f"0x{image_base:x}",
             "ghidra_address": f"0x{target_value:x}",
             "function": {
@@ -216,14 +227,15 @@ class Worker:
             "mapping": mapping,
             "assembly_mode": assembly_mode,
             "instructions": instructions,
+            "instruction_location": instruction_location,
             "analysis": {
                 "binary_sha256": expected_sha,
                 "project_cached": True,
-                "code_truncated": code_truncated,
+                **code_stats,
             },
         }
         if full:
-            response["code"] = code
+            response["code"] = returned_code
         return response
 
     def _open(self, binary: Path, digest: str) -> tuple[OpenProgram, bool]:
@@ -485,6 +497,11 @@ def _map_source(
             "end": end,
             "truncated": False,
         }
+    selection.update({
+        "total_lines": len(lines),
+        "has_more": end < len(lines),
+        "next_start": end + 1 if end < len(lines) else None,
+    })
     excerpt = []
     for number in range(start, end + 1):
         item = {"line": number, "text": lines[number - 1]}
@@ -536,6 +553,22 @@ def _requested_lines(args: dict) -> tuple[int | None, int | None]:
     return start, end
 
 
+def _bounded_code_payload(code: str, *, full: bool) -> tuple[str, dict]:
+    """Bound only the optional full-code payload, never mapping input."""
+    encoded = code.encode("utf-8")
+    returned = code
+    truncated = len(encoded) > MAX_CODE
+    if truncated:
+        returned = encoded[:MAX_CODE].decode("utf-8", errors="ignore")
+    return returned, {
+        "code_truncated": truncated,
+        "code_bytes": len(encoded),
+        "code_lines": len(code.splitlines()),
+        "returned_code_bytes": len(returned.encode("utf-8")) if full else 0,
+        "returned_code_lines": len(returned.splitlines()) if full else 0,
+    }
+
+
 def _attach_mapped_assembly(program, function, mapping: dict) -> bool:
     """Attach bounded instruction lists to every address-bearing source line."""
     listing = program.getListing()
@@ -547,6 +580,8 @@ def _attach_mapped_assembly(program, function, mapping: dict) -> bool:
 
     associations = 0
     truncated = False
+    first_truncated_line = None
+    last_truncated_line = None
     for source_line in mapping.get("excerpt") or []:
         ranges = []
         for address_range in source_line.get("address_ranges") or []:
@@ -560,6 +595,7 @@ def _attach_mapped_assembly(program, function, mapping: dict) -> bool:
         if not ranges:
             continue
         mapped = []
+        complete = True
         seen: set[int] = set()
         for start, end, instruction in instructions:
             if not any(start <= high and end >= low for low, high in ranges):
@@ -568,18 +604,27 @@ def _attach_mapped_assembly(program, function, mapping: dict) -> bool:
                 continue
             if associations >= MAX_MAPPED_INSTRUCTION_ASSOCIATIONS:
                 truncated = True
+                complete = False
+                if first_truncated_line is None:
+                    first_truncated_line = source_line.get("line")
+                last_truncated_line = source_line.get("line")
                 break
             seen.add(start)
             mapped.append(_instruction_payload(instruction))
             associations += 1
         if mapped:
             source_line["assembly"] = mapped
-        if truncated:
-            break
+        source_line["assembly_complete"] = complete
+    if truncated:
+        mapping["assembly_truncation"] = {
+            "first_line": first_truncated_line,
+            "last_line": last_truncated_line,
+            "association_limit": MAX_MAPPED_INSTRUCTION_ASSOCIATIONS,
+        }
     return truncated
 
 
-def _nearby_instructions(program, function, address) -> list[dict]:
+def _nearby_instructions(program, function, address) -> tuple[list[dict], dict]:
     listing = program.getListing()
     target = int(address.getOffset())
     before = collections.deque(maxlen=2)
@@ -588,14 +633,14 @@ def _nearby_instructions(program, function, address) -> list[dict]:
     for instruction in listing.getInstructions(function.getBody(), True):
         start = int(instruction.getAddress().getOffset())
         end = start + int(instruction.getLength()) - 1
-        if current is None and start <= target <= end:
+        if start <= target <= end:
             current = instruction
             continue
-        if current is None:
+        if end < target:
             before.append(instruction)
-        elif len(after) < 2:
+        elif start > target and len(after) < 2:
             after.append(instruction)
-        else:
+        elif start > target and len(after) >= 2:
             break
     selected = list(before) + ([current] if current is not None else []) + after
     output = []
@@ -603,17 +648,35 @@ def _nearby_instructions(program, function, address) -> list[dict]:
         item = _instruction_payload(instruction)
         item["current"] = instruction is current
         output.append(item)
-    return output
+    location = {
+        "requested_address": f"0x{target:x}",
+        "decoded": current is not None,
+        "kind": "instruction" if current is not None else "undecoded-gap",
+        "previous_address": (
+            f"0x{int(before[-1].getAddress().getOffset()):x}" if before else None
+        ),
+        "next_address": (
+            f"0x{int(after[0].getAddress().getOffset()):x}" if after else None
+        ),
+    }
+    return output, location
 
 
 def _instruction_payload(instruction) -> dict:
     raw = bytes((int(value) & 0xFF) for value in instruction.getBytes())
     address = int(instruction.getAddress().getOffset())
-    return {
+    payload = {
         "address": f"0x{address:x}",
         "bytes": raw.hex(),
         "text": str(instruction),
     }
+    try:
+        flows = sorted({int(flow.getOffset()) for flow in instruction.getFlows()})
+    except Exception:
+        flows = []
+    if flows:
+        payload["flow_targets"] = [f"0x{target:x}" for target in flows]
+    return payload
 
 
 def _count_projects(path: Path) -> int:

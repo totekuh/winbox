@@ -10,7 +10,7 @@ a roadmap whose top item nobody can start.
 
 ---
 
-## Open
+## Current status
 
 Items 1-8 have all been worked — `git log` is the record. Item 8 is addressed
 at its source (below) but stays listed as *Watching* because it is intermittent
@@ -24,6 +24,239 @@ cannot work there. Server 2022 has instead been seen exhausting the four
 per-vCPU DR0..3 slots, which is the hardware path's ceiling. There is no
 `--mode auto` — breakpoints must carry their type explicitly. The failure
 messages name the wall you actually hit instead of guessing at one.
+
+### Completed top-five batch (2026-08-23)
+
+This shortlist ranks implementation effort against research payoff while still
+putting security and state correctness ahead of convenience. Scores are
+relative (`5` is easiest/highest). The first three close correctness holes;
+the last two remove repeated agent round-trips and address arithmetic.
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **56 — harden guest-derived module paths** | 5 | 5 | Completed and edge-tested. |
+| 2 | **59 — repair decomp mapping edge cases** | 4 | 5 | Completed and edge-tested. |
+| 3 | **57 — explicit run/stop epoch + pinned decomp snapshot** | 3 | 5 | Completed and concurrency-tested. |
+| 4 | **63 — RVA/symbol inputs and decomp pagination** | 4 | 5 | Completed with API 4 continuation caching. |
+| 5 | **54 — one bounded stop-triage response** | 4 | 5 | Completed in daemon, CLI, and MCP. |
+
+Items 64 (compact/structured MCP responses), 53 (typed trace reads), and 62
+(verified PDB enrichment) are the next tier: all have high payoff, but either
+touch more public contracts or require deeper Ghidra/PDB integration.
+
+### 56. Completed — guest-derived module path hardening
+
+`kdbg_user_symbols_load` obtains `FullDllName` and `BaseDllName` from the
+target's writable PEB, then `_copy_via_share` interpolates them inside a
+single-quoted PowerShell `Copy-Item` command executed by the privileged guest
+agent. A hostile process can place a quote in either string and inject
+PowerShell. Host-side path containment does not make source-code interpolation
+safe. `_resolve_binary` also joins the live module name to `symbols_dir`
+without proving the resolved path remains below that directory, so an absolute
+or `..`-bearing spoofed name can select an unintended host file before PE
+validation rejects or accepts it.
+
+Implemented with UTF-16LE/base64 path data, `-LiteralPath`, strict cached-name
+validation, cache containment, random staging/partial names, mode-0600 atomic
+publication, and unconditional cleanup. Hostile quote/NUL/traversal, symlink
+escape, concurrent same-name, publication failure, and PowerShell-error paths
+are covered.
+
+### 57. Completed — explicit debugger state and stop-pinned decomp evidence
+
+`DaemonSession.stop` is populated on a halt but never invalidated before
+`cont`, step, step-over, or step-out resumes the VM. `op_status` therefore
+reports `halted=true` while execution is in progress, `op_regs` can return the
+previous stop's register blob, and failed timeout recovery can leave stale stop
+data attached to an indeterminate run state. The mid-`cont` status test proves
+the call is serviced but does not assert the `halted` value.
+
+The decomp bridge compounds this: status, RIP, module walk, PE identity reads,
+minutes of Ghidra work, and the final live-byte comparison are separate calls.
+Another client can continue, step, detach, or stop elsewhere while Ghidra is
+running, producing one response assembled from different stops.
+
+Implemented `running|halted|indeterminate`, random `session_id`, monotonic
+`stop_id`, resume-time invalidation, epoch-checked memory reads, an atomic
+address/module snapshot, and final stop revalidation. Failed recovery clears
+stale evidence. Mid-cont status, stale reads, stop changes, invalid coordinates,
+and recovery failures are covered.
+
+### 58. PE/symbol caching is basename-keyed and non-atomic across builds
+
+User binaries are published as `symbols/<BaseDllName>`, and decomp binary
+resolution searches primarily by basename. A second Windows build, snapshot,
+side-by-side DLL, or unrelated executable with the same name overwrites the
+first. The PE copy uses `shutil.copy2` directly at the visible destination, so
+concurrent readers can also observe a partial or replaced file. The symbol
+store points at only one active build even though the Ghidra cache itself is
+content-addressed.
+
+Publish verified PEs atomically under a CodeView/build-key or full SHA-256,
+persist that PE identity/path beside each symbol-store build, and select it
+from the fresh loader identity rather than the filename. Preserve a convenient
+basename index only as a lookup hint. Cover same-name/different-build modules,
+two snapshots, concurrent publication, interrupted copies, and rollback.
+Moderate effort, high correctness and multi-target research payoff.
+
+### 59. Completed — truthful decomp source/assembly edge behavior
+
+Four bounded-output cases need one coordinated fix:
+
+* The worker truncates C at 256 KiB before mapping untruncated Ghidra markup.
+  A reproduced exact token on original line 300 was reported as line 100 with
+  `candidate_lines=[300]` and no related excerpt line. Map against complete C;
+  truncate only the optional `full=true` payload.
+* Compact `full=true` omits `analysis.code_truncated`, so callers cannot tell
+  that the returned function is incomplete. Surface an explicit warning and
+  returned/original byte and line counts.
+* The global 512 assembly-association cap stops processing later source lines.
+  Those lines then look identical to genuinely unmapped declarations. Return
+  `assembly_complete` per line plus the exact truncation line/range.
+* If an address is inside a function body but not a decoded instruction,
+  `_nearby_instructions` walks to the end and returns the final two function
+  instructions as "nearby." Select nearest before/after by address and label
+  the requested location as undecoded.
+
+Mapping now always uses complete C while only the optional full-code payload is
+truncated with explicit byte/line counts and warnings. Every addressed line
+reports `assembly_complete`, truncation names the affected line range, and
+undecoded gaps return nearest before/after instructions with an explicit label.
+Oversized-code, gaps, cap boundaries, later lines, shared instructions, and all
+response detail contracts are covered.
+
+### 60. Worker API migration is unsafe across concurrently installed clients
+
+Any `DecompClient` whose expected worker API differs from the lock owner sends
+`shutdown` and starts its selected version. A stale MCP process can therefore
+downgrade an API 3 worker to API 2; a newer CLI then upgrades it again. This
+was observed live during the API 3 rollout. Projects survive, but the JVM,
+open-program cache, and in-flight work do not.
+
+Namespace sockets, locks, session files, and container names by worker API (or
+package protocol family), and garbage-collect old idle versions explicitly.
+At minimum, refuse automatic downgrades and return an actionable reload/version
+error. Test old/new clients in both call orders and during an active request.
+Small-to-moderate effort, high rollout stability payoff.
+
+### 61. The Ghidra service lacks resource limits, cancellation, and request liveness
+
+The container sets a PID cap but no memory, swap, CPU, or Docker log-rotation
+limits. Inspection found all compute/memory limits unset; the warm worker used
+about 502 MiB before heavy analysis. A hostile or pathological PE can exhaust
+the host, while three ordinary cached projects already consume 268 MiB.
+
+The serialized worker also performs a blocking `recv()` with no request-read
+deadline. One client that connects and never finishes a JSON line wedges every
+status/decomp request. A client timeout closes only its socket: Ghidra keeps
+analyzing, retries can queue duplicate work, `shutdown` cannot be processed
+until the analysis finishes, and Docker eventually may SIGKILL a project being
+written.
+
+Add configurable memory/CPU limits, log rotation, a short request-read timeout,
+request IDs, current-operation status, disconnect-aware cancellation where
+Ghidra permits it, and deduplication by binary/function/options. Make forced
+termination and corrupt-project recovery explicit and tested. Moderate effort,
+high stability payoff for hostile-input research.
+
+### 62. Verified PDB data is underused and synthetic recovery provenance decays
+
+The PDB currently proves identity and supplies one nearest-public hint; it is
+not imported into Ghidra and does not enrich function/global names, prototypes,
+or types. Agent output consequently contains `FUN_*`, `DAT_*`, and `param_*`
+even when an exact cached PDB exists. Public parsing also discards the PDB
+`function` flag, so the nearest symbol used for recovery is not guaranteed to
+be a function.
+
+Recovery then mutates the durable Ghidra project. The first query labels a
+created function `pdb-public-recovery` or `pdb-public-split-recovery`, but the
+next query finds it through `getFunctionContaining` and reports ordinary
+`analysis`, permanently laundering an inferred boundary into an analyzed one.
+
+Import the identity-matched PDB where practical, or apply the existing verified
+public/type maps through a versioned analysis profile. Retain function flags,
+persist winbox recovery provenance in program properties or a sidecar, and
+include the analysis-profile version in project cache keys. Never present a
+synthetic boundary as native analysis on reuse. Moderate-to-large effort, very
+high decompiler-quality payoff.
+
+### 63. Completed — direct coordinates and stop-bound continuation
+
+Mapped pseudocode may display `CALL 0x140010580`, a Ghidra preferred-base VA,
+while `kdbg_decomp(addr=...)` accepts only a live runtime VA. Feeding the output
+back into the tool fails or targets the wrong coordinate. Agents also cannot
+request a symbol or `module+rva` directly.
+
+`lines="1-22"` returns neither total line count, `has_more`, nor `next_start`.
+Paging therefore requires speculative calls, and every page repeats the loader
+walk, PE parsing/hashing, identity checks, and `decompileFunction` call.
+
+Implemented direct symbol and fresh-loader `module+rva` resolution, labelled
+flow targets, total/remaining line metadata, and a bounded opaque cursor tied
+to binary SHA, Ghidra version/profile, function RVA, session, and stop. API 4
+keeps up to 32 successful function decompilations per open program so later
+pages avoid another `decompileFunction` call while still revalidating live
+identity. Malformed/oversized/forged/stale cursors and coordinate conflicts are
+covered.
+
+### 64. MCP responses waste tokens and errors are not machine-actionable
+
+A live 68-line mapped response occupied 21,443 bytes. Compact JSON plus omission
+of repeated per-instruction `va` and `bytes` fields was 9,973 bytes, a 53.5%
+reduction. MCP still pretty-prints JSON, repeats runtime VAs derivable from one
+module base plus RVA, and always includes raw instruction bytes. At the same
+time, success is JSON but failure is a prose string prefixed with `error:`.
+Agents cannot reliably distinguish missing prerequisites, worker busy, stale
+stop, identity mismatch, timeout, or corrupt cache.
+
+Use compact MCP serialization/structured content, make bytes and repeated VAs
+opt-in, and version a common `{ok,result,error}` envelope whose error contains
+`code`, `message`, `retryable`, and bounded recovery hints. Preserve readable
+pretty JSON in interactive CLI output only. Small-to-moderate contract change,
+high context-efficiency and autonomous-recovery payoff.
+
+### 65. Analysis caches grow without visibility or eviction and one open slot thrashes
+
+There is no cache inventory, byte count, age, pruning, or size policy. The live
+validation cache contains three projects totaling 268 MiB, including one
+202 MiB project. `MAX_OPEN_PROGRAMS=1` bounds RAM but repeatedly closes and
+reopens projects when an agent alternates across an EXE, RPC runtime, and system
+DLLs.
+
+Expose per-project SHA/build/name, size, last-used time, analysis profile, and
+open state. Add explicit prune/dry-run operations and an optional total-size
+LRU. Replace the fixed one-program slot with a configurable memory-aware LRU;
+keep one as the safe low-memory default. Moderate effort, medium-to-high
+long-session efficiency payoff.
+
+### 66. The verification contract overstates runtime equivalence
+
+Compact output hardcodes `verified.exact_binary=true`. What is actually proven
+is a matching CodeView build (or weaker machine/timestamp/image-size tuple), a
+host-file SHA for the analyzed copy, and—when a current decoded instruction
+exists—one live/static instruction comparison. Runtime patches elsewhere in
+the function are not checked, and ordinary base relocations can make the one
+comparison warn without distinguishing relocation from mutation. Static PE
+metadata and the later SHA are also collected through separate path opens, so
+a concurrent replacement can combine headers from one file with a hash from
+another.
+
+Rename the claims to `build_identity_match`, `analyzed_file_sha256`, and
+`current_instruction_match`; report `not_checked` explicitly. Snapshot/copy the
+host PE once before parsing and hashing. A later enhancement can compare all
+function bytes while masking verified PE base relocations, producing bounded
+changed ranges. Moderate effort, high evidence-honesty payoff.
+
+### 67. New Ghidra status CLI commands corrupt JSON at narrow terminal widths
+
+`winbox kdbg decomp-status` and `winbox kdbg ghidra status` serialize JSON and
+then send it through Rich. At `COLUMNS=40`, both reproduced
+`Invalid control character` when piped into `python -m json.tool`, because Rich
+wraps inside JSON string values. `kdbg decomp` already fixed this exact defect.
+
+Emit lifecycle/status JSON with `click.echo` and add narrow-width pipe tests for
+every JSON-producing kdbg CLI surface. Tiny effort, immediate scripting UX
+payoff.
 
 ### 53. Predicates/actions need typed reads and bounded buffer capture
 
@@ -55,7 +288,7 @@ machine does not need to become multithreaded. Guard concurrent starts, stale
 workers, daemon death, detach, and MCP restart. Moderate effort and the highest
 orchestration payoff for autonomous research.
 
-### 54. Stop triage is fragmented across too many MCP calls
+### 54. Completed — bounded one-call stop triage
 
 After a breakpoint or exception, an AI must separately request registers,
 nearby disassembly, stack qwords, the heuristic backtrace, breakpoint metadata,
@@ -63,12 +296,12 @@ and often pointed-to memory. The halt is stable, but the repeated protocol
 round-trips waste time and context, and agents frequently omit one of the
 pieces needed to reason about the stop.
 
-Add a bounded `kdbg_context`/`kdbg_triage` response containing the stop reason,
-target/vCPU/CR3, registers, symbolized RIP, nearby disassembly, labeled stack,
-active breakpoint metadata, and an explicitly labeled heuristic backtrace.
-Optional memory follows must be caller-selected and tightly capped. This is a
-small composition layer over existing operations; it improves ergonomics more
-than raw capability, so it ranks below items 52/53/41.
+`kdbg_context` now returns an epoch-pinned target/stop, registers, symbolized
+RIP and branch targets, nearby assembly, labelled stack, explicitly heuristic
+backtrace, and bounded breakpoint metadata. Callers may request at most four
+memory follows, 256 bytes each and 1024 bytes total. Zero-sized components,
+bad integer/bool inputs, missing stop state, unreadable evidence, and every cap
+are covered in daemon/MCP/CLI tests.
 
 ### 12. WoW64 detection is currently ineffective; 32-bit modules are absent
 
@@ -135,7 +368,11 @@ distribution is required. Cross-cutting and not an easy win.
 *`git log` is the authoritative record. This section exists so the roadmap
 is self-contained — readers don't have to search git for "was this done?"*
 
-**9.** `kdbg_cont` timeout / halt state tracking. See commit `a2373bc`.
+**9.** `kdbg_cont` timeout recovery was made to re-halt before returning. See
+commit `a2373bc`. The 2026-08-23 audit found the separate run-transition/stale
+stop-generation gap now tracked as item 57; that does not reopen the original
+timeout fix, but the old heading's broader "halt state tracking" claim was too
+strong.
 
 **10.** `kdbg_stack` returns `{offset, va, value}` per qword. `kdbg_mem`
 gained `decode='qwords'`. See commit `9009a49`.
@@ -314,7 +551,7 @@ remains independent and controls only complete-function pseudocode.
 `lines="N-M", assembly="mapped"` returns up to 100 absolute pseudocode lines
 with bounded corresponding instructions nested per line, preserving disjoint
 ranges, shared optimized instructions, unmapped declarations, clamped function
-ends, and explicit truncation warnings. Worker API 3 prevents a stale Docker
+ends, and explicit truncation warnings. Worker API 4 prevents a stale Docker
 image from serving the older mapping/batch contract.
 
 PyGhidra now runs in a pinned, persistent Docker service rather than requiring
@@ -380,6 +617,38 @@ live bytes. Direct MCP wrapper calls passed without restarting the configured
 server. Cleanup left zero breakpoints, detached the daemon, stopped the
 gdbstub, kept the VM/guest agent healthy, and found no System 1001/41/6008
 events in the previous hour.
+
+**54/56/57/59/63.** The 2026-08-23 AI-research UX batch completed the five
+highest-return audit findings. Guest-derived loader paths are inert encoded
+data with unique atomic publication; debugger state has explicit run state and
+stop epochs; decomp mapping remains truthful under oversized output, decoded
+gaps, and association caps; symbol/module+RVA navigation and stop-bound paging
+reuse cached function results; and `kdbg_context` returns bounded one-call stop
+triage. Worker API 4 and its pinned Docker image carry the new contract.
+
+Live validation reattached Server 2025 `services.exe`, halted on the hardware
+breakpoint at `services!RQueryServiceStatus`, and returned an epoch-consistent
+context including an eight-byte memory follow. Status observed during a real
+continue reported `state=running`, `halted=false`, and no current `stop_id`,
+then timeout recovery produced a new halted generation. A cursor created at
+one generation was rejected after a live step. Direct symbol and
+`services.exe+0xfae0` requests both resolved the exact CodeView-matched PE.
+Mapped RVA `0xfaf5` connected pseudocode line 14 to its call instruction and
+labelled the target as RVA `0x10580`, static VA `0x140010580`, runtime VA
+`0x7ff744f10580`, and `services!?ScSetTcpKeepalive@@YAXXZ`. The next page
+returned in 0.178 seconds with `decompile_cache_hit=true`. The final API 4
+image ID was verified as the running container and the compiled-binary Docker
+integration passed in 12.32 seconds. The target was left halted at the restored
+hardware breakpoint for the post-reload MCP check.
+
+After the MCP reload, the registered schema exposed `kdbg_context` and the
+expanded symbol/module/RVA/cursor decomp inputs. MCP returned the same pinned
+epoch from triage and mapped decomp, including the eight-byte live memory
+follow and labelled call/branch targets. Cursor paging returned lines 17–19
+with a decompile-cache hit. A live MCP step advanced `stop_id` from 2 to 3;
+the old cursor then failed as stale, `disasm_count=33` and conflicting address
+coordinates failed at their documented bounds, and MCP continue restored the
+target to the hardware breakpoint at stop 4.
 
 **21.** Private user-mode software breakpoint removal now records the exact
 CR3 used by `install_user_breakpoint` and re-enters that CR3 before sending

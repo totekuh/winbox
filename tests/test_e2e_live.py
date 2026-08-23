@@ -1200,13 +1200,16 @@ class TestKdbg:
             tool("kdbg_regs")()
             tool("kdbg_stack")()
             tool("kdbg_bt")()
+            context = json.loads(tool("kdbg_context")())
+            assert context["schema"] == "winbox.kdbg-context/1"
+            assert context["state"] == "halted"
             tool("kdbg_mem")("0x7FFE0000", 16)
             tool("kdbg_disasm")("", 4)
             lifecycle = json.loads(tool("kdbg_ghidra_run")())
             assert lifecycle["api"]["worker_pid"] == 1
             assert json.loads(tool("kdbg_decomp_status")())["image_installed"]
             decomp = json.loads(tool("kdbg_decomp")(nt_close, 1, 2))
-            assert decomp["schema"] == "winbox.kdbg-decomp/3"
+            assert decomp["schema"] == "winbox.kdbg-decomp/4"
             assert decomp["detail"] == "compact"
             assert decomp["target"]["name"]
             assert decomp["verified"]["identity"] == "pdb-guid-age"

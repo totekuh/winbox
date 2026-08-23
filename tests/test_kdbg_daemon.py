@@ -172,6 +172,163 @@ def test_handle_op_returns_err_for_bad_args():
     assert "bad args" in reply["error"]
 
 
+def test_stop_epoch_invalidates_stale_reads_after_new_stop():
+    session = _make_session()
+    from winbox.kdbg.debugger.rsp import StopReply
+
+    session._capture_stop(StopReply(5, "01", "swbreak", "T05"))
+    old_session, old_stop = session.session_id, session.stop_id
+    session._capture_stop(StopReply(5, "01", "swbreak", "T05"))
+
+    reply = session.handle_op("mem", {
+        "va": "0x1000", "length": 1,
+        "session_id": old_session, "stop_id": old_stop,
+    })
+    assert reply["ok"] is False
+    assert "stale debugger stop" in reply["error"]
+
+
+def test_resume_clears_stop_evidence_and_status_reports_running():
+    session = _make_session()
+    session.stop = StopState(
+        vcpu="01", rip=0x1000, cr3=0x4d6bb000, signal=5,
+        raw_regs=_blob(rip=0x1000),
+    )
+    session.run_state = "halted"
+    session.stop_id = 9
+
+    session._begin_resume()
+
+    status = session.op_status()
+    assert status["state"] == "running"
+    assert status["halted"] is False
+    assert status["stop_id"] is None
+    assert session.handle_op("regs", {})["ok"] is False
+
+
+def test_decomp_snapshot_resolves_module_rva_atomically(monkeypatch):
+    from types import SimpleNamespace
+
+    session = _make_session()
+    session.stop = StopState(
+        vcpu="01", rip=0x1010, cr3=0x4d6bb000, signal=5, raw_regs=_blob()
+    )
+    session.run_state = "halted"
+    session.stop_id = 3
+    user = [SimpleNamespace(
+        name="sample.exe", base=0x7FF600000000, size=0x5000,
+        entry=0x1234, full_path=r"C:\sample.exe",
+    )]
+    monkeypatch.setattr(
+        session, "_live_modules", lambda kind: user if kind == "user" else []
+    )
+
+    result = session.op_decomp_snapshot(module="sample", rva="0x120")
+
+    assert result["runtime_va"] == "0x7ff600000120"
+    assert result["module"]["rva"] == "0x120"
+    assert result["stop_id"] == 3
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"module": "sample"}, "together"),
+        ({"rva": "0x10"}, "together"),
+        ({"module": "sample", "rva": "-1"}, "outside"),
+        ({"module": "sample", "rva": "0x100000000"}, "outside"),
+        ({"va": "0x10", "module": "sample", "rva": "0x10"}, "mutually"),
+    ],
+)
+def test_decomp_snapshot_rejects_ambiguous_or_invalid_coordinates(kwargs, message):
+    session = _make_session()
+    session.stop = StopState(
+        vcpu="01", rip=0x1010, cr3=0x4d6bb000, signal=5, raw_regs=_blob()
+    )
+    session.run_state = "halted"
+    reply = session.handle_op("decomp_snapshot", kwargs)
+    assert reply["ok"] is False
+    assert message in reply["error"]
+
+
+def test_context_is_bounded_and_epoch_consistent():
+    session = _make_session(store=FakeStore({"nt!Here": 0xfffff80608628780}))
+    session.stop = StopState(
+        vcpu="01", rip=0xfffff80608628780, cr3=0x1ae000,
+        signal=5, raw_regs=_blob(),
+    )
+    session.run_state = "halted"
+    session.stop_id = 4
+
+    result = session.op_context(
+        disasm_count=3, stack_qwords=2, bt_depth=1,
+        memory=[{"va": "0x2000", "length": 8}],
+    )
+
+    assert result["schema"] == "winbox.kdbg-context/1"
+    assert result["stop_epoch"]["stop_id"] == 4
+    assert len(result["assembly"]) == 3
+    assert len(result["stack"]["qwords"]) == 2
+    assert result["memory"] == [{"va": "0x2000", "bytes": "90" * 8}]
+
+
+def test_context_allows_zero_components_without_leaking_one_frame():
+    session = _make_session()
+    session.stop = StopState(
+        vcpu="01", rip=0x1000, cr3=0x4d6bb000, signal=5, raw_regs=_blob()
+    )
+    session.run_state = "halted"
+    result = session.op_context(disasm_count=0, stack_qwords=0, bt_depth=0)
+    assert result["assembly"] == []
+    assert result["stack"]["qwords"] == []
+    assert result["backtrace"]["frames"] == []
+
+
+def test_context_preserves_other_evidence_when_code_and_stack_are_unreadable():
+    from winbox.kdbg.debugger.rsp import RspError
+
+    class UnreadableRsp(FakeRsp):
+        def read_memory(self, va, length):
+            raise RspError("E14")
+
+    session = _make_session(rsp=UnreadableRsp())
+    session.stop = StopState(
+        vcpu="01", rip=0x1000, cr3=0x4d6bb000, signal=5,
+        raw_regs=_blob(rip=0x1000),
+    )
+    session.run_state = "halted"
+
+    result = session.op_context(disasm_count=2, stack_qwords=2, bt_depth=2)
+
+    assert result["registers"]["rip"].endswith("1000")
+    assert "assembly_error" in result
+    assert "stack_error" in result
+    assert result["assembly"] == []
+    assert result["stack"]["qwords"] == []
+    assert result["backtrace"]["frames"] == []
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        ({"disasm_count": 33}, "between"),
+        ({"stack_qwords": True}, "integer"),
+        ({"memory": [{"va": "0", "length": 1}] * 5}, "at most 4"),
+        ({"memory": [{"va": "0", "length": 257}]}, "between"),
+        ({"memory": [{"length": 8}]}, "requires va"),
+    ],
+)
+def test_context_rejects_oversized_or_ambiguous_inputs(kwargs, message):
+    session = _make_session()
+    session.stop = StopState(
+        vcpu="01", rip=0x1000, cr3=0x4d6bb000, signal=5, raw_regs=_blob()
+    )
+    session.run_state = "halted"
+    reply = session.handle_op("context", kwargs)
+    assert reply["ok"] is False
+    assert message in reply["error"]
+
+
 # ── op_status ───────────────────────────────────────────────────────────
 
 
@@ -809,10 +966,10 @@ def test_op_step_double_timeout_message_admits_indeterminate_state():
     assert "indeterminate" in reply["error"]
     # Recovery interrupt was attempted exactly once.
     assert rsp.interrupted == 1
-    # ``self.stop`` is the pre-step state since recovery didn't capture
-    # anything new — operator can see the daemon hasn't claimed false
-    # progress.
-    assert session.stop is pre_step_stop
+    # Stop-derived evidence is cleared before resume and stays unavailable
+    # when recovery cannot prove a new halt.
+    assert session.stop is None
+    assert session.op_status()["state"] == "indeterminate"
 
 
 # ── KPTI / KVA Shadow CR3 filter ────────────────────────────────────────

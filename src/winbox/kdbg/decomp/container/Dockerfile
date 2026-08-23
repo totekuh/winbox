@@ -9,7 +9,7 @@ ARG JPYPE_SHA256=cdca93cc74f8db1f604d2ea6adb764dec4dec68528f1ee68308fa3d52409573
 ARG PACKAGING_SHA256=5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
 
 LABEL io.winbox.component="pyghidra" \
-      io.winbox.worker-api="3" \
+      io.winbox.worker-api="4" \
       io.winbox.ghidra-version="${GHIDRA_VERSION}" \
       io.winbox.pyghidra-version="${PYGHIDRA_VERSION}"
 

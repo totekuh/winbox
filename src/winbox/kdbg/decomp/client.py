@@ -24,7 +24,7 @@ class DecompError(RuntimeError):
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-WORKER_API = "3"
+WORKER_API = "4"
 
 
 def runtime_dir(cfg: Config) -> Path:

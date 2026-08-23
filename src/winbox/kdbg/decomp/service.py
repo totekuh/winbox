@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +18,7 @@ from winbox.kdbg.decomp.identity import (
 )
 from winbox.kdbg.debugger.client import ClientError, DaemonClient
 from winbox.kdbg.format import symbolicate_va
-from winbox.kdbg.store import SymbolStore
+from winbox.kdbg.store import SymbolStore, SymbolStoreError
 
 
 MAX_CONTEXT_LINES = 20
@@ -75,6 +77,10 @@ def query_decomp(
     cfg: Config,
     *,
     addr: str = "",
+    symbol: str = "",
+    module: str = "",
+    rva: str = "",
+    cursor: str = "",
     before: int = 3,
     after: int = 5,
     full: bool = False,
@@ -96,26 +102,65 @@ def query_decomp(
     after = _bounded_int("after", after, 0, MAX_CONTEXT_LINES)
     timeout = _bounded_int("timeout", timeout, 5, 300)
     detail = _detail_level(detail)
+    cursor_data = _decode_cursor(cursor) if cursor else None
+    coordinates = sum(bool(value and str(value).strip()) for value in (addr, symbol))
+    coordinates += bool(module or rva)
+    if cursor_data and (coordinates or lines):
+        raise DecompError("cursor is mutually exclusive with address/symbol/module/lines")
+    if coordinates > 1:
+        raise DecompError("addr, symbol, and module+rva are mutually exclusive")
+    if bool(module) != bool(rva):
+        raise DecompError("module and rva must be supplied together")
+    if module and not str(module).strip():
+        raise DecompError("module must not be blank")
     line_range = _line_range(lines)
+    if cursor_data:
+        module = str(cursor_data["module"])
+        rva = str(cursor_data["function_rva"])
+        start = int(cursor_data["next_start"])
+        page_size = int(cursor_data["page_size"])
+        line_range = (start, start + page_size - 1)
     assembly = _assembly_mode(assembly)
     daemon = daemon_client or DaemonClient(cfg)
     worker = decomp_client or DecompClient(cfg)
 
+    store = SymbolStore(cfg.symbols_dir)
+    if symbol:
+        try:
+            module, _ = store.parse_symbol(symbol)
+            rva = f"0x{store.rva(symbol):x}"
+        except SymbolStoreError as exc:
+            raise DecompError(f"could not resolve symbol: {exc}") from exc
+
     try:
-        status = daemon.call("status")
-        target = status.get("target") or {}
-        if addr and addr.strip():
-            runtime_va = int(addr.strip(), 0)
-        else:
-            registers = daemon.call("regs")
-            runtime_va = int(str(registers.get("rip", "0")), 0)
+        snapshot_args: dict[str, Any] = {}
+        if module:
+            snapshot_args.update(module=module, rva=rva)
+        elif addr and addr.strip():
+            snapshot_args["va"] = addr.strip()
+        snapshot = daemon.call(
+            "decomp_snapshot", **snapshot_args
+        )
+        target = snapshot.get("target") or {}
+        runtime_va = int(str(snapshot.get("runtime_va", "0")), 0)
+        epoch_session = str(snapshot["session_id"])
+        epoch_stop = int(snapshot["stop_id"])
+        if cursor_data and (
+            cursor_data["session_id"] != epoch_session
+            or int(cursor_data["stop_id"]) != epoch_stop
+        ):
+            raise DecompError(
+                "continuation no longer matches this debugger stop"
+            )
         if runtime_va < 0 or runtime_va >= (1 << 64):
             raise ValueError("address outside uint64 range")
-    except (ClientError, TypeError, ValueError) as exc:
+    except DecompError:
+        raise
+    except (ClientError, KeyError, TypeError, ValueError) as exc:
         raise DecompError(f"could not resolve live address: {exc}") from exc
 
     try:
-        module = daemon.call("module_at", va=f"0x{runtime_va:x}")
+        module = snapshot["module"]
         module_base = int(str(module["base"]), 0)
         module_size = int(module["size"])
         rva = runtime_va - module_base
@@ -139,6 +184,7 @@ def query_decomp(
             try:
                 reply = daemon.call(
                     "mem", va=f"0x{address + offset:x}", length=size,
+                    session_id=epoch_session, stop_id=epoch_stop,
                 )
                 chunk = bytes.fromhex(str(reply["bytes"]))
             except (ClientError, KeyError, ValueError) as exc:
@@ -161,7 +207,6 @@ def query_decomp(
     except IdentityError as exc:
         raise DecompError(str(exc)) from exc
 
-    store = SymbolStore(cfg.symbols_dir)
     runtime_symbol = symbolicate_va(store, runtime_va)
     symbol_hint = _nearest_symbol_hint(store, str(module.get("name", "")), rva)
 
@@ -180,8 +225,42 @@ def query_decomp(
         line_end=line_range[1] if line_range else None,
         assembly=assembly,
     )
+    _annotate_flow_symbols(
+        result, store, str(module.get("name", "")), module_size
+    )
+
+    if cursor_data:
+        if (
+            cursor_data["binary_sha256"] != static_identity.sha256
+            or cursor_data["ghidra_version"] != result.get("ghidra_version")
+            or cursor_data["analysis_profile"] != result.get("analysis_profile")
+        ):
+            raise DecompError(
+                "continuation no longer matches this debugger stop or analysis"
+            )
+
+    selection = (result.get("mapping") or {}).get("selection") or {}
+    next_cursor = None
+    if selection.get("has_more") and selection.get("next_start"):
+        function_rva = int(str((result.get("function") or {})["rva"]), 0)
+        page_size = max(1, int(selection["end"]) - int(selection["start"]) + 1)
+        next_cursor = _encode_cursor({
+            "module": str(snapshot["module"]["name"]),
+            "function_rva": function_rva,
+            "next_start": int(selection["next_start"]),
+            "page_size": page_size,
+            "session_id": epoch_session,
+            "stop_id": epoch_stop,
+            "binary_sha256": static_identity.sha256,
+            "ghidra_version": result.get("ghidra_version"),
+            "analysis_profile": result.get("analysis_profile"),
+        })
 
     warnings: list[str] = []
+    if full and (result.get("analysis") or {}).get("code_truncated"):
+        warnings.append(
+            "full pseudocode was truncated; mapping and selected lines use the complete function"
+        )
     if (result.get("mapping") or {}).get("assembly_truncated"):
         warnings.append(
             "mapped assembly was truncated at the bounded response limit"
@@ -217,8 +296,22 @@ def query_decomp(
         except (IdentityError, KeyError, TypeError, ValueError):
             warnings.append("could not compare live and static instruction bytes")
 
+    try:
+        final_status = daemon.call("status")
+    except ClientError as exc:
+        raise DecompError(f"could not revalidate debugger stop: {exc}") from exc
+    if (
+        final_status.get("state") != "halted"
+        or final_status.get("session_id") != epoch_session
+        or final_status.get("stop_id") != epoch_stop
+    ):
+        raise DecompError(
+            "debugger stop changed during decompilation; retry at the new stop"
+        )
+
     composed = {
         "target": {"pid": target.get("pid"), "name": target.get("name")},
+        "stop_epoch": {"session_id": epoch_session, "stop_id": epoch_stop},
         "module": {
             **module,
             "runtime_va": f"0x{runtime_va:x}",
@@ -233,6 +326,7 @@ def query_decomp(
         },
         "runtime_symbol": runtime_symbol,
         "symbol_hint": symbol_hint,
+        "next_cursor": next_cursor,
         **result,
         "warnings": warnings,
     }
@@ -314,12 +408,15 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
                 _format_instruction(instruction, ghidra_base, module_base)
                 for instruction in mapped
             ]
+        if "assembly_complete" in source_line:
+            item["assembly_complete"] = bool(source_line["assembly_complete"])
         pseudocode.append(item)
 
     compact: dict[str, Any] = {
-        "schema": "winbox.kdbg-decomp/3",
+        "schema": "winbox.kdbg-decomp/4",
         "detail": detail,
         "target": result.get("target"),
+        "stop_epoch": result.get("stop_epoch"),
         "location": {
             "symbol": result.get("runtime_symbol"),
             "va": module.get("runtime_va"),
@@ -336,6 +433,8 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
         "assembly": nearby_assembly,
         "pseudocode": pseudocode,
         "line_selection": mapping.get("selection"),
+        "next_cursor": result.get("next_cursor"),
+        "instruction_location": result.get("instruction_location"),
         "rip_mapping": {
             "kind": kind,
             "pseudocode_line": selected_line,
@@ -350,10 +449,13 @@ def _format_result(result: dict[str, Any], detail: str) -> dict[str, Any]:
             "live_bytes_match": identity.get("live_bytes_match"),
         },
         "cache_hit": result.get("cache_hit"),
+        "decompile_cache_hit": result.get("decompile_cache_hit"),
         "warnings": result.get("warnings") or [],
     }
     if "code" in result:
         compact["code"] = result["code"]
+    if "code" in result and (result.get("analysis") or {}).get("code_truncated"):
+        compact["code_truncated"] = True
     if detail == "standard":
         compact.update({
             "module": module,
@@ -386,6 +488,24 @@ def _format_instruction(
             item["va"] = f"0x{module_base + instruction_rva:x}"
     if instruction.get("current"):
         item["current"] = True
+    targets = []
+    for target in instruction.get("flow_targets") or []:
+        static_target = _hex_int(target)
+        if static_target is None or ghidra_base is None:
+            continue
+        target_rva = static_target - ghidra_base
+        target_item = {
+            "rva": f"0x{target_rva:x}",
+            "static_va": f"0x{static_target:x}",
+        }
+        if module_base is not None:
+            target_item["runtime_va"] = f"0x{module_base + target_rva:x}"
+        symbol = (instruction.get("flow_target_symbols") or {}).get(str(target))
+        if symbol:
+            target_item["symbol"] = symbol
+        targets.append(target_item)
+    if targets:
+        item["flow_targets"] = targets
     return item
 
 
@@ -436,6 +556,90 @@ def _hex_int(value: Any) -> int | None:
         return None
 
 
+def _encode_cursor(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(value: str) -> dict[str, Any]:
+    raw = str(value).strip()
+    if not raw or len(raw) > 4096:
+        raise DecompError("invalid or oversized continuation cursor")
+    try:
+        padded = raw + "=" * (-len(raw) % 4)
+        payload = json.loads(base64.b64decode(
+            padded, altchars=b"-_", validate=True
+        ).decode("utf-8"))
+        required = {
+            "module", "function_rva", "next_start", "page_size",
+            "session_id", "stop_id", "binary_sha256", "ghidra_version",
+            "analysis_profile",
+        }
+        if not isinstance(payload, dict) or set(payload) != required:
+            raise ValueError("unexpected cursor fields")
+        if (
+            not isinstance(payload["module"], str)
+            or not payload["module"].strip()
+            or len(payload["module"]) > 260
+            or "\0" in payload["module"]
+        ):
+            raise ValueError("empty module")
+        for key in ("function_rva", "next_start", "page_size", "stop_id"):
+            if isinstance(payload[key], bool) or not isinstance(payload[key], int):
+                raise ValueError(f"{key} is not an integer")
+        if not 0 <= payload["function_rva"] < (1 << 32):
+            raise ValueError("function RVA out of range")
+        if not 1 <= payload["next_start"] <= 1_000_000:
+            raise ValueError("next line out of range")
+        if not 1 <= payload["page_size"] <= MAX_LINE_BATCH:
+            raise ValueError("line window out of range")
+        if payload["stop_id"] < 1:
+            raise ValueError("stop id out of range")
+        if (
+            not isinstance(payload["session_id"], str)
+            or not 1 <= len(payload["session_id"]) <= 128
+            or not isinstance(payload["binary_sha256"], str)
+            or len(payload["binary_sha256"]) != 64
+            or any(c not in "0123456789abcdef" for c in payload["binary_sha256"])
+            or not isinstance(payload["ghidra_version"], str)
+            or not 1 <= len(payload["ghidra_version"]) <= 64
+            or not isinstance(payload["analysis_profile"], str)
+            or not 1 <= len(payload["analysis_profile"]) <= 128
+        ):
+            raise ValueError("invalid cursor identity")
+        return payload
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise DecompError(f"invalid continuation cursor: {exc}") from exc
+
+
+def _annotate_flow_symbols(
+    result: dict[str, Any], store: SymbolStore, module_name: str, module_size: int
+) -> None:
+    """Attach reusable module-relative symbol labels to branch/call targets."""
+    ghidra_base = _hex_int(result.get("ghidra_image_base"))
+    if ghidra_base is None:
+        return
+    instructions = list(result.get("instructions") or [])
+    for source_line in (result.get("mapping") or {}).get("excerpt") or []:
+        instructions.extend(source_line.get("assembly") or [])
+    for instruction in instructions:
+        symbols = {}
+        for target in instruction.get("flow_targets") or []:
+            static_target = _hex_int(target)
+            if static_target is None:
+                continue
+            target_rva = static_target - ghidra_base
+            if not 0 <= target_rva < module_size:
+                continue
+            hint = _nearest_symbol_hint(store, module_name, target_rva)
+            if hint is None:
+                continue
+            suffix = f"+0x{hint['offset']:x}" if hint["offset"] else ""
+            symbols[str(target)] = f"{hint['module']}!{hint['name']}{suffix}"
+        if symbols:
+            instruction["flow_target_symbols"] = symbols
+
+
 def _resolve_binary(cfg: Config, module_name: str, explicit: str) -> Path:
     if explicit and explicit.strip():
         path = Path(explicit).expanduser().resolve()
@@ -444,6 +648,7 @@ def _resolve_binary(cfg: Config, module_name: str, explicit: str) -> Path:
         return path
 
     root = Path(cfg.symbols_dir)
+    resolved_root = root.resolve()
     normalized = module_name.lower()
     candidates: list[Path] = []
     if normalized in {"ntoskrnl.exe", "ntkrnlmp.exe", "ntkrnlpa.exe", "nt"}:
@@ -465,7 +670,7 @@ def _resolve_binary(cfg: Config, module_name: str, explicit: str) -> Path:
         if resolved in seen:
             continue
         seen.add(resolved)
-        if resolved.is_file():
+        if resolved.is_relative_to(resolved_root) and resolved.is_file():
             return resolved
     raise DecompError(
         f"no cached PE for live module {module_name!r}. Before attaching, run "

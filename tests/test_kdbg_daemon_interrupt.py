@@ -188,6 +188,9 @@ def test_status_is_served_while_cont_is_blocked(session):
     assert "error" not in out, out
     assert out["reply"]["ok"] is True
     assert out["reply"]["result"]["target"]["name"] == "notepad.exe"
+    assert out["reply"]["result"]["state"] == "running"
+    assert out["reply"]["result"]["halted"] is False
+    assert out["reply"]["result"]["stop_id"] is None
     assert reply["reason"] == "timeout"
 
 

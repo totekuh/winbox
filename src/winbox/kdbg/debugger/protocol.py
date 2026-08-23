@@ -47,6 +47,8 @@ OPS: frozenset[str] = frozenset({
     "stack",        # read N qwords from RSP
     "bt",           # basic backtrace
     "module_at",    # resolve a live VA through fresh loader-list walks
+    "decomp_snapshot", # atomically pin address + module to a stop epoch
+    "context",      # bounded stop triage in one epoch-consistent response
     "detach",       # graceful shutdown
 })
 

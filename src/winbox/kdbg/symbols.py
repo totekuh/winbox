@@ -14,7 +14,10 @@ separately by the caller (``walk_user_modules``).
 
 from __future__ import annotations
 
+import base64
 import logging
+import os
+import secrets
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,7 +77,18 @@ def _copy_via_share(
     the staging copy. Raises ``SymbolLoadError`` if the in-VM Copy-Item
     fails or the staged file never appears.
     """
+    if not src_in_vm or "\0" in src_in_vm:
+        raise SymbolLoadError("invalid source module path")
     cfg.symbols_dir.mkdir(parents=True, exist_ok=True)
+    # Both values originate in a target-controlled PEB. BaseDllName must be a
+    # single filename: rejecting both host and Windows separators keeps it from
+    # becoming either a host traversal or a guest-side Z:\ subpath.
+    if (
+        not cached_name
+        or cached_name in {".", ".."}
+        or any(character in cached_name for character in ("/", "\\", "\0"))
+    ):
+        raise SymbolLoadError(f"invalid module filename: {cached_name!r}")
     cached = cfg.symbols_dir / cached_name
     # cached_name can originate from a PEB BaseDllName read out of a live
     # process on the analyzed VM — a hostile sample can spoof that to a
@@ -84,17 +98,34 @@ def _copy_via_share(
         raise SymbolLoadError(f"invalid module filename: {cached_name!r}")
 
     cfg.shared_dir.mkdir(parents=True, exist_ok=True)
-    # Use a unique staging name — concurrent module loads (e.g. parallel
-    # MCP calls) on the same VM share would otherwise race on the basename.
-    staging = cfg.shared_dir / cached_name
+    # Never interpolate target-controlled loader strings into PowerShell
+    # source. UTF-16LE base64 is both lossless for Windows paths and restricted
+    # to an inert alphabet; the generated destination name is host-owned.
+    token = secrets.token_hex(16)
+    suffix = Path(cached_name).suffix
+    if len(suffix) > 16 or any(not (c.isalnum() or c == ".") for c in suffix):
+        suffix = ".bin"
+    staging_name = f"winbox-kdbg-{token}{suffix}"
+    staging = cfg.shared_dir / staging_name
     src_basename = src_in_vm.rsplit("\\", 1)[-1]
-    staging_in_vm = f"Z:\\{cached_name}"
+    staging_in_vm = f"Z:\\{staging_name}"
+
+    def encoded_path(value: str) -> str:
+        return base64.b64encode(value.encode("utf-16-le")).decode("ascii")
+
+    src_encoded = encoded_path(src_in_vm)
+    dst_encoded = encoded_path(staging_in_vm)
+    script = (
+        "$src=[Text.Encoding]::Unicode.GetString("
+        f"[Convert]::FromBase64String('{src_encoded}'))\n"
+        "$dst=[Text.Encoding]::Unicode.GetString("
+        f"[Convert]::FromBase64String('{dst_encoded}'))\n"
+        "Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop"
+    )
+    temporary = cfg.symbols_dir / f".{cached_name}.{token}.part"
 
     try:
-        result = ga.exec_powershell(
-            f"Copy-Item -Force '{src_in_vm}' '{staging_in_vm}'",
-            timeout=60,
-        )
+        result = ga.exec_powershell(script, timeout=60)
         if result.exitcode != 0:
             raise SymbolLoadError(
                 f"Copy-Item {src_basename} failed: {result.stderr or result.stdout}"
@@ -103,9 +134,12 @@ def _copy_via_share(
             raise SymbolLoadError(
                 f"{src_basename} did not appear on the share after Copy-Item"
             )
-        shutil.copy2(staging, cached)
+        shutil.copyfile(staging, temporary)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, cached)
     finally:
         staging.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
 
     return cached
 

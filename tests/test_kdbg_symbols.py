@@ -9,8 +9,12 @@ suite — no need to re-mock llvm-pdbutil here.
 
 from __future__ import annotations
 
+import base64
+import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 
@@ -246,6 +250,115 @@ def test_copy_via_share_rejects_path_traversal_in_cached_name(tmp_path):
             "../../../../etc/cron.d/evil",
         )
     assert not (tmp_path / "etc").exists()
+
+
+class _CopyCfg:
+    def __init__(self, root: Path) -> None:
+        self.symbols_dir = root / "symbols"
+        self.shared_dir = root / "share"
+
+
+class _ShareGA:
+    """Materialise the generated guest destination in the host share."""
+
+    def __init__(self, cfg: _CopyCfg, payload: bytes = b"PE") -> None:
+        self.cfg = cfg
+        self.payload = payload
+        self.scripts: list[str] = []
+
+    def exec_powershell(self, script: str, **_kwargs):
+        self.scripts.append(script)
+        encoded = re.findall(r"FromBase64String\('([^']+)'\)", script)
+        assert len(encoded) == 2
+        destination = base64.b64decode(encoded[1]).decode("utf-16-le")
+        (self.cfg.shared_dir / destination.rsplit("\\", 1)[-1]).write_bytes(
+            self.payload
+        )
+        return SimpleNamespace(exitcode=0, stdout="", stderr="")
+
+
+@pytest.mark.parametrize(
+    "cached_name",
+    ["", ".", "..", r"..\\evil.dll", "/tmp/evil.dll", "bad\0.dll"],
+)
+def test_copy_via_share_rejects_all_unsafe_cached_names(tmp_path, cached_name):
+    cfg = _CopyCfg(tmp_path)
+    with pytest.raises(SymbolLoadError, match="invalid module filename"):
+        symbols._copy_via_share(cfg, _ShareGA(cfg), r"C:\safe.dll", cached_name)
+
+
+@pytest.mark.parametrize("source", ["", "bad\0path"])
+def test_copy_via_share_rejects_invalid_source_path(tmp_path, source):
+    cfg = _CopyCfg(tmp_path)
+    with pytest.raises(SymbolLoadError, match="invalid source module path"):
+        symbols._copy_via_share(cfg, _ShareGA(cfg), source, "safe.dll")
+
+
+def test_copy_via_share_treats_hostile_source_as_data(tmp_path):
+    cfg = _CopyCfg(tmp_path)
+    ga = _ShareGA(cfg, b"trusted-result")
+    source = r"C:\Windows\x'; Remove-Item C:\important; #.dll"
+
+    copied = symbols._copy_via_share(cfg, ga, source, "sample.dll")
+
+    assert copied.read_bytes() == b"trusted-result"
+    assert source not in ga.scripts[0]
+    assert "Copy-Item -LiteralPath $src" in ga.scripts[0]
+    assert "-ErrorAction Stop" in ga.scripts[0]
+    assert not list(cfg.shared_dir.iterdir())
+    assert not list(cfg.symbols_dir.glob("*.part"))
+
+
+def test_copy_via_share_uses_unique_staging_for_concurrent_same_name(tmp_path):
+    cfg = _CopyCfg(tmp_path)
+    ga = _ShareGA(cfg, b"same-build")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda _: symbols._copy_via_share(
+                    cfg, ga, r"C:\Windows\System32\same.dll", "same.dll"
+                ),
+                range(2),
+            )
+        )
+
+    assert results == [cfg.symbols_dir / "same.dll"] * 2
+    assert results[0].read_bytes() == b"same-build"
+    destinations = []
+    for script in ga.scripts:
+        encoded = re.findall(r"FromBase64String\('([^']+)'\)", script)
+        destinations.append(base64.b64decode(encoded[1]).decode("utf-16-le"))
+    assert len(set(destinations)) == 2
+    assert not list(cfg.shared_dir.iterdir())
+    assert not list(cfg.symbols_dir.glob("*.part"))
+
+
+def test_copy_via_share_cleans_staging_and_partial_on_publish_failure(
+    tmp_path, monkeypatch
+):
+    cfg = _CopyCfg(tmp_path)
+    ga = _ShareGA(cfg)
+    monkeypatch.setattr(symbols.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("full")))
+
+    with pytest.raises(OSError, match="full"):
+        symbols._copy_via_share(cfg, ga, r"C:\safe.dll", "safe.dll")
+
+    assert not list(cfg.shared_dir.iterdir())
+    assert not list(cfg.symbols_dir.glob("*.part"))
+
+
+def test_copy_via_share_propagates_powershell_failure_without_artifacts(tmp_path):
+    cfg = _CopyCfg(tmp_path)
+
+    class FailingGA:
+        def exec_powershell(self, *_args, **_kwargs):
+            return SimpleNamespace(exitcode=1, stdout="", stderr="access denied")
+
+    with pytest.raises(SymbolLoadError, match="access denied"):
+        symbols._copy_via_share(cfg, FailingGA(), r"C:\safe.dll", "safe.dll")
+    assert not list(cfg.shared_dir.iterdir())
+    assert not list(cfg.symbols_dir.glob("*.part"))
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────

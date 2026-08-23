@@ -39,7 +39,7 @@ PS C:\Windows\system32>
 
 ## Platform capabilities
 
-- **MCP server** — 69 tools form a bounded, AI-native research control plane
+- **MCP server** — 70 tools form a bounded, AI-native research control plane
   for autonomous agents, covering VM lifecycle, execution, memory, symbols,
   debugging, drivers, IPC, defenses, networking, event logs, and evidence
   collection.
@@ -362,7 +362,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (69):**
+**Available tools (70):**
 
 User-mode primitives:
 
@@ -461,10 +461,11 @@ and requires a reboot.
 | `kdbg_regs()` | Dump GPRs + control regs from the firing vCPU |
 | `kdbg_stack(n?)` | Hex-dump the top `n` qwords of the current stack |
 | `kdbg_bt(depth?)` | Symbolicated backtrace (cross-module, with C++ demangling via `llvm-undname`) |
+| `kdbg_context(disasm_count?, stack_qwords?, bt_depth?, memory?)` | Return one stop-epoch-pinned triage bundle with registers, symbolized assembly, stack, heuristic backtrace, breakpoints, and bounded optional memory reads |
 | `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |
 | `kdbg_disasm(addr?, count?)` | Symbol-annotated Capstone disassembly at a target VA or the current RIP |
-| `kdbg_decomp(addr?, before?, after?, full?, binary?, timeout?, detail="compact", lines?, assembly="nearby")` | Resolve a live VA/current RIP through the fresh loader list, verify the exact PE, and return compact RVA-linked assembly/pseudocode; `lines="1-22", assembly="mapped"` batches source lines with their corresponding instructions |
+| `kdbg_decomp(addr?, symbol?, module?, rva?, cursor?, before?, after?, full?, binary?, timeout?, detail="compact", lines?, assembly="nearby")` | Resolve current RIP, runtime VA, symbol, or module+RVA, verify the exact PE, and return stop-pinned RVA-linked assembly/pseudocode with bounded pagination |
 | `kdbg_decomp_status()` | Report PyGhidra discovery, isolated worker/JVM state, and durable project-cache status without starting the JVM |
 | `kdbg_ghidra_install(pull?)` | Build the checksum-pinned JDK 21 + Ghidra + PyGhidra Docker image |
 | `kdbg_ghidra_run()` | Start and API-check the private, networkless persistent decompilation container |

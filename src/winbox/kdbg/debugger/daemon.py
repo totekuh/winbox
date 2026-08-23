@@ -42,6 +42,7 @@ import fcntl
 import json
 import os
 import select
+import secrets
 import signal
 import socket
 import struct
@@ -293,6 +294,9 @@ class DaemonSession:
         self._bp_by_va: dict[int, int] = {}
         self._next_bp_id = 0
         self.stop: StopState | None = None
+        self.session_id = secrets.token_hex(16)
+        self.stop_id = 0
+        self.run_state = "indeterminate"
         self.attach_time = time.monotonic()
 
         # Set when an op accesses gdb so other ops can detect "in flight".
@@ -459,7 +463,11 @@ class DaemonSession:
                 "name": self.target.name,
             },
             "bps": len(self.bps),
-            "halted": self.stop is not None,
+            "state": self.run_state,
+            "halted": self.run_state == "halted" and self.stop is not None,
+            "session_id": self.session_id,
+            "stop_id": self.stop_id if self.run_state == "halted" else None,
+            "last_stop_id": self.stop_id,
             "uptime_s": time.monotonic() - self.attach_time,
             "daemon_pid": os.getpid(),
         }
@@ -886,7 +894,12 @@ class DaemonSession:
                 result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
                 return result
 
-            self.rsp.cont()
+            self._begin_resume()
+            try:
+                self.rsp.cont()
+            except Exception:
+                self._mark_indeterminate()
+                raise
             try:
                 sr = self._wait_for_stop_serving(remaining)
             except RspError as e:
@@ -899,10 +912,11 @@ class DaemonSession:
                         sr = self.rsp.wait_for_stop(timeout=2.0)
                         self._capture_stop(sr)
                     except RspError:
-                        pass
+                        self._mark_indeterminate()
                     result = {"reason": "timeout", **self._stop_summary()}
                     result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
                     return result
+                self._mark_indeterminate()
                 raise RuntimeError(f"cont/wait failed: {e}") from e
 
             if self._interrupt_pending:
@@ -997,7 +1011,12 @@ class DaemonSession:
         if self.stop is None:
             raise RuntimeError("not halted; cont first")
         vcpu = self.stop.vcpu
-        self.rsp.step(vcpu)
+        self._begin_resume()
+        try:
+            self.rsp.step(vcpu)
+        except Exception:
+            self._mark_indeterminate()
+            raise
         try:
             sr = self.rsp.wait_for_stop(timeout=5.0)
         except RspError as e:
@@ -1017,9 +1036,7 @@ class DaemonSession:
                 recovered = True
             except RspError:
                 # Recovery interrupt+wait also failed → genuine hang.
-                # ``self.stop`` is whatever the pre-step state was; we
-                # don't claim it's current.
-                pass
+                self._mark_indeterminate()
             if recovered:
                 raise RuntimeError(
                     "step did not complete within 5s; stub recovered to halted state"
@@ -1047,7 +1064,12 @@ class DaemonSession:
 
         try:
             deadline = time.monotonic() + max(1.0, float(timeout))
-            self.rsp.cont()
+            self._begin_resume()
+            try:
+                self.rsp.cont()
+            except Exception:
+                self._mark_indeterminate()
+                raise
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1056,23 +1078,33 @@ class DaemonSession:
                         sr = self.rsp.wait_for_stop(timeout=2.0)
                         self._capture_stop(sr)
                     except RspError:
-                        pass
+                        self._mark_indeterminate()
+                    suffix = (
+                        "VM re-halted" if self.run_state == "halted"
+                        else "recovery halt failed; state is indeterminate"
+                    )
                     raise RuntimeError(
                         f"{reason} timed out ({timeout}s) waiting to reach "
-                        f"0x{target_rip:x}; VM re-halted"
+                        f"0x{target_rip:x}; {suffix}"
                     )
                 try:
                     sr = self.rsp.wait_for_stop(timeout=remaining)
                 except RspError as e:
                     if "timed out" in str(e).lower():
                         continue
+                    self._mark_indeterminate()
                     raise
                 regs = self.rsp.read_registers()
                 hit_rip = struct.unpack_from("<Q", regs, 128)[0]
                 if hit_rip == target_rip:
                     self._capture_stop(sr)
                     break
-                self.rsp.cont()
+                self._begin_resume()
+                try:
+                    self.rsp.cont()
+                except Exception:
+                    self._mark_indeterminate()
+                    raise
         finally:
             with suppress(RspError):
                 self.rsp.remove_breakpoint(target_rip, kind=1, hardware=True)
@@ -1156,10 +1188,37 @@ class DaemonSession:
 
     def op_regs(self) -> dict[str, Any]:
         if self.stop is None:
-            # Re-read live — useful between ops.
-            blob = self.rsp.read_registers()
-            return _decode_regs(blob)
+            raise RuntimeError(
+                f"registers unavailable while target state is {self.run_state}"
+            )
         return _decode_regs(self.stop.raw_regs)
+
+    def _require_stop_epoch(
+        self, session_id: str | None = None, stop_id: int | None = None
+    ) -> StopState:
+        # Test/custom embedders historically seed ``stop`` directly. Treat
+        # that as the initial halted state; resume paths always clear it.
+        if self.run_state == "indeterminate" and self.stop is not None:
+            self.run_state = "halted"
+        if (
+            self.run_state == "indeterminate"
+            and self.stop is None
+            and session_id is None
+            and stop_id is None
+        ):
+            # Backward-compatible unpinned memory access before the daemon's
+            # initial stop has been recorded. Epoch-pinned callers never use
+            # this path.
+            return None  # type: ignore[return-value]
+        if self.run_state != "halted" or self.stop is None:
+            raise RuntimeError(f"target is not halted (state={self.run_state})")
+        if session_id is not None and session_id != self.session_id:
+            raise RuntimeError("stale debugger session")
+        if stop_id is not None and int(stop_id) != self.stop_id:
+            raise RuntimeError(
+                f"stale debugger stop: expected {stop_id}, current {self.stop_id}"
+            )
+        return self.stop
 
     def _pick_vcpu(self) -> str:
         """Pick the vCPU to perform a CR3 masquerade against.
@@ -1196,11 +1255,18 @@ class DaemonSession:
         self.rsp.select_thread(vcpu)
         self._last_selected_vcpu = vcpu
 
-    def op_mem(self, va: int | str, length: int = 64) -> dict[str, Any]:
+    def op_mem(
+        self,
+        va: int | str,
+        length: int = 64,
+        session_id: str | None = None,
+        stop_id: int | None = None,
+    ) -> dict[str, Any]:
         """Read `length` bytes at `va` in target's CR3. Uses the same
         CR3-masquerade trick as bp install: temporarily writes target
         DTB into the firing vCPU's CR3 register, reads via gdb `m`,
         restores. Way faster than HMP page walks (~1ms vs ~40ms)."""
+        self._require_stop_epoch(session_id, stop_id)
         if isinstance(va, str):
             va = int(va, 0)
         length = max(0, min(int(length), 64 * 1024))
@@ -1305,24 +1371,145 @@ class DaemonSession:
                 break
         return {"rsp": f"0x{rsp_va:x}", "frames": frames}
 
-    def op_module_at(self, va: int | str) -> dict[str, Any]:
-        """Resolve a live VA against a fresh loader-list snapshot.
+    def op_context(
+        self,
+        disasm_count: int = 8,
+        stack_qwords: int = 16,
+        bt_depth: int = 8,
+        memory: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Return bounded, epoch-consistent evidence for the current stop."""
+        stop = self._require_stop_epoch()
 
-        This operation exists for the static/dynamic decompilation bridge.
-        It deliberately walks the live PEB/kernel list instead of trusting
-        symbol-store bases: ASLR, unload/reload, and same-named modules make a
-        stale cached base unsafe. The walk borrows this daemon's already
-        halted RSP connection and restores the complete selected-vCPU register
-        blob before returning.
-        """
-        if isinstance(va, str):
+        def bounded(name: str, value: Any, maximum: int) -> int:
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer")
             try:
-                va = int(va, 0)
-            except ValueError as exc:
-                raise ValueError(f"invalid virtual address: {va!r}") from exc
-        if va < 0 or va >= (1 << 64):
-            raise ValueError(f"virtual address outside uint64 range: {va}")
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be an integer") from exc
+            if not 0 <= parsed <= maximum:
+                raise ValueError(f"{name} must be between 0 and {maximum}")
+            return parsed
 
+        disasm_count = bounded("disasm_count", disasm_count, 32)
+        stack_qwords = bounded("stack_qwords", stack_qwords, 32)
+        bt_depth = bounded("bt_depth", bt_depth, 16)
+        epoch = {"session_id": self.session_id, "stop_id": self.stop_id}
+        response: dict[str, Any] = {
+            "schema": "winbox.kdbg-context/1",
+            "state": "halted",
+            "stop_epoch": epoch,
+            "target": {
+                "pid": self.target.pid,
+                "name": self.target.name,
+                "dtb": f"0x{self.target.dtb:x}",
+            },
+            "stop": self._stop_summary(),
+            "location": {
+                "va": f"0x{stop.rip:x}",
+                "symbol": self._best_symbol_for_va(stop.rip),
+            },
+            "registers": _decode_regs(stop.raw_regs),
+        }
+
+        assembly: list[dict[str, Any]] = []
+        if disasm_count:
+            try:
+                import capstone
+                raw = bytes.fromhex(self.op_mem(
+                    stop.rip, min(15 * disasm_count, 480), **epoch
+                )["bytes"])
+                md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+                md.detail = True
+                for instruction in md.disasm(raw, stop.rip):
+                    item = {
+                        "va": f"0x{instruction.address:x}",
+                        "bytes": instruction.bytes.hex(),
+                        "mnemonic": instruction.mnemonic,
+                        "op_str": instruction.op_str,
+                    }
+                    if any(group in (
+                        capstone.CS_GRP_CALL, capstone.CS_GRP_JUMP
+                    ) for group in instruction.groups):
+                        for operand in instruction.operands:
+                            if operand.type == capstone.x86.X86_OP_IMM:
+                                item["target_va"] = f"0x{operand.imm:x}"
+                                symbol = self._best_symbol_for_va(operand.imm)
+                                if symbol:
+                                    item["target_symbol"] = symbol
+                                break
+                    assembly.append(item)
+                    if len(assembly) >= disasm_count:
+                        break
+            except Exception as exc:  # evidence remains useful if one read fails
+                response["assembly_error"] = str(exc)
+        response["assembly"] = assembly
+
+        rsp_va = struct.unpack_from("<Q", stop.raw_regs, 7 * 8)[0]
+        scan_qwords = max(stack_qwords, min(bt_depth * 8, 128))
+        stack_raw = b""
+        if scan_qwords:
+            try:
+                stack_raw = bytes.fromhex(self.op_mem(
+                    rsp_va, scan_qwords * 8, **epoch
+                )["bytes"])
+            except Exception as exc:
+                response["stack_error"] = str(exc)
+        response["stack"] = {
+            "rsp": f"0x{rsp_va:x}",
+            "qwords": [
+                {
+                    "offset": f"rsp+0x{offset:02x}",
+                    "va": f"0x{rsp_va + offset:x}",
+                    "value": f"0x{int.from_bytes(stack_raw[offset:offset + 8], 'little'):016x}",
+                }
+                for offset in range(0, min(len(stack_raw), stack_qwords * 8), 8)
+            ],
+        }
+        frames = []
+        if bt_depth:
+            for offset in range(0, len(stack_raw), 8):
+                value = int.from_bytes(stack_raw[offset:offset + 8], "little")
+                if not _looks_like_code_va(value):
+                    continue
+                frames.append({
+                    "addr": f"0x{value:x}",
+                    "sym": self._best_symbol_for_va(value),
+                    "stack_off": f"+0x{offset:x}",
+                })
+                if len(frames) >= bt_depth:
+                    break
+        response["backtrace"] = {"rsp": f"0x{rsp_va:x}", "frames": frames}
+
+        bps = self.op_bp_list()["bps"]
+        response["breakpoints"] = {
+            "total": len(bps), "truncated": len(bps) > 32, "items": bps[:32]
+        }
+
+        requests = memory or []
+        if not isinstance(requests, list) or len(requests) > 4:
+            raise ValueError("memory must contain at most 4 read objects")
+        reads = []
+        total = 0
+        for request in requests:
+            if not isinstance(request, dict) or set(request) - {"va", "length"}:
+                raise ValueError("each memory read must contain only va and length")
+            if request.get("va") in (None, ""):
+                raise ValueError("each memory read requires va")
+            length = bounded("memory length", request.get("length", 64), 256)
+            total += length
+            if total > 1024:
+                raise ValueError("combined memory reads may not exceed 1024 bytes")
+            reads.append(self.op_mem(
+                request.get("va"), length, **epoch
+            ))
+        if reads:
+            response["memory"] = reads
+        return response
+
+    def _live_modules(self, kind: str):
+        """Return one fresh loader inventory while preserving RSP state."""
         from types import SimpleNamespace
         from winbox.kdbg.debugger.reader import use_local_rsp
         from winbox.kdbg.memory import WalkCache
@@ -1341,30 +1528,62 @@ class DaemonSession:
         try:
             with use_local_rsp(self.cfg.vm_name, self.rsp, stop):
                 cache = WalkCache()
-                if (va >> 47) == 0x1FFFF:
+                if kind == "kernel":
                     modules = list_modules(
                         self.cfg.vm_name, self.store, cache=cache,
                     )
-                    kind = "kernel"
                 else:
                     modules = list_user_modules(
                         self.cfg.vm_name, self.store, target, cache=cache,
                     )
-                    kind = "user"
                 walk_completed = True
+                return modules
         except Exception as exc:
-            # A rejected full-register restore has the same safety impact as
-            # the normal CR3 masquerade failure: never resume this session.
-            # ``walk_completed`` means the body succeeded and the exception
-            # came from use_local_rsp's restore-only __exit__ path, regardless
-            # of whether RSP surfaced ReaderError, RspError, or OSError.
             if walk_completed:
                 self._cr3_corrupted = True
             raise RuntimeError(f"live module walk failed: {exc}") from exc
         finally:
-            # use_local_rsp selects every vCPU directly; invalidate the Hg
-            # cache even on failure so a later debugger op always reselects.
             self._last_selected_vcpu = None
+
+    @staticmethod
+    def _module_payload(module, *, kind: str, va: int) -> dict[str, Any]:
+        return {
+            "name": module.name,
+            "base": f"0x{module.base:x}",
+            "size": module.size,
+            "rva": f"0x{va - module.base:x}",
+            "kind": kind,
+            "full_path": getattr(module, "full_path", ""),
+            "loader_entry": f"0x{module.entry:x}",
+            "inventory": "fresh",
+        }
+
+    def op_module_at(
+        self,
+        va: int | str,
+        session_id: str | None = None,
+        stop_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Resolve a live VA against a fresh loader-list snapshot.
+
+        This operation exists for the static/dynamic decompilation bridge.
+        It deliberately walks the live PEB/kernel list instead of trusting
+        symbol-store bases: ASLR, unload/reload, and same-named modules make a
+        stale cached base unsafe. The walk borrows this daemon's already
+        halted RSP connection and restores the complete selected-vCPU register
+        blob before returning.
+        """
+        self._require_stop_epoch(session_id, stop_id)
+        if isinstance(va, str):
+            try:
+                va = int(va, 0)
+            except ValueError as exc:
+                raise ValueError(f"invalid virtual address: {va!r}") from exc
+        if va < 0 or va >= (1 << 64):
+            raise ValueError(f"virtual address outside uint64 range: {va}")
+
+        kind = "kernel" if (va >> 47) == 0x1FFFF else "user"
+        modules = self._live_modules(kind)
 
         matches = [m for m in modules if m.base <= va < m.base + m.size]
         if not matches:
@@ -1375,15 +1594,92 @@ class DaemonSession:
         # Loader mappings should not overlap. Smallest is deterministic and
         # least permissive if corrupt guest metadata says that they do.
         module = min(matches, key=lambda item: item.size)
+        return self._module_payload(module, kind=kind, va=va)
+
+    def op_decomp_snapshot(
+        self,
+        va: int | str | None = None,
+        module: str = "",
+        rva: int | str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically bind an address and live module to one stop epoch."""
+        stop = self._require_stop_epoch()
+        if bool(module) != (rva is not None and rva != ""):
+            raise ValueError("module and rva must be supplied together")
+        if module and va not in (None, ""):
+            raise ValueError("va and module+rva are mutually exclusive")
+        module_payload = None
+        if module:
+            module = module.strip()
+            if not module:
+                raise ValueError("module must not be blank")
+            try:
+                rva_value = int(rva, 0) if isinstance(rva, str) else int(rva)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid RVA: {rva!r}") from exc
+            if rva_value < 0 or rva_value >= (1 << 32):
+                raise ValueError(f"RVA outside supported PE range: {rva_value}")
+            wanted = module.lower()
+            wanted_stem = wanted.rsplit(".", 1)[0]
+            selected_pair = None
+            kernel_name = (
+                wanted == "nt" or wanted.startswith("ntoskrnl")
+                or wanted.startswith("ntkrnl")
+            )
+            for kind in (("kernel", "user") if kernel_name else ("user", "kernel")):
+                matches = []
+                for candidate in self._live_modules(kind):
+                    name = str(candidate.name).lower()
+                    stem = name.rsplit(".", 1)[0]
+                    if name == wanted or stem == wanted_stem:
+                        matches.append(candidate)
+                exact = [item for item in matches if str(item.name).lower() == wanted]
+                if len(exact) == 1:
+                    selected_pair = (kind, exact[0])
+                    break
+                if len(matches) == 1:
+                    selected_pair = (kind, matches[0])
+                    break
+                if len(matches) > 1:
+                    names = ", ".join(sorted(str(item.name) for item in matches))
+                    raise RuntimeError(f"ambiguous live module {module!r}: {names}")
+            if selected_pair is None:
+                raise RuntimeError(f"live module not found: {module!r}")
+            kind, selected_module = selected_pair
+            if rva_value >= selected_module.size:
+                raise ValueError(
+                    f"RVA 0x{rva_value:x} outside {selected_module.name} "
+                    f"(size 0x{selected_module.size:x})"
+                )
+            runtime_va = selected_module.base + rva_value
+            module_payload = self._module_payload(
+                selected_module, kind=kind, va=runtime_va
+            )
+        else:
+            runtime_va = stop.rip if va in (None, "") else va
+        if isinstance(runtime_va, str):
+            try:
+                runtime_va = int(runtime_va, 0)
+            except ValueError as exc:
+                raise ValueError(f"invalid virtual address: {runtime_va!r}") from exc
+        if runtime_va < 0 or runtime_va >= (1 << 64):
+            raise ValueError(f"virtual address outside uint64 range: {runtime_va}")
+        if module_payload is None:
+            module_payload = self.op_module_at(
+                runtime_va, session_id=self.session_id, stop_id=self.stop_id
+            )
         return {
-            "name": module.name,
-            "base": f"0x{module.base:x}",
-            "size": module.size,
-            "rva": f"0x{va - module.base:x}",
-            "kind": kind,
-            "full_path": getattr(module, "full_path", ""),
-            "loader_entry": f"0x{module.entry:x}",
-            "inventory": "fresh",
+            "session_id": self.session_id,
+            "stop_id": self.stop_id,
+            "state": self.run_state,
+            "runtime_va": f"0x{runtime_va:x}",
+            "rip": f"0x{stop.rip:x}",
+            "target": {
+                "pid": self.target.pid,
+                "dtb": f"0x{self.target.dtb:x}",
+                "name": self.target.name,
+            },
+            "module": module_payload,
         }
 
     def op_detach(self) -> dict[str, Any]:
@@ -1433,6 +1729,17 @@ class DaemonSession:
             signal=sr.signal,
             raw_regs=regs,
         )
+        self.stop_id += 1
+        self.run_state = "halted"
+
+    def _begin_resume(self) -> None:
+        """Invalidate stop-derived evidence before a resume packet is sent."""
+        self.stop = None
+        self.run_state = "running"
+
+    def _mark_indeterminate(self) -> None:
+        self.stop = None
+        self.run_state = "indeterminate"
 
     def _mem_qword_reader(
         self,
@@ -1600,6 +1907,7 @@ class DaemonSession:
             return {}
         bp_hit = next((b for b in self.bps.values() if b.va == self.stop.rip), None)
         return {
+            "state": "halted",
             "vcpu": self.stop.vcpu,
             "rip": f"0x{self.stop.rip:x}",
             "cr3": f"0x{self.stop.cr3:x}",
@@ -1611,6 +1919,8 @@ class DaemonSession:
             "primary_cr3": self.stop.cr3 == self.target.dtb,
             "bp_id": bp_hit.bp_id if bp_hit else None,
             "bp_target": bp_hit.target if bp_hit else None,
+            "session_id": self.session_id,
+            "stop_id": self.stop_id,
         }
 
     def _bump_bp_hits(self, va: int, *, in_target: bool) -> None:

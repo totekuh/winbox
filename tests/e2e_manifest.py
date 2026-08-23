@@ -148,6 +148,10 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg start": (LIVE, ""),
     "kdbg stop": (LIVE, ""),
     "kdbg status": (LIVE, ""),
+    "kdbg context": (
+        EXCLUDED,
+        "same daemon operation is exercised live through kdbg_context; CLI JSON is unit-tested",
+    ),
     "kdbg symbols": (LIVE, "downloads and parses the nt PDB"),
     "kdbg sym": (LIVE, ""),
     "kdbg struct": (LIVE, ""),
@@ -248,6 +252,7 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg_mem": (LIVE, ""),
     "kdbg_stack": (LIVE, ""),
     "kdbg_bt": (LIVE, ""),
+    "kdbg_context": (LIVE, "one-call epoch-pinned stop triage"),
     "kdbg_bps": (LIVE, ""),
     "kdbg_bp": (LIVE, ""),
     "kdbg_bp_trace": (
@@ -300,6 +305,7 @@ CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "kdbg cont": "tests/test_kdbg_daemon.py",
     "kdbg step": "tests/test_kdbg_daemon.py",
     "kdbg interrupt": "tests/test_kdbg_daemon.py",
+    "kdbg context": "tests/test_kdbg_daemon.py",
     "kdbg ghidra install": "tests/test_kdbg_decomp_docker.py",
 }
 

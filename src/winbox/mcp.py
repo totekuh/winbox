@@ -3744,6 +3744,10 @@ def kdbg_disasm(addr: str = "", count: int = 8) -> str:
 @mcp.tool()
 def kdbg_decomp(
     addr: str = "",
+    symbol: str = "",
+    module: str = "",
+    rva: str = "",
+    cursor: str = "",
     before: int = 3,
     after: int = 5,
     full: bool = False,
@@ -3771,6 +3775,11 @@ def kdbg_decomp(
 
     Args:
         addr: Runtime VA as hex/decimal. Empty (default) means current RIP.
+        symbol: Loaded symbol such as ``services!RQueryServiceStatus``.
+        module: Live module name; use together with ``rva``.
+        rva: Module-relative address as hex/decimal; requires ``module``.
+        cursor: Opaque ``next_cursor`` from a previous page. It is pinned to
+            the same debugger stop and analysis and excludes other locations.
         before: Source context lines before the mapped line (0..20).
         after: Source context lines after the mapped line (0..20).
         full: Include the whole containing function (bounded to 256 KiB).
@@ -3789,6 +3798,10 @@ def kdbg_decomp(
         result = query_decomp(
             cfg,
             addr=addr,
+            symbol=symbol,
+            module=module,
+            rva=rva,
+            cursor=cursor,
             before=before,
             after=after,
             full=full,
@@ -3991,6 +4004,40 @@ def kdbg_write_mem(va: str, data: str) -> str:
             _kdbg_client(cfg).call("write_mem", va=va, data=data),
             indent=2,
         )
+    except _ClientError as e:
+        return f"error: {e}"
+
+
+@mcp.tool()
+def kdbg_context(
+    disasm_count: int = 8,
+    stack_qwords: int = 16,
+    bt_depth: int = 8,
+    memory: list[dict[str, object]] | None = None,
+) -> str:
+    """Return one bounded triage bundle for the current halted stop.
+
+    The response pins registers, symbolized nearby assembly, stack qwords,
+    candidate backtrace frames, active breakpoints, and up to four optional
+    memory reads to one debugger ``stop_id``. This is the preferred first
+    call after a breakpoint because it avoids mixing evidence across stops.
+
+    Args:
+        disasm_count: Instructions at RIP (0..32).
+        stack_qwords: Stack qwords to return (0..32).
+        bt_depth: Candidate return addresses to return (0..16).
+        memory: Optional list of up to four ``{va, length}`` reads; each is
+            capped at 256 bytes and their combined size at 1024 bytes.
+    """
+    cfg = _kdbg_cfg_only()
+    try:
+        return _json.dumps(_kdbg_client(cfg).call(
+            "context",
+            disasm_count=disasm_count,
+            stack_qwords=stack_qwords,
+            bt_depth=bt_depth,
+            memory=memory or [],
+        ), indent=2)
     except _ClientError as e:
         return f"error: {e}"
 
