@@ -6,7 +6,7 @@ winbox turns a headless Windows VM (Server Core 2022/2025 or Windows 11) into
 an automation, instrumentation, and analysis environment controlled from
 Kali. Execute tools, drive a PDB-aware hypervisor debugger, inspect protected
 memory, exercise drivers and IPC, change security posture, contain malware,
-and collect evidence through one CLI and a 69-tool MCP surface.
+and collect evidence through one CLI and a 75-tool MCP surface.
 
 Transparent execution is still the shortest path in: type
 `winbox exec SharpHound.exe -c All -d corp.local` and winbox boots the VM,
