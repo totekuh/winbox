@@ -195,7 +195,10 @@ def prepare_user_module_manifest(
 
     try:
         ensure_types_loaded(
-            cfg, store, ["_PEB", "_PEB_LDR_DATA", "_EWOW64PROCESS"], module="nt",
+            cfg, store, [
+                "_PEB", "_PEB_LDR_DATA", "_EWOW64PROCESS", "_KPCR",
+                "_KPRCB", "_KTHREAD", "_KTRAP_FRAME",
+            ], module="nt",
         )
         with debug_snapshot(cfg):
             cache = WalkCache()

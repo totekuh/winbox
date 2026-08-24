@@ -46,6 +46,10 @@ NT_DEFAULT_TYPES: tuple[str, ...] = (
     "_KPROCESS",
     "_ETHREAD",
     "_KTHREAD",
+    # Reverse WoW64 stitching at an arbitrary x86 stop resolves the firing
+    # CPU's current thread and its persisted full-width user trap context.
+    "_KPRCB",
+    "_KTRAP_FRAME",
     # RSP does not expose IDTR directly. KPCR is reachable from GS/KERNEL_GS
     # and its IdtBase field gives the same safe kernel-base anchor without HMP.
     "_KPCR",

@@ -4355,9 +4355,11 @@ def kdbg_bt(depth: int = 8) -> dict[str, Any]:
     Speculative stack hits are kept in a separate ``candidates`` array and are
     never promoted to frames unless a PDB recipe explicitly requires a return
     search. At a native active WoW64 bridge, exact-build instruction-derived
-    CPU-area offsets recover the saved x86 context and return one
-    ``windows-wow64-mixed`` trace. Malformed or missing metadata returns a
-    truthful partial trace.
+    CPU-area offsets recover the saved x86 context. At an arbitrary x86 stop,
+    exact nt PDB layouts validate the current KTHREAD's persisted x64 user trap
+    and native TEB stack bounds. Both directions return one explicitly bounded
+    ``windows-wow64-mixed`` trace; malformed or missing metadata preserves the
+    truthful single-architecture trace with ``transition_error``.
 
     Args:
         depth: Max frames to return (1..64).

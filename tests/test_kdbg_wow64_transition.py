@@ -117,3 +117,129 @@ def test_context_rejects_untrusted_code_or_stack(eip, esp):
             lambda va, _n: values[va].to_bytes(4, "little"),
             lambda va: va >= 0x70000000,
         )
+
+
+def native_structs():
+    def record(size, **fields):
+        return {
+            "size": size,
+            "fields": {
+                name: {"off": offset, "type": ""}
+                for name, offset in fields.items()
+            },
+        }
+
+    return {
+        "_KPCR": record(0x100, Self=0x18, CurrentPrcb=0x20),
+        "_KPRCB": record(0x200, CurrentThread=0x08),
+        "_KTHREAD": record(
+            0x500, StackLimit=0x30, StackBase=0x38, TrapFrame=0x90,
+            Teb=0xF0, Process=0x220,
+        ),
+        "_KTRAP_FRAME": record(
+            0x190, Rax=0x30, Rcx=0x38, Rdx=0x40, R8=0x48, R9=0x50,
+            R10=0x58, R11=0x60, Rbx=0x140, Rdi=0x148, Rsi=0x150,
+            Rbp=0x158, Rip=0x168, SegCs=0x170, Rsp=0x180,
+        ),
+    }
+
+
+def native_fixture():
+    layout = transition.derive_native_trap_layout(
+        lambda name: native_structs()[name],
+    )
+    kpcr = 0xFFFF800000100000
+    prcb = 0xFFFF800000200000
+    thread = 0xFFFF800000300000
+    trap = 0xFFFF800000401000
+    teb = 0x700000
+    process = 0xFFFF800000500000
+    memory = {}
+
+    def put(address, value, width=8):
+        raw = int(value).to_bytes(width, "little")
+        memory.update({address + index: byte for index, byte in enumerate(raw)})
+
+    put(kpcr + 0x18, kpcr)
+    put(kpcr + 0x20, prcb)
+    put(prcb + 0x08, thread)
+    put(thread + 0x30, trap - 0x1000)
+    put(thread + 0x38, trap + 0x1000)
+    put(thread + 0x90, trap)
+    put(thread + 0xF0, teb)
+    put(thread + 0x220, process)
+    put(teb + 0x08, 0x720000)
+    put(teb + 0x10, 0x710000)
+    put(teb + 0x30, teb)
+    for index, (_name, offset) in enumerate(layout.trap_registers, 1):
+        put(trap + offset, index)
+    put(trap + 0x168, 0x180001000)
+    put(trap + 0x170, 0x33, 2)
+    put(trap + 0x180, 0x718008)
+    raw = bytearray(608)
+    raw[180:188] = kpcr.to_bytes(8, "little")
+
+    def read(address, length):
+        return bytes(memory[address + index] for index in range(length))
+
+    return layout, raw, memory, put, read, process, trap
+
+
+def test_native_layout_and_current_kthread_trap_recovery():
+    layout, raw, _memory, _put, read, process, trap = native_fixture()
+
+    context = transition.recover_native_trap_context(
+        layout, bytes(raw), read, expected_process=process,
+        is_x64_code=lambda va: 0x180000000 <= va < 0x180010000,
+        is_bridge_code=lambda va: va == 0x180001000,
+    )
+
+    assert context.source == "current-kthread-trap-frame"
+    assert context.trap_frame == trap
+    assert context.rip == 0x180001000
+    assert context.rsp == 0x718008
+    assert context.registers["rax"] == 1
+    assert context.registers["r15"] == 0
+
+
+@pytest.mark.parametrize(
+    "corrupt,message",
+    [
+        ("process", "another process"),
+        ("teb", "TEB self"),
+        ("cs", "not x64"),
+        ("rsp", "outside native"),
+        ("bridge", "not in exact"),
+    ],
+)
+def test_native_trap_recovery_fails_closed(corrupt, message):
+    layout, raw, _memory, put, read, process, trap = native_fixture()
+    bridge = lambda va: va == 0x180001000
+    if corrupt == "process":
+        put(0xFFFF800000300000 + 0x220, process + 0x1000)
+    elif corrupt == "teb":
+        put(0x700000 + 0x30, 0)
+    elif corrupt == "cs":
+        put(trap + 0x170, 0x23, 2)
+    elif corrupt == "rsp":
+        put(trap + 0x180, 0x700000)
+    else:
+        bridge = lambda _va: False
+
+    with pytest.raises(transition.Wow64TransitionError, match=message):
+        transition.recover_native_trap_context(
+            layout, bytes(raw), read, expected_process=process,
+            is_x64_code=lambda _va: True, is_bridge_code=bridge,
+        )
+
+
+def test_native_layout_rejects_missing_or_out_of_bounds_pdb_fields():
+    records = native_structs()
+    del records["_KTHREAD"]["fields"]["TrapFrame"]
+    with pytest.raises(transition.Wow64TransitionError, match="TrapFrame"):
+        transition.derive_native_trap_layout(lambda name: records[name])
+
+    records = native_structs()
+    records["_KPCR"]["fields"]["Self"]["off"] = 0x100
+    with pytest.raises(transition.Wow64TransitionError, match="invalid"):
+        transition.derive_native_trap_layout(lambda name: records[name])

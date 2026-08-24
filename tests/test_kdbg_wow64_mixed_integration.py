@@ -52,7 +52,9 @@ def test_live_attach_manifest_and_mixed_wow64_transition_trace():
         fork_daemon(
             cfg, target.pid, gdbstub_port=1234, module_manifest=manifest,
         )
-        client.call("bp_add", target="wow64cpu!CpupSyscallStub", mode="hw")
+        bridge_bp = client.call(
+            "bp_add", target="wow64cpu!CpupSyscallStub", mode="hw",
+        )
         hit = client.call("cont", timeout=15, sock_timeout=25)
         assert hit["reason"] == "bp"
         first = client.call("bt", depth=24)
@@ -64,6 +66,37 @@ def test_live_attach_manifest_and_mixed_wow64_transition_trace():
         assert any(frame["architecture"] == "x86" for frame in first["frames"])
         assert [frame["addr"] for frame in first["frames"]] == [
             frame["addr"] for frame in second["frames"]
+        ]
+
+        client.call("bp_remove", id=bridge_bp["id"])
+        client.call(
+            "bp_add", target="ntdll_x86!_NtDelayExecution@8", mode="hw",
+        )
+        x86_hit = client.call("cont", timeout=15, sock_timeout=25)
+        assert x86_hit["reason"] == "bp"
+        reverse_first = client.call("bt", depth=24)
+        reverse_second = client.call("bt", depth=24)
+        assert "transition_error" not in reverse_first, reverse_first.get(
+            "transition_error"
+        )
+        assert reverse_first["method"] == "windows-wow64-mixed"
+        assert reverse_first["architecture"] == "mixed-x86-x64"
+        assert reverse_first["transition"]["direction"] == "x86-to-x64"
+        assert reverse_first["transition"]["context_source"] == (
+            "current-kthread-trap-frame"
+        )
+        assert any(
+            frame["architecture"] == "x86" for frame in reverse_first["frames"]
+        )
+        assert any(
+            frame["architecture"] == "x64" for frame in reverse_first["frames"]
+        )
+        boundary = next(
+            frame for frame in reverse_first["frames"] if frame.get("boundary")
+        )
+        assert boundary["boundary"] == "wow64-x86-to-x64"
+        assert [frame["addr"] for frame in reverse_first["frames"]] == [
+            frame["addr"] for frame in reverse_second["frames"]
         ]
     finally:
         if client.session_alive():

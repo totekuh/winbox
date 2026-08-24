@@ -124,6 +124,10 @@ At a native stop inside an active WoW64 transition, the same response can carry
 a `windows-wow64-mixed` backtrace. Its `transition` object identifies the exact
 `wow64cpu` build, instruction-derived layout, saved-context source and x86
 EIP/ESP; the first x86 frame has `boundary=wow64-x64-to-x86`.
+At an arbitrary x86 stop, exact nt PDB layouts instead validate the current
+KTHREAD's persisted x64 trap frame and native TEB stack bounds. The first
+suspended native caller is marked `boundary=wow64-x86-to-x64`; the historical
+syscall-stub frame used only to recover that caller is not presented as live.
 
 For rare breakpoints, prefer `kdbg_cont_start(timeout)`. It launches a tiny
 detached host client, atomically persists a token and daemon session identity,

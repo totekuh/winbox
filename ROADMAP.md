@@ -18,7 +18,7 @@ at its source (below) but stays listed as *Watching* because it is intermittent
 by nature.
 
 The major kdbg execution, symbol, decompilation, exact-artifact staging, x64
-unwind, ordinary WoW64 x86 unwind, and native-to-x86 transition stitching paths
+unwind, ordinary WoW64 x86 unwind, and bidirectional transition stitching paths
 are implemented and live-verified. No major capability item is currently open.
 Item 26 is an accepted minor trade-off rather than scheduled work, and item 8
 remains a watch condition rather than an active implementation item.
@@ -28,7 +28,7 @@ remains a watch condition rather than an active implementation item.
 | Rank | Item | Ease | ROI | Status |
 |---:|---|---:|---:|---|
 | 1 | **69 — automatic exact-binary staging** | 4 | 5 | Completed and live-verified with all 17 PING loader entries. |
-| 2 | **70 — mixed-mode WoW64 transition-stack stitching** | 1 | 3 | Completed for exact-build validated native x64→saved x86 transitions. |
+| 2 | **70 — mixed-mode WoW64 transition-stack stitching** | 1 | 3 | Completed for exact-build validated x64↔x86 transitions. |
 
 Final verification for items 69-70: complete default suite `2534
 passed, 5 skipped, 141 deselected`; all 11 direct QEMU RSP integrations; all
@@ -534,7 +534,7 @@ path took 36 seconds while fetching previously absent PDBs; the fully warm,
 revalidated path took 11 seconds. Newly discovered NSI/IPHLPAPI artifacts then
 contributed real frames without any manual `kdbg_user_symbols_load` call.
 
-### 70. Completed — exact-build native-to-x86 WoW64 transition stitching
+### 70. Completed — exact-build bidirectional WoW64 transition stitching
 
 The bridge does not trust a fixed Windows-build offset table. It requires the
 exact manifest/PDB pair for `wow64cpu.dll`, locates `RunSimulatedCode` and
@@ -556,12 +556,29 @@ and saved ESP `0x74eec8`. Repeated traces were identical; bounded depth omitted
 the bridge truthfully; ordinary x86 `NtDelayExecution` unwinding remained
 unchanged afterward.
 
-The supported stitch direction is a native x64 transition stop into its saved
-x86 callers. At an arbitrary compatibility-mode stop, QEMU's RSP `G` packet
-and HMP monitor both expose only the 32-bit register file, not the suspended
-native R14/RSP anchor. TEB64 reveals native stack bounds but not the exact
-suspended stack pointer; scanning that range would be speculative, so such
-stops deliberately remain the truthful ordinary x86 trace from item 68.
+The reverse direction no longer depends on QEMU exposing hidden compatibility-
+mode registers. At an arbitrary x86 stop, exact nt PDB layouts resolve the
+firing CPU's KPCR, current KTHREAD, and persisted x64 user trap frame. Recovery
+requires KPCR self identity, target EPROCESS identity, kernel-stack containment,
+native TEB self identity and stack bounds, x64 CS, an exact-manifest
+`wow64cpu` RIP, and an initial unwind into suspended `wow64cpu` code. The
+already-returned syscall-stub frame is discarded before appending the live
+native callers at `boundary=wow64-x86-to-x64`; no stack scan is used.
+
+After hard-reset recovery from the unsafe first prototype, the corrected
+read-only implementation passed the real-daemon integration against
+SysWOW64 `PING.EXE`: the original x64→x86 trace remained repeatable, an
+arbitrary x86 `NtDelayExecution` stop produced a repeatable x86→x64 mixed
+trace, detach resumed the VM, qemu-ga remained responsive, and the gdbstub was
+listening. After installing the workspace build and reloading MCP, the public
+endpoints reproduced a complete 17-frame trace (nine x86 plus eight x64) with
+the boundary at `wow64cpu!ReadWriteFileFault+0x31`, exact build provenance,
+and `context_source=current-kthread-trap-frame`. A second depth-24 call was
+identical, depth ten returned exactly nine x86 frames plus the first x64
+boundary with a truthful depth-limit result, and `kdbg_context` returned the
+same mixed trace from the pinned stop. Final detach resumed the VM; Windows
+10.0.26100.1742 answered through qemu-ga and the gdbstub was listening. The
+complete default suite passes (`2544 passed, 5 skipped, 141 deselected`).
 
 ---
 

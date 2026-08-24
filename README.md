@@ -465,9 +465,14 @@ PDB public symbols. A validated saved x86 context is stitched after the x64
 transition frames, producing one explicitly marked `windows-wow64-mixed`
 trace. An unrecognized build or invalid context remains a truthful native
 partial trace with `transition_error` rather than guessed frames.
-At an arbitrary x86 stop, QEMU does not expose the suspended native stack
-anchor, so kdbg returns the ordinary x86 trace instead of scanning the native
-TEB stack range for a guessed boundary.
+At an arbitrary x86 stop, QEMU does not expose the suspended native registers
+directly. kdbg now recovers them without scanning: exact nt PDB layouts resolve
+the firing CPU's self-validated KPCR, current KTHREAD, and persisted x64 user
+trap frame; process identity, kernel-stack containment, native TEB identity and
+stack bounds, x64 CS, exact `wow64cpu` image, and the first unwind step must all
+agree. The already-returned syscall-stub frame is discarded, and the suspended
+native callers are appended at `boundary=wow64-x86-to-x64`. Any failed
+invariant preserves the ordinary x86 trace with `transition_error`.
 
 | Tool | Description |
 |------|-------------|
@@ -487,7 +492,7 @@ TEB stack range for a guessed boundary.
 | `kdbg_resume(port?)` | Recovery valve for a VM left paused after a debugger/client failure |
 | `kdbg_regs()` | Dump GPRs + control regs from the firing vCPU |
 | `kdbg_stack(n?)` | Hex-dump the top `n` native stack words (x64 qwords or WoW64 x86 dwords) |
-| `kdbg_bt(depth?)` | Windows x64 `.pdata`, WoW64 x86 hybrid, or exact-build validated mixed x64→x86 transition backtrace, with explicit provenance and speculative candidates kept separate |
+| `kdbg_bt(depth?)` | Windows x64 `.pdata`, WoW64 x86 hybrid, or exact-build validated bidirectional mixed x64↔x86 transition backtrace, with explicit provenance and speculative candidates kept separate |
 | `kdbg_context(disasm_count?, stack_qwords?, bt_depth?, memory?)` | Return one stop-epoch-pinned triage bundle with registers, symbolized assembly, stack, metadata-driven backtrace, breakpoints, and bounded optional memory reads |
 | `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |

@@ -1462,7 +1462,7 @@ def kdbg_context(
 @click.option("-n", "--depth", type=int, default=8, show_default=True)
 @click.pass_context
 def kdbg_bt(ctx: click.Context, depth: int) -> None:
-    """Unwind the live Windows x64 or WoW64 x86 stack."""
+    """Unwind Windows x64, WoW64 x86, or a validated mixed stack."""
     cfg: Config = ctx.obj["cfg"]
     try:
         result = _client(cfg).call("bt", depth=depth)

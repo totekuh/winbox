@@ -1466,20 +1466,31 @@ class DaemonSession:
         depth = max(1, min(int(depth), 64))
         return self._unwind_backtrace(depth)
 
-    def _unwind_backtrace(self, depth: int) -> dict[str, Any]:
+    def _unwind_backtrace(
+        self,
+        depth: int,
+        *,
+        x64_context: Any | None = None,
+        allow_transition: bool = True,
+    ) -> dict[str, Any]:
         """Epoch-stable, bounded live-image unwind implementation."""
-        if self._is_x86_stop():
+        if x64_context is None and self._is_x86_stop():
             return self._unwind_x86_backtrace(depth)
         from winbox.kdbg.unwind import PeX64Unwinder, UnwindError
 
         stop = self._require_stop_epoch()
         epoch = {"session_id": self.session_id, "stop_id": self.stop_id}
-        registers = {
-            name: struct.unpack_from("<Q", stop.raw_regs, index * 8)[0]
-            for index, name in enumerate(_GPR_NAMES)
-        }
-        rip = stop.rip
-        rsp = registers["rsp"]
+        if x64_context is None:
+            registers = {
+                name: struct.unpack_from("<Q", stop.raw_regs, index * 8)[0]
+                for index, name in enumerate(_GPR_NAMES)
+            }
+            rip = stop.rip
+            rsp = registers["rsp"]
+        else:
+            registers = dict(x64_context.registers)
+            rip = int(x64_context.rip)
+            rsp = int(x64_context.rsp)
         initial_rsp = rsp
 
         # Read through a page cache so a typical frame costs no more than one
@@ -1602,9 +1613,15 @@ class DaemonSession:
             return read_static, confidence, identity_warning, artifact_source
 
         try:
-            modules = [
-                (module, "kernel") for module in self._live_modules("kernel")
-            ] + [
+            # A saved user trap can only unwind through user frames. Avoid a
+            # kernel loader walk here: that walk may need CR3 masquerading,
+            # and QEMU cannot safely round-trip a compatibility-mode G packet.
+            kernel_modules = (
+                [] if x64_context is not None else [
+                    (module, "kernel") for module in self._live_modules("kernel")
+                ]
+            )
+            modules = kernel_modules + [
                 (module, "user") for module in self._unwind_user_modules()
             ]
         except Exception as exc:
@@ -1698,7 +1715,10 @@ class DaemonSession:
         }
         if error:
             result["error"] = error
-        if self.module_manifest is not None and len(frames) < depth:
+        if (
+            allow_transition and self.module_manifest is not None
+            and len(frames) < depth
+        ):
             self._stitch_wow64_x86(
                 result, depth=depth, live_read=live_read,
             )
@@ -1840,9 +1860,154 @@ class DaemonSession:
                 length -= take
             return bytes(output)
 
-        return self._unwind_x86_context(
+        result = self._unwind_x86_context(
             eip, esp, ebp, ebx, depth, live_read,
         )
+        if self.module_manifest is not None and len(result.get("frames") or []) < depth:
+            self._stitch_wow64_x64(
+                result, depth=depth, live_read=live_read,
+            )
+        return result
+
+    def _stitch_wow64_x64(
+        self, result: dict[str, Any], *, depth: int, live_read,
+    ) -> None:
+        """Append the exact suspended native chain at an arbitrary x86 stop."""
+        del live_read  # x86 reader is deliberately uint32-bounded
+        frames = result.get("frames") or []
+        assert self.module_manifest is not None
+        bridge_entries = [
+            entry for entry in self.module_manifest.modules
+            if entry.architecture == "x64"
+            and _normalize_module_name(entry.name) == "wow64cpu"
+        ]
+        if len(bridge_entries) != 1:
+            result["transition_error"] = (
+                "attach manifest does not contain one exact x64 wow64cpu.dll"
+            )
+            return
+        bridge = bridge_entries[0]
+        try:
+            from winbox.kdbg.decomp.identity import sha256_file
+            from winbox.kdbg.wow64_transition import (
+                Wow64TransitionError,
+                derive_native_trap_layout,
+                derive_transition_layout,
+                recover_native_trap_context,
+            )
+
+            path = Path(bridge.pe_path).resolve(strict=True)
+            if sha256_file(path).lower() != bridge.pe_sha256.lower():
+                raise Wow64TransitionError("exact wow64cpu PE hash changed after attach")
+            if not bridge.store_build:
+                raise Wow64TransitionError("exact wow64cpu PDB was not enriched")
+            record = self.store.load_build(bridge.store_name, bridge.store_build)
+            if (
+                str(record.get("pe_sha256") or "").lower()
+                != bridge.pe_sha256.lower()
+            ):
+                raise Wow64TransitionError("wow64cpu PDB record is not bound to PE")
+            transition_layout = derive_transition_layout(
+                path, record.get("symbols") or {},
+            )
+            trap_layout = derive_native_trap_layout(self.store.struct)
+            stop = self._require_stop_epoch()
+            epoch = {"session_id": self.session_id, "stop_id": self.stop_id}
+
+            def native_read(va: int, length: int) -> bytes:
+                if (
+                    va < 0 or length < 0 or length > 1 << 20
+                    or va + length > (1 << 64)
+                ):
+                    raise Wow64TransitionError(
+                        f"native context read out of bounds: 0x{va:x}+0x{length:x}"
+                    )
+                return bytes.fromhex(
+                    self.op_mem(va, length, **epoch)["bytes"]
+                )
+
+            x64_ranges = [
+                (entry.base, entry.base + entry.size)
+                for entry in self.module_manifest.modules
+                if entry.architecture == "x64"
+            ]
+            context = recover_native_trap_context(
+                trap_layout, stop.raw_regs, native_read,
+                expected_process=self.target.eprocess,
+                is_x64_code=lambda address: any(
+                    start <= address < end for start, end in x64_ranges
+                ),
+                is_bridge_code=lambda address: (
+                    bridge.base <= address < bridge.base + bridge.size
+                ),
+            )
+            remaining = depth - len(frames)
+            # The persisted first frame is the just-returned syscall stub.
+            # One unwind step reaches the still-suspended RunSimulatedCode
+            # frame; retain only that frame and its callers.
+            native_result = self._unwind_backtrace(
+                remaining + 1, x64_context=context, allow_transition=False,
+            )
+            recovered = native_result.get("frames") or []
+            if len(recovered) < 2:
+                raise Wow64TransitionError(
+                    native_result.get("error")
+                    or "persisted bridge unwind returned fewer than two frames"
+                )
+            if any(
+                _normalize_module_name(str(recovered[index].get("module", "")))
+                != "wow64cpu"
+                for index in (0, 1)
+            ):
+                raise Wow64TransitionError(
+                    "persisted trap does not unwind into suspended wow64cpu code"
+                )
+            native_frames = recovered[1:remaining + 1]
+            if not native_frames:
+                raise Wow64TransitionError("no suspended native frames remain")
+            first_rsp = int(str(native_frames[0].get("rsp", "0")), 0)
+            if not context.stack_limit <= first_rsp < context.stack_base:
+                raise Wow64TransitionError(
+                    "recovered native caller lies outside TEB stack"
+                )
+        except Exception as exc:
+            result["transition_error"] = f"{type(exc).__name__}: {exc}"
+            return
+
+        x86_error = result.pop("error", None)
+        first_native_index = len(frames)
+        for frame in native_frames:
+            copied = dict(frame)
+            copied["index"] = len(frames)
+            if copied["index"] == first_native_index:
+                copied["boundary"] = "wow64-x86-to-x64"
+            frames.append(copied)
+        result["method"] = "windows-wow64-mixed"
+        result["architecture"] = "mixed-x86-x64"
+        result["complete"] = bool(native_result.get("complete"))
+        result["transition"] = {
+            "direction": "x86-to-x64",
+            "module": bridge.name,
+            "build": bridge.store_build,
+            "layout": transition_layout.derivation,
+            "context_source": context.source,
+            "kpcr": f"0x{context.kpcr:x}",
+            "thread": f"0x{context.thread:x}",
+            "trap_frame": f"0x{context.trap_frame:x}",
+            "persisted_rip": f"0x{context.rip:x}",
+            "persisted_rsp": f"0x{context.rsp:x}",
+            "x86_frame_count": first_native_index,
+            "x64_frame_count": len(native_frames),
+            "discarded_historical_frames": 1,
+        }
+        if x86_error:
+            result["x86_error"] = x86_error
+        if native_result.get("error"):
+            native_error = str(native_result["error"])
+            result["error"] = (
+                f"depth limit {depth} reached"
+                if native_error.startswith("depth limit ") else native_error
+            )
 
     def _unwind_x86_context(
         self, eip: int, esp: int, ebp: int, ebx: int, depth: int, live_read,

@@ -432,6 +432,9 @@ def test_native_wow64_bridge_stitches_validated_saved_x86_frames(
             assert (name, build) == ("wow64cpu", "BUILD")
             return {"pe_sha256": "a" * 64, "symbols": {"RunSimulatedCode": 1}}
 
+        def struct(self, _name):
+            return {}
+
     session = _make_session(store=Store(), manifest=manifest)
     session.stop = StopState(
         vcpu="03", rip=0x77241F70, cr3=0x4D6BB000, signal=5,
@@ -480,6 +483,152 @@ def test_native_wow64_bridge_failure_is_explicit_and_preserves_native_trace():
     session._stitch_wow64_x86(result, depth=8, live_read=lambda *_a: b"")
     assert result["method"] == "windows-x64-pdata"
     assert "one exact x64 wow64cpu.dll" in result["transition_error"]
+
+
+def test_x86_stop_stitches_validated_current_kthread_native_frames(
+    tmp_path, monkeypatch,
+):
+    from winbox.kdbg.staging import StagedUserModule, UserModuleManifest
+    from winbox.kdbg.wow64_transition import (
+        Wow64NativeContext,
+        Wow64TransitionLayout,
+    )
+
+    bridge_path = tmp_path / "wow64cpu.dll"
+    bridge_path.write_bytes(b"exact")
+    bridge = StagedUserModule(
+        "wow64cpu.dll", r"C:\Windows\System32\wow64cpu.dll", "x64",
+        0x77240000, 0xA000, str(bridge_path), "a" * 64,
+        "wow64cpu", store_build="BUILD",
+    )
+    manifest = UserModuleManifest(4584, (bridge,))
+
+    class Store(FakeStore):
+        def load_build(self, name, build):
+            assert (name, build) == ("wow64cpu", "BUILD")
+            return {"pe_sha256": "a" * 64, "symbols": {"RunSimulatedCode": 1}}
+
+        def struct(self, _name):
+            return {}
+
+    session = _make_session(store=Store(), manifest=manifest)
+    session.stop = StopState(
+        vcpu="03", rip=0x772C8750, cr3=0x4D6BB000, signal=5,
+        raw_regs=_blob(rip=0x772C8750, cs=0x23),
+    )
+    session.run_state = "halted"
+    layout = Wow64TransitionLayout(
+        0x1920, 0x1A38, 0x1488, 0x80, 0x3C, 0x48, 0x38, 0x28,
+    )
+    context = Wow64NativeContext(
+        rip=0x77241F83, rsp=0x70E8D8,
+        registers={name: 0 for name in (
+            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        )},
+        kpcr=0xFFFFB8004BB1C000,
+        thread=0xFFFF8187EE77B080,
+        trap_frame=0xFFFFA38F29F37AA0,
+        teb=0x2B93000,
+        stack_limit=0x708000,
+        stack_base=0x70FB80,
+    )
+    monkeypatch.setattr(
+        "winbox.kdbg.decomp.identity.sha256_file", lambda _p: "a" * 64,
+    )
+    monkeypatch.setattr(
+        "winbox.kdbg.wow64_transition.derive_transition_layout",
+        lambda *_a: layout,
+    )
+    monkeypatch.setattr(
+        "winbox.kdbg.wow64_transition.derive_native_trap_layout",
+        lambda *_a: object(),
+    )
+    monkeypatch.setattr(
+        "winbox.kdbg.wow64_transition.recover_native_trap_context",
+        lambda *_a, **_k: context,
+    )
+    monkeypatch.setattr(session, "op_mem", lambda *_a, **_k: {"bytes": "00" * 8})
+    monkeypatch.setattr(session, "_unwind_backtrace", lambda *_a, **_k: {
+        "method": "windows-x64-pdata", "complete": False,
+        "frames": [
+            {"index": 0, "addr": "0x77241f83", "rsp": "0x70e8d8",
+             "module": "wow64cpu.dll", "architecture": "x64"},
+            {"index": 1, "addr": "0x77241bba", "rsp": "0x70e8e0",
+             "module": "wow64cpu.dll", "architecture": "x64"},
+            {"index": 2, "addr": "0x77241789", "rsp": "0x70e990",
+             "module": "wow64cpu.dll", "architecture": "x64"},
+        ],
+        "error": "truthful native root",
+    })
+    result = {
+        "method": "windows-x86-hybrid", "complete": False,
+        "frames": [
+            {"index": 0, "addr": "0x772c8750", "module": "ntdll.dll",
+             "architecture": "x86"},
+        ],
+        "error": "truthful x86 root",
+        "candidates": [{"address": "0x1234"}],
+    }
+
+    session._stitch_wow64_x64(result, depth=8, live_read=lambda *_a: b"")
+
+    assert "transition_error" not in result, result.get("transition_error")
+    assert result["method"] == "windows-wow64-mixed"
+    assert result["architecture"] == "mixed-x86-x64"
+    assert [frame["index"] for frame in result["frames"]] == [0, 1, 2]
+    assert result["frames"][1]["boundary"] == "wow64-x86-to-x64"
+    assert result["transition"]["direction"] == "x86-to-x64"
+    assert result["transition"]["discarded_historical_frames"] == 1
+    assert result["x86_error"] == "truthful x86 root"
+    assert result["error"] == "truthful native root"
+    assert result["candidates"] == [{"address": "0x1234"}]
+
+
+def test_x86_to_native_bridge_failure_preserves_x86_trace():
+    from winbox.kdbg.staging import UserModuleManifest
+
+    session = _make_session(manifest=UserModuleManifest(4584, ()))
+    result = {
+        "method": "windows-x86-hybrid", "complete": False,
+        "frames": [{"index": 0, "module": "ntdll.dll", "architecture": "x86"}],
+    }
+    session._stitch_wow64_x64(result, depth=8, live_read=lambda *_a: b"")
+    assert result["method"] == "windows-x86-hybrid"
+    assert "one exact x64 wow64cpu.dll" in result["transition_error"]
+
+
+def test_saved_x64_context_never_walks_kernel_modules(monkeypatch):
+    from types import SimpleNamespace
+    from winbox.kdbg.staging import UserModuleManifest
+
+    session = _make_session(manifest=UserModuleManifest(4584, ()))
+    session.stop = StopState(
+        vcpu="03", rip=0x772C8750, cr3=0x4D6BB000, signal=5,
+        raw_regs=_blob(rip=0x772C8750, cs=0x23),
+    )
+    session.run_state = "halted"
+    monkeypatch.setattr(
+        session, "_live_modules",
+        lambda _kind: (_ for _ in ()).throw(
+            AssertionError("saved user context must not walk kernel modules")
+        ),
+    )
+    context = SimpleNamespace(
+        rip=0, rsp=0x70E8E0,
+        registers={name: 0 for name in (
+            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        )},
+    )
+
+    result = session._unwind_backtrace(
+        4, x64_context=context, allow_transition=False,
+    )
+
+    assert result["method"] == "windows-x64-pdata"
+    assert result["complete"] is True
+    assert result["frames"] == []
 
 
 @pytest.mark.parametrize(
