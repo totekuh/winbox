@@ -150,13 +150,26 @@ class FakeCfg:
 
 
 def _make_session(rsp=None, store=None, target=None, manifest=None) -> DaemonSession:
-    return DaemonSession(
+    session = DaemonSession(
         cfg=FakeCfg(),
         rsp=rsp or FakeRsp(),
         target=target or TargetInfo(pid=4584, dtb=0x4d6bb000, name="notepad.exe"),
         store=store or FakeStore({"notepad!Save": 0x7ff6e289eabc}),
         module_manifest=manifest,
     )
+    # Production captures an initial stop before opening the daemon socket.
+    # Keep direct unit sessions in the same valid starting state rather than
+    # relying on the removed pre-stop compatibility bypass.
+    regs = session.rsp.regs_blob
+    session.stop = StopState(
+        vcpu="01",
+        rip=struct.unpack_from("<Q", regs, 128)[0],
+        cr3=struct.unpack_from("<Q", regs, _CR3_OFFSET)[0],
+        signal=5,
+        raw_regs=regs,
+    )
+    session.run_state = "halted"
+    return session
 
 
 # ── op dispatch / unknown ops ───────────────────────────────────────────
@@ -174,6 +187,81 @@ def test_handle_op_returns_err_for_bad_args():
     reply = session.handle_op("bp_add", {"wrong_kw": "x"})
     assert reply["ok"] is False
     assert "bad args" in reply["error"]
+
+
+def test_running_state_matrix_allows_only_passive_control_ops():
+    session = _make_session()
+    session._begin_resume()
+
+    assert session.handle_op("status", {})["ok"] is True
+    assert session.handle_op("bp_list", {})["ok"] is True
+    for op, args in (
+        ("regs", {}),
+        ("mem", {"va": "0x1000", "length": 1}),
+        ("write_mem", {"va": "0x1000", "data": "90"}),
+        ("bp_add", {"target": "0x1000"}),
+        ("cont", {"timeout": 1}),
+    ):
+        reply = session.handle_op(op, args)
+        assert reply["ok"] is False
+        assert reply["code"] == "state_conflict"
+        assert reply["state"] == "running"
+        assert "state is running" in reply["error"]
+
+
+def test_operation_matrix_classifies_every_protocol_operation():
+    session = _make_session()
+    assert session._allowed_operations() == OPS
+
+    session._begin_resume()
+    running = session._allowed_operations()
+    assert running == {
+        "status", "interrupt", "bp_list", "bp_trace", "detach",
+    }
+    assert running | (OPS - running) == OPS
+
+    session._mark_indeterminate()
+    indeterminate = session._allowed_operations()
+    assert indeterminate == {"status", "interrupt", "detach"}
+    assert indeterminate | (OPS - indeterminate) == OPS
+
+    session._cr3_corrupted = True
+    poisoned = session._allowed_operations()
+    assert poisoned == {"status", "detach"}
+    assert poisoned | (OPS - poisoned) == OPS
+
+
+def test_indeterminate_state_requires_explicit_recovery():
+    session = _make_session()
+    session._mark_indeterminate()
+
+    status = session.handle_op("status", {})["result"]
+    assert status["state"] == "indeterminate"
+    assert status["resume_safe"] is False
+    assert status["allowed_operations"] == ["detach", "interrupt", "status"]
+    refused = session.handle_op("regs", {})
+    assert refused["ok"] is False
+    assert refused["code"] == "state_conflict"
+    assert "indeterminate" in refused["error"]
+
+
+def test_poisoned_state_reports_health_and_allows_safe_detach():
+    session = _make_session()
+    session._cr3_corrupted = True
+
+    status = session.handle_op("status", {})["result"]
+    assert status["cr3_poisoned"] is True
+    assert status["resume_safe"] is False
+    assert status["allowed_operations"] == ["detach", "status"]
+    assert "restore" in status["recovery"].lower()
+
+    refused = session.handle_op("interrupt", {})
+    assert refused["ok"] is False
+    assert refused["code"] == "cr3_poisoned"
+    detached = session.handle_op("detach", {})["result"]
+    assert detached["shutting_down"] is True
+    assert detached["resume_safe"] is False
+    assert detached["vm_will_remain_paused"] is True
 
 
 def test_stop_epoch_invalidates_stale_reads_after_new_stop():
@@ -1122,11 +1210,13 @@ def test_bp_remove_user_soft_falls_back_without_installed_cr3():
 # ── interrupt / status fast paths ──────────────────────────────────────
 
 
-def test_interrupt_queues_pending_flag():
+def test_interrupt_on_known_halt_is_idempotent():
     session = _make_session()
     assert session._interrupt_pending is False
-    session.handle_op("interrupt", {})
-    assert session._interrupt_pending is True
+    reply = session.handle_op("interrupt", {})
+    assert reply["result"]["already_halted"] is True
+    assert session._interrupt_pending is False
+    assert session.rsp.interrupted == 0
 
 
 def test_interrupt_also_sends_real_break_to_rsp():
@@ -1138,6 +1228,8 @@ def test_interrupt_also_sends_real_break_to_rsp():
     surfaces a stop reply promptly."""
     rsp = FakeRsp()
     session = _make_session(rsp=rsp)
+    session._begin_resume()
+    session._busy = True
     session.handle_op("interrupt", {})
     assert rsp.interrupted == 1
     assert session._interrupt_pending is True
@@ -1154,11 +1246,44 @@ def test_interrupt_swallows_rsp_failure_without_raising():
             raise RspError("socket closed")
     rsp = _BrokenRsp()
     session = _make_session(rsp=rsp)
+    session._begin_resume()
+    session._busy = True
     reply = session.handle_op("interrupt", {})
     # No exception leaked; flag still set so the cont loop can pick up
     # cooperative interrupt if the socket recovers.
     assert reply["ok"] is True
     assert session._interrupt_pending is True
+
+
+def test_interrupt_recovers_indeterminate_state_when_no_op_is_active():
+    rsp = FakeRsp()
+    session = _make_session(rsp=rsp)
+    session._mark_indeterminate()
+
+    reply = session.handle_op("interrupt", {})
+
+    assert reply["ok"] is True
+    assert reply["result"]["recovered"] is True
+    assert reply["result"]["state"] == "halted"
+    assert rsp.interrupted == 1
+    assert session.run_state == "halted"
+    assert session.stop is not None
+
+
+def test_interrupt_recovery_failure_remains_indeterminate():
+    from winbox.kdbg.debugger.rsp import RspError
+
+    class _BrokenRsp(FakeRsp):
+        def wait_for_stop(self, *, timeout=None):
+            raise RspError("read timed out")
+
+    session = _make_session(rsp=_BrokenRsp())
+    session._mark_indeterminate()
+    reply = session.handle_op("interrupt", {})
+
+    assert reply["ok"] is False
+    assert session.run_state == "indeterminate"
+    assert session.stop is None
 
 
 def test_cont_timeout_captures_halt_state():
@@ -1537,6 +1662,68 @@ def test_op_cont_silent_continues_unrelated_cr3():
     out = session.handle_op("cont", {"timeout": 0.5})
     result = out["result"]
     assert result["reason"] == "timeout"
+    assert result["state"] == "halted"
+    assert result["in_target"] is False
+    assert session.run_state == "halted"
+    assert session.stop is not None
+
+
+def test_filtered_cr3_timeout_captures_the_received_stop(monkeypatch):
+    """Budget expiry after CR3 filtering must not leave a lying running state."""
+    import winbox.kdbg.debugger.daemon as daemon_mod
+
+    class _Clock:
+        values = iter((0.0, 0.0, 0.6, 0.6))
+
+        @classmethod
+        def monotonic(cls):
+            return next(cls.values, 0.6)
+
+    target = TargetInfo(
+        pid=8000, dtb=0x1225AD000, name="cyserver.exe",
+        user_dtb=0x1225AC000,
+    )
+    rsp = FakeRsp(regs_blob=_blob(rip=_KERNEL_VA, cr3=0xDEADBEEF000))
+    session = _make_session(rsp=rsp, target=target)
+    monkeypatch.setattr(daemon_mod, "time", _Clock)
+
+    result = session.op_cont(timeout=0.5)
+
+    assert result["reason"] == "timeout"
+    assert result["state"] == "halted"
+    assert result["cr3"] == "0xdeadbeef000"
+    assert session.stop is not None
+    assert session.run_state == "halted"
+
+
+def test_deadline_expires_after_filter_check_before_next_resume(monkeypatch):
+    """No gap may exist between filter accounting and the loop deadline."""
+    import winbox.kdbg.debugger.daemon as daemon_mod
+
+    class _Clock:
+        # start, first-loop budget, post-filter check (still inside), next
+        # loop header (expired), warning elapsed.
+        values = iter((0.0, 0.0, 0.49, 0.51, 0.51))
+
+        @classmethod
+        def monotonic(cls):
+            return next(cls.values, 0.51)
+
+    target = TargetInfo(
+        pid=8000, dtb=0x1225AD000, name="cyserver.exe",
+        user_dtb=0x1225AC000,
+    )
+    rsp = FakeRsp(regs_blob=_blob(rip=_KERNEL_VA, cr3=0xDEADBEEF000))
+    session = _make_session(rsp=rsp, target=target)
+    monkeypatch.setattr(daemon_mod, "time", _Clock)
+
+    result = session.op_cont(timeout=0.5)
+
+    assert result["reason"] == "timeout"
+    assert result["state"] == "halted"
+    assert result["in_target"] is False
+    assert rsp.continued == 1
+    assert session.stop is not None
 
 
 def test_op_cont_silent_continue_does_not_inflate_bp_hits():
@@ -2341,6 +2528,62 @@ def test_op_cont_predicate_skip_then_halt():
     assert rsp.continued >= 2
 
 
+def test_predicate_skip_at_deadline_captures_stop(monkeypatch):
+    import winbox.kdbg.debugger.daemon as daemon_mod
+
+    class _Clock:
+        values = iter((0.0, 0.0, 0.6, 0.6))
+
+        @classmethod
+        def monotonic(cls):
+            return next(cls.values, 0.6)
+
+    rsp = _ScriptedRsp([
+        _blob(rip=_KERNEL_VA, rcx=1, cr3=_TARGET_DTB),
+    ])
+    session = _make_session(rsp=rsp)
+    _install_kernel_bp(session, condition="rcx == 2")
+    monkeypatch.setattr(daemon_mod, "time", _Clock)
+
+    result = session.op_cont(timeout=0.5)
+
+    assert result["reason"] == "timeout"
+    assert result["state"] == "halted"
+    assert session.stop is not None
+    assert next(iter(session.bps.values())).predicate_skips == 1
+
+
+def test_action_autocont_at_deadline_captures_stop(monkeypatch, tmp_path):
+    import winbox.kdbg.debugger.daemon as daemon_mod
+
+    class _Clock:
+        values = iter((0.0, 0.0, 0.6, 0.6))
+
+        @classmethod
+        def monotonic(cls):
+            return next(cls.values, 0.6)
+
+    rsp = _ScriptedRsp([
+        _blob(rip=_KERNEL_VA, rax=0x42, cr3=_TARGET_DTB),
+    ])
+    session = _make_session(rsp=rsp)
+    session.cfg.root_dir = tmp_path
+    added = session.handle_op("bp_add", {
+        "target": f"0x{_KERNEL_VA:x}",
+        "mode": "soft",
+        "actions": ["rax"],
+    })
+    assert added["ok"] is True
+    monkeypatch.setattr(daemon_mod, "time", _Clock)
+
+    result = session.op_cont(timeout=0.5)
+
+    assert result["reason"] == "timeout"
+    assert result["state"] == "halted"
+    assert session.stop is not None
+    assert next(iter(session.bps.values())).trace_count == 1
+
+
 def test_op_cont_predicate_mem_deref_halts_when_match():
     """[rsp+0x18] == 0x226048 — only fires that satisfy the qword
     deref should halt."""
@@ -2685,6 +2928,30 @@ def test_op_write_mem_failed_restore_also_poisons():
     assert session._cr3_corrupted is True
 
 
+def test_detach_certificate_observes_poison_from_breakpoint_cleanup():
+    """Cleanup must finish before detach can certify out-of-band resume."""
+    rsp = _FailingRestoreRsp()
+    session = _make_session(rsp=rsp)
+    session.bps[0] = Breakpoint(
+        bp_id=0,
+        va=0x7FF600001000,
+        target="target!entry",
+        user_mode=True,
+        hw=False,
+        installed_at=time.monotonic(),
+        installed_cr3=session.target.dtb,
+    )
+    session._bp_by_va[session.bps[0].va] = 0
+
+    reply = session.handle_op("detach", {})
+
+    assert reply["ok"] is True
+    assert reply["result"]["cr3_poisoned"] is True
+    assert reply["result"]["resume_safe"] is False
+    assert reply["result"]["vm_will_remain_paused"] is True
+    assert rsp.continued == 0
+
+
 def test_batched_predicate_failed_restore_poisons_without_retrying():
     """A failed batch restore is fatal, never a reason to try another CR3."""
     user_dtb = 0x4d6bc000
@@ -2767,6 +3034,23 @@ def test_shutdown_skips_cont_when_cr3_corrupted():
     assert rsp.bps_removed == []
 
 
+def test_shutdown_skips_rsp_cleanup_when_state_is_indeterminate():
+    """Unknown state is not an implicit license to remove bps or resume."""
+    rsp = FakeRsp()
+    rsp._sock = MagicMock()
+    session = _make_session(rsp=rsp)
+    session.bps[0] = Breakpoint(
+        bp_id=0, va=0xfffff80608000000, target="nt!Foo",
+        user_mode=False, hw=False, installed_at=time.monotonic(),
+    )
+    session._mark_indeterminate()
+
+    session.shutdown()
+
+    assert rsp.continued == 0
+    assert rsp.bps_removed == []
+
+
 def test_shutdown_returns_quickly_when_not_busy():
     """shutdown waits up to ~2s for an in-flight op to clear self._busy
     before yanking the socket. When not busy, it returns quickly."""
@@ -2842,8 +3126,8 @@ def test_op_mem_at_in_target_wow64_stop_avoids_full_register_rewrite():
     assert rsp.g_packets == 0
 
 
-def test_op_mem_falls_back_to_threads0_pre_stop():
-    """When no stop is recorded, op_mem falls back to threads[0]."""
+def test_op_mem_refuses_pre_stop_instead_of_guessing_a_vcpu():
+    """Memory access must not bypass an unknown target state."""
     rsp = FakeRsp(threads=("05", "06"))
     selected: list[str] = []
     real_select = rsp.select_thread
@@ -2855,11 +3139,12 @@ def test_op_mem_falls_back_to_threads0_pre_stop():
     rsp.select_thread = tracking_select
 
     session = _make_session(rsp=rsp)
-    assert session.stop is None  # pre-stop
+    session._mark_indeterminate()
 
     reply = session.handle_op("mem", {"va": "0x1000", "length": 8})
-    assert reply["ok"]
-    assert "05" in selected
+    assert reply["ok"] is False
+    assert "indeterminate" in reply["error"]
+    assert selected == []
 
 
 def test_op_write_mem_uses_stop_vcpu_when_set():
@@ -3116,6 +3401,7 @@ def test_wow64_backtrace_uses_verified_store_without_live_loader_walk(
 
 def test_op_stack_requires_halt():
     session = _make_session()
+    session._begin_resume()
     with pytest.raises(RuntimeError, match="not halted"):
         session.op_stack()
 
@@ -3237,6 +3523,7 @@ class TestStepOver:
 
     def test_step_over_requires_halt(self):
         session = _make_session()
+        session._begin_resume()
         with pytest.raises(RuntimeError, match="not halted"):
             session.op_step_over()
 
@@ -3382,6 +3669,7 @@ class TestStepOut:
 
     def test_step_out_requires_halt(self):
         session = _make_session()
+        session._begin_resume()
         with pytest.raises(RuntimeError, match="not halted"):
             session.op_step_out()
 

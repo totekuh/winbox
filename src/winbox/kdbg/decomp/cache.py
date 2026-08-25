@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from winbox.config import Config
-from winbox.kdbg.decomp.client import DecompClient, DecompError, cache_dir
+from winbox.kdbg.decomp.client import (
+    DecompClient,
+    DecompError,
+    cache_dir,
+    maintenance_lock,
+)
 from winbox.kdbg.decomp.docker import project_dir
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -154,6 +159,23 @@ def prune_cache(
         raise DecompError("cache prune limits must not be negative")
     if max_bytes == 0 and older_than_days == 0:
         raise DecompError("max_bytes or older_than_days must be supplied for cache prune")
+    if dry_run:
+        return _prune_cache(
+            cfg, max_bytes=max_bytes, older_than_days=older_than_days,
+            dry_run=True,
+        )
+    with maintenance_lock(cfg):
+        # Inventory, ownership validation, and deletion all occur under one
+        # lock. Paths selected by a dry run are never trusted for an apply.
+        return _prune_cache(
+            cfg, max_bytes=max_bytes, older_than_days=older_than_days,
+            dry_run=False,
+        )
+
+
+def _prune_cache(
+    cfg: Config, *, max_bytes: int, older_than_days: float, dry_run: bool,
+) -> dict[str, Any]:
     inventory = cache_inventory(cfg)
     entries = sorted(inventory["entries"], key=lambda x: float(x.get("last_used") or 0))
     now = time.time()

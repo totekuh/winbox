@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from winbox.config import Config
+from winbox.kdbg.decomp.locking import exclusive_file_lock
 
 
 class DecompError(RuntimeError):
@@ -65,6 +66,15 @@ def cache_dir(cfg: Config) -> Path:
 
 def log_path(cfg: Config) -> Path:
     return runtime_dir(cfg) / f"decomp-{protocol_family()}.log"
+
+
+def maintenance_lock_path(cfg: Config) -> Path:
+    return runtime_dir(cfg) / f"decomp-maintenance-{protocol_family()}.lock"
+
+
+def maintenance_lock(cfg: Config):
+    """Serialize cache mutation, worker startup, and project ownership."""
+    return exclusive_file_lock(maintenance_lock_path(cfg))
 
 
 def project_dir() -> Path:
@@ -286,12 +296,6 @@ class DecompClient:
     ) -> dict[str, Any]:
         selected_backend = backend()
         request_id = secrets.token_hex(16)
-        if op == "decompile" and selected_backend == "docker":
-            args = dict(args)
-            args.setdefault("binary_name", Path(str(args.get("binary", ""))).name)
-            args["binary"] = self._stage_binary(
-                Path(str(args.get("binary", ""))), str(args.get("sha256", ""))
-            )
         active = self.active_backend()
         if active is not None and active != selected_backend:
             if not start:
@@ -306,6 +310,19 @@ class DecompClient:
                 "refusing automatic shutdown or downgrade. Reload/version-align "
                 "the client and worker."
             )
+        if op == "decompile" and selected_backend == "docker":
+            args = dict(args)
+            args.setdefault("binary_name", Path(str(args.get("binary", ""))).name)
+            # Keep the exact staged input alive through first-worker startup.
+            # Once startup completes, worker_alive() makes applied pruning
+            # refuse; the worker takes this same lock around project access.
+            with maintenance_lock(self.cfg):
+                args["binary"] = self._stage_binary(
+                    Path(str(args.get("binary", ""))),
+                    str(args.get("sha256", "")),
+                )
+                if not self.worker_alive() and start:
+                    self._start_worker()
         payload = json.dumps(
             {"request_id": request_id, "op": op, "args": args}, separators=(",", ":")
         ).encode("utf-8") + b"\n"
@@ -318,7 +335,14 @@ class DecompClient:
                     raise DecompError("PyGhidra worker is not running")
                 self._start_worker()
             try:
-                reply = self._exchange(payload, timeout=timeout)
+                if op == "status":
+                    reply = self._exchange(payload, timeout=timeout)
+                else:
+                    # The transaction owns project import/open/save for its
+                    # complete lifetime. Status remains non-mutating and does
+                    # not queue behind cache maintenance.
+                    with maintenance_lock(self.cfg):
+                        reply = self._exchange(payload, timeout=timeout)
             except (OSError, DecompError) as exc:
                 if op == "decompile":
                     self._cancel_request(request_id)
@@ -345,10 +369,12 @@ class DecompClient:
     def _shutdown_conflicting_worker(self, active: str, selected: str) -> None:
         request_id = secrets.token_hex(16)
         try:
-            reply = self._exchange(
-                json.dumps({"request_id": request_id, "op": "shutdown", "args": {}},
-                           separators=(",", ":")).encode() + b"\n", timeout=10.0
-            )
+            with maintenance_lock(self.cfg):
+                reply = self._exchange(
+                    json.dumps({
+                        "request_id": request_id, "op": "shutdown", "args": {},
+                    }, separators=(",", ":")).encode() + b"\n", timeout=10.0
+                )
         except (OSError, DecompError) as exc:
             raise DecompError(
                 f"could not migrate active {active} worker to {selected}: {exc}"
@@ -381,16 +407,21 @@ class DecompClient:
         return reply
 
     def _start_worker(self) -> None:
-        self._enforce_cache_budget()
-        if backend() == "docker":
-            from winbox.kdbg.decomp.docker import DockerError, DockerManager
+        with maintenance_lock(self.cfg):
+            # Re-check under the shared lock: another caller may have started
+            # the worker while this caller waited.
+            if self.worker_alive():
+                return
+            self._enforce_cache_budget()
+            if backend() == "docker":
+                from winbox.kdbg.decomp.docker import DockerError, DockerManager
 
-            try:
-                DockerManager(self.cfg).start()
-            except DockerError as exc:
-                raise DecompError(str(exc)) from exc
-            return
-        self._start_host_worker()
+                try:
+                    DockerManager(self.cfg).start()
+                except DockerError as exc:
+                    raise DecompError(str(exc)) from exc
+                return
+            self._start_host_worker()
 
     def _enforce_cache_budget(self) -> None:
         raw = os.environ.get("WINBOX_GHIDRA_CACHE_MAX_BYTES", "0").strip()

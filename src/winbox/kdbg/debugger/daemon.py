@@ -70,6 +70,8 @@ from winbox.kdbg.debugger.predicate import (
 from winbox.kdbg.debugger.protocol import (
     OPS,
     ProtocolError,
+    WATCHPOINT_SIZES,
+    WATCHPOINT_TYPES,
     decode,
     encode,
     read_line,
@@ -117,6 +119,8 @@ def log_path(cfg: Config) -> Path:
 MAX_BREAKPOINT_ACTIONS = 16
 MAX_CAPTURE_BYTES_PER_HIT = 1024
 MAX_CAPTURE_BYTES_PER_TRACE = 16 * 1024 * 1024
+_DAEMON_STARTUP_TIMEOUT = 60.0
+_STARTUP_STATUS_MAX_BYTES = 64 * 1024
 
 
 @dataclass
@@ -283,6 +287,11 @@ class DaemonSession:
     # Public for tests; tests can subclass to inject FakeRsp.
     BUSY_REPLY = reply_err("BUSY: another op in progress")
     SHUTDOWN_REPLY = reply_err("daemon shutting down")
+    _RUNNING_OPS = frozenset({
+        "status", "interrupt", "bp_list", "bp_trace", "detach",
+    })
+    _INDETERMINATE_OPS = frozenset({"status", "interrupt", "detach"})
+    _POISONED_OPS = frozenset({"status", "detach"})
 
     def __init__(
         self,
@@ -346,15 +355,15 @@ class DaemonSession:
         method = getattr(self, f"op_{op}", None)
         if method is None:
             return reply_err(f"op not implemented: {op!r}")
-        # If a previous CR3 masquerade left the firing vCPU's CR3 in
-        # an unrestored state, refuse anything that could resume the
-        # guest or talk to the gdbstub. Status/interrupt are safe-ish
-        # but we lock them out too — the operator should detach + restart.
-        if self._cr3_corrupted and op != "status":
-            return reply_err(
-                "daemon poisoned: CR3 restore previously failed; "
-                "detach and restart the kdbg session"
-            )
+        state_error = self._operation_state_error(op)
+        if state_error is not None:
+            reply = reply_err(state_error)
+            reply.update({
+                "code": "cr3_poisoned" if self._cr3_corrupted else "state_conflict",
+                "state": self.run_state,
+                "allowed_operations": sorted(self._allowed_operations()),
+            })
+            return reply
         try:
             result = method(**args)
         except TypeError as e:
@@ -364,6 +373,29 @@ class DaemonSession:
         if isinstance(result, dict):
             return reply_ok(result)
         return reply_ok({"value": result})
+
+    def _allowed_operations(self) -> frozenset[str]:
+        """Return the operation set that is safe in the current state."""
+        if self._cr3_corrupted:
+            return self._POISONED_OPS
+        if self.run_state == "halted" and self.stop is not None:
+            return OPS
+        if self.run_state == "running":
+            return self._RUNNING_OPS
+        return self._INDETERMINATE_OPS
+
+    def _operation_state_error(self, op: str) -> str | None:
+        if op in self._allowed_operations():
+            return None
+        if self._cr3_corrupted:
+            return (
+                "daemon poisoned: CR3 restore previously failed; only status "
+                "and poison-safe detach are allowed (the VM must not resume)"
+            )
+        return (
+            f"operation {op!r} unavailable while target state is "
+            f"{self.run_state}; use status, interrupt recovery, or detach"
+        )
 
     # ── CR3 masquerade plumbing ─────────────────────────────────────────
 
@@ -468,6 +500,11 @@ class DaemonSession:
     # ── ops ─────────────────────────────────────────────────────────────
 
     def op_status(self) -> dict[str, Any]:
+        resume_safe = (
+            not self._cr3_corrupted
+            and self.run_state == "halted"
+            and self.stop is not None
+        )
         result = {
             "target": {
                 "pid": self.target.pid,
@@ -482,13 +519,26 @@ class DaemonSession:
             "last_stop_id": self.stop_id,
             "uptime_s": time.monotonic() - self.attach_time,
             "daemon_pid": os.getpid(),
+            "cr3_poisoned": self._cr3_corrupted,
+            "resume_safe": resume_safe,
+            "allowed_operations": sorted(self._allowed_operations()),
         }
+        if self._cr3_corrupted:
+            result["recovery"] = (
+                "detach leaves the VM paused; restore the original CR3 "
+                "manually or restore a snapshot before resuming"
+            )
+        elif self.run_state == "indeterminate":
+            result["recovery"] = (
+                "use interrupt to establish a fresh halted stop before "
+                "issuing debugger operations"
+            )
         if self.module_manifest is not None:
             result["auto_stage"] = self.module_manifest.summary()
         return result
 
-    _VALID_WP_TYPES = frozenset({"write", "read", "access"})
-    _VALID_WP_SIZES = frozenset({1, 2, 4, 8})
+    _VALID_WP_TYPES = frozenset(WATCHPOINT_TYPES)
+    _VALID_WP_SIZES = frozenset(WATCHPOINT_SIZES)
 
     def op_bp_add(
         self,
@@ -929,6 +979,8 @@ class DaemonSession:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 result = {"reason": "timeout"}
+                if self.run_state == "halted" and self.stop is not None:
+                    result.update(self._stop_summary())
                 result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
                 return result
 
@@ -1000,6 +1052,17 @@ class DaemonSession:
                     hit_bp = self.bps.get(self._bp_by_va.get(rip, -1))
                     if hit_bp is not None and hit_bp.hw:
                         self._hw_bp_verified = True
+                # QEMU is physically stopped right now. Record that truth
+                # before checking the clock; the deadline can advance in the
+                # tiny window between this branch and the next loop header.
+                # A subsequent resume invalidates this evidence normally.
+                self._capture_stop_with_regs(sr, regs, vcpu=firing_vcpu)
+                if time.monotonic() >= deadline:
+                    result = {"reason": "timeout", **self._stop_summary()}
+                    result.update(self._unfired_hw_bp_warnings(
+                        time.monotonic() - _cont_start
+                    ))
+                    return result
                 continue
 
             # Predicate gate. Reuse the regs blob we already read so
@@ -1025,6 +1088,13 @@ class DaemonSession:
                 if bp._predicate is not None and not truthy:
                     bp.predicate_skips += 1
                     bp.hits += 1
+                    self._capture_stop_with_regs(sr, regs, vcpu=firing_vcpu)
+                    if time.monotonic() >= deadline:
+                        result = {"reason": "timeout", **self._stop_summary()}
+                        result.update(self._unfired_hw_bp_warnings(
+                            time.monotonic() - _cont_start
+                        ))
+                        return result
                     continue
                 if bp._predicate is not None:
                     bp.predicate_hits += 1
@@ -1039,6 +1109,12 @@ class DaemonSession:
 
             if bp is not None and bp._action_asts:
                 self._append_action_trace(bp, regs, action_values or {})
+                if time.monotonic() >= deadline:
+                    result = {"reason": "timeout", **self._stop_summary()}
+                    result.update(self._unfired_hw_bp_warnings(
+                        time.monotonic() - _cont_start
+                    ))
+                    return result
                 continue
 
             result = {"reason": "bp", **self._stop_summary()}
@@ -1085,7 +1161,7 @@ class DaemonSession:
         self._begin_resume()
         try:
             self.rsp.step(vcpu)
-        except Exception:
+        except Exception:  # noqa: BLE001 — any incomplete capture is unknown state
             # A failed exchange does not tell us whether QEMU accepted the
             # resume packet.  Do not issue another breakpoint command against
             # a possibly-running stub or claim the removed breakpoint exists.
@@ -1275,12 +1351,38 @@ class DaemonSession:
         no rsp-state mutation) so it's safe to call concurrently with
         a cont-loop's read on the same RspClient.
         """
-        self._interrupt_pending = True
-        # Best-effort — if the rsp socket is dead the cont loop is
-        # already going to surface its own error. Don't double-fault.
-        with suppress(RspError, OSError):
+        if self.run_state == "halted" and self.stop is not None:
+            self._interrupt_pending = False
+            return {
+                "queued": False,
+                "already_halted": True,
+                **self._stop_summary(),
+            }
+
+        if self._busy:
+            self._interrupt_pending = True
+            # Best-effort: the in-flight op owns the read side and will
+            # surface transport failure itself.
+            with suppress(RspError, OSError):
+                self.rsp.interrupt()
+            return {"queued": True}
+
+        # No operation owns the RSP stream. Perform a complete recovery
+        # transaction here so an indeterminate daemon cannot merely claim
+        # an interrupt was queued and then permit stale-stop operations.
+        self._interrupt_pending = False
+        try:
             self.rsp.interrupt()
-        return {"queued": True}
+            sr = self.rsp.wait_for_stop(timeout=2.0)
+            self._capture_stop(sr)
+        except Exception:
+            self._mark_indeterminate()
+            raise
+        return {
+            "queued": False,
+            "recovered": True,
+            **self._stop_summary(),
+        }
 
     def op_regs(self) -> dict[str, Any]:
         if self.stop is None:
@@ -1292,20 +1394,6 @@ class DaemonSession:
     def _require_stop_epoch(
         self, session_id: str | None = None, stop_id: int | None = None
     ) -> StopState:
-        # Test/custom embedders historically seed ``stop`` directly. Treat
-        # that as the initial halted state; resume paths always clear it.
-        if self.run_state == "indeterminate" and self.stop is not None:
-            self.run_state = "halted"
-        if (
-            self.run_state == "indeterminate"
-            and self.stop is None
-            and session_id is None
-            and stop_id is None
-        ):
-            # Backward-compatible unpinned memory access before the daemon's
-            # initial stop has been recorded. Epoch-pinned callers never use
-            # this path.
-            return None  # type: ignore[return-value]
         if self.run_state != "halted" or self.stop is None:
             raise RuntimeError(f"target is not halted (state={self.run_state})")
         if session_id is not None and session_id != self.session_id:
@@ -1403,6 +1491,7 @@ class DaemonSession:
 
         Returns ``{va, length}`` on success.
         """
+        self._require_stop_epoch()
         if isinstance(va, str):
             va = int(va, 0)
         try:
@@ -2493,11 +2582,53 @@ class DaemonSession:
         }
 
     def op_detach(self) -> dict[str, Any]:
-        """Clean shutdown. Removes bps, detaches gdb (which resumes VM),
-        signals the serve loop to exit. The connection that called this
-        gets the reply; the daemon then exits."""
+        """Shut down without ever resuming an unsafe or unknown state."""
+        # Breakpoint removal can itself perform a CR3 masquerade. Do it
+        # before issuing the resume-safety certificate so a restore failure
+        # cannot poison the session after the caller was told it may resume.
+        self._cleanup_breakpoints_for_shutdown()
+        resume_safe = (
+            not self._cr3_corrupted
+            and self.run_state == "halted"
+            and self.stop is not None
+        )
         self._shutdown_requested = True
-        return {"shutting_down": True}
+        result = {
+            "shutting_down": True,
+            "cr3_poisoned": self._cr3_corrupted,
+            "resume_safe": resume_safe,
+            "vm_will_resume": resume_safe,
+            "vm_will_remain_paused": self._cr3_corrupted,
+        }
+        if self._cr3_corrupted:
+            result["recovery"] = (
+                "CR3 restore failed: detach will leave the VM paused; "
+                "restore the original CR3 manually or restore a snapshot"
+            )
+        elif not resume_safe:
+            result["recovery"] = (
+                f"target state is {self.run_state}; automatic resume is disabled"
+            )
+        return result
+
+    def _cleanup_breakpoints_for_shutdown(self) -> None:
+        """Best-effort cleanup, permitted only at a proven clean halt."""
+        if (
+            self._cr3_corrupted
+            or self.run_state != "halted"
+            or self.stop is None
+        ):
+            return
+        for bp in list(self.bps.values()):
+            if self._cr3_corrupted:
+                break
+            # Preserve the historical best-effort detach contract for an
+            # ordinary z-packet failure. CR3 restore failures set the poison
+            # bit in their own finally path and are observed below.
+            with suppress(Exception):
+                self._remove_bp_via_stub(bp)
+        self.bps.clear()
+        self._bp_by_va.clear()
 
     # ── helpers ─────────────────────────────────────────────────────────
 
@@ -2987,10 +3118,10 @@ class DaemonSession:
                 conn.sendall(encode(reply_err("malformed request")))
             return
 
-        # Lightweight ops (status/interrupt) bypass the busy lock so they
+        # Passive/lightweight ops bypass the busy lock so they
         # can break out of a stuck cont — but cont can't run concurrent
         # with itself, so the guard still applies elsewhere.
-        is_lightweight = op in ("status", "interrupt")
+        is_lightweight = op in ("status", "interrupt", "bp_list", "bp_trace")
         if self._busy and not is_lightweight:
             with suppress(OSError):
                 conn.sendall(encode(self.BUSY_REPLY))
@@ -3041,16 +3172,16 @@ class DaemonSession:
         # hardware=bp.hw so hardware bps installed via Z1 actually get
         # removed via z1 — sending z0 for an hw bp is a no-op in QEMU
         # and leaks DR0..3 across the detach.
-        if not self._cr3_corrupted:
-            for bp in list(self.bps.values()):
-                # User-mode soft bps must be cleared under the CR3
-                # masquerade (see _remove_bp_via_stub) or their 0xCC is
-                # left in target's page. suppress() still swallows a plain
-                # removal failure, but a masquerade restore failure sets
-                # _cr3_corrupted, which correctly gates off the cont below.
-                with suppress(Exception):
-                    self._remove_bp_via_stub(bp)
+        self._cleanup_breakpoints_for_shutdown()
+        # A breakpoint removal may itself need a CR3 masquerade and poison
+        # the session while unwinding. Compute this only after cleanup.
+        safe_to_resume = (
+            not self._cr3_corrupted
+            and self.run_state == "halted"
+            and self.stop is not None
+        )
         self.bps.clear()
+        self._bp_by_va.clear()
 
         # Send cont to resume the VM, give QEMU time to process it,
         # then just close the socket. QEMU's CHR_EVENT_CLOSED handler
@@ -3070,17 +3201,23 @@ class DaemonSession:
         # without resuming, leaving the VM paused so the operator
         # can recover the CR3 manually (or restore from snapshot).
         try:
-            if not self._cr3_corrupted:
+            if safe_to_resume:
                 with suppress(Exception):
                     self.rsp.cont()
                 # Hold long enough that vCont;c is fully processed by
                 # QEMU before we yank the socket. 100ms is more than
                 # enough — vCont round-trip is sub-ms.
                 time.sleep(0.1)
-            else:
+            elif self._cr3_corrupted:
                 print(
                     "[kdbg-daemon] CR3 corrupted; skipping cont on shutdown — "
                     "VM will remain paused. Recover CR3 via HMP or restore snapshot.",
+                    file=sys.stderr, flush=True,
+                )
+            else:
+                print(
+                    f"[kdbg-daemon] target state is {self.run_state}; skipping "
+                    "cont on shutdown because resume safety is not established.",
                     file=sys.stderr, flush=True,
                 )
         finally:
@@ -3573,23 +3710,26 @@ def fork_daemon(
     except CetSafetyError as exc:
         raise DaemonError(str(exc)) from exc
 
+    from winbox.kdbg.debugger.child_lifecycle import (
+        ChildStartupError,
+        supervise_startup,
+    )
+
     pipe_r, pipe_w = os.pipe()
     pid = os.fork()
     if pid > 0:
         # Parent
         os.close(pipe_w)
         try:
-            line = b""
-            while True:
-                chunk = os.read(pipe_r, 4096)
-                if not chunk:
-                    break
-                line += chunk
-                if b"\n" in line:
-                    break
-        finally:
-            os.close(pipe_r)
-        line = line.split(b"\n", 1)[0]
+            line = supervise_startup(
+                pid,
+                pipe_r,
+                timeout=_DAEMON_STARTUP_TIMEOUT,
+                max_bytes=_STARTUP_STATUS_MAX_BYTES,
+                label="kdbg daemon",
+            )
+        except ChildStartupError as exc:
+            raise DaemonError(str(exc)) from exc
         if line == b"OK":
             return pid
         text = line.decode("utf-8", errors="replace")
@@ -3599,6 +3739,14 @@ def fork_daemon(
 
     # Child — won't return
     os.close(pipe_r)
+    class _StartupCancelled(DaemonError):
+        pass
+
+    def _cancel_startup(_signum, _frame):
+        raise _StartupCancelled("daemon startup cancelled by parent")
+
+    signal.signal(signal.SIGTERM, _cancel_startup)
+    signal.signal(signal.SIGINT, _cancel_startup)
     # Track lifecycle so the error paths can do the right thing without
     # double-closing the pipe (writes after close = EBADF, parent then
     # sees an empty pipe instead of our error message) and so we can

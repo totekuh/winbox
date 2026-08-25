@@ -179,6 +179,8 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg bt": (LIVE, ""),
     "kdbg bps": (LIVE, ""),
     "kdbg bp": (LIVE, ""),
+    "kdbg bp-trace": (EXCLUDED, "action trace querying is covered by CLI unit "
+                                      "and real daemon-socket integration tests"),
     "kdbg rm": (LIVE, ""),
     "kdbg user-bp": (LIVE, "argument validation only"),
     "kdbg cont": (EXCLUDED, "blocks until a breakpoint fires or its budget "
@@ -320,6 +322,7 @@ CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "kdbg step": "tests/test_kdbg_daemon.py",
     "kdbg interrupt": "tests/test_kdbg_daemon.py",
     "kdbg context": "tests/test_kdbg_daemon.py",
+    "kdbg bp-trace": "tests/test_kdbg.py",
     "kdbg ghidra install": "tests/test_kdbg_decomp_docker.py",
     "kdbg ghidra prune": "tests/test_kdbg_decomp_hardening.py",
 }

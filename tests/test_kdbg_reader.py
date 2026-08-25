@@ -8,6 +8,7 @@ import threading
 import time
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -113,6 +114,25 @@ def test_local_snapshot_collects_all_cr3_and_kernel_gs_candidates():
     assert snap.kernel_gs_bases == (
         0xFFFFF78000000000, 0xFFFFF78000001000,
     )
+
+
+def test_reader_handshake_failure_best_effort_resumes_before_raw_close(
+    monkeypatch, tmp_path,
+):
+    import winbox.kdbg.debugger.reader as reader
+
+    cfg = Config(winbox_dir=tmp_path)
+    rsp = MagicMock()
+    rsp.handshake.side_effect = RspError("handshake failed")
+    monkeypatch.setattr(reader, "gdbstub_has_client", lambda port: False)
+    monkeypatch.setattr(reader, "probe_port", lambda host, port: True)
+    monkeypatch.setattr(reader.RspClient, "connect", lambda *args, **kwargs: rsp)
+
+    with pytest.raises(RspError, match="handshake failed"):
+        reader._open_rsp(cfg, 1234)
+
+    rsp.cont.assert_called_once()
+    rsp._sock.close.assert_called_once()
 
 
 def test_local_snapshot_read_in_active_cr3_restores_without_g_packet():

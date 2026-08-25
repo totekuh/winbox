@@ -13,15 +13,84 @@ a roadmap whose top item nobody can start.
 
 ## Current status
 
-Items 1-8 have all been worked — `git log` is the record. Item 8 is addressed
+Items 1-70 have all been worked — `git log` is the record. Item 8 is addressed
 at its source (below) but stays listed as *Watching* because it is intermittent
 by nature.
 
 The major kdbg execution, symbol, decompilation, exact-artifact staging, x64
 unwind, ordinary WoW64 x86 unwind, and bidirectional transition stitching paths
-are implemented and live-verified. No major capability item is currently open.
-Item 26 is an accepted minor trade-off rather than scheduled work, and item 8
-remains a watch condition rather than an active implementation item.
+are implemented and live-verified. A post-v1.6.0 stability/usability review on
+2026-08-25 opened items 71-84; items 71-73 and 76-78 were implemented the same
+day. Items 74-75 and 79-84 remain open. Item 26 remains an accepted minor
+trade-off, and item 8 remains a watch condition.
+
+### Completed top-three sequence (2026-08-25)
+
+The implementation landed as one coherent state-safety change because all
+three paths share the same halt/ownership invariants.
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **73 — preserve a truthful halt at filtered-stop timeout** | 5 | 5 | Completed for CR3, predicate, and action filtering boundaries. |
+| 2 | **71 — poison-safe detach without out-of-band resume** | 4 | 5 | Completed with pre-certificate cleanup and caller-side resume gating. |
+| 3 | **72 — enforce one debugger run-state operation matrix** | 4 | 5 | Completed in dispatch with explicit interrupt recovery. |
+
+Verification: the complete default suite passes (`2562 passed, 5 skipped, 141
+deselected`); the focused daemon/transport/MCP/CLI/decomp set passes (`573
+passed, 1 skipped`); and real Docker/PyGhidra integration passes. Three safe
+live-VM lifecycle checks passed and left the Server 2022 guest running, the
+agent responsive, the gdbstub stopped, and no daemon attached. Full live attach
+correctly refused because that boot had CET user shadow stacks active; the
+subsequent explicitly authorized prepared-boot validation is recorded below.
+
+### Completed second top-three sequence (2026-08-25)
+
+With the immediate debugger state hazards closed, the next batch favors one
+small operator-facing win and two stability foundations that unblock later
+cache and lifecycle work.
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **78 — CLI parity for watchpoints, actions, and trace queries** | 5 | 5 | Completed with shared bounds, human rendering, and machine-safe JSON. |
+| 2 | **76 — serialize Ghidra cache maintenance with worker lifecycle** | 4 | 5 | Completed with one re-entrant cross-process maintenance lock. |
+| 3 | **77 — bounded and reaped debugger child-process lifecycle** | 3 | 5 | Completed with capped startup handshakes and deterministic reaping. |
+
+Verification: the complete default suite passes (`2589 passed, 5 skipped, 141
+deselected`) and the focused cache/process/socket/CLI set passes (`740 passed,
+1 skipped`). The real Docker/PyGhidra integration passed against the existing
+API-5 image. With the live worker holding five projects, a dry run selected
+four entries and an applied prune correctly refused without deleting any of
+them. After MCP reload, the public status/cache endpoints reported the worker
+responsive and the public dry-run prune selected the same four entries, removed
+zero, and left the cache unchanged at 387,050,786 bytes; the same worker stayed
+healthy with no active operation. Three safe live-VM lifecycle checks passed;
+the Server 2022 guest remained running and agent-responsive with no daemon or
+gdbstub left active. An explicitly authorized CET preparation and reboot then
+reported `UserShadowStack=OFF`, attached the real daemon to `services.exe`, and
+staged and symbol-enriched all 25 loader entries with zero failures or warnings.
+Live register capture and a complete five-frame pdata unwind succeeded; a
+durable continue entered running state, an interrupt returned a truthful halt
+at stop ID 2, and detach certified `resume_safe=true` and `cr3_poisoned=false`.
+Final cleanup stopped the gdbstub, reaped both observed host child PIDs, retained
+no attached session, and left the VM running and guest agent responsive.
+
+### Selected third top-three sequence (2026-08-25)
+
+This batch establishes the observable and typed control plane needed before the
+larger cancellation/prewarming and corrupt-project recovery changes. It also
+finishes the smallest high-return cache usability gap while item 76's locking
+work is fresh.
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **80 — non-blocking decompiler status with phase and progress** | 4 | 5 | Selected; immediate operator feedback and a prerequisite for item 74. |
+| 2 | **79 — typed errors from daemon and worker through MCP** | 3 | 5 | Selected; removes substring-based retry/recovery decisions and supports items 74-75. |
+| 3 | **81 — targeted cache removal and accounting reconciliation** | 5 | 4 | Selected; precise low-risk recovery built directly on item 76's maintenance lock. |
+
+Item 75 is the narrow miss: its reliability payoff is high, but implementing
+typed worker errors and exact cache targeting first makes quarantine/rebuild
+safer and its recovery contract substantially cleaner. Item 74 remains the
+largest payoff and largest effort; item 80 supplies the progress model it needs.
 
 ### Completed final unwind batch (2026-08-24)
 
@@ -30,7 +99,7 @@ remains a watch condition rather than an active implementation item.
 | 1 | **69 — automatic exact-binary staging** | 4 | 5 | Completed and live-verified with all 17 PING loader entries. |
 | 2 | **70 — mixed-mode WoW64 transition-stack stitching** | 1 | 3 | Completed for exact-build validated x64↔x86 transitions. |
 
-Final verification for items 69-70: complete default suite `2534
+Final verification for items 69-70: complete default suite `2544
 passed, 5 skipped, 141 deselected`; all 11 direct QEMU RSP integrations; all
 three live walk integrations; and the dedicated real-daemon mixed WoW64 test.
 That live test automatically staged `PING.EXE`, hit
@@ -99,7 +168,7 @@ tools; cache inventory grouped current and legacy projects sharing one SHA,
 dry-run pruning selected entries without deletion, and applying while the
 worker was live was refused.
 
-### Next top-three sequence
+### Completed top-three sequence (2026-08-23)
 
 Completed on 2026-08-23. Item 26 remains explicitly accepted/minor and item 8
 remains a watched intermittent condition rather than active implementation
@@ -579,6 +648,250 @@ boundary with a truthful depth-limit result, and `kdbg_context` returned the
 same mixed trace from the pinned stop. Final detach resumed the VM; Windows
 10.0.26100.1742 answered through qemu-ga and the gdbstub was listening. The
 complete default suite passes (`2544 passed, 5 skipped, 141 deselected`).
+
+### 71. Completed — poison-safe detach without out-of-band resume
+
+A failed CR3 restore correctly poisons the daemon because resuming that vCPU
+can immediately bugcheck the guest. The dispatch guard then rejects every
+operation except `status`, including `detach`, even though its error tells the
+operator to detach. Both CLI and MCP detach suppress the resulting client
+error, wait for a lock that cannot be released, and unconditionally call
+`ensure_not_paused`. That recovery helper may continue through a second GDB
+connection or `virsh resume`, bypassing the poison barrier and running the
+known-bad CR3. The same out-of-band resume is unsafe whenever a still-live
+daemon is stuck inside any CR3-sensitive operation.
+
+Implemented on 2026-08-25. Status and detach now expose `cr3_poisoned`,
+`resume_safe`, permitted operations, and explicit recovery. Poisoned and
+indeterminate teardown close ownership without RSP cleanup or resume. CLI and
+MCP call `ensure_not_paused` only after the daemon is gone and its detach reply
+explicitly certified resume safety. Breakpoint cleanup runs before that
+certificate, closing the edge case where user-software-breakpoint removal
+itself fails to restore CR3. Unit coverage proves clean, poisoned,
+transport-error, and cleanup-time-poison paths; real JSON-line socket coverage
+proves the poison-safe response crosses the transport unchanged.
+
+### 72. Completed — one enforced debugger run-state operation matrix
+
+`running|halted|indeterminate` is recorded, but enforcement remains local and
+incomplete. `_require_stop_epoch` deliberately lets an unpinned memory read
+continue when state is indeterminate and no stop exists, for compatibility
+with tests/custom embedders; a production daemon always captures its initial
+stop before serving, so that escape hatch is unsafe after failed recovery.
+`write_mem`, breakpoint insertion/removal, and `cont` also lack one central
+halted-state policy and can issue RSP traffic when execution or stream state is
+unknown.
+
+Implemented on 2026-08-25. Dispatch now owns one operation matrix: a proven
+halt permits normal operations; running permits status, interrupt, passive
+breakpoint/trace reads, and detach; indeterminate permits status, complete
+interrupt recovery, and safe detach; poison permits only status and detach.
+The pre-stop memory fallback is gone, writes require a stop, passive reads can
+cross the busy socket boundary, and a standalone interrupt must drain and
+capture a fresh stop before restoring normal access. Tests cover all operation
+families, an already-halted no-op, active-continue queuing, successful recovery,
+failed recovery, unknown-state shutdown, and real-socket enforcement.
+
+### 73. Completed — preserve a truthful halt at filtered-stop timeout
+
+After QEMU reports a breakpoint in an unrelated CR3, or a target hit fails its
+predicate, `op_cont` silently filters it and returns to the top of its loop.
+If handling that stop consumed the remaining deadline, the top-level deadline
+branch returns `{reason: timeout}` without capturing the stop or resuming.
+QEMU is physically halted, while the daemon reports `run_state=running` and
+`stop=None`. This was reproduced with a deterministic clock; the current tests
+cover ordinary timeout recovery and silent filtering separately but not their
+deadline boundary.
+
+Implemented on 2026-08-25. Budget expiry after a received stop now captures
+that stop from the already-read register blob and returns the normal halt
+summary/epoch with `reason=timeout`; interrupt-and-drain remains limited to a
+timeout while QEMU is running. Deterministic-clock tests cover an unrelated
+CR3, a false predicate, action auto-continue, and expiry before another resume.
+Every branch now leaves `run_state=halted`, a non-null stop, and truthful target
+membership in the returned summary.
+
+### 74. Open — cancellable asynchronous Ghidra analysis and offline prewarming
+
+The public timeout bounds `decompileFunction`, but the client allows another
+840 seconds for first-use work. Cancellation checks bracket `_open`, while
+`_open` calls `open_program(..., analyze=True)` synchronously; the cancellation
+watcher is created only afterward around `decompileFunction`. Cancelling or
+disconnecting during import/auto-analysis therefore leaves the one serialized
+worker busy, and forced container stop can kill a project mid-write. A normal
+first query also keeps the VM halted for minutes to perform work that does not
+need a live stop.
+
+Split import/analysis/decompile into durable request phases with separate
+budgets, progress, and cancellation where Ghidra permits it. Add
+`kdbg_decomp_prepare(module|all)` to analyze exact staged artifacts while the
+VM runs, plus attach-time optional background prewarming. Preserve completed
+cache work if the live stop changes, but make the eventual live mapping and
+byte check a short stop-pinned operation. Test disconnect, cancel, worker
+restart, forced termination, stale-stop completion, and cold/warm latency.
+Large effort, very high stability and usability payoff.
+
+### 75. Open — corrupt-project quarantine and deterministic rebuild
+
+An existing digest/profile-keyed Ghidra project is opened directly. If Ghidra
+rejects a corrupt or half-written `.gpr`/`.rep`, the worker returns an
+application error; the client deliberately retries only transport failures, so
+every later query for that digest fails the same way. There is no automatic
+quarantine, one-shot clean rebuild, typed corrupt-cache result, or exact repair
+command. Age/size pruning is an awkward and potentially over-broad recovery.
+
+Classify project-open corruption separately from analysis failure, atomically
+move the exact project pair into a bounded quarantine, and attempt one clean
+rebuild under the project lock. Add `cache repair --sha256` and report the
+quarantined path, original failure, rebuild result, and retained exact binary.
+Never loop rebuilds or delete the only artifact automatically. Cover truncated
+GPR, malformed repository, forced-kill residue, failed quarantine, failed
+rebuild, and successful reuse. Moderate effort, high long-term reliability
+payoff.
+
+### 76. Completed — serialize Ghidra cache maintenance with worker lifecycle
+
+Applied pruning inventories entries, checks `worker_alive()`, and then deletes
+projects and binaries. Worker startup/project open does not share that lock, so
+a request can start after the point-in-time check and race deletion. Automatic
+budget enforcement has the same maintenance path immediately before startup,
+and concurrent callers can interleave those decisions.
+
+Implemented on 2026-08-25. One protocol-family flock now spans staged inputs,
+automatic budget enforcement, host/container startup, every mutating worker
+transaction, backend migration, and applied pruning. It is re-entrant within a
+thread, serialized across local threads and processes, and treats kernel flock
+ownership—not stale file contents—as authoritative. Applied prune inventories,
+checks worker ownership, and deletes under the same lock; dry-run inventory
+stays concurrent. Tests cover start-vs-prune, project-open-vs-prune, concurrent
+starters, nested acquisition, stale files, process death, and live refusal.
+
+### 77. Completed — bounded and reaped debugger child-process lifecycle
+
+The interactive daemon and persistent reader both use a direct `os.fork` and
+make the parent block on an unbounded status-pipe read. Neither path registers
+or calls `waitpid`. A long-lived MCP parent can therefore retain exited daemon
+or reader zombies, and a child wedged during symbol/bootstrap/RSP setup can
+block attach or the first read indefinitely. CLI parents normally exit soon,
+which hides the lifecycle defect.
+
+Implemented on 2026-08-25. Both fork paths use a shared supervisor with an
+absolute startup deadline, 64-KiB status cap, exact-child termination, and
+synchronous failure reaping; successful long-lived children get a dedicated
+background `waitpid` reaper. Startup SIGTERM/SIGINT unwinds through each
+child's safe cleanup path, and reader handshake failure best-effort resumes
+before raw close. Real-process tests cover success, explicit error, timeout,
+oversized status, parent cancellation, already-reaped/PID-reuse safety,
+process death, and repeated children without zombies.
+
+### 78. Completed — CLI parity for watchpoints, actions, and trace queries
+
+The daemon and MCP expose hardware watchpoints, typed predicates, bounded
+action captures, and paged/filtered trace queries. The interactive CLI `bp`
+surface accepts only execution mode and condition, and there is no CLI
+`bp-trace`, so operators must switch to MCP or write protocol calls for shipped
+features.
+
+Implemented on 2026-08-25. `kdbg bp` now supports `--watch`, shared validated
+sizes, repeatable `--action`, conditions, and readable watch/action results;
+`kdbg bps` labels watchpoint kind and width. New `kdbg bp-trace` exposes bounded
+tail/cursor/filter/error/summary/top queries, compact human rows, continuation
+metadata, and `--json` output that bypasses Rich wrapping. Protocol constants
+are shared with daemon validation. Unit tests cover exact forwarding, repeated
+actions, watch widths, ignored execution-bp size, every query bound, compact
+rendering, JSON parseability, and watchpoint list rendering; the existing real
+daemon-socket trace integration covers the backend query path.
+
+### 79. Open — typed errors from daemon and worker through MCP
+
+The MCP envelope advertises stable error codes, but daemon and PyGhidra worker
+errors are prose. `_research_error` infers categories from substrings such as
+`busy`, `timeout`, `stale`, and `not found`; wording changes or an incidental
+word can silently change retryability and recovery advice. Worker protocol
+version mismatch is structured only indirectly through its message.
+
+Define versioned `{code,message,retryable,details}` errors in both internal
+protocols and preserve them through clients, CLI rendering, and MCP. Keep a
+bounded `operation_failed` fallback for legacy peers. Cover every documented
+category, malicious/oversized detail, old/new peers in both directions, and
+messages containing misleading keywords. Moderate effort, high agent
+reliability payoff.
+
+### 80. Open — non-blocking decompiler status with phase and progress
+
+While the serialized worker is analyzing, status first attempts to queue an
+API request and waits five seconds before declaring the worker busy. The
+session sidecar names only the current operation and start time, so it cannot
+distinguish staging, JVM startup, import, auto-analysis, decompilation,
+mapping, cancellation, or project save. Operators see a delay followed by
+little evidence about whether progress is healthy.
+
+Publish an atomic heartbeat/phase snapshot from the worker and have status
+return it immediately without entering the serialized request queue. Include
+request id, phase, elapsed time, last progress time, cancellation state,
+binary digest/name, and bounded failure detail; never expose caller-supplied
+host paths unnecessarily. Add stale-heartbeat and dead-worker classification.
+Small-to-moderate effort, high operational usability payoff.
+
+### 81. Open — targeted cache removal and accounting reconciliation
+
+Cache inventory is useful, but mutation selects only by aggregate byte target
+or age. Recovering one known-bad digest, removing one obsolete build, or
+reclaiming an unexpectedly large entry requires contrived limits. Aggregate
+usage also includes unowned metadata/log/temporary overhead that per-entry
+sizes cannot reclaim, so `estimated_remaining_bytes` may not reach the
+requested ceiling without explaining why.
+
+Add exact SHA/project/module selectors, show owned versus overhead bytes, list
+unattributed files safely, and report an explicit residual when selected
+entries cannot satisfy `max_bytes`. Keep preview as the default and route all
+applied changes through item 76's maintenance lock. Small effort, medium-to-high
+usability payoff.
+
+### 82. Open — observable and selectable attach-time artifact staging
+
+Attach always copies every bounded user image and attempts symbol enrichment
+serially before the daemon takes RSP ownership. This maximizes unwind quality,
+but a cold attach can take tens of seconds with no progress and gives callers
+no supported way to prefer fast binary-only staging, reuse-only operation, or
+full enrichment. A transient PDB service delay is paid on the critical attach
+path even when the immediate task needs only kernel state.
+
+Expose explicit `full|binaries|cached-only` staging policies, per-module
+progress, elapsed timings, and a dry preflight summary. Preserve `full` as the
+safe default for complete mixed-mode unwind; label reduced policies in the
+frozen manifest so later traces remain truthful about missing artifacts. Add
+CLI/MCP parity and tests for interruption, partial completion, and subsequent
+offline enrichment. Moderate effort, medium-to-high usability payoff.
+
+### 83. Open — target-liveness and exit diagnostics
+
+A target that exits during continue currently looks like an ordinary timeout;
+live testing proved detach remains safe, but the operator receives no signal
+that the original EPROCESS is terminating, unlinked, or replaced by PID reuse.
+Repeated continues can therefore waste time against a dead target and produce
+confusing module/symbol errors later.
+
+On timeout or explicit status request, offer a bounded liveness check keyed by
+the captured EPROCESS plus PID/create-time evidence, without turning the hot
+breakpoint path into a full process walk. Report `alive|exiting|gone|unknown`
+and refuse to silently bind a reused PID. Keep failures advisory unless
+identity is conclusive. Moderate effort, medium usability payoff.
+
+### 84. Open — deeper exact-PDB enrichment for Ghidra
+
+Exact PDB function-public flags and durable synthetic-boundary provenance now
+improve names without laundering inferred analysis. Ghidra still receives few
+of the types, globals, prototypes, parameter names, and data symbols already
+available in exact Microsoft PDBs, so pseudocode retains avoidable `FUN_*`,
+`DAT_*`, and weak signatures.
+
+Build a versioned, bounded enrichment profile that imports verified symbols
+and types where the PDB parser can prove identity and semantics. Record every
+applied source and conflict, preserve Ghidra originals, include the profile in
+project identity, and make the cost separately controllable during prewarming.
+Start with function signatures and named globals before broad type graphs.
+Large effort, high analysis-quality payoff.
 
 ---
 

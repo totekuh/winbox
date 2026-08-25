@@ -140,6 +140,46 @@ def _client_call(sock_path: str, op: str, *, delay: float, out: dict,
     return t
 
 
+def _socketpair_call(session, op: str, **args):
+    """Exercise framing + dispatch without starting a second serve loop."""
+    server, client = socket.socketpair()
+    try:
+        client.sendall(encode(request(op, **args)))
+        session._serve_one(server)
+        return decode(read_line(client))
+    finally:
+        server.close()
+        client.close()
+
+
+def test_state_matrix_is_enforced_at_real_socket_boundary(session):
+    session.run_state = "running"
+    session.stop = None
+
+    passive = _socketpair_call(session, "bp_list")
+    refused = _socketpair_call(session, "regs")
+
+    assert passive["ok"] is True
+    assert refused["ok"] is False
+    assert refused["code"] == "state_conflict"
+    assert refused["allowed_operations"] == [
+        "bp_list", "bp_trace", "detach", "interrupt", "status",
+    ]
+    assert "state is running" in refused["error"]
+
+
+def test_poison_safe_detach_contract_crosses_real_socket(session):
+    session._cr3_corrupted = True
+
+    reply = _socketpair_call(session, "detach")
+
+    assert reply["ok"] is True
+    assert reply["result"]["cr3_poisoned"] is True
+    assert reply["result"]["resume_safe"] is False
+    assert reply["result"]["vm_will_remain_paused"] is True
+    assert session._shutdown_requested is True
+
+
 def test_interrupt_is_served_while_cont_is_blocked(session):
     """The whole point: `kdbg interrupt` must reach the daemon and end the
     cont, not sit in the backlog until the client gives up."""

@@ -3748,12 +3748,57 @@ class TestKdbgDaemonTools:
         # Alive on first probe, dead on second (simulates fast daemon shutdown).
         client = MagicMock()
         client.session_alive.side_effect = [True, False]
-        client.call.return_value = {"shutting_down": True}
+        client.call.return_value = {
+            "shutting_down": True,
+            "resume_safe": True,
+            "cr3_poisoned": False,
+        }
         with patch("winbox.mcp._kdbg_client", return_value=client), \
-             patch("winbox.kdbg.hmp.ensure_not_paused", return_value=None):
+             patch("winbox.kdbg.hmp.ensure_not_paused", return_value=None) as guard:
             result = kdbg_detach()
         client.call.assert_called_once_with("detach")
-        assert _mcp_result(result)["detached"] is True
+        parsed = _mcp_result(result)
+        assert parsed["detached"] is True
+        assert parsed["resume_safe"] is True
+        guard.assert_called_once()
+
+    def test_poisoned_detach_never_uses_out_of_band_resume(self, mock_mcp):
+        from winbox.mcp import kdbg_detach
+
+        client = MagicMock()
+        client.session_alive.side_effect = [True, False]
+        client.call.return_value = {
+            "shutting_down": True,
+            "resume_safe": False,
+            "cr3_poisoned": True,
+            "recovery": "restore snapshot before resuming",
+        }
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.kdbg.hmp.ensure_not_paused") as guard:
+            result = kdbg_detach()
+
+        parsed = _mcp_result(result)
+        assert parsed["detached"] is True
+        assert parsed["cr3_poisoned"] is True
+        assert "restore snapshot" in parsed["recovery"]
+        guard.assert_not_called()
+
+    def test_detach_transport_error_without_certificate_never_resumes(self, mock_mcp):
+        from winbox.kdbg.debugger.client import ClientError
+        from winbox.mcp import kdbg_detach
+
+        client = MagicMock()
+        client.session_alive.side_effect = [True, False]
+        client.call.side_effect = ClientError("connection closed")
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.kdbg.hmp.ensure_not_paused") as guard:
+            result = kdbg_detach()
+
+        parsed = _mcp_result(result)
+        assert parsed["detached"] is True
+        assert parsed["resume_safe"] is False
+        assert "automatic resume skipped" in parsed["warning"]
+        guard.assert_not_called()
 
     # ── kdbg_resume ───────────────────────────────────────────────────
 

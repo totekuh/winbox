@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from winbox.config import Config
-from winbox.kdbg.decomp.client import WORKER_API, open_program_limit, protocol_family
+from winbox.kdbg.decomp.client import (
+    WORKER_API,
+    maintenance_lock,
+    open_program_limit,
+    protocol_family,
+)
 
 
 GHIDRA_VERSION = "12.1.3"
@@ -228,8 +233,9 @@ class DockerManager:
         return {"installed": True, "image": IMAGE, "log": str(log_path), **info}
 
     def start(self, *, wait_seconds: float = 45.0) -> dict[str, Any]:
-        with _lifecycle_lock(self.cfg):
-            return self._start(wait_seconds=wait_seconds)
+        with maintenance_lock(self.cfg):
+            with _lifecycle_lock(self.cfg):
+                return self._start(wait_seconds=wait_seconds)
 
     def _start(self, *, wait_seconds: float) -> dict[str, Any]:
         image = self.image_info()

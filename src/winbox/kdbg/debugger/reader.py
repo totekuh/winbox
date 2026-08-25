@@ -51,6 +51,8 @@ class ReaderError(HmpError):
 
 _MAX_READ = 1 << 20
 _DEFAULT_PORT = 1234
+_READER_STARTUP_TIMEOUT = 30.0
+_STARTUP_STATUS_MAX_BYTES = 64 * 1024
 _active_snapshot: ContextVar["DebugSnapshot | None"] = ContextVar(
     "winbox_kdbg_snapshot", default=None,
 )
@@ -500,35 +502,55 @@ def _open_rsp(cfg: Config, port: int) -> RspClient:
         rsp.query_halt_reason()
         return rsp
     except BaseException:
+        # A startup cancellation or handshake failure may arrive after QEMU
+        # accepted the connection and halted. Best-effort resume before raw
+        # close; no CR3 masquerade has happened on this startup path.
+        with suppress(Exception):
+            rsp.cont()
         with suppress(OSError):
             rsp._sock.close()
         raise
 
 
 def _fork_reader(cfg: Config, port: int) -> int:
+    from winbox.kdbg.debugger.child_lifecycle import (
+        ChildStartupError,
+        supervise_startup,
+    )
+
     pipe_r, pipe_w = os.pipe()
     pid = os.fork()
     if pid:
         os.close(pipe_w)
         try:
-            line = b""
-            while b"\n" not in line:
-                chunk = os.read(pipe_r, 4096)
-                if not chunk:
-                    break
-                line += chunk
-        finally:
-            os.close(pipe_r)
-        status = line.split(b"\n", 1)[0].decode(errors="replace")
+            line = supervise_startup(
+                pid,
+                pipe_r,
+                timeout=_READER_STARTUP_TIMEOUT,
+                max_bytes=_STARTUP_STATUS_MAX_BYTES,
+                label="RSP reader",
+            )
+        except ChildStartupError as exc:
+            raise ReaderError(str(exc)) from exc
+        status = line.decode(errors="replace")
         if status == "OK":
             return pid
         raise ReaderError(status.removeprefix("ERR: ") or "reader broker failed")
 
     os.close(pipe_r)
+    class _StartupCancelled(Exception):
+        pass
+
+    def _cancel_startup(_signum, _frame):
+        raise _StartupCancelled("reader startup cancelled by parent")
+
+    signal.signal(signal.SIGTERM, _cancel_startup)
+    signal.signal(signal.SIGINT, _cancel_startup)
     rsp: RspClient | None = None
     listener: socket.socket | None = None
     lock_fd: int | None = None
     exit_code = 0
+    guest_running = False
     try:
         _detach_to_log(cfg)
         lock_fd = _acquire_lock(cfg)
@@ -536,6 +558,7 @@ def _fork_reader(cfg: Config, port: int) -> int:
         # A fresh gdb connection halts the guest.  The broker keeps it running
         # between transactions and uses RSP Ctrl-C for each coherent snapshot.
         rsp.cont()
+        guest_running = True
         listener = _bind_listener(cfg)
         reader_session_path = session_path(cfg)
         reader_session_path.write_text(json.dumps({
@@ -568,6 +591,9 @@ def _fork_reader(cfg: Config, port: int) -> int:
             with suppress(OSError):
                 listener.close()
         if rsp is not None:
+            if pipe_w >= 0 and not guest_running:
+                with suppress(Exception):
+                    rsp.cont()
             # Broker only leaves this path while the guest is running unless it
             # is poisoned.  Raw close avoids RspClient.close's extra halt dance.
             with suppress(OSError):

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
+import threading
 import time
 from pathlib import Path
 
@@ -10,7 +12,14 @@ import pytest
 
 from winbox.config import Config
 from winbox.kdbg.decomp.cache import cache_inventory, prune_cache
-from winbox.kdbg.decomp.client import DecompClient, DecompError, open_program_limit
+from winbox.kdbg.decomp.client import (
+    DecompClient,
+    DecompError,
+    maintenance_lock,
+    maintenance_lock_path,
+    open_program_limit,
+)
+from winbox.kdbg.decomp.docker import DockerManager
 from winbox.kdbg.decomp.identity import PeIdentity
 from winbox.kdbg.decomp.service import _format_instruction, _resolve_verified_binary, _snapshot_binary
 from winbox.kdbg.decomp.worker import Worker, WorkerError, _read_request, _recover_function
@@ -138,6 +147,136 @@ def test_cache_apply_refuses_live_worker(monkeypatch, tmp_path):
     with pytest.raises(DecompError, match="stop the Ghidra worker"):
         prune_cache(cfg, older_than_days=1, dry_run=False)
     assert (root / "binaries" / f"{digest}.exe").exists()
+
+
+def test_worker_start_and_applied_prune_share_one_maintenance_lock(
+    monkeypatch, tmp_path,
+):
+    cfg = Config(winbox_dir=tmp_path)
+    root = tmp_path / "decomp" / "cache"
+    (root / "binaries").mkdir(parents=True)
+    (root / "metadata").mkdir()
+    digest = "c" * 64
+    binary = root / "binaries" / f"{digest}.exe"
+    binary.write_bytes(b"live")
+    (root / "metadata" / f"{digest}.json").write_text(json.dumps({
+        "sha256": digest, "project_name": "p_live", "last_used": 1,
+    }))
+
+    manager = DockerManager(cfg)
+    startup_entered = threading.Event()
+    release_startup = threading.Event()
+    worker_live = {"value": False}
+
+    def start(*, wait_seconds):
+        startup_entered.set()
+        assert release_startup.wait(2)
+        worker_live["value"] = True
+        return {"started": True}
+
+    monkeypatch.setattr(manager, "_start", start)
+    monkeypatch.setattr(
+        DecompClient, "worker_alive", lambda self: worker_live["value"],
+    )
+    start_thread = threading.Thread(target=manager.start)
+    outcome = {}
+
+    def apply_prune():
+        try:
+            prune_cache(cfg, older_than_days=1, dry_run=False)
+        except Exception as exc:  # noqa: BLE001 — captured for the assertion
+            outcome["error"] = exc
+
+    start_thread.start()
+    assert startup_entered.wait(2)
+    prune_thread = threading.Thread(target=apply_prune)
+    prune_thread.start()
+    assert not outcome
+    release_startup.set()
+    start_thread.join(2)
+    prune_thread.join(2)
+
+    assert not start_thread.is_alive()
+    assert not prune_thread.is_alive()
+    assert isinstance(outcome.get("error"), DecompError)
+    assert "stop the Ghidra worker" in str(outcome["error"])
+    assert binary.exists()
+
+
+def test_project_transaction_and_applied_prune_share_lock(monkeypatch, tmp_path):
+    cfg = Config(winbox_dir=tmp_path)
+    source = tmp_path / "sample.exe"
+    source.write_bytes(b"exact")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    client = DecompClient(cfg)
+    transaction_entered = threading.Event()
+    release_transaction = threading.Event()
+    outcome = {}
+
+    monkeypatch.setattr(DecompClient, "worker_alive", lambda self: True)
+
+    def exchange(payload, *, timeout):
+        request_id = json.loads(payload)["request_id"]
+        transaction_entered.set()
+        assert release_transaction.wait(2)
+        return {"ok": True, "request_id": request_id, "result": {"done": True}}
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    query = threading.Thread(target=lambda: client.call(
+        "decompile", binary=str(source), sha256=digest, rva=0,
+    ))
+    query.start()
+    assert transaction_entered.wait(2)
+
+    def apply_prune():
+        try:
+            prune_cache(cfg, max_bytes=1, dry_run=False)
+        except Exception as exc:  # noqa: BLE001 — captured for assertion
+            outcome["error"] = exc
+
+    pruning = threading.Thread(target=apply_prune)
+    pruning.start()
+    assert not outcome
+    release_transaction.set()
+    query.join(2)
+    pruning.join(2)
+
+    assert not query.is_alive()
+    assert not pruning.is_alive()
+    assert isinstance(outcome.get("error"), DecompError)
+    assert "stop the Ghidra worker" in str(outcome["error"])
+
+
+def test_stale_maintenance_file_is_not_treated_as_live_ownership(tmp_path):
+    cfg = Config(winbox_dir=tmp_path)
+    path = maintenance_lock_path(cfg)
+    path.parent.mkdir(parents=True)
+    path.write_text('{"pid":999999999}\n')
+
+    with maintenance_lock(cfg):
+        owner = json.loads(path.read_text())
+
+    assert owner["pid"] == os.getpid()
+
+
+def test_process_death_releases_maintenance_lock(tmp_path):
+    cfg = Config(winbox_dir=tmp_path)
+    ready_r, ready_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(ready_r)
+        with maintenance_lock(cfg):
+            os.write(ready_w, b"1")
+            os._exit(0)
+
+    os.close(ready_w)
+    try:
+        assert os.read(ready_r, 1) == b"1"
+    finally:
+        os.close(ready_r)
+    os.waitpid(pid, 0)
+    with maintenance_lock(cfg):
+        pass
 
 
 def test_pdb_public_function_flag_is_preserved():

@@ -118,6 +118,8 @@ def test_socket_protocol_batches_condition_and_actions_into_one_g_pair(tmp_path)
         ),
         store=_Store(),
     )
+    # fork_daemon records this initial halt before exposing its socket.
+    session._capture_stop(StopReply(5, "01", None, "T05thread:01;"))
     sock_path = tmp_path / "batch.sock"
     listen = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listen.bind(str(sock_path))

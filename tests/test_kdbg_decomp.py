@@ -1124,6 +1124,7 @@ def _session(tmp_path):
         SymbolStore(tmp_path / "symbols"),
     )
     session.stop = StopState("02", 0x1000, 0x1000, 5, b"\0" * 256)
+    session.run_state = "halted"
     return session
 
 

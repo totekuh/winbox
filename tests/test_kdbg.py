@@ -307,6 +307,193 @@ class TestKdbgUserBreakpointOwnership:
         rsp.close.assert_called_once()
 
 
+class TestKdbgBreakpointCliParity:
+    def test_watchpoint_and_repeated_actions_forward_exact_contract(
+        self, runner, kdbg_env,
+    ):
+        from winbox.cli import cli
+
+        client = MagicMock()
+        client.call.return_value = {
+            "id": 3, "va": "0x1000", "user_mode": True, "hw": True,
+            "wp_type": "access", "wp_size": 8,
+            "condition": "rcx == 4", "actions": ["rax", "bytes(rdx,16)"],
+            "elapsed_ms": 1.25,
+        }
+        with patch("winbox.cli.kdbg._client", return_value=client):
+            result = runner.invoke(cli, [
+                "kdbg", "bp", "0x1000", "--watch", "access", "--size", "8",
+                "--condition", "rcx == 4", "--action", "rax",
+                "--action", "bytes(rdx,16)",
+            ])
+
+        assert result.exit_code == 0, result.output
+        client.call.assert_called_once_with(
+            "bp_add", target="0x1000", mode="hw", condition="rcx == 4",
+            wp_type="access", wp_size=8, actions=["rax", "bytes(rdx,16)"],
+        )
+        assert "watch-access/8" in result.output
+        assert "actions=2" in result.output
+
+    @pytest.mark.parametrize("size", ["0", "3", "16"])
+    def test_watchpoint_size_rejects_unsupported_width_before_daemon(
+        self, runner, kdbg_env, size,
+    ):
+        from winbox.cli import cli
+
+        client = MagicMock()
+        with patch("winbox.cli.kdbg._client", return_value=client):
+            result = runner.invoke(cli, [
+                "kdbg", "bp", "0x1000", "--watch", "write", "--size", size,
+            ])
+        assert result.exit_code == 2
+        client.call.assert_not_called()
+
+    def test_size_without_watch_is_not_forwarded(self, runner, kdbg_env):
+        from winbox.cli import cli
+
+        client = MagicMock()
+        client.call.return_value = {
+            "id": 1, "va": "0x1000", "user_mode": False, "hw": True,
+            "condition": None, "elapsed_ms": 1.0,
+        }
+        with patch("winbox.cli.kdbg._client", return_value=client):
+            result = runner.invoke(cli, ["kdbg", "bp", "0x1000", "--size", "8"])
+        assert result.exit_code == 0, result.output
+        client.call.assert_called_once_with(
+            "bp_add", target="0x1000", mode="hw", condition=None,
+        )
+
+    def test_bp_trace_forwards_all_query_options_and_renders_compact_rows(
+        self, runner, kdbg_env,
+    ):
+        from winbox.cli import cli
+
+        client = MagicMock()
+        client.call.return_value = {
+            "id": 3,
+            "entries": [{
+                "hit": 40, "rip": "0x1234", "values": {"rax": "0x22"},
+            }],
+            "total": 100, "returned": 1, "truncated": True, "next_hit": 41,
+            "summary": {"rax": {"distinct": 1}},
+        }
+        with patch("winbox.cli.kdbg._client", return_value=client):
+            result = runner.invoke(cli, [
+                "kdbg", "bp-trace", "3", "--from-hit", "40", "--limit", "50",
+                "--expression", "rax", "--value", "34", "--errors-only",
+                "--summary", "--top", "7",
+            ])
+
+        assert result.exit_code == 0, result.output
+        client.call.assert_called_once_with(
+            "bp_trace", id=3, tail=20, from_hit=40, limit=50,
+            expression="rax", value="34", errors_only=True, summary=True, top=7,
+        )
+        assert "#40" in result.output
+        assert "rax=0x22" in result.output
+        assert "next_hit=41" in result.output
+        assert "truncated" in result.output
+
+    def test_bp_trace_json_is_machine_safe(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+
+        payload = {
+            "id": 1, "entries": [], "total": 0, "returned": 0,
+            "truncated": False,
+        }
+        client = MagicMock()
+        client.call.return_value = payload
+        with patch("winbox.cli.kdbg._client", return_value=client):
+            result = runner.invoke(cli, ["kdbg", "bp-trace", "1", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == payload
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            ["--tail", "0"], ["--tail", "201"],
+            ["--limit", "0"], ["--top", "21"], ["--from-hit", "-1"],
+        ],
+    )
+    def test_bp_trace_bounds_fail_before_daemon(
+        self, runner, kdbg_env, arguments,
+    ):
+        from winbox.cli import cli
+
+        client = MagicMock()
+        with patch("winbox.cli.kdbg._client", return_value=client):
+            result = runner.invoke(cli, ["kdbg", "bp-trace", "1", *arguments])
+        assert result.exit_code == 2
+        client.call.assert_not_called()
+
+    def test_bps_renders_watchpoint_kind(self, runner, kdbg_env):
+        from winbox.cli import cli
+
+        client = MagicMock()
+        client.call.return_value = {"bps": [{
+            "id": 1, "va": "0x1000", "hw": True, "wp_type": "write",
+            "wp_size": 4, "hits": 2, "age_s": 1.0, "target": "buffer",
+        }]}
+        with patch("winbox.cli.kdbg._client", return_value=client):
+            result = runner.invoke(cli, ["kdbg", "bps"])
+        assert result.exit_code == 0, result.output
+        assert "write/4" in result.output
+
+
+class TestKdbgDetach:
+    def test_clean_detach_uses_resume_guard_only_with_certificate(
+        self, runner, kdbg_env
+    ):
+        from winbox.cli import cli
+
+        daemon = MagicMock()
+        daemon.session_alive.side_effect = [True, False]
+        daemon.call.return_value = {
+            "shutting_down": True,
+            "resume_safe": True,
+            "cr3_poisoned": False,
+        }
+        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
+             patch(
+                 "winbox.kdbg.debugger.continue_job.poll_continue",
+                 return_value={"state": "idle"},
+             ), \
+             patch("winbox.cli.kdbg.ensure_not_paused", return_value=None) as guard:
+            result = runner.invoke(cli, ["kdbg", "detach"])
+
+        assert result.exit_code == 0, result.output
+        assert "detached" in result.output
+        guard.assert_called_once()
+
+    def test_poisoned_detach_skips_resume_guard_and_prints_recovery(
+        self, runner, kdbg_env
+    ):
+        from winbox.cli import cli
+
+        daemon = MagicMock()
+        daemon.session_alive.side_effect = [True, False]
+        daemon.call.return_value = {
+            "shutting_down": True,
+            "resume_safe": False,
+            "cr3_poisoned": True,
+            "recovery": "restore snapshot before resuming",
+        }
+        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
+             patch(
+                 "winbox.kdbg.debugger.continue_job.poll_continue",
+                 return_value={"state": "idle"},
+             ), \
+             patch("winbox.cli.kdbg.ensure_not_paused") as guard:
+            result = runner.invoke(cli, ["kdbg", "detach"])
+
+        assert result.exit_code == 0, result.output
+        assert "restore snapshot" in result.output
+        guard.assert_not_called()
+
+
 class TestKdbgResume:
     """`kdbg resume` had zero unit coverage before this — only the live e2e
     suite touched it, which is why a dead conditional (state == RUNNING

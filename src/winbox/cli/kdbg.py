@@ -53,6 +53,8 @@ from winbox.kdbg.debugger.reader import (
     reader_info,
     stop_reader,
 )
+from winbox.kdbg.debugger.protocol import WATCHPOINT_SIZES, WATCHPOINT_TYPES
+from winbox.kdbg.debugger.trace import MAX_SUMMARY_TOP, MAX_TRACE_RESULTS
 from winbox.kdbg.cet import (
     CetSafetyError,
     format_status as format_cet_status,
@@ -1008,9 +1010,30 @@ def kdbg_session(ctx: click.Context) -> None:
         "'(rax & 0x80000000) != 0'."
     ),
 )
+@click.option(
+    "--watch", "wp_type",
+    type=click.Choice(WATCHPOINT_TYPES, case_sensitive=False),
+    default=None,
+    help="Install a hardware watchpoint (Z2/Z3/Z4) instead of an execution bp.",
+)
+@click.option(
+    "--size", "wp_size", type=click.Choice(WATCHPOINT_SIZES),
+    default=1, show_default=True,
+    help="Watched byte width; meaningful only with --watch.",
+)
+@click.option(
+    "--action", "actions", multiple=True,
+    help="Expression/capture to log on every hit; repeat up to 16 times.",
+)
 @click.pass_context
 def kdbg_bp(
-    ctx: click.Context, target: str, mode: str, condition: str | None,
+    ctx: click.Context,
+    target: str,
+    mode: str,
+    condition: str | None,
+    wp_type: str | None,
+    wp_size: int,
+    actions: tuple[str, ...],
 ) -> None:
     """Install a bp at TARGET (hex VA or ``module!symbol``).
 
@@ -1019,29 +1042,42 @@ def kdbg_bp(
     access. Use ``--mode soft`` for the legacy 0xCC behaviour
     (needed when >4 simultaneous bps required).
 
-    With ``--condition`` the daemon only halts on fires that satisfy
-    the predicate; other fires silent-cont. See ``winbox kdbg bps``
-    for predicate hit/skip/error counters.
+    ``--watch`` selects a hardware data watchpoint. Repeat ``--action``
+    to log expressions/captures and auto-continue instead of halting.
+    With ``--condition`` only matching hits are surfaced or logged.
     """
     cfg: Config = ctx.obj["cfg"]
     if condition is not None and not condition.strip():
         condition = None
     try:
-        result = _client(cfg).call(
-            "bp_add", target=target, mode=mode, condition=condition,
-        )
+        kwargs = {
+            "target": target,
+            "mode": mode,
+            "condition": condition,
+        }
+        if wp_type is not None:
+            kwargs.update({"wp_type": wp_type, "wp_size": wp_size})
+        if actions:
+            kwargs["actions"] = list(actions)
+        result = _client(cfg).call("bp_add", **kwargs)
     except ClientError as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
     user_kernel = "user" if result["user_mode"] else "kernel"
-    bp_kind = "hw" if result["hw"] else "soft"
+    if result.get("wp_type"):
+        bp_kind = f"watch-{result['wp_type']}/{result['wp_size']}"
+    else:
+        bp_kind = "hw" if result["hw"] else "soft"
     cond_suffix = ""
     if result.get("condition"):
         cond_suffix = f"  cond={result['condition']!r}"
+    action_suffix = ""
+    if result.get("actions"):
+        action_suffix = f"  actions={len(result['actions'])}"
     console.print(
         f"[green][+][/] bp #{result['id']} at {result['va']} "
         f"({user_kernel}-mode, {bp_kind}, {result['elapsed_ms']:.1f}ms)"
-        f"{cond_suffix}"
+        f"{cond_suffix}{action_suffix}"
     )
 
 
@@ -1061,11 +1097,98 @@ def kdbg_bps(ctx: click.Context) -> None:
         return
     console.print("[dim]  id  VA                 kind  hits  age      target[/]")
     for b in bps:
-        kind = "hw" if b.get("hw") else "soft"
+        if b.get("wp_type"):
+            kind = f"{b['wp_type']}/{b.get('wp_size', '?')}"
+        else:
+            kind = "hw" if b.get("hw") else "soft"
         console.print(
             f"  {b['id']:2d}  {b['va']:18s} {kind:4s}  {b['hits']:5d}  "
             f"{b['age_s']:6.1f}s  {b['target']}"
         )
+
+
+@kdbg.command("bp-trace")
+@click.argument("bp_id", type=int)
+@click.option(
+    "--tail", type=click.IntRange(1, MAX_TRACE_RESULTS),
+    default=20, show_default=True,
+)
+@click.option("--from-hit", type=click.IntRange(min=0), default=None)
+@click.option(
+    "--limit", type=click.IntRange(1, MAX_TRACE_RESULTS),
+    default=20, show_default=True,
+)
+@click.option("--expression", default=None, help="Filter/project one exact action.")
+@click.option("--value", default=None, help="Filter an exact numeric or string value.")
+@click.option("--errors-only", is_flag=True, help="Return only action errors.")
+@click.option("--summary", is_flag=True, help="Include bounded value distributions.")
+@click.option(
+    "--top", type=click.IntRange(1, MAX_SUMMARY_TOP),
+    default=10, show_default=True,
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_bp_trace(
+    ctx: click.Context,
+    bp_id: int,
+    tail: int,
+    from_hit: int | None,
+    limit: int,
+    expression: str | None,
+    value: str | None,
+    errors_only: bool,
+    summary: bool,
+    top: int,
+    as_json: bool,
+) -> None:
+    """Query bounded action-trace records for BP_ID."""
+    cfg: Config = ctx.obj["cfg"]
+    kwargs = {
+        "id": bp_id,
+        "tail": tail,
+        "limit": limit,
+        "errors_only": errors_only,
+        "summary": summary,
+        "top": top,
+    }
+    if from_hit is not None:
+        kwargs["from_hit"] = from_hit
+    if expression is not None:
+        kwargs["expression"] = expression
+    if value is not None:
+        kwargs["value"] = value
+    try:
+        result = _client(cfg).call("bp_trace", **kwargs)
+    except ClientError as e:
+        console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+
+    if as_json:
+        import json as _json
+        click.echo(_json.dumps(result, indent=2))
+        return
+
+    entries = result.get("entries", [])
+    if not entries:
+        console.print("[dim](no matching trace entries)[/]")
+    for entry in entries:
+        values = entry.get("values") or {}
+        rendered = "  ".join(f"{key}={val}" for key, val in values.items())
+        console.print(
+            f"  #{entry.get('hit', '?'):<6} {entry.get('rip', '?'):18s} {rendered}"
+        )
+    suffix = " truncated" if result.get("truncated") else ""
+    cursor = (
+        f" next_hit={result['next_hit']}" if result.get("next_hit") is not None else ""
+    )
+    console.print(
+        f"[dim]returned={result.get('returned', len(entries))} "
+        f"total={result.get('total', '?')}{cursor}{suffix}[/]"
+    )
+    if result.get("summary") is not None:
+        import json as _json
+        console.print("[dim]summary[/]")
+        click.echo(_json.dumps(result["summary"], indent=2))
 
 
 @kdbg.command("rm")
@@ -1492,7 +1615,7 @@ def kdbg_bt(ctx: click.Context, depth: int) -> None:
 @kdbg.command("detach")
 @click.pass_context
 def kdbg_detach(ctx: click.Context) -> None:
-    """Tear down the kdbg session (removes bps, resumes VM, releases lock)."""
+    """Tear down kdbg; resume only with the daemon's safety certificate."""
     cfg: Config = ctx.obj["cfg"]
     client = _client(cfg)
     if not client.session_alive():
@@ -1511,9 +1634,12 @@ def kdbg_detach(ctx: click.Context) -> None:
             wait_continue(cfg, token=str(job["token"]), timeout=5.0)
     except ContinueJobError as exc:
         console.print(f"[yellow][!][/] async continue cleanup: {exc}")
+    detach_result = None
+    detach_error = None
     try:
-        client.call("detach")
+        detach_result = client.call("detach")
     except ClientError as e:
+        detach_error = e
         console.print(f"[yellow][!][/] {e}")
     # Daemon should exit shortly. Wait briefly for the lock to release.
     import time as _t
@@ -1527,12 +1653,21 @@ def kdbg_detach(ctx: click.Context) -> None:
         _t.sleep(0.1)
     if not detached:
         console.print("[yellow][!][/] daemon didn't exit within 5s; lock may be stale")
-    # A daemon that didn't shut down cleanly never resumed the CPU, leaving
-    # the VM paused with only that warning to show for it — after which every
-    # winbox command sees a VM that looks down.
-    note = ensure_not_paused(cfg.vm_name)
+    resume_safe = bool(
+        detach_result is not None and detach_result.get("resume_safe") is True
+    )
+    note = ensure_not_paused(cfg.vm_name) if detached and resume_safe else None
     if note:
         console.print(f"[yellow][!][/] {note}")
+    recovery = detach_result.get("recovery") if detach_result else None
+    if recovery:
+        console.print(f"[yellow][!][/] {recovery}")
+    if detach_error is not None and not detached:
+        console.print(
+            "[red][-][/] automatic resume skipped: daemon did not certify "
+            "that resuming is safe"
+        )
+        raise SystemExit(1)
 
 
 @kdbg.command("resume")

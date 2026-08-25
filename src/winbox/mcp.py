@@ -4377,9 +4377,11 @@ def kdbg_bt(depth: int = 8) -> dict[str, Any]:
 
 @mcp.tool()
 def kdbg_detach() -> dict[str, Any]:
-    """Tear down the kdbg session: remove bps, resume VM, release lock.
+    """Tear down kdbg and resume only when the daemon certifies it is safe.
 
-    Safe to call when no session is active — returns "no session".
+    A poisoned or indeterminate session releases daemon ownership but leaves
+    the VM untouched and returns explicit recovery guidance. Safe to call when
+    no session is active — returns "no session".
     """
     cfg = _kdbg_cfg_only()
     client = _kdbg_client(cfg)
@@ -4396,31 +4398,49 @@ def kdbg_detach() -> dict[str, Any]:
             wait_continue(cfg, token=str(job["token"]), timeout=5.0)
     except ContinueJobError as exc:
         return _research_error(exc, operation="kdbg_detach")
+    detach_result: dict[str, Any] | None = None
+    detach_error: _ClientError | None = None
     try:
-        client.call("detach")
-    except _ClientError as e:
-        # Daemon may have already started shutting down; ignore.
-        pass
+        detach_result = client.call("detach")
+    except _ClientError as exc:
+        # The daemon may have exited after accepting the request. We still
+        # wait for ownership release, but without its explicit safety
+        # certificate we must never reconnect to the gdbstub and resume.
+        detach_error = exc
     # Wait for lock release (daemon exit) up to 5s.
     import time as _time
     from winbox.kdbg.hmp import ensure_not_paused
 
     deadline = _time.monotonic() + 5.0
     detached = False
-    warning = "daemon didn't exit within 5s; lock may be stale"
+    warning: str | None = "daemon didn't exit within 5s; lock may be stale"
     while _time.monotonic() < deadline:
         if not client.session_alive():
             detached = True
             warning = None
             break
         _time.sleep(0.1)
-    # A daemon that didn't shut down cleanly never resumed the CPU, so the VM
-    # is left paused and every later tool call sees it as down.
-    note = ensure_not_paused(cfg.vm_name)
+    if detach_error is not None:
+        warning = (
+            f"detach request failed: {detach_error}; automatic resume skipped "
+            "because the daemon did not certify it as safe"
+        )
+
+    resume_safe = bool(
+        detach_result is not None and detach_result.get("resume_safe") is True
+    )
+    note = None
+    if detached and resume_safe:
+        note = ensure_not_paused(cfg.vm_name)
+    recovery = detach_result.get("recovery") if detach_result else None
     return _research_ok({
         "detached": detached,
         "warning": warning,
-        "recovery": note or None,
+        "resume_safe": resume_safe,
+        "cr3_poisoned": bool(
+            detach_result and detach_result.get("cr3_poisoned") is True
+        ),
+        "recovery": recovery or note or None,
     })
 
 

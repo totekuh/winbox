@@ -52,6 +52,9 @@ OPS: frozenset[str] = frozenset({
     "detach",       # graceful shutdown
 })
 
+WATCHPOINT_TYPES = ("write", "read", "access")
+WATCHPOINT_SIZES = (1, 2, 4, 8)
+
 
 # Hard cap on a single line — enough for any single response we
 # generate (largest is bp_list with hundreds of bps), small enough to
