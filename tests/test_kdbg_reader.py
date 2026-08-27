@@ -114,6 +114,10 @@ def test_local_snapshot_collects_all_cr3_and_kernel_gs_candidates():
     assert snap.kernel_gs_bases == (
         0xFFFFF78000000000, 0xFFFFF78000001000,
     )
+    assert snap.vcpu_kernel_gs_bases == (
+        (1, (0xFFFFF78000000000,)),
+        (2, (0xFFFFF78000001000,)),
+    )
 
 
 def test_reader_handshake_failure_best_effort_resumes_before_raw_close(

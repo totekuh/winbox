@@ -2978,9 +2978,13 @@ from winbox.kdbg.cet import (
 )
 from winbox.kdbg.pe import PeError as _KdbgPeError
 from winbox.kdbg.walk import find_process as _kdbg_find_process
+from winbox.kdbg.walk import list_current_vcpu_threads as _kdbg_list_current_vcpu_threads
 from winbox.kdbg.walk import list_modules as _kdbg_list_modules
 from winbox.kdbg.walk import list_processes as _kdbg_list_processes
+from winbox.kdbg.walk import list_threads as _kdbg_list_threads
 from winbox.kdbg.walk import list_user_modules as _kdbg_list_user_modules, is_wow64 as _kdbg_is_wow64
+from winbox.kdbg.walk import resolve_thread_start_addresses as _kdbg_resolve_thread_start_addresses
+from winbox.kdbg.walk import select_threads as _kdbg_select_threads
 
 
 @mcp.tool()
@@ -3176,6 +3180,198 @@ def kdbg_ps() -> dict[str, Any]:
         for p in procs
     ]
     return _research_ok({"processes": out, "count": len(out)})
+
+
+def _kdbg_thread_address(attribution: Any) -> dict[str, Any]:
+    return {
+        "address": f"0x{attribution.address:016x}",
+        "mapping": attribution.mapping,
+        "module": attribution.module,
+        "module_base": (
+            f"0x{attribution.module_base:016x}"
+            if attribution.module_base is not None else None
+        ),
+        "module_size": (
+            f"0x{attribution.module_size:x}"
+            if attribution.module_size is not None else None
+        ),
+        "rva": f"0x{attribution.rva:x}" if attribution.rva is not None else None,
+        "architecture": attribution.architecture,
+        "symbol": attribution.symbol,
+        "symbol_offset": (
+            f"0x{attribution.symbol_offset:x}"
+            if attribution.symbol_offset is not None else None
+        ),
+    }
+
+
+def _kdbg_current_vcpu_record(record: Any) -> dict[str, Any]:
+    return {
+        "vcpu": record.vcpu,
+        "status": record.status,
+        "ethread": f"0x{record.ethread:016x}" if record.ethread is not None else None,
+        "eprocess": f"0x{record.eprocess:016x}" if record.eprocess is not None else None,
+        "pid": record.pid,
+        "process_name": record.process_name,
+        "tid": record.tid,
+        "in_target_process": record.in_target_process,
+        "reason": record.reason,
+    }
+
+
+def _kdbg_thread_record(
+    thread: Any, *, attribution: Any = None, running_on_vcpus: tuple[int, ...] | list[int] = (),
+) -> dict[str, Any]:
+    """Serialize ThreadRecord with both stable raw and best-effort enum names."""
+    result = {
+        "tid": thread.tid,
+        "ethread": f"0x{thread.ethread:016x}",
+        "state": {"raw": thread.state, "name": thread.state_name},
+        "wait_reason": {
+            "raw": thread.wait_reason,
+            "name": thread.wait_reason_name,
+        },
+        "priority": thread.priority,
+        "base_priority": thread.base_priority,
+        "context_switches": thread.context_switches,
+        "teb": f"0x{thread.teb:016x}",
+        "kernel_stack": f"0x{thread.kernel_stack:016x}",
+        "stack_limit": f"0x{thread.stack_limit:016x}",
+        "stack_base": f"0x{thread.stack_base:016x}",
+        "start_address": f"0x{thread.start_address:016x}",
+        "win32_start_address": f"0x{thread.win32_start_address:016x}",
+        "create_time": thread.create_time,
+        "exit_status": thread.exit_status,
+    }
+    if attribution is not None:
+        result["start_attribution"] = {
+            "start_address": _kdbg_thread_address(attribution.start_address),
+            "win32_start_address": _kdbg_thread_address(
+                attribution.win32_start_address,
+            ),
+        }
+    if running_on_vcpus:
+        result["running_on_vcpus"] = list(running_on_vcpus)
+    return result
+
+
+@mcp.tool()
+def kdbg_threads(
+    pid: int,
+    detail: str = "full",
+    state: str = "",
+    wait_reason: str = "",
+    sort: str = "tid",
+    limit: int = 256,
+    resolve: bool = False,
+    include_current: bool = True,
+) -> dict[str, Any]:
+    """Walk one process's kernel thread list without injecting into the guest.
+
+    Returns bounded scheduler metadata, ETHREAD identity, thread start
+    addresses, TEB, and stack bounds from ``EPROCESS.ThreadListHead``.
+    ``kernel_stack`` is the raw KTHREAD field, not an asserted saved RSP;
+    use ``kdbg_context`` only for the currently stopped debugger thread.
+
+    Each ``state`` and ``wait_reason`` reports an invariant raw byte plus a
+    best-effort current-Windows enum name; wait-reason names are intentionally
+    omitted unless the scheduler state is ``Waiting``. A malformed list/read
+    or the hard safety cap returns the validated prefix with ``complete=false``
+    and a truthful ``truncated_reason``. ``limit`` only bounds returned detail
+    rows: ``walk_complete`` remains independent, and summary metadata reports
+    all walked/matching/filtered rows. ``resolve`` maps returned start VAs to
+    live modules and already-local symbols without downloading anything.
+
+    Args:
+        pid: Target process ID (find it with ``kdbg_ps`` first).
+        detail: ``full`` returns bounded rows; ``summary`` returns counts only.
+        state: Optional raw scheduler-state byte or enum name (e.g. Waiting).
+        wait_reason: Optional raw wait byte or enum name; matches Waiting only.
+        sort: ``tid``, ``state``, ``wait``, ``priority``, ``context-switches``,
+            ``start``, ``win32-start``, or ``create-time``.
+        limit: Maximum returned detailed rows (1..1024; default 256).
+        resolve: Attribute returned start addresses against live module lists.
+        include_current: Return validated current ETHREAD identity per halted vCPU.
+    """
+    cfg, vm, _ = _get_state()
+    vm_state = vm.state()
+    if vm_state not in (VMState.RUNNING, VMState.PAUSED):
+        return _research_error(
+            f"VM is not running (state: {vm_state.value})", operation="kdbg_threads"
+        )
+    try:
+        with _kdbg_debug_snapshot(cfg):
+            store = _kdbg_get_store()
+            cache = _KdbgWalkCache()
+            target = _kdbg_find_process(cfg.vm_name, store, pid=pid, cache=cache)
+            if target is None:
+                return _research_error(f"pid {pid} not found", operation="kdbg_threads")
+            walked = _kdbg_list_threads(
+                cfg.vm_name, store, target, cache=cache,
+            )
+            if detail not in {"full", "summary"}:
+                raise _KdbgHmpError("detail must be 'full' or 'summary'")
+            selected = _kdbg_select_threads(
+                walked.threads, state=state or None, wait_reason=wait_reason or None,
+                sort=sort, limit=limit,
+            )
+            displayed = selected.threads if detail == "full" else ()
+            attributions: dict[int, Any] = {}
+            attribution_warnings: tuple[str, ...] = ()
+            if resolve:
+                attributions, attribution_warnings = _kdbg_resolve_thread_start_addresses(
+                    cfg.vm_name, store, target, displayed, cache=cache,
+                )
+            current_vcpus: list[Any] = []
+            current_vcpus_error: str | None = None
+            if include_current:
+                try:
+                    current_vcpus = _kdbg_list_current_vcpu_threads(
+                        cfg.vm_name, store, target, threads=walked.threads, cache=cache,
+                    )
+                except (_KdbgStoreError, _KdbgHmpError) as exc:
+                    current_vcpus_error = str(exc)
+    except (_KdbgStoreError, _KdbgHmpError) as e:
+        return _research_error(e, operation="kdbg_threads")
+    running_by_ethread: dict[int, list[int]] = {}
+    for current in current_vcpus:
+        if current.status == "current" and current.in_target_process and current.ethread is not None:
+            running_by_ethread.setdefault(current.ethread, []).append(current.vcpu)
+    response = {
+        "pid": target.pid,
+        "name": target.name,
+        "eprocess": f"0x{target.eprocess:016x}",
+        "process_create_time": target.create_time,
+        "threads": [
+            _kdbg_thread_record(
+                thread,
+                attribution=attributions.get(thread.ethread),
+                running_on_vcpus=running_by_ethread.get(thread.ethread, ()),
+            )
+            for thread in displayed
+        ],
+        "count": len(displayed),
+        "total_count": selected.total_count,
+        "matched_count": selected.matched_count,
+        "filtered_out": selected.filtered_out,
+        "returned": len(displayed),
+        "output_truncated": selected.output_truncated,
+        "detail_rows_omitted": detail == "summary" and selected.matched_count > 0,
+        "detail": detail,
+        "summary": {
+            "states": selected.state_counts,
+            "wait_reasons": selected.wait_reason_counts,
+        },
+        "complete": walked.complete,
+        "walk_complete": walked.complete,
+        "truncated_reason": walked.truncated_reason,
+        "current_vcpus": [_kdbg_current_vcpu_record(current) for current in current_vcpus],
+    }
+    if attribution_warnings:
+        response["attribution_warnings"] = list(attribution_warnings)
+    if current_vcpus_error is not None:
+        response["current_vcpus_error"] = current_vcpus_error
+    return _research_ok(response)
 
 
 @mcp.tool()

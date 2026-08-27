@@ -2966,6 +2966,156 @@ class TestKdbgListTools:
             assert entry["dtb"].startswith("0x")
             assert entry["eprocess"].startswith("0x")
 
+    def test_kdbg_threads_returns_identity_and_truthful_partial_status(self, mock_mcp):
+        from winbox.kdbg.walk import ProcessRecord, ThreadRecord, ThreadWalkResult
+        from winbox.mcp import kdbg_threads
+
+        _, _, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+        target = ProcessRecord(
+            pid=1234, name="target.exe", eprocess=0xffffae00abcdef00,
+            directory_table_base=0x7fa000, create_time=0x11223344,
+        )
+        walked = ThreadWalkResult(
+            threads=[ThreadRecord(
+                tid=4321, ethread=0xffffae0012345000, state=5,
+                state_name="Waiting", wait_reason=6, wait_reason_name="UserRequest",
+                priority=13, base_priority=8, context_switches=927,
+                teb=0x7ffde000, kernel_stack=0xfffff80001234000,
+                stack_limit=0xfffff80001230000, stack_base=0xfffff80001238000,
+                start_address=0xfffff80010001000,
+                win32_start_address=0x7ff740001000, create_time=0x1234,
+                exit_status=259,
+            )],
+            complete=False,
+            truncated_reason="cycle detected at ETHREAD list entry 0xffffae0012345578",
+        )
+
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_list_threads", return_value=walked):
+            result = _mcp_result(kdbg_threads(1234))
+
+        assert result["pid"] == 1234
+        assert result["name"] == "target.exe"
+        assert result["eprocess"] == "0xffffae00abcdef00"
+        assert result["process_create_time"] == 0x11223344
+        assert result["count"] == 1
+        assert result["complete"] is False
+        assert result["truncated_reason"] == walked.truncated_reason
+        assert result["threads"] == [{
+            "tid": 4321,
+            "ethread": "0xffffae0012345000",
+            "state": {"raw": 5, "name": "Waiting"},
+            "wait_reason": {"raw": 6, "name": "UserRequest"},
+            "priority": 13,
+            "base_priority": 8,
+            "context_switches": 927,
+            "teb": "0x000000007ffde000",
+            "kernel_stack": "0xfffff80001234000",
+            "stack_limit": "0xfffff80001230000",
+            "stack_base": "0xfffff80001238000",
+            "start_address": "0xfffff80010001000",
+            "win32_start_address": "0x00007ff740001000",
+            "create_time": 0x1234,
+            "exit_status": 259,
+        }]
+
+    def test_kdbg_threads_rejects_missing_pid_without_walking(self, mock_mcp):
+        from winbox.mcp import kdbg_threads
+
+        _, _, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_find_process", return_value=None), \
+             patch("winbox.mcp._kdbg_list_threads") as listed:
+            error = _mcp_error(kdbg_threads(9999))
+
+        assert error["message"] == "pid 9999 not found"
+        listed.assert_not_called()
+
+    def test_kdbg_threads_bounds_rows_and_serializes_attribution_and_vcpu(self, mock_mcp):
+        from winbox.kdbg.walk import (
+            CurrentVcpuRecord,
+            ProcessRecord,
+            ThreadAddressAttribution,
+            ThreadRecord,
+            ThreadStartAttribution,
+            ThreadWalkResult,
+        )
+        from winbox.mcp import kdbg_threads
+
+        _, _, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+        target = ProcessRecord(
+            pid=1234, name="target.exe", eprocess=0xffffae00abcdef00,
+            directory_table_base=0x7fa000,
+        )
+        thread = ThreadRecord(
+            tid=4321, ethread=0xffffae0012345000, state=5,
+            state_name="Waiting", wait_reason=6, wait_reason_name="UserRequest",
+            priority=13, base_priority=8, context_switches=927,
+            teb=0x7ffde000, kernel_stack=0xfffff80001234000,
+            stack_limit=0xfffff80001230000, stack_base=0xfffff80001238000,
+            start_address=0xfffff80010001000,
+            win32_start_address=0x7ff740001000, create_time=0x1234,
+            exit_status=259,
+        )
+        attribution = ThreadStartAttribution(
+            start_address=ThreadAddressAttribution(
+                address=thread.start_address, mapping="kernel_module",
+                module="ntoskrnl.exe", module_base=0xfffff80010000000,
+                module_size=0x4000, rva=0x1000,
+                symbol="PspSystemThreadStartup", symbol_offset=0,
+            ),
+            win32_start_address=ThreadAddressAttribution(
+                address=thread.win32_start_address, mapping="user_not_in_loader_module",
+            ),
+        )
+        current = CurrentVcpuRecord(
+            vcpu=3, status="current", ethread=thread.ethread,
+            eprocess=target.eprocess, pid=target.pid, process_name=target.name,
+            tid=thread.tid, in_target_process=True,
+        )
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_list_threads", return_value=ThreadWalkResult([thread], True)), \
+             patch("winbox.mcp._kdbg_resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
+             patch("winbox.mcp._kdbg_list_current_vcpu_threads", return_value=[current]):
+            result = _mcp_result(kdbg_threads(1234, resolve=True))
+
+        assert (result["count"], result["total_count"], result["matched_count"], result["returned"]) == (1, 1, 1, 1)
+        assert result["walk_complete"] is True
+        assert result["threads"][0]["running_on_vcpus"] == [3]
+        start = result["threads"][0]["start_attribution"]["start_address"]
+        assert (start["mapping"], start["module"], start["symbol"], start["symbol_offset"]) == (
+            "kernel_module", "ntoskrnl.exe", "PspSystemThreadStartup", "0x0",
+        )
+        assert result["current_vcpus"] == [{
+            "vcpu": 3, "status": "current", "ethread": "0xffffae0012345000",
+            "eprocess": "0xffffae00abcdef00", "pid": 1234,
+            "process_name": "target.exe", "tid": 4321,
+            "in_target_process": True, "reason": None,
+        }]
+
+    def test_kdbg_threads_rejects_invalid_bounded_view(self, mock_mcp):
+        from winbox.kdbg.walk import ProcessRecord, ThreadWalkResult
+        from winbox.mcp import kdbg_threads
+
+        _, _, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+        target = ProcessRecord(
+            pid=1234, name="target.exe", eprocess=0xffffae00abcdef00,
+            directory_table_base=0x7fa000,
+        )
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_list_threads", return_value=ThreadWalkResult([], True)):
+            error = _mcp_error(kdbg_threads(1234, state="invented"))
+
+        assert error["code"] == "invalid_argument"
+        assert "invalid state" in error["message"]
+
     def test_kdbg_lm_returns_json_array(self, mock_mcp):
         import json as _json
         from winbox.kdbg.walk import ModuleRecord

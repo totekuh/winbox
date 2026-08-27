@@ -176,6 +176,155 @@ class TestKdbgAttachPolicies:
         assert "Invalid value" in result.output
 
 
+class TestKdbgThreads:
+    def _target_and_threads(self):
+        from winbox.kdbg.walk import ProcessRecord, ThreadRecord, ThreadWalkResult
+
+        target = ProcessRecord(
+            pid=4712, name="target.exe", eprocess=0xffffae00abcdef00,
+            directory_table_base=0x7fa000, create_time=0x11223344,
+        )
+        result = ThreadWalkResult(
+            threads=[ThreadRecord(
+                tid=4816, ethread=0xffffae0012345000, state=5,
+                state_name="Waiting", wait_reason=6, wait_reason_name="UserRequest",
+                priority=13, base_priority=8, context_switches=927,
+                teb=0x7ffde000, kernel_stack=0xfffff80001234000,
+                stack_limit=0xfffff80001230000, stack_base=0xfffff80001238000,
+                start_address=0xfffff80010001000,
+                win32_start_address=0x7ff740001000, create_time=0x1234,
+                exit_status=259,
+            )],
+            complete=False,
+            truncated_reason="cycle detected at ETHREAD list entry 0xffffae0012345578",
+        )
+        return target, result
+
+    def test_renders_thread_metadata_and_partial_walk_warning(self, runner, kdbg_env):
+        from winbox.cli import cli
+
+        target, walked = self._target_and_threads()
+        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg._get_store"), \
+             patch("winbox.cli.kdbg.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.list_threads", return_value=walked):
+            result = runner.invoke(cli, ["kdbg", "threads", "4712"])
+
+        assert result.exit_code == 0, result.output
+        assert "4816" in result.output
+        assert "Waiting" in result.output
+        assert "UserRequest" in result.output
+        assert "incomplete thread walk" in result.output
+        assert "cycle detected at ETHREAD list entry" in result.output
+        assert "0xffffae0012345578" in result.output
+
+    def test_emits_machine_safe_thread_json(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+
+        target, walked = self._target_and_threads()
+        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg._get_store"), \
+             patch("winbox.cli.kdbg.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.list_threads", return_value=walked):
+            result = runner.invoke(cli, ["kdbg", "threads", "4712", "--json"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["pid"] == 4712
+        assert payload["complete"] is False
+        assert payload["threads"][0]["ethread"] == "0xffffae0012345000"
+        assert payload["threads"][0]["state"] == {"raw": 5, "name": "Waiting"}
+        assert payload["threads"][0]["wait_reason"] == {
+            "raw": 6, "name": "UserRequest",
+        }
+
+    def test_bounds_rows_and_emits_resolution_and_current_vcpu(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+        from winbox.kdbg.walk import (
+            CurrentVcpuRecord,
+            ThreadAddressAttribution,
+            ThreadStartAttribution,
+        )
+
+        target, walked = self._target_and_threads()
+        thread = walked.threads[0]
+        attribution = ThreadStartAttribution(
+            start_address=ThreadAddressAttribution(
+                address=thread.start_address, mapping="kernel_module",
+                module="ntoskrnl.exe", module_base=0xfffff80010000000,
+                module_size=0x4000, rva=0x1000,
+                symbol="PspSystemThreadStartup", symbol_offset=0,
+            ),
+            win32_start_address=ThreadAddressAttribution(
+                address=thread.win32_start_address, mapping="user_module",
+                module="target.exe", module_base=0x7ff740000000,
+                module_size=0x4000, rva=0x1000, architecture="x64",
+            ),
+        )
+        current = CurrentVcpuRecord(
+            vcpu=2, status="current", ethread=thread.ethread,
+            eprocess=target.eprocess, pid=target.pid, process_name=target.name,
+            tid=thread.tid, in_target_process=True,
+        )
+        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg._get_store"), \
+             patch("winbox.cli.kdbg.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.list_threads", return_value=walked), \
+             patch("winbox.cli.kdbg.resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
+             patch("winbox.cli.kdbg.list_current_vcpu_threads", return_value=[current]):
+            result = runner.invoke(cli, [
+                "kdbg", "threads", "4712", "--json", "--resolve",
+                "--state", "Waiting", "--limit", "1",
+            ])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert (payload["total_count"], payload["matched_count"], payload["returned"]) == (1, 1, 1)
+        assert payload["walk_complete"] is False
+        assert payload["threads"][0]["running_on_vcpus"] == [2]
+        assert payload["threads"][0]["start_attribution"]["start_address"] == {
+            "address": "0xfffff80010001000", "mapping": "kernel_module",
+            "module": "ntoskrnl.exe", "module_base": "0xfffff80010000000",
+            "module_size": "0x4000", "rva": "0x1000", "architecture": None,
+            "symbol": "PspSystemThreadStartup", "symbol_offset": "0x0",
+        }
+        assert payload["current_vcpus"][0]["tid"] == 4816
+
+    def test_summary_omits_rows_without_claiming_walk_truncation(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+
+        target, walked = self._target_and_threads()
+        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg._get_store"), \
+             patch("winbox.cli.kdbg.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.list_threads", return_value=walked), \
+             patch("winbox.cli.kdbg.list_current_vcpu_threads", return_value=[]):
+            result = runner.invoke(cli, ["kdbg", "threads", "4712", "--json", "--detail", "summary"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["threads"] == []
+        assert payload["detail_rows_omitted"] is True
+        assert payload["output_truncated"] is False
+        assert payload["walk_complete"] is False
+
+    def test_missing_pid_never_walks_threads(self, runner, kdbg_env):
+        from winbox.cli import cli
+
+        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg._get_store"), \
+             patch("winbox.cli.kdbg.find_process", return_value=None), \
+             patch("winbox.cli.kdbg.list_threads") as listed:
+            result = runner.invoke(cli, ["kdbg", "threads", "9999"])
+
+        assert result.exit_code == 1
+        assert "pid 9999 not found" in result.output
+        listed.assert_not_called()
+
+
 class TestKdbgTargetStatus:
     def test_emits_machine_safe_liveness_json(self, runner, kdbg_env):
         import json

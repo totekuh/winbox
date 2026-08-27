@@ -45,6 +45,71 @@ if TYPE_CHECKING:
 MAX_PROCESSES = 4096
 MAX_MODULES = 1024
 MAX_USER_MODULES = 1024
+MAX_THREADS_PER_PROCESS = 8192
+
+
+# Values from nt!KTHREAD_STATE / nt!KWAIT_REASON.  The raw byte is always
+# returned too: new Windows builds can add a value without making a correct
+# walker suddenly lie about the thread's state.
+_KTHREAD_STATES = {
+    0: "Initialized",
+    1: "Ready",
+    2: "Running",
+    3: "Standby",
+    4: "Terminated",
+    5: "Waiting",
+    6: "Transition",
+    7: "DeferredReady",
+    8: "GateWait",
+}
+
+_KWAIT_REASONS = {
+    0: "Executive",
+    1: "FreePage",
+    2: "PageIn",
+    3: "PoolAllocation",
+    4: "DelayExecution",
+    5: "Suspended",
+    6: "UserRequest",
+    7: "WrExecutive",
+    8: "WrFreePage",
+    9: "WrPageIn",
+    10: "WrPoolAllocation",
+    11: "WrDelayExecution",
+    12: "WrSuspended",
+    13: "WrUserRequest",
+    14: "WrEventPair",
+    15: "WrQueue",
+    16: "WrLpcReceive",
+    17: "WrLpcReply",
+    18: "WrVirtualMemory",
+    19: "WrPageOut",
+    20: "WrRendezvous",
+    21: "Spare2",
+    22: "Spare3",
+    23: "Spare4",
+    24: "Spare5",
+    25: "WrCalloutStack",
+    26: "WrKernel",
+    27: "WrResource",
+    28: "WrPushLock",
+    29: "WrMutex",
+    30: "WrQuantumEnd",
+    31: "WrDispatchInt",
+    32: "WrPreempted",
+    33: "WrYieldExecution",
+    34: "WrFastMutex",
+    35: "WrGuardedMutex",
+    36: "WrRundown",
+    37: "WrAlertByThreadId",
+    38: "WrDeferredPreempt",
+    39: "WrPhysicalFault",
+    40: "WrIoRing",
+    41: "WrMdlCache",
+    42: "WrRcu",
+    43: "WrSparse",
+    44: "WrSilo",
+}
 
 # A kernel CR3 is a boot-scoped translation anchor, not cached process state.
 # PID 4's DirectoryTableBase remains valid for the lifetime of a Windows boot;
@@ -112,6 +177,209 @@ class UserModuleRecord:
     full_path: str          # FullDllName, e.g. "C:\\Windows\\System32\\ntdll.dll"
     entry: int              # VA of the LDR_DATA_TABLE_ENTRY
     architecture: str = "x64"
+
+
+@dataclass
+class ThreadRecord:
+    """One thread reached through ``EPROCESS.ThreadListHead``.
+
+    This is metadata read from the stopped kernel's scheduler structures; it
+    intentionally does *not* claim to provide registers or a stack for an
+    arbitrary non-running thread.  ``kernel_stack`` is the KTHREAD field, not
+    an asserted saved RSP.
+    """
+
+    tid: int
+    ethread: int
+    state: int
+    state_name: str | None
+    wait_reason: int
+    wait_reason_name: str | None
+    priority: int
+    base_priority: int
+    context_switches: int
+    teb: int
+    kernel_stack: int
+    stack_limit: int
+    stack_base: int
+    start_address: int
+    win32_start_address: int
+    create_time: int
+    exit_status: int
+
+
+@dataclass
+class ThreadWalkResult:
+    """Result of a bounded process-thread walk.
+
+    Existing legacy walkers predate a machine-readable partial-result
+    contract.  Threads are new, so make any malformed link, read failure, or
+    cap explicit to callers instead of passing a plausible partial list off as
+    complete.
+    """
+
+    threads: list[ThreadRecord]
+    complete: bool
+    truncated_reason: str | None = None
+
+
+class ThreadFilterError(HmpError):
+    """A bounded thread-view request is malformed."""
+
+
+@dataclass(frozen=True)
+class ThreadSelection:
+    """A presentation-bounded view of a complete-or-partial raw walk.
+
+    ``walk_complete`` always describes the ETHREAD traversal, while
+    ``output_truncated`` only describes an intentional client-facing limit.
+    Keeping them separate prevents a compact response from masquerading as a
+    corrupt kernel list, or vice versa.
+    """
+
+    threads: tuple[ThreadRecord, ...]
+    total_count: int
+    matched_count: int
+    filtered_out: int
+    output_truncated: bool
+    state_counts: dict[str, int]
+    wait_reason_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class ThreadAddressAttribution:
+    """One conservative attribution of a thread-start virtual address."""
+
+    address: int
+    mapping: str
+    module: str | None = None
+    module_base: int | None = None
+    module_size: int | None = None
+    rva: int | None = None
+    architecture: str | None = None
+    symbol: str | None = None
+    symbol_offset: int | None = None
+
+
+@dataclass(frozen=True)
+class ThreadStartAttribution:
+    start_address: ThreadAddressAttribution
+    win32_start_address: ThreadAddressAttribution
+
+
+@dataclass(frozen=True)
+class CurrentVcpuRecord:
+    """One halted vCPU's validated scheduler-thread identity."""
+
+    vcpu: int
+    status: str
+    ethread: int | None = None
+    eprocess: int | None = None
+    pid: int | None = None
+    process_name: str | None = None
+    tid: int | None = None
+    in_target_process: bool = False
+    reason: str | None = None
+
+
+_THREAD_SORTS = {
+    "tid", "state", "wait", "priority", "context-switches", "start",
+    "win32-start", "create-time",
+}
+
+
+def _enum_filter(value: str | int | None, names: dict[int, str], label: str) -> int | None:
+    """Parse a raw or symbolic scheduler filter without version guessing."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ThreadFilterError(f"{label} must be a raw byte or known enum name")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            parsed = int(text, 0)
+        except ValueError:
+            wanted = "".join(char for char in text.casefold() if char.isalnum())
+            matches = [
+                raw for raw, name in names.items()
+                if "".join(char for char in name.casefold() if char.isalnum()) == wanted
+            ]
+            if len(matches) != 1:
+                choices = ", ".join(names.values())
+                raise ThreadFilterError(
+                    f"invalid {label} {value!r}; use a raw byte or one of: {choices}"
+                )
+            return matches[0]
+    else:
+        raise ThreadFilterError(f"{label} must be a raw byte or known enum name")
+    if not 0 <= parsed <= 0xFF:
+        raise ThreadFilterError(f"{label} raw value must be between 0 and 255")
+    return parsed
+
+
+def select_threads(
+    threads: list[ThreadRecord],
+    *,
+    state: str | int | None = None,
+    wait_reason: str | int | None = None,
+    sort: str = "tid",
+    limit: int = 256,
+) -> ThreadSelection:
+    """Filter/sort a raw thread walk and intentionally bound returned rows."""
+    wanted_state = _enum_filter(state, _KTHREAD_STATES, "state")
+    wanted_wait = _enum_filter(wait_reason, _KWAIT_REASONS, "wait_reason")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1024:
+        raise ThreadFilterError("limit must be an integer between 1 and 1024")
+    sort = sort.strip().lower()
+    if sort not in _THREAD_SORTS:
+        choices = ", ".join(sorted(_THREAD_SORTS))
+        raise ThreadFilterError(f"sort must be one of: {choices}")
+
+    state_counts: dict[str, int] = {}
+    wait_counts: dict[str, int] = {}
+    for thread in threads:
+        state_key = thread.state_name or f"unknown({thread.state})"
+        state_counts[state_key] = state_counts.get(state_key, 0) + 1
+        if thread.state == 5:
+            wait_key = thread.wait_reason_name or f"unknown({thread.wait_reason})"
+            wait_counts[wait_key] = wait_counts.get(wait_key, 0) + 1
+
+    matched = [
+        thread for thread in threads
+        if (wanted_state is None or thread.state == wanted_state)
+        and (
+            wanted_wait is None
+            or (thread.state == 5 and thread.wait_reason == wanted_wait)
+        )
+    ]
+    if sort == "tid":
+        matched.sort(key=lambda thread: (thread.tid, thread.ethread))
+    elif sort == "state":
+        matched.sort(key=lambda thread: (thread.state, thread.tid, thread.ethread))
+    elif sort == "wait":
+        matched.sort(key=lambda thread: (thread.state != 5, thread.wait_reason, thread.tid))
+    elif sort == "priority":
+        matched.sort(key=lambda thread: (-thread.priority, thread.tid, thread.ethread))
+    elif sort == "context-switches":
+        matched.sort(key=lambda thread: (-thread.context_switches, thread.tid, thread.ethread))
+    elif sort == "start":
+        matched.sort(key=lambda thread: (thread.start_address, thread.tid, thread.ethread))
+    elif sort == "win32-start":
+        matched.sort(key=lambda thread: (thread.win32_start_address, thread.tid, thread.ethread))
+    else:  # create-time
+        matched.sort(key=lambda thread: (thread.create_time, thread.tid, thread.ethread))
+
+    return ThreadSelection(
+        threads=tuple(matched[:limit]),
+        total_count=len(threads),
+        matched_count=len(matched),
+        filtered_out=len(threads) - len(matched),
+        output_truncated=len(matched) > limit,
+        state_counts=state_counts,
+        wait_reason_counts=wait_counts,
+    )
 
 
 # ── Shared helpers ──────────────────────────────────────────────────────
@@ -524,6 +792,303 @@ def read_process_identity(
     return record
 
 
+# ── Per-process thread list (EPROCESS.ThreadListHead) ───────────────────
+
+
+@dataclass(frozen=True)
+class _ThreadField:
+    """One fixed-width field in the ETHREAD/KTHREAD prefix."""
+
+    name: str
+    offset: int
+    size: int
+
+
+@dataclass(frozen=True)
+class _ThreadLayout:
+    thread_list_head: int
+    thread_list_entry: int
+    fields: dict[str, _ThreadField]
+    spans: tuple[_ProcessSpan, ...]
+
+
+def _thread_field(
+    struct: dict,
+    struct_name: str,
+    field_name: str,
+    size: int,
+    *,
+    base: int = 0,
+) -> _ThreadField:
+    """Resolve and validate one exact-PDB field before reading memory."""
+    raw = struct.get("fields", {}).get(field_name, {}).get("off")
+    if raw is None:
+        raise SymbolStoreError(
+            f"{struct_name}.{field_name} is absent from nt types — "
+            "re-run `winbox kdbg symbols`"
+        )
+    try:
+        offset = int(raw) + base
+    except (TypeError, ValueError) as exc:
+        raise SymbolStoreError(
+            f"invalid {struct_name}.{field_name} offset in nt types"
+        ) from exc
+    struct_size = int(struct.get("size") or 0)
+    relative_end = offset - base + size
+    if offset < base or size <= 0 or (struct_size and relative_end > struct_size):
+        raise SymbolStoreError(
+            f"invalid {struct_name}.{field_name} span in nt types"
+        )
+    return _ThreadField(field_name, offset, size)
+
+
+def _compact_spans(fields: list[_ThreadField]) -> tuple[_ProcessSpan, ...]:
+    """Coalesce nearby thread fields without sparse ETHREAD over-reads."""
+    spans: list[_ProcessSpan] = []
+    for field in sorted(fields, key=lambda value: value.offset):
+        if spans and field.offset <= spans[-1].start + spans[-1].size + 32:
+            previous = spans[-1]
+            end = max(previous.start + previous.size, field.offset + field.size)
+            spans[-1] = _ProcessSpan(previous.start, end - previous.start)
+        else:
+            spans.append(_ProcessSpan(field.offset, field.size))
+    return tuple(spans)
+
+
+def _thread_layout(store: SymbolStore) -> _ThreadLayout:
+    """Return validated offsets for the thread walker.
+
+    ETHREAD starts with its embedded KTHREAD (``Tcb``).  The exact PDB tells
+    us both offsets, and the walker rejects a non-zero Tcb instead of assuming
+    a layout it has not verified.
+    """
+    eproc = store.struct("_EPROCESS")
+    ethread = store.struct("_ETHREAD")
+    kthread = store.struct("_KTHREAD")
+    eproc_size = int(eproc.get("size") or 0)
+
+    raw_head = eproc.get("fields", {}).get("ThreadListHead", {}).get("off")
+    if raw_head is None:
+        raise SymbolStoreError(
+            "_EPROCESS.ThreadListHead is absent from nt types — "
+            "re-run `winbox kdbg symbols`"
+        )
+    try:
+        thread_list_head = int(raw_head)
+    except (TypeError, ValueError) as exc:
+        raise SymbolStoreError("invalid _EPROCESS.ThreadListHead offset in nt types") from exc
+    if thread_list_head < 0 or (eproc_size and thread_list_head + 16 > eproc_size):
+        raise SymbolStoreError("invalid _EPROCESS.ThreadListHead span in nt types")
+
+    raw_tcb = ethread.get("fields", {}).get("Tcb", {}).get("off")
+    try:
+        tcb = int(raw_tcb)
+    except (TypeError, ValueError) as exc:
+        raise SymbolStoreError("_ETHREAD.Tcb is absent or invalid in nt types") from exc
+    if tcb != 0:
+        raise SymbolStoreError(
+            f"unsupported _ETHREAD.Tcb offset 0x{tcb:x} — refusing to guess KTHREAD base"
+        )
+    ethread_size = int(ethread.get("size") or 0)
+    kthread_size = int(kthread.get("size") or 0)
+    if ethread_size and kthread_size and kthread_size > ethread_size:
+        raise SymbolStoreError("_KTHREAD exceeds _ETHREAD in nt types")
+
+    fields = {
+        "thread_list_entry": _thread_field(
+            ethread, "_ETHREAD", "ThreadListEntry", 8,
+        ),
+        # CLIENT_ID is a documented pair of pointer-width HANDLEs on x64.
+        # It is embedded in ETHREAD; the PDB parser intentionally stores
+        # field offsets rather than nested type trees, so read its bounded
+        # 16-byte native layout directly.
+        "cid": _thread_field(ethread, "_ETHREAD", "Cid", 16),
+        "start_address": _thread_field(ethread, "_ETHREAD", "StartAddress", 8),
+        "win32_start_address": _thread_field(
+            ethread, "_ETHREAD", "Win32StartAddress", 8,
+        ),
+        "create_time": _thread_field(ethread, "_ETHREAD", "CreateTime", 8),
+        # ETHREAD.ExitTime aliases KeyedWaitChain in current public PDBs.
+        # Without decoding the controlling union state it is often a kernel
+        # pointer on live threads, so exposing it as a timestamp would be a
+        # polished lie.  Do not add it back as a naked field.
+        "exit_status": _thread_field(ethread, "_ETHREAD", "ExitStatus", 4),
+        "state": _thread_field(kthread, "_KTHREAD", "State", 1, base=tcb),
+        "wait_reason": _thread_field(
+            kthread, "_KTHREAD", "WaitReason", 1, base=tcb,
+        ),
+        "priority": _thread_field(kthread, "_KTHREAD", "Priority", 1, base=tcb),
+        "base_priority": _thread_field(
+            kthread, "_KTHREAD", "BasePriority", 1, base=tcb,
+        ),
+        "context_switches": _thread_field(
+            kthread, "_KTHREAD", "ContextSwitches", 4, base=tcb,
+        ),
+        "teb": _thread_field(kthread, "_KTHREAD", "Teb", 8, base=tcb),
+        "kernel_stack": _thread_field(
+            kthread, "_KTHREAD", "KernelStack", 8, base=tcb,
+        ),
+        "stack_limit": _thread_field(
+            kthread, "_KTHREAD", "StackLimit", 8, base=tcb,
+        ),
+        "stack_base": _thread_field(
+            kthread, "_KTHREAD", "StackBase", 8, base=tcb,
+        ),
+        # KTHREAD.Process is a PKPROCESS; EPROCESS embeds KPROCESS at offset
+        # zero on supported x64 Windows.  It gives us an ownership invariant
+        # independent of the list membership and client PID.
+        "process": _thread_field(kthread, "_KTHREAD", "Process", 8, base=tcb),
+    }
+    return _ThreadLayout(
+        thread_list_head=thread_list_head,
+        thread_list_entry=fields["thread_list_entry"].offset,
+        fields=fields,
+        spans=_compact_spans(list(fields.values())),
+    )
+
+
+def _is_kernel_pointer(value: int) -> bool:
+    return value != 0 and value & 0x7 == 0 and value >> 48 == 0xFFFF
+
+
+def _read_thread_entry(
+    vm_name: str,
+    cr3: int,
+    ethread: int,
+    target: ProcessRecord,
+    layout: _ThreadLayout,
+    cache: WalkCache,
+) -> tuple[ThreadRecord, int]:
+    """Read one ETHREAD/KTHREAD prefix in compact, exact-PDB spans."""
+    chunks: list[tuple[_ProcessSpan, bytes]] = []
+    for span in layout.spans:
+        raw = read_virt_cr3(
+            vm_name, cr3, ethread + span.start, span.size, cache=cache,
+        )
+        if len(raw) != span.size:
+            raise HmpError(
+                f"short ETHREAD read at 0x{ethread + span.start:x}: "
+                f"expected {span.size}, got {len(raw)}"
+            )
+        chunks.append((span, raw))
+
+    def field(name: str) -> bytes:
+        wanted = layout.fields[name]
+        for span, raw in chunks:
+            if span.start <= wanted.offset and wanted.offset + wanted.size <= span.start + span.size:
+                start = wanted.offset - span.start
+                return raw[start:start + wanted.size]
+        raise HmpError(f"ETHREAD field {name} is outside read spans")
+
+    next_flink = int.from_bytes(field("thread_list_entry"), "little")
+    if next_flink != target.eprocess + layout.thread_list_head and not _is_kernel_pointer(next_flink):
+        raise HmpError(f"invalid ETHREAD list pointer 0x{next_flink:x}")
+
+    cid = field("cid")
+    client_pid = int.from_bytes(cid[:8], "little")
+    tid = int.from_bytes(cid[8:], "little")
+    if client_pid != target.pid:
+        raise HmpError(
+            f"ETHREAD 0x{ethread:x} belongs to pid {client_pid}, expected {target.pid}"
+        )
+    if tid == 0:
+        raise HmpError(f"ETHREAD 0x{ethread:x} has a zero client thread id")
+
+    owner = int.from_bytes(field("process"), "little")
+    if owner != target.eprocess:
+        raise HmpError(
+            f"ETHREAD 0x{ethread:x} KTHREAD.Process=0x{owner:x}, "
+            f"expected EPROCESS 0x{target.eprocess:x}"
+        )
+
+    state = int.from_bytes(field("state"), "little")
+    wait_reason = int.from_bytes(field("wait_reason"), "little")
+    return ThreadRecord(
+        tid=tid,
+        ethread=ethread,
+        state=state,
+        state_name=_KTHREAD_STATES.get(state),
+        wait_reason=wait_reason,
+        # KWAIT_REASON is meaningful only while the scheduler state is
+        # Waiting. Preserve its raw byte for forensics, but do not decorate a
+        # Ready/Running thread with a stale-looking wait reason.
+        wait_reason_name=_KWAIT_REASONS.get(wait_reason) if state == 5 else None,
+        priority=int.from_bytes(field("priority"), "little", signed=True),
+        base_priority=int.from_bytes(field("base_priority"), "little", signed=True),
+        context_switches=int.from_bytes(field("context_switches"), "little"),
+        teb=int.from_bytes(field("teb"), "little"),
+        kernel_stack=int.from_bytes(field("kernel_stack"), "little"),
+        stack_limit=int.from_bytes(field("stack_limit"), "little"),
+        stack_base=int.from_bytes(field("stack_base"), "little"),
+        start_address=int.from_bytes(field("start_address"), "little"),
+        win32_start_address=int.from_bytes(field("win32_start_address"), "little"),
+        create_time=int.from_bytes(field("create_time"), "little"),
+        exit_status=int.from_bytes(field("exit_status"), "little", signed=True),
+    ), next_flink
+
+
+@snapshot_operation
+def list_threads(
+    vm_name: str,
+    store: SymbolStore,
+    target: ProcessRecord,
+    *,
+    cache: WalkCache | None = None,
+) -> ThreadWalkResult:
+    """Walk one process's ``EPROCESS.ThreadListHead`` safely.
+
+    The caller supplies a process record obtained in the same coherent RSP
+    snapshot.  Kernel metadata is read through a separately verified kernel
+    CR3; using a process's user-side KPTI root here would make the result
+    depend on where the scheduler happened to stop.
+    """
+    if target.pid <= 0 or target.eprocess <= 0:
+        raise HmpError("invalid target process record for thread walk")
+    layout = _thread_layout(store)
+    process_head = store.resolve("PsActiveProcessHead")
+    kernel_cr3, _, selected_cache = _read_kernel_list_head(
+        vm_name, process_head, None,
+    )
+    cache = cache or selected_cache
+    head = target.eprocess + layout.thread_list_head
+    try:
+        flink = _read_u64(vm_name, kernel_cr3, head, cache)
+    except (HmpError, PageWalkError) as exc:
+        return ThreadWalkResult([], False, f"could not read ThreadListHead: {exc}")
+
+    results: list[ThreadRecord] = []
+    seen: set[int] = set()
+    while flink != head:
+        if flink == 0:
+            return ThreadWalkResult(results, False, "ThreadListHead contained a null link")
+        if not _is_kernel_pointer(flink):
+            return ThreadWalkResult(
+                results, False, f"invalid ETHREAD list pointer 0x{flink:x}",
+            )
+        if flink in seen:
+            return ThreadWalkResult(
+                results, False, f"cycle detected at ETHREAD list entry 0x{flink:x}",
+            )
+        if len(results) >= MAX_THREADS_PER_PROCESS:
+            return ThreadWalkResult(
+                results, False, f"hit MAX_THREADS_PER_PROCESS={MAX_THREADS_PER_PROCESS}",
+            )
+        seen.add(flink)
+        ethread = flink - layout.thread_list_entry
+        if not _is_kernel_pointer(ethread):
+            return ThreadWalkResult(
+                results, False, f"invalid ETHREAD pointer 0x{ethread:x}",
+            )
+        try:
+            record, flink = _read_thread_entry(
+                vm_name, kernel_cr3, ethread, target, layout, cache,
+            )
+        except (HmpError, PageWalkError, SymbolStoreError) as exc:
+            return ThreadWalkResult(results, False, str(exc))
+        results.append(record)
+    return ThreadWalkResult(results, True)
+
+
 # ── Module list ─────────────────────────────────────────────────────────
 
 
@@ -825,4 +1390,274 @@ def list_user_modules(
             # Old stores are upgraded by MCP/CLI before calling this function;
             # direct library callers retain the native list until upgraded.
             pass
+    return results
+
+
+# ── Thread start attribution and current-vCPU mapping ───────────────────
+
+
+def _module_containing(address: int, modules: list[ModuleRecord | UserModuleRecord]):
+    for module in modules:
+        if module.base <= address < module.base + module.size:
+            return module
+    return None
+
+
+def _symbol_store_names(module: ModuleRecord | UserModuleRecord, *, kernel: bool) -> tuple[str, ...]:
+    """Return only plausible local-store keys; no network or symbol loads."""
+    stem = module.name.rsplit(".", 1)[0].casefold()
+    if kernel and module.name.casefold() in {"ntoskrnl.exe", "ntkrnlmp.exe"}:
+        return ("nt", stem)
+    if isinstance(module, UserModuleRecord) and module.architecture == "x86":
+        return (f"{stem}_x86", stem)
+    return (stem,)
+
+
+def _nearest_symbol(store: SymbolStore, module: ModuleRecord | UserModuleRecord, rva: int, *, kernel: bool) -> tuple[str, int] | None:
+    """Find one nearest known public without trusting a stale stored base."""
+    list_known = getattr(store, "list_modules", None)
+    load = getattr(store, "load", None)
+    if not callable(list_known) or not callable(load):
+        return None
+    try:
+        available = {str(name).casefold() for name in list_known()}
+    except (OSError, SymbolStoreError):
+        return None
+    for name in _symbol_store_names(module, kernel=kernel):
+        if name.casefold() not in available:
+            continue
+        try:
+            symbols = load(name).get("symbols", {})
+        except (OSError, SymbolStoreError, ValueError, TypeError):
+            continue
+        nearest: tuple[int, str] | None = None
+        for symbol, raw_rva in symbols.items():
+            try:
+                symbol_rva = int(raw_rva)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= symbol_rva <= rva and (
+                nearest is None or symbol_rva > nearest[0]
+            ):
+                nearest = (symbol_rva, str(symbol))
+        if nearest is not None:
+            return nearest[1], rva - nearest[0]
+    return None
+
+
+def _attribute_thread_address(
+    address: int,
+    *,
+    kernel_modules: list[ModuleRecord],
+    user_modules: list[UserModuleRecord],
+    store: SymbolStore,
+) -> ThreadAddressAttribution:
+    if address == 0:
+        return ThreadAddressAttribution(address=0, mapping="null")
+    # Code addresses need only be canonical high-half; unlike linked-list
+    # pointers they are not required to be eight-byte aligned.
+    kernel = address >> 48 == 0xFFFF
+    module = _module_containing(address, kernel_modules if kernel else user_modules)
+    if module is None:
+        # The PEB loader tells us only which images are loaded. Do not call an
+        # unmatched low VA "private" or "JIT" without a VAD walk to prove it.
+        return ThreadAddressAttribution(
+            address=address,
+            mapping="kernel_unmapped" if kernel else "user_not_in_loader_module",
+        )
+    rva = address - module.base
+    symbol = _nearest_symbol(store, module, rva, kernel=kernel)
+    return ThreadAddressAttribution(
+        address=address,
+        mapping="kernel_module" if kernel else "user_module",
+        module=module.name,
+        module_base=module.base,
+        module_size=module.size,
+        rva=rva,
+        architecture=None if kernel else module.architecture,
+        symbol=symbol[0] if symbol is not None else None,
+        symbol_offset=symbol[1] if symbol is not None else None,
+    )
+
+
+@snapshot_operation
+def resolve_thread_start_addresses(
+    vm_name: str,
+    store: SymbolStore,
+    target: ProcessRecord,
+    threads: list[ThreadRecord] | tuple[ThreadRecord, ...],
+    *,
+    cache: WalkCache | None = None,
+) -> tuple[dict[int, ThreadStartAttribution], tuple[str, ...]]:
+    """Resolve selected start VAs against live loaded-module views.
+
+    This is deliberately opt-in and only receives presentation-bounded rows.
+    Missing PEB metadata is reported as a warning while kernel attribution and
+    the raw ETHREAD walk remain usable.
+    """
+    cache = cache or WalkCache()
+    warnings: list[str] = []
+    try:
+        kernel_modules = list_modules(vm_name, store, cache=cache)
+    except (HmpError, PageWalkError, SymbolStoreError) as exc:
+        kernel_modules = []
+        warnings.append(f"kernel module attribution unavailable: {exc}")
+    try:
+        user_modules = list_user_modules(vm_name, store, target, cache=cache)
+    except (HmpError, PageWalkError, SymbolStoreError) as exc:
+        user_modules = []
+        warnings.append(f"user module attribution unavailable: {exc}")
+    return {
+        thread.ethread: ThreadStartAttribution(
+            start_address=_attribute_thread_address(
+                thread.start_address,
+                kernel_modules=kernel_modules,
+                user_modules=user_modules,
+                store=store,
+            ),
+            win32_start_address=_attribute_thread_address(
+                thread.win32_start_address,
+                kernel_modules=kernel_modules,
+                user_modules=user_modules,
+                store=store,
+            ),
+        )
+        for thread in threads
+    }, tuple(warnings)
+
+
+@dataclass(frozen=True)
+class _CurrentVcpuLayout:
+    kpcr_self: _ThreadField
+    kpcr_current_prcb: _ThreadField
+    kprcb_current_thread: _ThreadField
+
+
+def _current_vcpu_layout(store: SymbolStore) -> _CurrentVcpuLayout:
+    kpcr = store.struct("_KPCR")
+    kprcb = store.struct("_KPRCB")
+    return _CurrentVcpuLayout(
+        kpcr_self=_thread_field(kpcr, "_KPCR", "Self", 8),
+        kpcr_current_prcb=_thread_field(kpcr, "_KPCR", "CurrentPrcb", 8),
+        kprcb_current_thread=_thread_field(
+            kprcb, "_KPRCB", "CurrentThread", 8,
+        ),
+    )
+
+
+@snapshot_operation
+def list_current_vcpu_threads(
+    vm_name: str,
+    store: SymbolStore,
+    target: ProcessRecord,
+    *,
+    threads: list[ThreadRecord] | tuple[ThreadRecord, ...] = (),
+    cache: WalkCache | None = None,
+) -> list[CurrentVcpuRecord]:
+    """Map every halted vCPU to its validated current ETHREAD.
+
+    RSP exposes vCPU register sets, not Windows thread contexts. We recover
+    the scheduler identity only via exact-PDB KPCR/KPRCB fields and validate
+    the resulting KTHREAD's process and CLIENT_ID before exposing it.
+    """
+    snapshot = current_snapshot(vm_name)
+    if snapshot is None:
+        raise HmpError("no active RSP snapshot for current-vCPU walk")
+    per_vcpu = tuple(getattr(snapshot, "vcpu_kernel_gs_bases", ()))
+    if not per_vcpu:
+        return []
+    layout = _current_vcpu_layout(store)
+    thread_layout = _thread_layout(store)
+    process_layout = _process_layout(store)
+    process_head = store.resolve("PsActiveProcessHead")
+    kernel_cr3, _, selected_cache = _read_kernel_list_head(vm_name, process_head, None)
+    cache = cache or selected_cache
+    target_threads = {thread.ethread: thread for thread in threads}
+    results: list[CurrentVcpuRecord] = []
+
+    for raw_vcpu, raw_candidates in per_vcpu:
+        try:
+            vcpu = int(raw_vcpu)
+            candidates = tuple(int(candidate) for candidate in raw_candidates)
+        except (TypeError, ValueError):
+            continue
+        errors: list[str] = []
+        resolved: CurrentVcpuRecord | None = None
+        for kpcr in candidates:
+            try:
+                if not _is_kernel_pointer(kpcr):
+                    raise HmpError(f"invalid KPCR candidate 0x{kpcr:x}")
+                if _read_u64(vm_name, kernel_cr3, kpcr + layout.kpcr_self.offset, cache) != kpcr:
+                    raise HmpError("KPCR self pointer mismatch")
+                prcb = _read_u64(
+                    vm_name, kernel_cr3, kpcr + layout.kpcr_current_prcb.offset, cache,
+                )
+                if not _is_kernel_pointer(prcb):
+                    raise HmpError(f"invalid KPRCB pointer 0x{prcb:x}")
+                ethread = _read_u64(
+                    vm_name, kernel_cr3, prcb + layout.kprcb_current_thread.offset, cache,
+                )
+                if not _is_kernel_pointer(ethread):
+                    raise HmpError(f"invalid current ETHREAD pointer 0x{ethread:x}")
+                owner = _read_u64(
+                    vm_name, kernel_cr3, ethread + thread_layout.fields["process"].offset, cache,
+                )
+                if not _is_kernel_pointer(owner):
+                    raise HmpError(f"invalid KTHREAD.Process pointer 0x{owner:x}")
+                process, _ = _read_process_entry(
+                    vm_name, kernel_cr3, owner, process_layout, cache,
+                )
+                if process.eprocess != owner or process.pid < 0:
+                    raise HmpError("current KTHREAD owner identity is invalid")
+                cid = read_virt_cr3(
+                    vm_name, kernel_cr3, ethread + thread_layout.fields["cid"].offset,
+                    16, cache=cache,
+                )
+                if len(cid) != 16:
+                    raise HmpError("short current ETHREAD CLIENT_ID read")
+                client_pid = int.from_bytes(cid[:8], "little")
+                tid = int.from_bytes(cid[8:], "little")
+                if process.pid == 0:
+                    # Each processor's IdleThread is a legitimate current
+                    # KTHREAD but deliberately has a zero CLIENT_ID. It is
+                    # scheduler state, not a user-visible thread handle.
+                    if client_pid != 0 or tid != 0:
+                        raise HmpError("idle ETHREAD CLIENT_ID is not zero")
+                    resolved = CurrentVcpuRecord(
+                        vcpu=vcpu,
+                        status="idle",
+                        ethread=ethread,
+                        eprocess=owner,
+                        pid=0,
+                        process_name=process.name,
+                        tid=0,
+                    )
+                    break
+                if client_pid != process.pid or tid == 0:
+                    raise HmpError("current ETHREAD CLIENT_ID does not match owning process")
+                listed = target_threads.get(ethread)
+                in_target = owner == target.eprocess
+                if in_target and (listed is None or listed.tid != tid):
+                    raise HmpError("current target ETHREAD is absent from validated ThreadListHead")
+                resolved = CurrentVcpuRecord(
+                    vcpu=vcpu,
+                    status="current",
+                    ethread=ethread,
+                    eprocess=owner,
+                    pid=process.pid,
+                    process_name=process.name,
+                    tid=tid,
+                    in_target_process=in_target,
+                )
+                break
+            except (HmpError, PageWalkError, SymbolStoreError) as exc:
+                errors.append(f"0x{kpcr:x}: {exc}")
+        if resolved is None:
+            results.append(CurrentVcpuRecord(
+                vcpu=vcpu,
+                status="unavailable",
+                reason="; ".join(errors[:2])[:512] or "no KPCR candidate",
+            ))
+        else:
+            results.append(resolved)
     return results

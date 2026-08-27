@@ -26,6 +26,10 @@ bounded first phase were completed on 2026-08-27. Item 26's IPv6 listener
 residual is fixed; its `DirectoryTableBase` trade-off remains accepted. Item 8
 remains a watch condition. A follow-up review the same day opened and completed
 items 85-87 for cache ownership, subprocess bounds, and prepare-job lifecycle.
+A live thread-research review after the PDB-backed `kdbg_threads` launch opened
+items 88-99 below. Items 88-91 were completed and live-verified the same day;
+the remaining items are deliberately scoped to make stopped-kernel thread
+evidence more intelligible and bounded without requiring an in-guest Frida agent.
 
 ### Completed top-three sequence (2026-08-25)
 
@@ -179,6 +183,159 @@ worker heartbeat, transitioned `running` → `cancelling` → `cancelled`, and
 returned typed `cancelled`; resuming its partial project then completed and
 applied 2,431 function names and 1,809 globals. The live VM remained running
 and agent-responsive throughout.
+
+### Completed top-three sequence — thread research visibility and stability (2026-08-27)
+
+`kdbg_threads` now supplies bounded triage evidence rather than a raw unbounded
+ETHREAD dump. These three had the largest immediate research payoff; item 88's
+small rendering correction shipped alongside item 89.
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **89 — bounded thread result profiles and filters** | 4 | 5 | Completed with full/summary profiles, filters, sort, 1..1024 limit, and separate walk/output truth. |
+| 2 | **90 — module/symbol attribution for thread starts** | 4 | 5 | Completed with opt-in live module joins and already-local nearest-public symbols. |
+| 3 | **91 — vCPU-to-current-ETHREAD attribution** | 3 | 5 | Completed through validated KPCR→KPRCB→KTHREAD identity, including IdleThreads. |
+
+### 88. Completed — truthful non-waiting thread presentation
+
+The walker correctly omits a wait-reason name unless `KTHREAD.State` is
+`Waiting`, but the human CLI currently formats the missing name as
+`unknown(<raw>)`. A terminated or ready thread can therefore look as if it has
+an unknown active wait. Render `—` for non-waiting rows, retain the raw byte in
+JSON, and expose stale/raw scheduler fields only in an explicit verbose view.
+Cover waiting, known non-waiting, unknown-state, and unknown-wait-value output.
+
+Implemented the human renderer as `—` for non-Waiting rows while retaining the
+raw byte in JSON. A stale scheduler byte therefore cannot masquerade as an
+active unknown wait.
+
+### 89. Completed — bounded thread result profiles, filters, and complete semantics
+
+`MAX_THREADS_PER_PROCESS=8192` bounds traversal but can still serialize several
+megabytes of rows while the guest is stopped. The persistent reader serves one
+snapshot at a time, so an unbounded response also delays unrelated research.
+Add `summary|full` detail profiles, state/wait/address filters, deterministic
+sorting, and a bounded result limit for CLI and MCP. Distinguish a completed
+kernel walk from a deliberately shortened response with `walk_complete`,
+`returned`, `filtered_out`, and `output_truncated`; never label a client limit
+as a corrupted list. Test a high-thread fixture, no-match filters, stable sort,
+MCP response-size bounds, and live timing/cleanup.
+
+Implemented `detail=full|summary`, raw-or-named state/wait filters,
+deterministic sort keys, and a 1..1024 detail-row limit across CLI and MCP.
+Responses now distinguish `walk_complete`, total/matched/filtered/returned
+counts, `output_truncated`, and summary-only row omission. The legacy
+`complete` field remains the kernel-walk truth.
+
+### 90. Completed — module and symbol attribution for thread start addresses
+
+Raw `StartAddress` and `Win32StartAddress` force every consumer to repeat the
+same loader/module joins. Add opt-in `--resolve` / `resolve=true` enrichment
+that returns address domain (kernel/user), owning module, RVA, and a verified
+symbol where one exists. Explicitly label addresses as `private`, `jit`,
+`unmapped`, or `not_checked` rather than guessing. Keep the raw address and
+identity/provenance beside every resolved result; test native, WoW64, kernel,
+private, and stale-loader cases.
+
+Implemented opt-in `--resolve` / `resolve=true`: returned start rows carry
+live kernel/user module, base, image size, RVA, architecture where applicable,
+and a nearest already-local public symbol. Unmatched user VAs are labelled
+`user_not_in_loader_module`, not guessed as private/JIT; no network or symbol
+loading occurs during resolution.
+
+### 91. Completed — map the halted vCPUs to their current ETHREADs
+
+The list identifies every thread but not which one each halted vCPU was
+executing. Read each `_KPRCB.CurrentThread` through exact PDB offsets, validate
+its owning process/ETHREAD identity, and annotate matching rows with
+`running_on_vcpus`. Return a separate bounded current-vCPU list for threads
+outside the selected process. This is scheduler evidence, not a claim that
+arbitrary listed threads have recoverable register contexts. Cover SMP, a
+foreign current process, migration, and a halted vCPU whose metadata is unreadable.
+
+The snapshot broker now preserves candidate KPCR bases per vCPU. The walker
+validates KPCR self, KPRCB, current ETHREAD, KTHREAD owner, EPROCESS identity,
+and CLIENT_ID before returning `current_vcpus` and annotating target rows with
+`running_on_vcpus`. Per-CPU IdleThreads are returned explicitly as `status=idle`
+with zero PID/TID rather than misreported as broken user threads.
+
+Verification: focused walker/reader/CLI tests pass (`69 passed`); full default
+coverage passes (`2720 passed, 144 deselected`); five real CLI integration
+tests and the live MCP/CLI parity test pass. A fresh installed MCP stdio server
+advertised all seven new inputs and live-validated a complete 174-thread PID 4
+summary, four IdleThread vCPUs, and eight intentionally bounded resolved rows.
+The guest was left running, agent-responsive, and with the gdbstub stopped.
+
+### 92. Planned — optional wait-object and owner-chain evidence
+
+`KWAIT_REASON` says broadly why a thread is waiting, not which dispatcher
+object or owner is blocking it. Add an opt-in, PDB-backed `KWAIT_BLOCK` walk
+that returns a bounded object address/type and owner TID only where the object
+semantics prove one. Cycles, freed objects, unknown object types, and absent
+owners must remain explicit partial evidence; never manufacture a deadlock
+graph from a raw pointer.
+
+### 93. Planned — strengthen thread-list integrity invariants
+
+The forward-list, CID, and `KTHREAD.Process` checks are good but leave several
+cheap stopped-snapshot invariants unused. Validate `_EPROCESS.Pcb == 0` before
+equating a `PKPROCESS` with an EPROCESS address; read and check `LIST_ENTRY`
+back-links including the head; reject duplicate live TIDs; and return the exact
+link/ETHREAD that failed. Add corrupt-head, bad-Blink, duplicate-TID, and
+nonzero-Pcb tests.
+
+### 94. Planned — strict partial-result controls and structured truncation
+
+Best-effort prefix data is useful interactively but unsafe for automation that
+requires a complete list. Add CLI `--require-complete` and MCP
+`require_complete`; preserve the prefix only in explicit best-effort mode.
+Replace a lone truncation string with bounded structured evidence (`stage`,
+`link`, `ethread`, `returned`, `reason`) while retaining a human summary. Test
+every malformed/read/cap path and ensure strict callers receive a typed error.
+
+### 95. Planned — snapshot queueing, duration, and ownership visibility
+
+The RSP broker intentionally serializes complete snapshot transactions, but a
+concurrent MCP caller currently has no queue/duration/owner visibility. Add
+per-VM bounded queueing or a typed `busy` result, cancellation before a snapshot
+begins, and response metadata for queue delay, stop duration, snapshot ID, and
+reader owner. Stress simultaneous CLI/MCP walks and cancellation; prove the
+guest resumes and no interactive debugger session is disturbed.
+
+### 96. Planned — normalized timestamp, status, and pointer presentation
+
+Expose raw FILETIME and NTSTATUS values for forensics but add unambiguous UTC
+timestamps, hexadecimal status, common status names, and explicit `null` for
+unavailable values. Rename or annotate the raw `KernelStack` field so users do
+not mistake it for a saved RSP. Zero/terminating/system-thread cases and JSON
+schema compatibility require coverage.
+
+### 97. Planned — baseline and diffable thread snapshots
+
+One list describes one stop; research often needs what changed. Persist a
+bounded, host-side baseline keyed by EPROCESS, ETHREAD, and creation time, then
+report created/exited threads, state/priority transitions, and context-switch
+deltas on a later explicit snapshot. Baselines must expire across reboot,
+PID/EPROCESS reuse, and symbol-store changes. Do not turn this into aggressive
+polling: each sample remains an explicit CET-gated stop transaction.
+
+### 98. Planned — all-process thread triage summary
+
+Add a bounded summary view that ranks processes by total/runnable/waiting
+threads, newest threads, private-or-unmapped starts, and optionally high
+context-switch deltas. It should return counts and small ranked samples first,
+not an all-process dump of every ETHREAD. Test global caps, process exits during
+selection, empty filters, and a live multi-process summary.
+
+### 99. Planned — malformed-PDB and architecture-assumption hardening
+
+Thread layout derivation is PDB-driven but still assumes parseable numeric
+field records, x64 pointer widths, and the current canonical-address form.
+Normalize malformed symbol-store data to `SymbolStoreError`, validate field
+width/type where extraction exposes it, and state/refuse unsupported paging or
+architecture modes rather than decoding them as x64. Fuzz malformed layouts and
+add unsupported-architecture, five-level-address-policy, and stale-symbol
+fixtures.
 
 ### Completed final unwind batch (2026-08-24)
 

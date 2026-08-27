@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -16,9 +17,14 @@ import pytest
 from winbox.kdbg import walk
 from winbox.kdbg.walk import (
     ProcessRecord,
+    ThreadRecord,
     UserModuleRecord,
     is_wow64,
+    list_current_vcpu_threads,
+    list_threads,
     list_user_modules,
+    resolve_thread_start_addresses,
+    select_threads,
 )
 
 
@@ -802,6 +808,434 @@ def test_list_processes_no_switch_when_system_dtb_matches(monkeypatch):
     # All reads should use the same CR3
     assert all(c == DTB for c in cr3s_used)
     assert walk._cached_kernel_cr3("vm") == DTB
+
+
+# ── Per-process ETHREAD list ───────────────────────────────────────────
+
+
+_THREAD_TYPES = {
+    "_EPROCESS": {
+        "size": 0x800,
+        "fields": {"ThreadListHead": {"off": 0x380, "type": ""}},
+    },
+    "_ETHREAD": {
+        "size": 0x700,
+        "fields": {
+            "Tcb": {"off": 0, "type": ""},
+            "ThreadListEntry": {"off": 0x580, "type": ""},
+            "Cid": {"off": 0x500, "type": ""},
+            "StartAddress": {"off": 0x4E0, "type": ""},
+            "Win32StartAddress": {"off": 0x560, "type": ""},
+            "CreateTime": {"off": 0x4C0, "type": ""},
+            "ExitStatus": {"off": 0x5D8, "type": ""},
+        },
+    },
+    "_KTHREAD": {
+        "size": 0x480,
+        "fields": {
+            "State": {"off": 0x184, "type": ""},
+            "WaitReason": {"off": 0x283, "type": ""},
+            "Priority": {"off": 0xC3, "type": ""},
+            "BasePriority": {"off": 0x233, "type": ""},
+            "ContextSwitches": {"off": 0x154, "type": ""},
+            "Teb": {"off": 0xF0, "type": ""},
+            "KernelStack": {"off": 0x58, "type": ""},
+            "StackLimit": {"off": 0x30, "type": ""},
+            "StackBase": {"off": 0x38, "type": ""},
+            "Process": {"off": 0x220, "type": ""},
+        },
+    },
+}
+
+
+class _ThreadStore(FakeStore):
+    def resolve(self, name):
+        assert name == "PsActiveProcessHead"
+        return 0xFFFFF800_00C26340
+
+
+def _thread_store() -> _ThreadStore:
+    return _ThreadStore(_THREAD_TYPES)
+
+
+def _thread_target() -> ProcessRecord:
+    return ProcessRecord(
+        pid=4712,
+        name="target.exe",
+        eprocess=0xFFFFE001_00100000,
+        directory_table_base=0x12345000,
+        create_time=0x1122334455667788,
+    )
+
+
+def _thread_backing(monkeypatch, target: ProcessRecord):
+    """Install a byte-addressed ETHREAD fake and return a record builder."""
+    layout = walk._thread_layout(_thread_store())
+    memory: dict[int, int] = {}
+    qwords: dict[int, int] = {}
+    calls = []
+
+    def put(addr: int, size: int, value: int, *, signed: bool = False):
+        raw = value.to_bytes(size, "little", signed=signed)
+        memory.update(dict(zip(range(addr, addr + size), raw)))
+
+    def read_span(vm, cr3, va, length, *, cache):
+        calls.append((vm, cr3, va, length, cache))
+        return bytes(memory.get(va + i, 0) for i in range(length))
+
+    monkeypatch.setattr(walk, "read_virt_cr3", read_span)
+    monkeypatch.setattr(
+        walk, "_read_kernel_list_head",
+        lambda *_args: (0x1AE000, 0xFFFFE001_00000000, walk.WalkCache()),
+    )
+    monkeypatch.setattr(
+        walk, "_read_u64",
+        lambda _vm, _cr3, va, _cache: qwords[va],
+    )
+
+    def add(
+        ethread: int,
+        next_flink: int,
+        tid: int,
+        *,
+        client_pid: int | None = None,
+        owner: int | None = None,
+        state: int = 5,
+        wait_reason: int = 6,
+    ) -> None:
+        fields = layout.fields
+        put(ethread + fields["thread_list_entry"].offset, 8, next_flink)
+        put(ethread + fields["cid"].offset, 8, target.pid if client_pid is None else client_pid)
+        put(ethread + fields["cid"].offset + 8, 8, tid)
+        put(ethread + fields["process"].offset, 8, target.eprocess if owner is None else owner)
+        put(ethread + fields["state"].offset, 1, state)
+        put(ethread + fields["wait_reason"].offset, 1, wait_reason)
+        put(ethread + fields["priority"].offset, 1, 13, signed=True)
+        put(ethread + fields["base_priority"].offset, 1, 8, signed=True)
+        put(ethread + fields["context_switches"].offset, 4, 927)
+        put(ethread + fields["teb"].offset, 8, 0x00000000_7FFDE000)
+        put(ethread + fields["kernel_stack"].offset, 8, 0xFFFFF800_01234000)
+        put(ethread + fields["stack_limit"].offset, 8, 0xFFFFF800_01230000)
+        put(ethread + fields["stack_base"].offset, 8, 0xFFFFF800_01238000)
+        put(ethread + fields["start_address"].offset, 8, 0xFFFFF800_10001000)
+        put(ethread + fields["win32_start_address"].offset, 8, 0x00007FF7_40001000)
+        put(ethread + fields["create_time"].offset, 8, 0x0102030405060708)
+        put(ethread + fields["exit_status"].offset, 4, 259, signed=True)
+
+    return layout, qwords, add, calls
+
+
+def test_list_threads_walks_validated_ethread_ring(monkeypatch):
+    target = _thread_target()
+    layout, qwords, add, calls = _thread_backing(monkeypatch, target)
+    head = target.eprocess + layout.thread_list_head
+    first = 0xFFFFE001_00200000
+    second = 0xFFFFE001_00300000
+    qwords[head] = first + layout.thread_list_entry
+    add(first, second + layout.thread_list_entry, 4816)
+    add(second, head, 4820, state=1, wait_reason=0xFE)
+
+    result = list_threads("vm", _thread_store(), target)
+
+    assert result.complete is True
+    assert result.truncated_reason is None
+    assert result.threads == [
+        ThreadRecord(
+            tid=4816, ethread=first, state=5, state_name="Waiting",
+            wait_reason=6, wait_reason_name="UserRequest", priority=13,
+            base_priority=8, context_switches=927, teb=0x7FFDE000,
+            kernel_stack=0xFFFFF80001234000, stack_limit=0xFFFFF80001230000,
+            stack_base=0xFFFFF80001238000, start_address=0xFFFFF80010001000,
+            win32_start_address=0x7FF740001000, create_time=0x0102030405060708,
+            exit_status=259,
+        ),
+        ThreadRecord(
+            tid=4820, ethread=second, state=1, state_name="Ready",
+            wait_reason=0xFE, wait_reason_name=None, priority=13,
+            base_priority=8, context_switches=927, teb=0x7FFDE000,
+            kernel_stack=0xFFFFF80001234000, stack_limit=0xFFFFF80001230000,
+            stack_base=0xFFFFF80001238000, start_address=0xFFFFF80010001000,
+            win32_start_address=0x7FF740001000, create_time=0x0102030405060708,
+            exit_status=259,
+        ),
+    ]
+    # Each ETHREAD is read in bounded, coalesced exact-PDB spans through the
+    # separately verified kernel CR3; no target DTB guessing is involved.
+    assert {call[1] for call in calls} == {0x1AE000}
+    assert len(calls) == len(layout.spans) * 2
+
+
+def test_list_threads_reports_cycle_without_claiming_complete(monkeypatch):
+    target = _thread_target()
+    layout, qwords, add, _ = _thread_backing(monkeypatch, target)
+    head = target.eprocess + layout.thread_list_head
+    ethread = 0xFFFFE001_00200000
+    node = ethread + layout.thread_list_entry
+    qwords[head] = node
+    add(ethread, node, 4816)
+
+    result = list_threads("vm", _thread_store(), target)
+
+    assert [thread.tid for thread in result.threads] == [4816]
+    assert result.complete is False
+    assert result.truncated_reason == f"cycle detected at ETHREAD list entry 0x{node:x}"
+
+
+def test_list_threads_rejects_foreign_client_pid_before_returning_it(monkeypatch):
+    target = _thread_target()
+    layout, qwords, add, _ = _thread_backing(monkeypatch, target)
+    head = target.eprocess + layout.thread_list_head
+    ethread = 0xFFFFE001_00200000
+    qwords[head] = ethread + layout.thread_list_entry
+    add(ethread, head, 4816, client_pid=9001)
+
+    result = list_threads("vm", _thread_store(), target)
+
+    assert result.threads == []
+    assert result.complete is False
+    assert "belongs to pid 9001, expected 4712" in result.truncated_reason
+
+
+def test_list_threads_rejects_foreign_kthread_owner_before_returning_it(monkeypatch):
+    target = _thread_target()
+    layout, qwords, add, _ = _thread_backing(monkeypatch, target)
+    head = target.eprocess + layout.thread_list_head
+    ethread = 0xFFFFE001_00200000
+    qwords[head] = ethread + layout.thread_list_entry
+    add(ethread, head, 4816, owner=0xFFFFE001_00400000)
+
+    result = list_threads("vm", _thread_store(), target)
+
+    assert result.threads == []
+    assert result.complete is False
+    assert "KTHREAD.Process=0xffffe00100400000" in result.truncated_reason
+
+
+def test_list_threads_reports_cap_as_partial_result(monkeypatch):
+    target = _thread_target()
+    layout, qwords, add, _ = _thread_backing(monkeypatch, target)
+    head = target.eprocess + layout.thread_list_head
+    first = 0xFFFFE001_00200000
+    second = 0xFFFFE001_00300000
+    qwords[head] = first + layout.thread_list_entry
+    add(first, second + layout.thread_list_entry, 4816)
+    add(second, head, 4820)
+    monkeypatch.setattr(walk, "MAX_THREADS_PER_PROCESS", 1)
+
+    result = list_threads("vm", _thread_store(), target)
+
+    assert [thread.tid for thread in result.threads] == [4816]
+    assert result.complete is False
+    assert result.truncated_reason == "hit MAX_THREADS_PER_PROCESS=1"
+
+
+def test_list_threads_accepts_empty_ring(monkeypatch):
+    target = _thread_target()
+    layout, qwords, _, _ = _thread_backing(monkeypatch, target)
+    qwords[target.eprocess + layout.thread_list_head] = target.eprocess + layout.thread_list_head
+
+    result = list_threads("vm", _thread_store(), target)
+
+    assert result == walk.ThreadWalkResult([], True)
+
+
+def test_select_threads_separates_complete_walk_from_output_limit():
+    threads = [
+        ThreadRecord(
+            tid=1, ethread=0xFFFFE001_00100000, state=5, state_name="Waiting",
+            wait_reason=6, wait_reason_name="UserRequest", priority=8,
+            base_priority=8, context_switches=5, teb=0, kernel_stack=0,
+            stack_limit=0, stack_base=0, start_address=0x1000,
+            win32_start_address=0, create_time=1, exit_status=259,
+        ),
+        ThreadRecord(
+            tid=2, ethread=0xFFFFE001_00200000, state=1, state_name="Ready",
+            wait_reason=6, wait_reason_name=None, priority=12,
+            base_priority=8, context_switches=20, teb=0, kernel_stack=0,
+            stack_limit=0, stack_base=0, start_address=0x2000,
+            win32_start_address=0, create_time=2, exit_status=259,
+        ),
+        ThreadRecord(
+            tid=3, ethread=0xFFFFE001_00300000, state=5, state_name="Waiting",
+            wait_reason=6, wait_reason_name="UserRequest", priority=9,
+            base_priority=8, context_switches=30, teb=0, kernel_stack=0,
+            stack_limit=0, stack_base=0, start_address=0x3000,
+            win32_start_address=0, create_time=3, exit_status=259,
+        ),
+    ]
+
+    selected = select_threads(
+        threads, state="Waiting", wait_reason="UserRequest",
+        sort="context-switches", limit=1,
+    )
+
+    assert [thread.tid for thread in selected.threads] == [3]
+    assert selected.total_count == 3
+    assert selected.matched_count == 2
+    assert selected.filtered_out == 1
+    assert selected.output_truncated is True
+    assert selected.state_counts == {"Waiting": 2, "Ready": 1}
+    assert selected.wait_reason_counts == {"UserRequest": 2}
+
+
+def test_select_threads_rejects_invalid_filter_and_limit():
+    with pytest.raises(walk.ThreadFilterError, match="invalid state"):
+        select_threads([], state="hallucinating")
+    with pytest.raises(walk.ThreadFilterError, match="between 1 and 1024"):
+        select_threads([], limit=0)
+
+
+def test_resolve_thread_start_addresses_uses_live_module_bases_and_local_symbols(monkeypatch):
+    target = _thread_target()
+    thread = ThreadRecord(
+        tid=4816, ethread=0xFFFFE001_00200000, state=5, state_name="Waiting",
+        wait_reason=6, wait_reason_name="UserRequest", priority=13,
+        base_priority=8, context_switches=927, teb=0, kernel_stack=0,
+        stack_limit=0, stack_base=0, start_address=0xFFFFF800_10001234,
+        win32_start_address=0x00007FF7_40002222, create_time=1, exit_status=259,
+    )
+    kernel = walk.ModuleRecord(
+        name="ntoskrnl.exe", base=0xFFFFF800_10000000, size=0x4000,
+        entry=0xFFFFE001_01000000,
+    )
+    user = UserModuleRecord(
+        name="target.exe", base=0x00007FF7_40000000, size=0x4000,
+        full_path="C:\\target.exe", entry=0x7FF70000,
+    )
+
+    class SymbolFake:
+        def list_modules(self):
+            return ["nt", "target"]
+
+        def load(self, name):
+            return {
+                "symbols": (
+                    {"PspSystemThreadStartup": 0x1000}
+                    if name == "nt" else {"ThreadMain": 0x2000}
+                ),
+            }
+
+    monkeypatch.setattr(walk, "list_modules", lambda *_a, **_k: [kernel])
+    monkeypatch.setattr(walk, "list_user_modules", lambda *_a, **_k: [user])
+
+    resolved, warnings = resolve_thread_start_addresses(
+        "vm", SymbolFake(), target, [thread], cache=walk.WalkCache(),
+    )
+
+    assert warnings == ()
+    start = resolved[thread.ethread].start_address
+    assert (start.mapping, start.module, start.rva, start.symbol, start.symbol_offset) == (
+        "kernel_module", "ntoskrnl.exe", 0x1234, "PspSystemThreadStartup", 0x234,
+    )
+    win32 = resolved[thread.ethread].win32_start_address
+    assert (win32.mapping, win32.module, win32.rva, win32.symbol) == (
+        "user_module", "target.exe", 0x2222, "ThreadMain",
+    )
+
+
+def test_resolve_thread_start_addresses_does_not_guess_private_or_jit(monkeypatch):
+    target = _thread_target()
+    thread = ThreadRecord(
+        tid=4816, ethread=0xFFFFE001_00200000, state=1, state_name="Ready",
+        wait_reason=0, wait_reason_name=None, priority=8, base_priority=8,
+        context_switches=0, teb=0, kernel_stack=0, stack_limit=0, stack_base=0,
+        start_address=0x00007FF7_50000000, win32_start_address=0, create_time=1,
+        exit_status=259,
+    )
+    monkeypatch.setattr(walk, "list_modules", lambda *_a, **_k: [])
+    monkeypatch.setattr(walk, "list_user_modules", lambda *_a, **_k: [])
+
+    resolved, warnings = resolve_thread_start_addresses(
+        "vm", FakeStore(_THREAD_TYPES), target, [thread], cache=walk.WalkCache(),
+    )
+
+    assert warnings == ()
+    assert resolved[thread.ethread].start_address.mapping == "user_not_in_loader_module"
+    assert resolved[thread.ethread].win32_start_address.mapping == "null"
+
+
+def test_list_current_vcpu_threads_validates_kpcr_prcb_and_ethread(monkeypatch):
+    target = _thread_target()
+    ethread = 0xFFFFE001_00200000
+    kpcr = 0xFFFFF780_00000000
+    prcb = 0xFFFFF780_00000100
+    owner = target.eprocess
+    idle_kpcr = 0xFFFFF780_00001000
+    idle_prcb = 0xFFFFF780_00001100
+    idle_ethread = 0xFFFFE001_00400000
+    idle_owner = 0xFFFFE001_00000000
+    listed = ThreadRecord(
+        tid=4816, ethread=ethread, state=2, state_name="Running",
+        wait_reason=0, wait_reason_name=None, priority=13, base_priority=8,
+        context_switches=927, teb=0, kernel_stack=0, stack_limit=0, stack_base=0,
+        start_address=0, win32_start_address=0, create_time=1, exit_status=259,
+    )
+    thread_layout = SimpleNamespace(fields={
+        "process": walk._ThreadField("Process", 0x220, 8),
+        "cid": walk._ThreadField("Cid", 0x500, 16),
+    })
+    current_layout = walk._CurrentVcpuLayout(
+        kpcr_self=walk._ThreadField("Self", 0x18, 8),
+        kpcr_current_prcb=walk._ThreadField("CurrentPrcb", 0x20, 8),
+        kprcb_current_thread=walk._ThreadField("CurrentThread", 0x8, 8),
+    )
+    values = {
+        kpcr + 0x18: kpcr,
+        kpcr + 0x20: prcb,
+        prcb + 0x8: ethread,
+        ethread + 0x220: owner,
+        idle_kpcr + 0x18: idle_kpcr,
+        idle_kpcr + 0x20: idle_prcb,
+        idle_prcb + 0x8: idle_ethread,
+        idle_ethread + 0x220: idle_owner,
+    }
+    monkeypatch.setattr(
+        walk, "current_snapshot",
+        lambda _vm: SimpleNamespace(
+            vcpu_kernel_gs_bases=((0, (0xDEAD, kpcr)), (1, (0xBEEF,)), (2, (idle_kpcr,))),
+        ),
+    )
+    monkeypatch.setattr(walk, "_current_vcpu_layout", lambda _store: current_layout)
+    monkeypatch.setattr(walk, "_thread_layout", lambda _store: thread_layout)
+    monkeypatch.setattr(walk, "_process_layout", lambda _store: object())
+    monkeypatch.setattr(walk, "_read_kernel_list_head", lambda *_args: (0x1AE000, 0, walk.WalkCache()))
+    monkeypatch.setattr(walk, "_read_u64", lambda _vm, _cr3, va, _cache: values[va])
+    monkeypatch.setattr(
+        walk, "_read_process_entry",
+        lambda _vm, _cr3, eprocess, _layout, _cache: (
+            ProcessRecord(
+                pid=0 if eprocess == idle_owner else target.pid,
+                name="Idle" if eprocess == idle_owner else target.name,
+                eprocess=eprocess, directory_table_base=0x1AE000,
+            ),
+            0,
+        ),
+    )
+    def fake_cid(_vm, _cr3, va, length, *, cache):
+        assert length == 16
+        if va == ethread + 0x500:
+            return target.pid.to_bytes(8, "little") + listed.tid.to_bytes(8, "little")
+        if va == idle_ethread + 0x500:
+            return b"\x00" * 16
+        return b""
+    monkeypatch.setattr(
+        walk, "read_virt_cr3",
+        fake_cid,
+    )
+
+    current = list_current_vcpu_threads(
+        "vm", _thread_store(), target, threads=[listed], cache=walk.WalkCache(),
+    )
+
+    assert current[0].status == "current"
+    assert (current[0].vcpu, current[0].ethread, current[0].tid, current[0].in_target_process) == (
+        0, ethread, 4816, True,
+    )
+    assert current[1].status == "unavailable"
+    assert "invalid KPCR candidate" in current[1].reason
+    assert (current[2].status, current[2].pid, current[2].tid, current[2].process_name) == (
+        "idle", 0, 0, "Idle",
+    )
 
 
 # ── WoW64 detection ───────────────────────────────────────────────────

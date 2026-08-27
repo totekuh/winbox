@@ -1195,6 +1195,51 @@ class TestKdbg:
         finally:
             run("kdbg", "stop")
 
+    def test_threads_walk_through_mcp_and_cli(self, run, tool):
+        """Threads are metadata only: validate a complete real list, not stacks."""
+        # Stateless walkers own the persistent reader between calls. Release
+        # it first so this lifecycle test starts from the same clean gdbstub
+        # boundary as the other kdbg tests.
+        run("kdbg", "stop", expect_ok=False)
+        run("kdbg", "start")
+        try:
+            pid = self._target_pid(tool)
+            walked = self._result(
+                tool, "kdbg_threads", pid, resolve=True, limit=1024,
+            )
+            assert walked["pid"] == pid
+            assert walked["complete"] is True, walked
+            assert walked["walk_complete"] is True, walked
+            assert walked["truncated_reason"] is None
+            assert walked["count"] > 0
+            assert walked["count"] == len(walked["threads"])
+            assert walked["total_count"] == walked["matched_count"] == walked["count"]
+            assert walked["output_truncated"] is False
+            assert walked["summary"]["states"]
+            tids = [thread["tid"] for thread in walked["threads"]]
+            assert len(tids) == len(set(tids))
+            for thread in walked["threads"]:
+                assert thread["tid"] > 0
+                assert thread["ethread"].startswith("0xffff")
+                assert isinstance(thread["state"]["raw"], int)
+                assert isinstance(thread["wait_reason"]["raw"], int)
+                assert "start_attribution" in thread
+                assert thread["start_attribution"]["start_address"]["mapping"]
+            assert walked["current_vcpus"]
+            assert {current["status"] for current in walked["current_vcpus"]} <= {
+                "current", "idle", "unavailable",
+            }
+
+            cli = run("kdbg", "threads", str(pid), "--json", "--resolve", "--limit", "1024")
+            cli_walked = json.loads(cli.output)
+            assert cli_walked["pid"] == pid
+            assert cli_walked["complete"] is True, cli_walked
+            assert cli_walked["walk_complete"] is True, cli_walked
+            assert cli_walked["count"] == len(cli_walked["threads"])
+            assert {thread["tid"] for thread in cli_walked["threads"]} == set(tids)
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+
     def test_attach_read_and_detach_leaves_the_vm_running(self, tool, cfg, run):
         """A daemon that does not shut down cleanly never resumes the CPU,
         which left the guest paused behind a warning."""

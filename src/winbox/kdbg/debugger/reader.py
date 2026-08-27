@@ -109,6 +109,11 @@ class DebugSnapshot:
     current_cr3: int
     cr3_candidates: tuple[int, ...]
     kernel_gs_bases: tuple[int, ...]
+    # One tuple per halted QEMU vCPU: (numeric vCPU id, candidate KPCR bases).
+    # ``kernel_gs_bases`` remains the flattened compatibility view used by
+    # nt-base discovery; callers that need scheduler attribution must retain
+    # this per-vCPU relationship.
+    vcpu_kernel_gs_bases: tuple[tuple[int, tuple[int, ...]], ...]
 
     def read_virtual(self, cr3: int, addr: int, length: int) -> bytes:
         raise NotImplementedError
@@ -128,6 +133,18 @@ class _RemoteSnapshot(DebugSnapshot):
         self.kernel_gs_bases = tuple(
             int(value, 0) for value in begin.get("kernel_gs_bases", [])
         )
+        vcpu_bases: list[tuple[int, tuple[int, ...]]] = []
+        for item in begin.get("vcpu_kernel_gs_bases", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                vcpu = int(item["vcpu"])
+                bases = tuple(int(value, 0) for value in item.get("bases", []))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if vcpu >= 0 and bases:
+                vcpu_bases.append((vcpu, bases))
+        self.vcpu_kernel_gs_bases = tuple(vcpu_bases)
 
     @classmethod
     def connect(cls, cfg: Config, *, timeout: float = 15.0) -> "_RemoteSnapshot":
@@ -199,6 +216,7 @@ class _LocalRspSnapshot(DebugSnapshot):
                 ) from exc
         cr3s: list[int] = []
         kernel_gs_bases: list[int] = []
+        vcpu_kernel_gs_bases: list[tuple[int, tuple[int, ...]]] = []
         regs_by_thread: dict[str, bytes] = {}
         for thread in threads:
             rsp.select_thread(thread)
@@ -211,10 +229,20 @@ class _LocalRspSnapshot(DebugSnapshot):
             # 172/180. Depending on whether this vCPU stopped in user or
             # kernel mode, either side of SWAPGS can contain KPCR. Keep only
             # canonical-high candidates and validate IdtBase later.
+            vcpu_bases: list[int] = []
             for offset in (172, 180):
                 base = struct.unpack_from("<Q", regs, offset)[0]
-                if base >> 47 == 0x1FFFF and base not in kernel_gs_bases:
-                    kernel_gs_bases.append(base)
+                if base >> 47 == 0x1FFFF:
+                    if base not in vcpu_bases:
+                        vcpu_bases.append(base)
+                    if base not in kernel_gs_bases:
+                        kernel_gs_bases.append(base)
+            try:
+                vcpu = int(thread, 16)
+            except ValueError as exc:
+                raise ReaderError(f"gdbstub returned invalid vCPU id {thread!r}") from exc
+            if vcpu_bases:
+                vcpu_kernel_gs_bases.append((vcpu, tuple(vcpu_bases)))
         rsp.select_thread(self._vcpu)
         self._original_regs = regs_by_thread.get(self._vcpu) or rsp.read_registers()
         self.current_cr3 = struct.unpack_from(
@@ -222,6 +250,7 @@ class _LocalRspSnapshot(DebugSnapshot):
         )[0]
         self.cr3_candidates = tuple(cr3s)
         self.kernel_gs_bases = tuple(kernel_gs_bases)
+        self.vcpu_kernel_gs_bases = tuple(vcpu_kernel_gs_bases)
         self._active_cr3 = self.current_cr3
         self._physical = False
         self._poisoned = False
@@ -362,6 +391,13 @@ class _ReaderBroker:
                 "cr3s": [f"0x{value:x}" for value in snapshot.cr3_candidates],
                 "kernel_gs_bases": [
                     f"0x{value:x}" for value in snapshot.kernel_gs_bases
+                ],
+                "vcpu_kernel_gs_bases": [
+                    {
+                        "vcpu": vcpu,
+                        "bases": [f"0x{value:x}" for value in bases],
+                    }
+                    for vcpu, bases in snapshot.vcpu_kernel_gs_bases
                 ],
             })))
             while True:

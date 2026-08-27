@@ -39,7 +39,7 @@ PS C:\Windows\system32>
 
 ## Platform capabilities
 
-- **MCP server** — 80 tools form a bounded, AI-native research control plane
+- **MCP server** — 81 tools form a bounded, AI-native research control plane
   for autonomous agents, covering VM lifecycle, execution, memory, symbols,
   debugging, drivers, IPC, defenses, networking, event logs, and evidence
   collection.
@@ -362,7 +362,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (80):**
+**Available tools (81):**
 
 User-mode primitives:
 
@@ -438,6 +438,7 @@ and requires a reboot.
 | `kdbg_sym(name, search?, limit?, rva?)` | Resolve `mod!sym` to VA or RVA; substring search supported |
 | `kdbg_struct(type_name, field?, module?)` | Dump full struct layout or one field offset |
 | `kdbg_ps()` | Walk `PsActiveProcessHead` (JSON: pid, dtb, eprocess, name) |
+| `kdbg_threads(pid, detail?, state?, wait_reason?, sort?, limit?, resolve?, include_current?)` | Bounded validated ETHREAD walk with scheduler summaries/filters, optional live module+local-symbol start attribution, and exact KPCR→KPRCB current-vCPU identities; never claims arbitrary-thread registers or stacks |
 | `kdbg_lm()` | Walk `PsLoadedModuleList` (JSON: base, size, name) |
 | `kdbg_user_lm(pid)` | Walk native and WoW64 PEB loader views; every module is labelled x64 or x86 |
 | `kdbg_read_va(pid, address, length)` | CR3-switching arbitrary-process read; works against PPL targets (1MB cap, hex bytes) |
@@ -522,7 +523,7 @@ The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker pro
 Kali Linux
 ├── winbox control plane
 │   ├── CLI (Python/Click)
-│   └── MCP server (80 bounded agent tools)
+│   └── MCP server (81 bounded agent tools)
 ├── hypervisor research plane
 │   ├── QMP/HMP ────────────> VM + gdbstub lifecycle
 │   ├── persistent RSP ─────> vCPUs, memory, break/watchpoints, stepping
