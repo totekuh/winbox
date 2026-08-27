@@ -3116,6 +3116,91 @@ class TestKdbgListTools:
         assert error["code"] == "invalid_argument"
         assert "invalid state" in error["message"]
 
+    def test_kdbg_doctor_reports_catalog_without_opening_rsp(self, mock_mcp):
+        from winbox.mcp import kdbg_doctor
+
+        _, _, cfg = mock_mcp
+        report = {
+            "ready": True,
+            "vm": {"name": "winbox", "state": "running", "running": True},
+            "guest_agent": {"responding": True, "error": None},
+            "cet": {"safe_for_debug": True, "summary": "safe", "error": None},
+            "symbols": {"nt": {"identity": "cached_unverified", "live_base": "not_checked"}},
+            "debugger": {"state": "stopped", "owner": None},
+            "mcp": {"catalog_revision": "test", "tool_count": 83},
+            "notes": [],
+        }
+        with patch("winbox.mcp._kdbg_collect_doctor", return_value=report) as doctor:
+            result = _mcp_result(kdbg_doctor())
+
+        assert result is report
+        assert doctor.call_args.kwargs["tool_count"] == 83
+
+    def test_kdbg_triage_is_single_snapshot_and_bounds_unmapped_leads(self, mock_mcp):
+        from contextlib import nullcontext
+        from winbox.kdbg.walk import (
+            CurrentVcpuRecord, ModuleRecord, ProcessRecord, ThreadAddressAttribution,
+            ThreadRecord, ThreadStartAttribution, ThreadWalkResult, UserModuleRecord,
+        )
+        from winbox.mcp import kdbg_triage
+
+        _, _, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+        target = ProcessRecord(
+            pid=1234, name="target.exe", eprocess=0xffffae00abcdef00,
+            directory_table_base=0x7fa000,
+        )
+        thread = ThreadRecord(
+            tid=4321, ethread=0xffffae0012345000, state=5, state_name="Waiting",
+            wait_reason=6, wait_reason_name="UserRequest", priority=13, base_priority=8,
+            context_switches=927, teb=0x7ffde000, kernel_stack=0xfffff80001234000,
+            stack_limit=0xfffff80001230000, stack_base=0xfffff80001238000,
+            start_address=0xfffff80010001000, win32_start_address=0x7ff740001000,
+            create_time=0x1234, exit_status=259,
+        )
+        attribution = ThreadStartAttribution(
+            start_address=ThreadAddressAttribution(
+                address=thread.start_address, mapping="kernel_module", module="ntoskrnl.exe",
+                module_base=0xfffff80010000000, module_size=0x4000, rva=0x1000,
+            ),
+            win32_start_address=ThreadAddressAttribution(
+                address=thread.win32_start_address, mapping="user_not_in_loader_module",
+            ),
+        )
+        current = CurrentVcpuRecord(
+            vcpu=1, status="current", ethread=thread.ethread, eprocess=target.eprocess,
+            pid=target.pid, process_name=target.name, tid=thread.tid, in_target_process=True,
+        )
+        snapshot = MagicMock(return_value=nullcontext())
+        with patch("winbox.mcp._kdbg_debug_snapshot", snapshot), \
+             patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_list_threads", return_value=ThreadWalkResult([thread], True)), \
+             patch("winbox.mcp._kdbg_list_modules", return_value=[ModuleRecord("ntoskrnl.exe", 0xfffff80010000000, 0x4000, 0)]), \
+             patch("winbox.mcp._kdbg_ensure_types_loaded"), \
+             patch("winbox.mcp._kdbg_list_user_modules", return_value=[UserModuleRecord("target.exe", 0x7ff740000000, 0x4000, "C:\\target.exe", 0)]), \
+             patch("winbox.mcp._kdbg_resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
+             patch("winbox.mcp._kdbg_list_current_vcpu_threads", return_value=[current]):
+            result = _mcp_result(kdbg_triage(1234, thread_limit=1))
+
+        assert snapshot.call_count == 1
+        assert result["snapshot"] == "single_rsp_stop"
+        assert result["thread_summary"]["top_rows_returned"] == 1
+        assert result["threads"][0]["running_on_vcpus"] == [1]
+        assert result["user_modules"]["count"] == 1
+        assert result["unmapped_starts"] == [{
+            "tid": 4321, "ethread": "0xffffae0012345000",
+            "field": "win32_start_address", "address": "0x00007ff740001000",
+            "mapping": "user_not_in_loader_module",
+        }]
+
+    def test_kdbg_triage_rejects_unbounded_limit_before_a_snapshot(self, mock_mcp):
+        from winbox.mcp import kdbg_triage
+
+        error = _mcp_error(kdbg_triage(1234, thread_limit=65))
+        assert error["code"] == "invalid_argument"
+        assert "between 1 and 64" in error["message"]
+
     def test_kdbg_lm_returns_json_array(self, mock_mcp):
         import json as _json
         from winbox.kdbg.walk import ModuleRecord

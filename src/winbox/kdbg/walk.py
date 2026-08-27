@@ -1488,6 +1488,8 @@ def resolve_thread_start_addresses(
     threads: list[ThreadRecord] | tuple[ThreadRecord, ...],
     *,
     cache: WalkCache | None = None,
+    kernel_modules: list[ModuleRecord] | None = None,
+    user_modules: list[UserModuleRecord] | None = None,
 ) -> tuple[dict[int, ThreadStartAttribution], tuple[str, ...]]:
     """Resolve selected start VAs against live loaded-module views.
 
@@ -1497,16 +1499,18 @@ def resolve_thread_start_addresses(
     """
     cache = cache or WalkCache()
     warnings: list[str] = []
-    try:
-        kernel_modules = list_modules(vm_name, store, cache=cache)
-    except (HmpError, PageWalkError, SymbolStoreError) as exc:
-        kernel_modules = []
-        warnings.append(f"kernel module attribution unavailable: {exc}")
-    try:
-        user_modules = list_user_modules(vm_name, store, target, cache=cache)
-    except (HmpError, PageWalkError, SymbolStoreError) as exc:
-        user_modules = []
-        warnings.append(f"user module attribution unavailable: {exc}")
+    if kernel_modules is None:
+        try:
+            kernel_modules = list_modules(vm_name, store, cache=cache)
+        except (HmpError, PageWalkError, SymbolStoreError) as exc:
+            kernel_modules = []
+            warnings.append(f"kernel module attribution unavailable: {exc}")
+    if user_modules is None:
+        try:
+            user_modules = list_user_modules(vm_name, store, target, cache=cache)
+        except (HmpError, PageWalkError, SymbolStoreError) as exc:
+            user_modules = []
+            warnings.append(f"user module attribution unavailable: {exc}")
     return {
         thread.ethread: ThreadStartAttribution(
             start_address=_attribute_thread_address(

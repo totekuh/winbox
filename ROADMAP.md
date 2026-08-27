@@ -27,9 +27,9 @@ residual is fixed; its `DirectoryTableBase` trade-off remains accepted. Item 8
 remains a watch condition. A follow-up review the same day opened and completed
 items 85-87 for cache ownership, subprocess bounds, and prepare-job lifecycle.
 A live thread-research review after the PDB-backed `kdbg_threads` launch opened
-items 88-99 below. Items 88-91 were completed and live-verified the same day;
-the remaining items are deliberately scoped to make stopped-kernel thread
-evidence more intelligible and bounded without requiring an in-guest Frida agent.
+items 88-101 below. Items 88-91 and 100-101 were completed and live-verified
+the same day; the remaining items are deliberately scoped to make stopped-kernel
+thread evidence more intelligible and bounded without requiring an in-guest Frida agent.
 
 ### Completed top-three sequence (2026-08-25)
 
@@ -195,6 +195,32 @@ small rendering correction shipped alongside item 89.
 | 1 | **89 — bounded thread result profiles and filters** | 4 | 5 | Completed with full/summary profiles, filters, sort, 1..1024 limit, and separate walk/output truth. |
 | 2 | **90 — module/symbol attribution for thread starts** | 4 | 5 | Completed with opt-in live module joins and already-local nearest-public symbols. |
 | 3 | **91 — vCPU-to-current-ETHREAD attribution** | 3 | 5 | Completed through validated KPCR→KPRCB→KTHREAD identity, including IdleThreads. |
+
+### Completed quick research views (2026-08-27)
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **100 — kdbg doctor readiness report** | 5 | 5 | Completed as a non-disruptive VM/agent/CET/symbol/ownership/catalog report. |
+| 2 | **101 — one-snapshot process triage** | 4 | 5 | Completed with bounded threads, vCPU ownership, user modules, and scoped unmapped-start leads. |
+
+### 100. Completed — kdbg doctor readiness report
+
+The reload and debugging lifecycle previously required correlating separate VM,
+CET, symbol, reader, daemon, and MCP status calls. `kdbg doctor` now returns a
+single read-only report for both CLI and MCP. It never opens QEMU's RSP socket,
+so it cannot halt the guest merely to inspect health. Cached PDB identity is
+explicitly marked `cached_unverified` and the live base `not_checked`; a walker
+or base refresh remains the authoritative live verification path.
+
+### 101. Completed — one-snapshot process triage
+
+`kdbg_triage(pid, thread_limit=16)` and `winbox kdbg triage PID` collect the
+process, complete ETHREAD walk summary, top context-switch rows with module
+attribution, current-vCPU ETHREAD identities, and a capped PEB module view
+inside one RSP stop. Loader/module misses are returned as bounded leads only
+for those top rows (`unmapped_starts_scope=top_rows_only`), never a claim that
+a private/JIT mapping is malicious. Missing PEB metadata and current-vCPU
+attribution degrade visibly without hiding an otherwise valid thread walk.
 
 ### 88. Completed — truthful non-waiting thread presentation
 

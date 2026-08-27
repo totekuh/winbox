@@ -170,3 +170,28 @@ def test_live_thread_research_view_is_bounded_resolved_and_vcpu_aware():
         start["mapping"] == "kernel_module" and start["module"]
         for start in starts
     ), starts
+
+
+def test_live_doctor_and_triage_are_bounded_and_leave_a_usable_vm():
+    """CLI-only smoke for the one-call operator views on the installed build."""
+    _require_safe_live_vm()
+
+    doctor = _winbox("kdbg", "doctor", "--json")
+    assert doctor.returncode == 0, doctor.stderr or doctor.stdout
+    report = json.loads(doctor.stdout)
+    assert report["vm"]["running"] is True
+    assert report["guest_agent"]["responding"] is True
+    assert report["cet"]["safe_for_debug"] is True
+    assert report["symbols"]["nt"]["available"] is True
+    assert report["symbols"]["nt"]["live_base"] == "not_checked"
+    assert report["mcp"]["catalog_revision"]
+
+    triage = _winbox("kdbg", "triage", "4", "--json", "--thread-limit", "8")
+    assert triage.returncode == 0, triage.stderr or triage.stdout
+    payload = json.loads(triage.stdout)
+    assert payload["snapshot"] == "single_rsp_stop"
+    assert payload["process"]["pid"] == 4
+    assert payload["thread_summary"]["walk_complete"] is True, payload
+    assert 0 < len(payload["threads"]) <= 8
+    assert payload["current_vcpus"]
+    assert payload["unmapped_starts_scope"] == "top_rows_only"

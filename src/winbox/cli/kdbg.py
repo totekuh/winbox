@@ -62,6 +62,7 @@ from winbox.kdbg.cet import (
     query_status as query_cet_status,
     restore as restore_cet_policy,
 )
+from winbox.kdbg.doctor import collect_doctor
 from winbox.kdbg.format import format_struct as _format_struct, format_sym as _format_sym
 from winbox.kdbg.hmp import (
     HmpError,
@@ -80,6 +81,11 @@ from winbox.kdbg.walk import (
     select_threads,
 )
 from winbox.vm import VM, GuestAgent, VMState
+from winbox import __version__
+
+
+_MCP_CATALOG_REVISION = "2026-08-27.kdbg-doctor-triage.1"
+_MCP_TOOL_COUNT = 83
 
 # Use the canonical HMP wrapper in tuple-mode for start/stop/status so the
 # raw virsh stderr lands in the user's terminal verbatim — the default
@@ -243,6 +249,46 @@ def kdbg_cet_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     rendered = format_cet_status(status)
     state, rest = rendered.split(": ", 1)
     console.print(f"[{colour}]{state}[/]: {rest}")
+
+
+@kdbg.command("doctor")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.option("--port", default=1234, show_default=True, help="GDB stub port to inspect.")
+@click.pass_context
+def kdbg_doctor(ctx: click.Context, as_json: bool, port: int) -> None:
+    """Report kdbg readiness without attaching to or stopping the guest."""
+    import json as _json
+
+    cfg: Config = ctx.obj["cfg"]
+    report = collect_doctor(
+        cfg, VM(cfg), GuestAgent(cfg), port=port,
+        catalog_revision=_MCP_CATALOG_REVISION,
+        tool_count=_MCP_TOOL_COUNT,
+        version=__version__,
+    )
+    if as_json:
+        click.echo(_json.dumps(report, indent=2))
+        return
+
+    status = "[green]ready[/]" if report["ready"] else "[yellow]not ready[/]"
+    vm = report["vm"]
+    agent = report["guest_agent"]
+    symbols = report["symbols"]["nt"]
+    debugger = report["debugger"]
+    console.print(f"kdbg doctor: {status}")
+    console.print(f"  VM: {vm['name']} ({vm['state']})")
+    console.print(f"  agent: {'responding' if agent['responding'] else 'unavailable'}")
+    console.print(f"  CET: {report['cet']['summary'] or report['cet']['error'] or 'not checked'}")
+    console.print(
+        f"  symbols: {'nt ' + str(symbols['build']) if symbols['available'] else 'not loaded'} "
+        f"({symbols['identity']}; live base {symbols['live_base']})"
+    )
+    console.print(
+        f"  debugger: {debugger['state']}"
+        f"{(' (' + str(debugger['owner']) + ')') if debugger['owner'] else ''}"
+    )
+    mcp = report["mcp"]
+    console.print(f"  MCP: {mcp['version']} / {mcp['catalog_revision']} ({mcp['tool_count']} tools)")
 
 
 @kdbg.command("prepare")
@@ -696,6 +742,162 @@ def kdbg_threads(
         console.print(f"[yellow][!][/] current-vCPU attribution unavailable: {current_vcpus_error}")
     if not result.complete:
         console.print(f"[yellow][!][/] incomplete thread walk: {result.truncated_reason}")
+
+
+def _module_json_record(module) -> dict:
+    return {
+        "base": f"0x{module.base:016x}",
+        "size": f"0x{module.size:x}",
+        "name": module.name,
+        "full_path": getattr(module, "full_path", None),
+        "architecture": getattr(module, "architecture", "kernel"),
+    }
+
+
+def _unmapped_start_rows(threads, attributions) -> list[dict]:
+    """Show loader/module mismatches as leads, never as a malware verdict."""
+    rows: list[dict] = []
+    for thread in threads:
+        attribution = attributions.get(thread.ethread)
+        if attribution is None:
+            continue
+        for field, value in (
+            ("start_address", attribution.start_address),
+            ("win32_start_address", attribution.win32_start_address),
+        ):
+            if value.mapping not in {"kernel_unmapped", "user_not_in_loader_module"}:
+                continue
+            rows.append({
+                "tid": thread.tid,
+                "ethread": f"0x{thread.ethread:016x}",
+                "field": field,
+                "address": f"0x{value.address:016x}",
+                "mapping": value.mapping,
+            })
+    return rows
+
+
+@kdbg.command("triage")
+@click.argument("pid", type=int)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.option(
+    "--thread-limit", type=click.IntRange(1, 64), default=16, show_default=True,
+    help="Top context-switch thread rows to resolve and return.",
+)
+@click.pass_context
+def kdbg_triage(ctx: click.Context, pid: int, as_json: bool, thread_limit: int) -> None:
+    """Capture one bounded, coherent kernel-research view for PID."""
+    import json as _json
+
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+    try:
+        with debug_snapshot(cfg):
+            store = _get_store(cfg)
+            cache = WalkCache()
+            target = find_process(cfg.vm_name, store, pid=pid, cache=cache)
+            if target is None:
+                console.print(f"[red][-][/] pid {pid} not found in process list")
+                raise SystemExit(1)
+            walked = list_threads(cfg.vm_name, store, target, cache=cache)
+            selected = select_threads(
+                walked.threads, sort="context-switches", limit=thread_limit,
+            )
+            kernel_modules = list_modules(cfg.vm_name, store, cache=cache)
+            module_error = None
+            try:
+                ensure_types_loaded(
+                    cfg, store, ["_PEB", "_PEB_LDR_DATA", "_EWOW64PROCESS"], module="nt",
+                )
+                user_modules = list_user_modules(cfg.vm_name, store, target, cache=cache)
+            except (SymbolStoreError, SymbolLoadError, HmpError) as exc:
+                user_modules = []
+                module_error = str(exc)
+            attributions, attribution_warnings = resolve_thread_start_addresses(
+                cfg.vm_name, store, target, selected.threads, cache=cache,
+                kernel_modules=kernel_modules, user_modules=user_modules,
+            )
+            current_vcpus = []
+            current_vcpus_error = None
+            try:
+                current_vcpus = list_current_vcpu_threads(
+                    cfg.vm_name, store, target, threads=walked.threads, cache=cache,
+                )
+            except (SymbolStoreError, HmpError, ReaderError) as exc:
+                current_vcpus_error = str(exc)
+    except (SymbolStoreError, SymbolLoadError, HmpError, ReaderError) as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+
+    running_by_ethread: dict[int, list[int]] = {}
+    for current in current_vcpus:
+        if current.status == "current" and current.in_target_process and current.ethread is not None:
+            running_by_ethread.setdefault(current.ethread, []).append(current.vcpu)
+    module_limit = 64
+    payload = {
+        "snapshot": "single_rsp_stop",
+        "process": {
+            "pid": target.pid, "name": target.name,
+            "eprocess": f"0x{target.eprocess:016x}",
+            "dtb": f"0x{target.directory_table_base:012x}",
+            "create_time": target.create_time,
+        },
+        "thread_summary": {
+            "total_count": selected.total_count,
+            "walk_complete": walked.complete,
+            "truncated_reason": walked.truncated_reason,
+            "states": selected.state_counts,
+            "wait_reasons": selected.wait_reason_counts,
+            "top_rows_returned": len(selected.threads),
+            "top_rows_truncated": selected.output_truncated,
+            "sort": "context-switches",
+        },
+        "threads": [
+            _thread_json_record(
+                thread, attribution=attributions.get(thread.ethread),
+                running_on_vcpus=running_by_ethread.get(thread.ethread, ()),
+            ) for thread in selected.threads
+        ],
+        "current_vcpus": [_current_vcpu_json(current) for current in current_vcpus],
+        "user_modules": {
+            "count": len(user_modules),
+            "returned": min(len(user_modules), module_limit),
+            "output_truncated": len(user_modules) > module_limit,
+            "modules": [_module_json_record(module) for module in user_modules[:module_limit]],
+        },
+        "unmapped_starts": _unmapped_start_rows(selected.threads, attributions),
+        "unmapped_starts_scope": "top_rows_only",
+    }
+    if module_error:
+        payload["user_modules"]["error"] = module_error
+    if attribution_warnings:
+        payload["attribution_warnings"] = list(attribution_warnings)
+    if current_vcpus_error:
+        payload["current_vcpus_error"] = current_vcpus_error
+    if as_json:
+        click.echo(_json.dumps(payload, indent=2))
+        return
+
+    console.print(f"[dim]pid {target.pid} ({target.name}) — EPROCESS 0x{target.eprocess:x}[/]")
+    console.print(
+        f"  threads: {selected.total_count} walked; {len(selected.threads)} top context-switch rows; "
+        f"complete={walked.complete}"
+    )
+    console.print(f"  user modules: {len(user_modules)}")
+    console.print(f"  current vCPUs: {len(current_vcpus)}")
+    if payload["unmapped_starts"]:
+        console.print("[yellow]  unmapped starts (top rows only):[/]")
+        for row in payload["unmapped_starts"]:
+            console.print(f"    tid {row['tid']} {row['field']} {row['address']} ({row['mapping']})")
+    else:
+        console.print("  unmapped starts (top rows only): none")
+    if module_error:
+        console.print(f"[yellow][!][/] user module view unavailable: {module_error}")
+    if not walked.complete:
+        console.print(f"[yellow][!][/] incomplete thread walk: {walked.truncated_reason}")
 
 
 @kdbg.command("lm")

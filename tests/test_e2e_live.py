@@ -1240,6 +1240,40 @@ class TestKdbg:
         finally:
             run("kdbg", "stop", expect_ok=False)
 
+    def test_doctor_and_triage_are_live_bounded_and_coherent(self, run, tool):
+        """The fast report never needs an RSP stop; triage needs exactly one."""
+        run("kdbg", "stop", expect_ok=False)
+        doctor = self._result(tool, "kdbg_doctor")
+        assert doctor["vm"]["running"] is True
+        assert doctor["guest_agent"]["responding"] is True
+        assert doctor["cet"]["safe_for_debug"] is True, doctor
+        assert doctor["symbols"]["nt"]["available"] is True
+        assert doctor["symbols"]["nt"]["live_base"] == "not_checked"
+        assert doctor["mcp"]["catalog_revision"]
+        cli_doctor = json.loads(run("kdbg", "doctor", "--json").output)
+        assert cli_doctor["mcp"]["catalog_revision"] == doctor["mcp"]["catalog_revision"]
+
+        run("kdbg", "start")
+        try:
+            pid = self._target_pid(tool)
+            triage = self._result(tool, "kdbg_triage", pid, thread_limit=16)
+            assert triage["snapshot"] == "single_rsp_stop"
+            assert triage["process"]["pid"] == pid
+            assert triage["thread_summary"]["walk_complete"] is True, triage
+            assert 0 < triage["thread_summary"]["top_rows_returned"] <= 16
+            assert len(triage["threads"]) == triage["thread_summary"]["top_rows_returned"]
+            assert triage["current_vcpus"]
+            assert triage["user_modules"]["count"] >= triage["user_modules"]["returned"]
+            assert triage["unmapped_starts_scope"] == "top_rows_only"
+
+            cli = json.loads(run("kdbg", "triage", str(pid), "--json", "--thread-limit", "16").output)
+            assert cli["snapshot"] == "single_rsp_stop"
+            assert cli["process"]["pid"] == pid
+            assert cli["thread_summary"]["walk_complete"] is True, cli
+            assert 0 < len(cli["threads"]) <= 16
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+
     def test_attach_read_and_detach_leaves_the_vm_running(self, tool, cfg, run):
         """A daemon that does not shut down cleanly never resumes the CPU,
         which left the guest paused behind a warning."""

@@ -324,6 +324,81 @@ class TestKdbgThreads:
         assert "pid 9999 not found" in result.output
         listed.assert_not_called()
 
+    def test_triage_emits_one_snapshot_bounded_machine_safe_view(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+        from winbox.kdbg.walk import (
+            CurrentVcpuRecord, ModuleRecord, ThreadAddressAttribution,
+            ThreadStartAttribution, UserModuleRecord,
+        )
+
+        target, walked = self._target_and_threads()
+        thread = walked.threads[0]
+        attribution = ThreadStartAttribution(
+            start_address=ThreadAddressAttribution(
+                address=thread.start_address, mapping="kernel_unmapped",
+            ),
+            win32_start_address=ThreadAddressAttribution(
+                address=thread.win32_start_address, mapping="user_module", module="target.exe",
+                module_base=0x7ff740000000, module_size=0x4000, rva=0x1000,
+            ),
+        )
+        current = CurrentVcpuRecord(
+            vcpu=2, status="current", ethread=thread.ethread,
+            eprocess=target.eprocess, pid=target.pid, process_name=target.name,
+            tid=thread.tid, in_target_process=True,
+        )
+        snapshot = MagicMock(return_value=nullcontext())
+        with patch("winbox.cli.kdbg.debug_snapshot", snapshot), \
+             patch("winbox.cli.kdbg._get_store"), \
+             patch("winbox.cli.kdbg.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.list_threads", return_value=walked), \
+             patch("winbox.cli.kdbg.list_modules", return_value=[ModuleRecord("ntoskrnl.exe", 0xfffff80010000000, 0x4000, 0)]), \
+             patch("winbox.cli.kdbg.ensure_types_loaded"), \
+             patch("winbox.cli.kdbg.list_user_modules", return_value=[UserModuleRecord("target.exe", 0x7ff740000000, 0x4000, "C:\\target.exe", 0)]), \
+             patch("winbox.cli.kdbg.resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
+             patch("winbox.cli.kdbg.list_current_vcpu_threads", return_value=[current]):
+            result = runner.invoke(cli, ["kdbg", "triage", "4712", "--json", "--thread-limit", "1"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert snapshot.call_count == 1
+        assert payload["snapshot"] == "single_rsp_stop"
+        assert payload["process"]["pid"] == 4712
+        assert payload["threads"][0]["running_on_vcpus"] == [2]
+        assert payload["user_modules"]["count"] == 1
+        assert payload["unmapped_starts"][0]["mapping"] == "kernel_unmapped"
+
+    def test_triage_bounds_limit_in_click(self, runner, kdbg_env):
+        from winbox.cli import cli
+
+        result = runner.invoke(cli, ["kdbg", "triage", "4712", "--thread-limit", "65"])
+        assert result.exit_code == 2
+        assert "1<=x<=64" in result.output
+
+
+class TestKdbgDoctor:
+    def test_doctor_json_uses_shared_non_disruptive_report(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+
+        report = {
+            "ready": True,
+            "vm": {"name": "winbox", "state": "running", "running": True},
+            "guest_agent": {"responding": True, "error": None},
+            "cet": {"safe_for_debug": True, "summary": "safe", "error": None},
+            "symbols": {"nt": {"available": True, "identity": "cached_unverified", "live_base": "not_checked", "build": "build"}},
+            "debugger": {"state": "stopped", "owner": None},
+            "mcp": {"version": "test", "catalog_revision": "test", "tool_count": 83},
+            "notes": [],
+        }
+        with patch("winbox.cli.kdbg.collect_doctor", return_value=report) as doctor:
+            result = runner.invoke(cli, ["kdbg", "doctor", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == report
+        assert doctor.call_args.kwargs["tool_count"] == 83
+
 
 class TestKdbgTargetStatus:
     def test_emits_machine_safe_liveness_json(self, runner, kdbg_env):

@@ -13,6 +13,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from winbox.config import Config
+from winbox import __version__ as _winbox_version
 from winbox.vm import (
     VM,
     VMState,
@@ -27,6 +28,7 @@ from winbox.jobs import Job, JobMode, JobStatus, JobStore
 # both python and powershell job output without knowing which is which.
 from winbox.vm.guest import _clixml_to_text
 from winbox.kdbg.errors import bounded_details
+from winbox.kdbg.doctor import collect_doctor as _kdbg_collect_doctor
 
 mcp = FastMCP(
     "winbox",
@@ -41,6 +43,8 @@ mcp = FastMCP(
 )
 
 _RESEARCH_ENVELOPE = "winbox.mcp/1"
+_MCP_CATALOG_REVISION = "2026-08-27.kdbg-doctor-triage.1"
+_MCP_TOOL_COUNT = 83
 
 
 def _research_ok(result: Any) -> dict[str, Any]:
@@ -2988,6 +2992,28 @@ from winbox.kdbg.walk import select_threads as _kdbg_select_threads
 
 
 @mcp.tool()
+def kdbg_doctor(port: int = 1234) -> dict[str, Any]:
+    """Fast, non-disruptive kdbg readiness report.
+
+    Reports VM and guest-agent reachability, CET safety, cached nt symbol
+    identity, gdbstub/reader ownership, and this MCP catalog revision.  It
+    never attaches to the RSP socket or stops the guest.  Consequently,
+    ``symbols.nt.live_base`` is honestly ``not_checked``: a walker or explicit
+    base refresh performs that live RSP verification.
+    """
+    cfg, vm, ga = _get_state()
+    try:
+        return _research_ok(_kdbg_collect_doctor(
+            cfg, vm, ga, port=port,
+            catalog_revision=_MCP_CATALOG_REVISION,
+            tool_count=_MCP_TOOL_COUNT,
+            version=_winbox_version,
+        ))
+    except Exception as exc:
+        return _research_error(exc, operation="kdbg_doctor")
+
+
+@mcp.tool()
 def kdbg_cet_status() -> dict[str, Any]:
     """Report whether Windows CET state is safe for QEMU GDB stop/resume.
 
@@ -3372,6 +3398,150 @@ def kdbg_threads(
     if current_vcpus_error is not None:
         response["current_vcpus_error"] = current_vcpus_error
     return _research_ok(response)
+
+
+def _kdbg_triage_module(module: Any) -> dict[str, Any]:
+    return {
+        "base": f"0x{module.base:016x}",
+        "size": f"0x{module.size:x}",
+        "name": module.name,
+        "full_path": getattr(module, "full_path", None),
+        "architecture": getattr(module, "architecture", "kernel"),
+    }
+
+
+def _kdbg_triage_unmapped_rows(threads: Any, attributions: dict[int, Any]) -> list[dict[str, Any]]:
+    """Conservative module/loader mismatches: leads, not a verdict."""
+    rows: list[dict[str, Any]] = []
+    for thread in threads:
+        attribution = attributions.get(thread.ethread)
+        if attribution is None:
+            continue
+        for field, value in (
+            ("start_address", attribution.start_address),
+            ("win32_start_address", attribution.win32_start_address),
+        ):
+            if value.mapping not in {"kernel_unmapped", "user_not_in_loader_module"}:
+                continue
+            rows.append({
+                "tid": thread.tid,
+                "ethread": f"0x{thread.ethread:016x}",
+                "field": field,
+                "address": f"0x{value.address:016x}",
+                "mapping": value.mapping,
+            })
+    return rows
+
+
+@mcp.tool()
+def kdbg_triage(pid: int, thread_limit: int = 16) -> dict[str, Any]:
+    """Capture one bounded, coherent process-research snapshot.
+
+    One RSP stop collects process identity, the complete ETHREAD walk and its
+    scheduler summary, the busiest bounded thread rows, current-vCPU ETHREAD
+    identities, and a capped PEB module view.  Start mappings are resolved
+    only for those top rows; ``unmapped_starts_scope`` makes that boundary
+    explicit.  ``user_not_in_loader_module`` is a lead (JIT/private/VAD work
+    may explain it), not a malware classification.
+
+    Args:
+        pid: Target process ID.
+        thread_limit: Top context-switch rows to resolve and return (1..64).
+    """
+    if not 1 <= thread_limit <= 64:
+        return _research_error(
+            "thread_limit must be between 1 and 64", operation="kdbg_triage",
+        )
+    cfg, vm, _ = _get_state()
+    state = vm.state()
+    if state not in (VMState.RUNNING, VMState.PAUSED):
+        return _research_error(
+            f"VM is not running (state: {state.value})", operation="kdbg_triage",
+        )
+    try:
+        with _kdbg_debug_snapshot(cfg):
+            store = _kdbg_get_store()
+            cache = _KdbgWalkCache()
+            target = _kdbg_find_process(cfg.vm_name, store, pid=pid, cache=cache)
+            if target is None:
+                return _research_error(f"pid {pid} not found", operation="kdbg_triage")
+            walked = _kdbg_list_threads(cfg.vm_name, store, target, cache=cache)
+            selected = _kdbg_select_threads(
+                walked.threads, sort="context-switches", limit=thread_limit,
+            )
+            kernel_modules = _kdbg_list_modules(cfg.vm_name, store, cache=cache)
+            module_error: str | None = None
+            try:
+                _kdbg_ensure_types_loaded(
+                    cfg, store, ["_PEB", "_PEB_LDR_DATA", "_EWOW64PROCESS"], module="nt",
+                )
+                user_modules = _kdbg_list_user_modules(
+                    cfg.vm_name, store, target, cache=cache,
+                )
+            except (_KdbgStoreError, _KdbgSymbolLoadError, _KdbgHmpError) as exc:
+                user_modules = []
+                module_error = str(exc)
+            attributions, attribution_warnings = _kdbg_resolve_thread_start_addresses(
+                cfg.vm_name, store, target, selected.threads, cache=cache,
+                kernel_modules=kernel_modules, user_modules=user_modules,
+            )
+            current_vcpus: list[Any] = []
+            current_vcpus_error: str | None = None
+            try:
+                current_vcpus = _kdbg_list_current_vcpu_threads(
+                    cfg.vm_name, store, target, threads=walked.threads, cache=cache,
+                )
+            except (_KdbgStoreError, _KdbgHmpError) as exc:
+                current_vcpus_error = str(exc)
+    except (_KdbgStoreError, _KdbgSymbolLoadError, _KdbgHmpError) as exc:
+        return _research_error(exc, operation="kdbg_triage")
+
+    running_by_ethread: dict[int, list[int]] = {}
+    for current in current_vcpus:
+        if current.status == "current" and current.in_target_process and current.ethread is not None:
+            running_by_ethread.setdefault(current.ethread, []).append(current.vcpu)
+    module_limit = 64
+    result: dict[str, Any] = {
+        "snapshot": "single_rsp_stop",
+        "process": {
+            "pid": target.pid, "name": target.name,
+            "eprocess": f"0x{target.eprocess:016x}",
+            "dtb": f"0x{target.directory_table_base:012x}",
+            "create_time": target.create_time,
+        },
+        "thread_summary": {
+            "total_count": selected.total_count,
+            "walk_complete": walked.complete,
+            "truncated_reason": walked.truncated_reason,
+            "states": selected.state_counts,
+            "wait_reasons": selected.wait_reason_counts,
+            "top_rows_returned": len(selected.threads),
+            "top_rows_truncated": selected.output_truncated,
+            "sort": "context-switches",
+        },
+        "threads": [
+            _kdbg_thread_record(
+                thread, attribution=attributions.get(thread.ethread),
+                running_on_vcpus=running_by_ethread.get(thread.ethread, ()),
+            ) for thread in selected.threads
+        ],
+        "current_vcpus": [_kdbg_current_vcpu_record(current) for current in current_vcpus],
+        "user_modules": {
+            "count": len(user_modules),
+            "returned": min(len(user_modules), module_limit),
+            "output_truncated": len(user_modules) > module_limit,
+            "modules": [_kdbg_triage_module(module) for module in user_modules[:module_limit]],
+        },
+        "unmapped_starts": _kdbg_triage_unmapped_rows(selected.threads, attributions),
+        "unmapped_starts_scope": "top_rows_only",
+    }
+    if module_error:
+        result["user_modules"]["error"] = module_error
+    if attribution_warnings:
+        result["attribution_warnings"] = list(attribution_warnings)
+    if current_vcpus_error:
+        result["current_vcpus_error"] = current_vcpus_error
+    return _research_ok(result)
 
 
 @mcp.tool()

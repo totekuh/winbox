@@ -142,6 +142,7 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "office": (EXCLUDED, "needs a licensed Microsoft Office installer image"),
 
     # kdbg
+    "kdbg doctor": (LIVE, "non-disruptive debugger readiness and catalog report"),
     "kdbg cet-status": (LIVE, "read-only debugger safety preflight"),
     "kdbg prepare": (LIVE, "confirmation-refusal path only; does not change policy"),
     "kdbg restore-cet": (LIVE, "confirmation-refusal path only; does not change policy"),
@@ -157,6 +158,7 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg struct": (LIVE, ""),
     "kdbg ps": (LIVE, ""),
     "kdbg threads": (LIVE, "validated ETHREAD ownership and scheduler metadata"),
+    "kdbg triage": (LIVE, "one bounded coherent process-research snapshot"),
     "kdbg lm": (LIVE, ""),
     "kdbg base": (LIVE, ""),
     "kdbg session": (LIVE, ""),
@@ -243,6 +245,7 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "pipe_close": (LIVE, "including the double-close case"),
 
     # kdbg
+    "kdbg_doctor": (LIVE, "non-disruptive debugger readiness and catalog report"),
     "kdbg_cet_status": (LIVE, "read-only debugger safety preflight"),
     "kdbg_prepare": (LIVE, "confirmation-refusal path only; does not change policy"),
     "kdbg_restore_cet": (LIVE, "confirmation-refusal path only; does not change policy"),
@@ -256,6 +259,7 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg_struct": (LIVE, ""),
     "kdbg_ps": (LIVE, ""),
     "kdbg_threads": (LIVE, "validated ETHREAD ownership and scheduler metadata"),
+    "kdbg_triage": (LIVE, "one bounded coherent process-research snapshot"),
     "kdbg_lm": (LIVE, ""),
     "kdbg_base_refresh": (LIVE, ""),
     "kdbg_attach": (LIVE, ""),
