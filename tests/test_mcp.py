@@ -3178,6 +3178,79 @@ class TestKdbgDaemonTools:
         assert out["auto_stage"]["staged"] == 2
         assert ff.call_args.kwargs["module_manifest"].pid == 4584
 
+    def test_attach_forwards_reduced_staging_policy(self, mock_mcp):
+        from winbox.mcp import kdbg_attach
+        import winbox.kdbg.staging as staging_module
+
+        client = self._client_with(alive=False)
+        captured = {}
+
+        def prepare(_cfg, _ga, _store, pid, **kwargs):
+            captured.update(pid=pid, **kwargs)
+            return SimpleNamespace(pid=pid, summary=lambda: {
+                "staging_policy": kwargs["policy"], "staged": 1,
+            })
+
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
+             patch.object(staging_module, "prepare_user_module_manifest", prepare), \
+             patch("winbox.mcp._fork_daemon", return_value=1234):
+            result = kdbg_attach(4584, staging_policy="binaries")
+        assert result["ok"] is True
+        assert captured["policy"] == "binaries"
+        assert captured["enrich_symbols"] is False
+
+    def test_attach_preflight_does_not_take_gdbstub_or_fork(self, mock_mcp):
+        from winbox.mcp import kdbg_attach
+        import winbox.kdbg.staging as staging_module
+
+        client = self._client_with(alive=False)
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch.object(
+                 staging_module, "preflight_user_module_staging",
+                 return_value={"schema": "winbox.kdbg-staging-preflight/1", "dry_run": True},
+             ) as preflight, \
+             patch("winbox.kdbg.hmp.gdbstub_has_client") as probe, \
+             patch("winbox.mcp._fork_daemon") as fork:
+            result = kdbg_attach(4584, staging_policy="cached-only", preflight=True)
+        assert _mcp_result(result)["dry_run"] is True
+        preflight.assert_called_once()
+        assert preflight.call_args.kwargs["policy"] == "cached-only"
+        probe.assert_not_called()
+        fork.assert_not_called()
+
+    def test_attach_prewarm_starts_only_exact_symbol_modules(self, mock_mcp):
+        from winbox.mcp import kdbg_attach
+        from winbox.kdbg.staging import StagedUserModule, UserModuleManifest
+        import winbox.kdbg.staging as staging_module
+
+        client = self._client_with(alive=False)
+        modules = (
+            StagedUserModule(
+                "a.dll", "C:\\a.dll", "x64", 0x1000, 0x1000,
+                "/cache/a.dll", "a" * 64, "a", store_build="BUILD-A",
+            ),
+            StagedUserModule(
+                "b.dll", "C:\\b.dll", "x64", 0x2000, 0x1000,
+                "/cache/b.dll", "b" * 64, "b", store_build=None,
+            ),
+        )
+        manifest = UserModuleManifest(pid=4584, modules=modules)
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
+             patch.object(
+                 staging_module, "prepare_user_module_manifest",
+                 return_value=manifest,
+             ), \
+             patch("winbox.mcp._fork_daemon", return_value=1234), \
+             patch(
+                 "winbox.kdbg.decomp.start_prepare_background",
+                 return_value={"token": "c" * 32, "state": "starting"},
+             ) as start:
+            result = kdbg_attach(4584, prewarm=True)
+        assert _mcp_result(result)["prewarm"]["token"] == "c" * 32
+        assert start.call_args.kwargs["modules"] == ["a"]
+
     def test_attach_surfaces_manifest_failure_before_taking_gdbstub(self, mock_mcp):
         from winbox.mcp import kdbg_attach
         from winbox.kdbg.staging import StagingError
@@ -3304,6 +3377,16 @@ class TestKdbgDaemonTools:
         assert out["attached"] is True
         assert out["target"]["pid"] == 4584
         assert out["bps"] == 1
+
+    def test_target_status_forwards_bounded_daemon_probe(self, mock_mcp):
+        from winbox.mcp import kdbg_target_status
+        client = self._client_with(call_result={
+            "state": "gone", "reason": "pid_reused", "advisory": True,
+        })
+        with patch("winbox.mcp._kdbg_client", return_value=client):
+            result = kdbg_target_status()
+        assert _mcp_result(result)["state"] == "gone"
+        client.call.assert_called_once_with("target_status")
 
     # ── kdbg_bp ─────────────────────────────────────────────────────────
 

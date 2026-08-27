@@ -39,7 +39,7 @@ PS C:\Windows\system32>
 
 ## Platform capabilities
 
-- **MCP server** — 75 tools form a bounded, AI-native research control plane
+- **MCP server** — 80 tools form a bounded, AI-native research control plane
   for autonomous agents, covering VM lifecycle, execution, memory, symbols,
   debugging, drivers, IPC, defenses, networking, event logs, and evidence
   collection.
@@ -362,7 +362,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (75):**
+**Available tools (80):**
 
 User-mode primitives:
 
@@ -453,11 +453,13 @@ At a WoW64 compatibility-mode stop, the daemon uses 32-bit disassembly,
 native-width stack entries, and a conservative hybrid call-chain walker.
 Exact-build PDB FPO/frame records are preferred, followed by validated EBP
 chains and bounded prologue simulation. Raw module-looking stack values remain
-separate speculative candidates. Attach now freezes every native and x86
-loader entry into a bounded content-addressed manifest before the daemon takes
-QEMU's one RSP connection. PE machine, live image size, hash, and PDB identity
-are verified before unwind metadata is trusted; manual per-DLL preloading is
-no longer required.
+separate speculative candidates. Attach freezes native and x86 loader entries
+into a bounded content-addressed manifest before the daemon takes QEMU's one
+RSP connection. `full` remains the safe default; `binaries` skips network
+enrichment, while `cached-only` performs no guest copy or download. A dry
+preflight predicts bounded per-module work without mutation. PE machine, live
+image size, hash, and PDB identity are verified before unwind metadata is
+trusted; manual per-DLL preloading is no longer required.
 
 At an active native WoW64 transition stop, `kdbg_bt` additionally derives the
 CPU-area/context offsets from the exact `wow64cpu.dll` instruction stream and
@@ -476,9 +478,10 @@ invariant preserves the ordinary x86 trace with `transition_error`.
 
 | Tool | Description |
 |------|-------------|
-| `kdbg_attach(pid, port?)` | Snapshot and symbol-enrich exact user binaries, then fork the session daemon and attach. Returns bounded `auto_stage` counts/failures |
+| `kdbg_attach(pid, port?, staging_policy?, preflight?, prewarm?)` | Preflight or attach with `full`, `binaries`, or `cached-only` staging; optional background Ghidra prewarming |
 | `kdbg_detach()` | Tear down the session and leave the VM running |
 | `kdbg_session()` | Show current daemon state (target pid, attach time, bp count, halted vs running) |
+| `kdbg_target_status()` | Probe the captured EPROCESS/create-time identity as alive, exiting, gone, or unknown without rebinding PID reuse |
 | `kdbg_bp(target, mode?, condition?, wp_type?, wp_size?, actions?)` | Install an explicit hardware/software breakpoint or hardware watchpoint. Predicates support exact-width `byte`/`word`/`dword`/`qword` reads; actions additionally support bounded `bytes`/`ascii`/`utf16` capture. Action hits append JSONL traces and auto-continue. |
 | `kdbg_bps()` | List installed bps with hit/skip/error counters |
 | `kdbg_bp_trace(bp_id, tail?, from_hit?, limit?, expression?, value?, errors_only?, summary?, top?)` | Bounded backward tail or cursor pagination over action traces, with projection/filtering and AI-sized value/error/distribution summaries |
@@ -497,10 +500,14 @@ invariant preserves the ordinary x86 trace with `transition_error`.
 | `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |
 | `kdbg_disasm(addr?, count?, instruction_bytes?)` | Symbol-annotated Capstone disassembly; raw bytes are opt-in |
-| `kdbg_decomp(addr?, symbol?, module?, rva?, cursor?, before?, after?, full?, binary?, timeout?, detail="compact", lines?, assembly="nearby", instruction_bytes?, runtime_vas?)` | Resolve current RIP, runtime VA, symbol, or module+RVA, verify PE build identity, snapshot exact host content, and return stop-pinned RVA-linked assembly/pseudocode with bounded pagination; repeated VAs and raw bytes are opt-in |
+| `kdbg_decomp(addr?, symbol?, module?, rva?, cursor?, before?, after?, full?, binary?, timeout?, analysis_timeout?, detail="compact", lines?, assembly="nearby", instruction_bytes?, runtime_vas?)` | Resolve current RIP, runtime VA, symbol, or module+RVA, verify PE build identity, snapshot exact host content, and return stop-pinned RVA-linked assembly/pseudocode with bounded pagination; repeated VAs and raw bytes are opt-in |
 | `kdbg_decomp_status()` | Report PyGhidra discovery, isolated worker/JVM state, and durable project-cache status without starting the JVM |
 | `kdbg_decomp_cache()` | List content-keyed binary/project sizes, analysis profiles, and LRU timestamps |
-| `kdbg_decomp_cache_prune(max_bytes?, older_than_days?, dry_run?)` | Dry-run-first LRU pruning; applying requires the worker to be stopped |
+| `kdbg_decomp_cache_prune(max_bytes?, older_than_days?, sha256?, project?, module?, dry_run?)` | Dry-run-first exact/LRU pruning with reconciled accounting; applying requires the worker to be stopped |
+| `kdbg_decomp_cache_repair(sha256)` | Delete one exact corrupt project cache and attempt one deterministic rebuild from its retained hash-addressed binary |
+| `kdbg_decomp_prepare(module?, analysis_timeout?, background?, force_enrichment?)` | Analyze and exact-PDB-enrich cached modules without a debugger stop; background mode returns a durable token |
+| `kdbg_decomp_prepare_status(token?)` | Read the latest or selected durable preparation result |
+| `kdbg_decomp_cancel(request_id?, token?)` | Cooperatively cancel one active request or exact background preparation token; identities are mutually exclusive |
 | `kdbg_ghidra_install(pull?)` | Build the checksum-pinned JDK 21 + Ghidra + PyGhidra Docker image |
 | `kdbg_ghidra_run()` | Start and API-check the private, networkless persistent decompilation container |
 | `kdbg_ghidra_stop()` | Stop/remove the labelled container while preserving analyzed projects and binary cache |
@@ -515,7 +522,7 @@ The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker pro
 Kali Linux
 ├── winbox control plane
 │   ├── CLI (Python/Click)
-│   └── MCP server (75 bounded agent tools)
+│   └── MCP server (80 bounded agent tools)
 ├── hypervisor research plane
 │   ├── QMP/HMP ────────────> VM + gdbstub lifecycle
 │   ├── persistent RSP ─────> vCPUs, memory, break/watchpoints, stepping

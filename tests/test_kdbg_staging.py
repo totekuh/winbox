@@ -217,3 +217,162 @@ def test_manifest_error_text_is_bounded(tmp_path, monkeypatch):
     )
     manifest = staging.prepare_user_module_manifest(FakeCfg(), object(), object(), 13)
     assert len(manifest.failures[0]) < 600
+
+
+def test_binaries_policy_copies_without_network_enrichment(tmp_path, monkeypatch):
+    install_inventory(monkeypatch, [
+        module("fast.dll", "x64", 0x180000000, 0x3000, r"C:\fast.dll"),
+    ])
+    path = tmp_path / "fast.dll"
+    path.write_bytes(b"fast")
+    monkeypatch.setattr(staging, "copy_user_module", lambda *_a, **_k: path)
+    monkeypatch.setattr(staging, "_sha256", lambda _p: "c" * 64)
+    monkeypatch.setattr(staging, "read_pdb_ref", lambda _p: SimpleNamespace(build_key="PDB"))
+    monkeypatch.setattr(staging, "_matching_store_build", lambda *_a: None)
+    monkeypatch.setattr(
+        staging, "load_module",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("network enrichment")),
+    )
+    progress = []
+    manifest = staging.prepare_user_module_manifest(
+        FakeCfg(), object(), object(), 14, policy="binaries", progress=progress.append,
+    )
+    summary = manifest.summary()
+    assert summary["staging_policy"] == "binaries"
+    assert summary["complete_exact_snapshot"] is False
+    assert summary["staged"] == 1
+    assert progress[0]["state"] == "copied"
+    assert progress[0]["symbol_state"] == "not-requested"
+
+
+def test_binary_only_snapshot_can_be_enriched_by_subsequent_full_attach(
+    tmp_path, monkeypatch,
+):
+    install_inventory(monkeypatch, [
+        module("later.dll", "x64", 0x180000000, 0x3000, r"C:\later.dll"),
+    ])
+    path = tmp_path / "later.dll"
+    path.write_bytes(b"later")
+    monkeypatch.setattr(staging, "copy_user_module", lambda *_a, **_k: path)
+    monkeypatch.setattr(staging, "_sha256", lambda _p: "e" * 64)
+    monkeypatch.setattr(staging, "read_pdb_ref", lambda _p: SimpleNamespace(build_key="PDB"))
+    monkeypatch.setattr(staging, "_matching_store_build", lambda *_a: None)
+    loaded = []
+    monkeypatch.setattr(
+        staging, "load_module",
+        lambda *_a, **_k: loaded.append(1) or SimpleNamespace(build="PDB"),
+    )
+    binary_only = staging.prepare_user_module_manifest(
+        FakeCfg(), object(), object(), 19, policy="binaries",
+    )
+    assert binary_only.summary()["symbol_enriched"] == 0
+    assert loaded == []
+    enriched = staging.prepare_user_module_manifest(
+        FakeCfg(), object(), object(), 19, policy="full",
+    )
+    assert enriched.summary()["symbol_enriched"] == 1
+    assert loaded == [1]
+
+
+def test_interrupted_module_copy_is_bounded_partial_completion(tmp_path, monkeypatch):
+    install_inventory(monkeypatch, [
+        module("interrupted.dll", "x64", 0x180000000, 0x3000, r"C:\i.dll"),
+        module("good.dll", "x64", 0x180010000, 0x3000, r"C:\good.dll"),
+    ])
+    good = tmp_path / "good.dll"
+    good.write_bytes(b"good")
+
+    def copy(_cfg, _ga, _path, name, **_kwargs):
+        if name == "interrupted.dll":
+            raise InterruptedError("copy interrupted")
+        return good
+
+    monkeypatch.setattr(staging, "copy_user_module", copy)
+    monkeypatch.setattr(staging, "_sha256", lambda _p: "f" * 64)
+    monkeypatch.setattr(staging, "read_pdb_ref", lambda _p: (_ for _ in ()).throw(staging.PeError("none")))
+    monkeypatch.setattr(staging, "_matching_store_build", lambda *_a: None)
+    manifest = staging.prepare_user_module_manifest(
+        FakeCfg(), object(), object(), 20, policy="binaries",
+    )
+    assert [item.name for item in manifest.modules] == ["good.dll"]
+    assert manifest.summary()["failed"] == 1
+    assert [item["state"] for item in manifest.summary()["module_progress"]] == [
+        "failed", "copied",
+    ]
+
+
+def test_cached_only_policy_performs_no_guest_copy_or_download(tmp_path, monkeypatch):
+    install_inventory(monkeypatch, [
+        module("reuse.dll", "x64", 0x180000000, 0x3000, r"C:\reuse.dll"),
+    ])
+    path = tmp_path / "reuse.dll"
+    path.write_bytes(b"cached")
+    digest = "d" * 64
+    monkeypatch.setattr(staging, "_sha256", lambda _p: digest)
+    monkeypatch.setattr(staging, "read_pdb_ref", lambda _p: SimpleNamespace(build_key="PDB"))
+    monkeypatch.setattr(
+        staging, "copy_user_module",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("guest copy")),
+    )
+    monkeypatch.setattr(
+        staging, "load_module",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("download")),
+    )
+    store = SimpleNamespace(load=lambda _name: {
+        "architecture": "x64", "pe_path": str(path),
+        "pe_sha256": digest, "build": "PDB",
+    })
+    manifest = staging.prepare_user_module_manifest(
+        FakeCfg(), object(), store, 15, policy="cached-only",
+    )
+    assert manifest.modules[0].artifact_source == "cached-store"
+    assert manifest.summary()["module_progress"][0]["state"] == "reused"
+
+
+def test_cached_only_isolates_missing_or_mismatched_records(monkeypatch):
+    install_inventory(monkeypatch, [
+        module("missing.dll", "x64", 0x180000000, 0x3000, r"C:\missing.dll"),
+    ])
+    store = SimpleNamespace(load=lambda _name: (_ for _ in ()).throw(OSError("missing")))
+    manifest = staging.prepare_user_module_manifest(
+        FakeCfg(), object(), store, 16, policy="cached-only",
+    )
+    assert manifest.modules == ()
+    assert manifest.summary()["failed"] == 1
+    assert "missing.dll@x64" in manifest.failures[0]
+
+
+def test_preflight_is_bounded_and_does_not_copy_or_enrich(monkeypatch):
+    modules = [
+        module(f"m{i}.dll", "x64", 0x180000000 + i * 0x10000, 0x3000, rf"C:\m{i}.dll")
+        for i in range(staging.MAX_PROGRESS_RECORDS + 2)
+    ]
+    install_inventory(monkeypatch, modules)
+    monkeypatch.setattr(
+        staging, "copy_user_module",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("copy")),
+    )
+    monkeypatch.setattr(
+        staging, "ensure_types_loaded",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("type mutation")),
+    )
+    result = staging.preflight_user_module_staging(
+        FakeCfg(), object(), 17, policy="binaries",
+    )
+    assert result["dry_run"] is True
+    assert result["discovered"] == staging.MAX_PROGRESS_RECORDS + 2
+    assert len(result["modules"]) == staging.MAX_PROGRESS_RECORDS
+    assert result["modules_truncated"] is True
+    assert result["network_symbol_enrichment"] is False
+
+
+@pytest.mark.parametrize("policy", ["", "Full", "anything"])
+def test_invalid_staging_policy_fails_before_guest_work(monkeypatch, policy):
+    monkeypatch.setattr(
+        staging, "debug_snapshot",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("guest work")),
+    )
+    with pytest.raises(staging.StagingError, match="staging policy"):
+        staging.prepare_user_module_manifest(
+            FakeCfg(), object(), object(), 18, policy=policy,
+        )

@@ -64,6 +64,8 @@ class ProcessRecord:
                                         # 0 if the field is absent (pre-KPTI struct) or
                                         # the read failed. Either way the daemon falls
                                         # back to filtering on directory_table_base alone.
+    create_time: int = 0       # EPROCESS.CreateTime when present in exact types
+    exit_time: int = 0         # EPROCESS.ExitTime; non-zero means termination began
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,8 @@ class _ProcessLayout:
     pid: int
     dtb: int
     user_dtb: int | None
+    create_time: int | None
+    exit_time: int | None
     spans: tuple[_ProcessSpan, ...]
 
 
@@ -278,10 +282,18 @@ def _process_layout(store: SymbolStore) -> _ProcessLayout:
     dtb = int(kproc_fields["DirectoryTableBase"]["off"])
     raw_user_dtb = kproc_fields.get("UserDirectoryTableBase", {}).get("off")
     user_dtb = int(raw_user_dtb) if raw_user_dtb is not None else None
+    raw_create_time = eproc_fields.get("CreateTime", {}).get("off")
+    raw_exit_time = eproc_fields.get("ExitTime", {}).get("off")
+    create_time = int(raw_create_time) if raw_create_time is not None else None
+    exit_time = int(raw_exit_time) if raw_exit_time is not None else None
 
     fields = [(active_links, 8), (image_name, 15), (pid, 8), (dtb, 8)]
     if user_dtb is not None:
         fields.append((user_dtb, 8))
+    if create_time is not None:
+        fields.append((create_time, 8))
+    if exit_time is not None:
+        fields.append((exit_time, 8))
     field_start = min(offset for offset, _ in fields)
     field_end = max(offset + size for offset, size in fields)
     eproc_size = int(eproc.get("size") or 0)
@@ -318,6 +330,8 @@ def _process_layout(store: SymbolStore) -> _ProcessLayout:
         pid=pid,
         dtb=dtb,
         user_dtb=user_dtb,
+        create_time=create_time,
+        exit_time=exit_time,
         spans=tuple(spans),
     )
 
@@ -368,12 +382,22 @@ def _read_process_entry(
             and raw_user_dtb < (1 << 52)
         ):
             user_dtb = raw_user_dtb
+    create_time = (
+        int.from_bytes(field(layout.create_time, 8), "little")
+        if layout.create_time is not None else 0
+    )
+    exit_time = (
+        int.from_bytes(field(layout.exit_time, 8), "little")
+        if layout.exit_time is not None else 0
+    )
     return ProcessRecord(
         pid=pid,
         name=name,
         eprocess=eprocess,
         directory_table_base=dtb,
         user_directory_table_base=user_dtb,
+        create_time=create_time,
+        exit_time=exit_time,
     ), next_flink
 
 
@@ -473,6 +497,31 @@ def find_process(
         if wanted_name is not None and proc.name.lower() == wanted_name:
             return proc
     return None
+
+
+@snapshot_operation
+def read_process_identity(
+    vm_name: str,
+    store: SymbolStore,
+    *,
+    eprocess: int,
+    cache: WalkCache | None = None,
+) -> ProcessRecord:
+    """Read one captured EPROCESS directly, including create/exit evidence.
+
+    This remains useful after ActiveProcessLinks has been unlinked. Callers
+    must still compare the returned PID, EPROCESS address, and create time to
+    their captured identity before trusting it.
+    """
+    if not isinstance(eprocess, int) or eprocess <= 0:
+        raise HmpError("invalid captured EPROCESS address")
+    layout = _process_layout(store)
+    head = store.resolve("PsActiveProcessHead")
+    kernel_cr3, _, selected_cache = _read_kernel_list_head(vm_name, head, None)
+    record, _ = _read_process_entry(
+        vm_name, kernel_cr3, eprocess, layout, cache or selected_cache,
+    )
+    return record
 
 
 # ── Module list ─────────────────────────────────────────────────────────

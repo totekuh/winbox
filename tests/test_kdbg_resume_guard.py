@@ -182,9 +182,15 @@ class TestProbePortAddressMatching:
         """`--any-interface` binds 0.0.0.0; that still serves 127.0.0.1."""
         assert self._probe(monkeypatch, {("0.0.0.0", 1234)}) is True
 
-    def test_ipv6_or_unparsed_address_matches(self, monkeypatch):
-        """Better to accept than to report a live stub as absent."""
-        assert self._probe(monkeypatch, {(None, 1234)}) is True
+    def test_unparsed_address_is_never_treated_as_a_wildcard(self, monkeypatch):
+        """Malformed listener data must not identify an unrelated service."""
+        assert self._probe(monkeypatch, {(None, 1234)}) is False
+
+    def test_ipv6_listener_stays_in_its_address_family(self, monkeypatch):
+        assert self._probe(monkeypatch, {("::1", 1234)}) is False
+        assert self._probe(
+            monkeypatch, {("::1", 1234)}, host="::1",
+        ) is True
 
     def test_a_different_host_on_the_same_port_does_not_match(self, monkeypatch):
         assert self._probe(monkeypatch, {("10.1.2.3", 1234)}) is False

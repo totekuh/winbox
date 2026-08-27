@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
+import subprocess
+import sys
+import tempfile
+import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from winbox.config import Config
 from winbox.kdbg.decomp.client import DecompClient, DecompError, cache_dir
@@ -32,8 +39,427 @@ DETAIL_LEVELS = {"compact", "standard", "diagnostic"}
 ASSEMBLY_MODES = {"nearby", "mapped"}
 
 
+def _wrapped_decomp_error(prefix: str, exc: BaseException) -> DecompError:
+    return DecompError(
+        f"{prefix}: {getattr(exc, 'message', exc)}",
+        code=getattr(exc, "code", None),
+        retryable=bool(getattr(exc, "retryable", False)),
+        details=getattr(exc, "details", {}),
+    )
+
+
 def worker_status(cfg: Config) -> dict[str, Any]:
     return DecompClient(cfg).status()
+
+
+MAX_PREPARE_MODULES = 256
+PREPARE_JOB_SCHEMA = "winbox.decomp-prepare-job/2"
+PREPARE_JOB_LEGACY_SCHEMA = "winbox.decomp-prepare-job/1"
+PREPARE_JOB_MAX_BYTES = 2 * 1024 * 1024
+PREPARE_JOB_MAX_RETAINED = 128
+PREPARE_JOB_MAX_AGE = 30 * 86400
+PREPARE_JOB_START_GRACE = 5.0
+PREPARE_JOB_HEARTBEAT_STALE = 5.0
+_PREPARE_TOKEN = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _prepare_modules(cfg: Config, module: str | list[str] | tuple[str, ...]) -> list[str]:
+    store = SymbolStore(cfg.symbols_dir)
+    available = store.list_modules()
+    if isinstance(module, str):
+        requested = [module]
+    elif isinstance(module, (list, tuple)) and all(isinstance(x, str) for x in module):
+        requested = list(module)
+    else:
+        raise DecompError("module must be a string or list of strings", code="invalid_argument")
+    if len(requested) == 1 and requested[0].strip().lower() == "all":
+        selected = available
+    else:
+        lookup = {name.lower(): name for name in available}
+        selected = []
+        for raw in requested:
+            name = raw.strip()
+            match = lookup.get(name.lower())
+            if not name or match is None:
+                raise DecompError(
+                    f"symbol module is not loaded: {raw}", code="cache_entry_missing",
+                )
+            if match not in selected:
+                selected.append(match)
+    if not selected:
+        raise DecompError("no exact symbol modules are available", code="cache_entry_missing")
+    if len(selected) > MAX_PREPARE_MODULES:
+        raise DecompError(
+            f"prepare selection exceeds {MAX_PREPARE_MODULES} modules",
+            code="invalid_argument",
+        )
+    return selected
+
+
+def prepare_decomp(
+    cfg: Config, *, module: str | list[str] | tuple[str, ...] = "all",
+    analysis_timeout: int = 900, force_enrichment: bool = False,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Analyze exact staged artifacts without requiring a debugger stop."""
+    if isinstance(analysis_timeout, bool) or not isinstance(analysis_timeout, int):
+        raise DecompError("analysis_timeout must be an integer", code="invalid_argument")
+    if not 5 <= analysis_timeout <= 1800:
+        raise DecompError(
+            "analysis_timeout must be between 5 and 1800 seconds",
+            code="invalid_argument",
+        )
+    selected = _prepare_modules(cfg, module)
+    store = SymbolStore(cfg.symbols_dir)
+    from winbox.kdbg.decomp.enrichment import build_enrichment
+    client = DecompClient(cfg)
+    started = time.monotonic()
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for index, name in enumerate(selected):
+        if cancel_requested is not None and cancel_requested():
+            failures.extend({
+                "module": pending[:260], "code": "cancelled",
+                "error": "background preparation was cancelled",
+            } for pending in selected[index:])
+            break
+        request_id = ""
+        if progress is not None:
+            progress({
+                "module": name, "index": index + 1, "total": len(selected),
+                "request_id": "", "state": "extracting_enrichment",
+            })
+        try:
+            record = store.load(name)
+            sidecar, enrichment = build_enrichment(
+                cfg, store, name, force=force_enrichment,
+                cancel_requested=cancel_requested,
+            )
+            if cancel_requested is not None and cancel_requested():
+                raise DecompError(
+                    "background preparation was cancelled",
+                    code="cancelled", retryable=True,
+                )
+            request_id = secrets.token_hex(16)
+            if progress is not None:
+                progress({
+                    "module": name, "index": index + 1, "total": len(selected),
+                    "request_id": request_id, "state": "module_started",
+                })
+            result = client.call(
+                "prepare", timeout=float(analysis_timeout) + 90.0,
+                request_id=request_id,
+                binary=str(record.get("pe_path") or ""),
+                binary_name=name,
+                sha256=str(record.get("pe_sha256") or ""),
+                analysis_timeout=analysis_timeout,
+                enrichment=str(sidecar),
+            )
+            results.append({
+                "module": name,
+                "pdb_build": enrichment.get("pdb_build"),
+                **result,
+            })
+        except (DecompError, SymbolStoreError, OSError, ValueError) as exc:
+            failures.append({
+                "module": name[:260],
+                "code": str(getattr(exc, "code", None) or "operation_failed")[:64],
+                "error": str(getattr(exc, "message", exc))[:512],
+            })
+        finally:
+            if progress is not None:
+                progress({
+                    "module": name, "index": index + 1, "total": len(selected),
+                    "request_id": "", "state": "module_finished",
+                })
+    return {
+        "schema": "winbox.decomp-prepare-batch/1",
+        "requested": len(selected),
+        "prepared": len(results),
+        "failed": len(failures),
+        "results": results[:MAX_PREPARE_MODULES],
+        "failures": failures[:64],
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def _prepare_job_dir(cfg: Config) -> Path:
+    return cache_dir(cfg).parent / "prepare-jobs"
+
+
+def _prepare_job_path(cfg: Config, token: str) -> Path:
+    return _prepare_job_dir(cfg) / f"{token}.json"
+
+
+def _write_prepare_job(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _process_start_ticks(pid: int) -> int | None:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        suffix = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(")", 1)[1]
+        return int(suffix.split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _process_identity(pid: Any, start_ticks: Any) -> str:
+    try:
+        expected_pid = int(pid)
+        expected_ticks = int(start_ticks)
+    except (TypeError, ValueError):
+        return "unknown"
+    observed = _process_start_ticks(expected_pid)
+    if observed is None:
+        return "dead"
+    return "alive" if observed == expected_ticks else "replaced"
+
+
+def _load_prepare_job(path: Path) -> dict[str, Any]:
+    try:
+        if path.is_symlink():
+            raise ValueError("prepare status must not be a symlink")
+        if path.stat().st_size > PREPARE_JOB_MAX_BYTES:
+            raise ValueError("prepare status exceeds size cap")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise DecompError(
+            f"cannot read prepare status: {exc}", code="invalid_response",
+        ) from exc
+    if not isinstance(value, dict) or value.get("schema") not in {
+        PREPARE_JOB_SCHEMA, PREPARE_JOB_LEGACY_SCHEMA,
+    }:
+        raise DecompError("invalid prepare status", code="invalid_response")
+    token = str(value.get("token") or "")
+    if not _PREPARE_TOKEN.fullmatch(token) or path.stem != token:
+        raise DecompError("prepare status identity mismatch", code="identity_mismatch")
+    if value.get("schema") == PREPARE_JOB_SCHEMA:
+        nonce = str(value.get("nonce") or "")
+        if not _PREPARE_TOKEN.fullmatch(nonce):
+            raise DecompError("prepare job nonce is invalid", code="invalid_response")
+    return value
+
+
+def _lost_prepare_job(path: Path, value: dict[str, Any], reason: str) -> dict[str, Any]:
+    lost = dict(value)
+    lost.update({
+        "state": "lost", "completed_at": time.time(),
+        "error": {
+            "code": "worker_lost",
+            "message": reason[:2048],
+        },
+    })
+    _write_prepare_job(path, lost)
+    return lost
+
+
+def _reconcile_prepare_job(path: Path, value: dict[str, Any]) -> dict[str, Any]:
+    result = dict(value)
+    if value.get("schema") != PREPARE_JOB_SCHEMA:
+        result["process_liveness"] = "legacy-unknown"
+        return result
+    state = str(value.get("state") or "")
+    now = time.time()
+    heartbeat = float(value.get("heartbeat_at") or value.get("started_at") or 0)
+    result["heartbeat_age_seconds"] = max(0.0, now - heartbeat) if heartbeat else None
+    identity = "not-applicable"
+    if state == "starting":
+        identity = _process_identity(
+            value.get("launcher_pid"), value.get("launcher_start_ticks"),
+        )
+        started = float(value.get("started_at") or 0)
+        if identity in {"dead", "replaced"} and now - started >= PREPARE_JOB_START_GRACE:
+            result = _lost_prepare_job(
+                path, value, f"prepare launcher identity became {identity} before child startup",
+            )
+            identity = "dead"
+    elif state in {"running", "cancelling"}:
+        identity = _process_identity(value.get("pid"), value.get("process_start_ticks"))
+        if (
+            identity in {"dead", "replaced"}
+            and now - heartbeat >= PREPARE_JOB_HEARTBEAT_STALE
+        ):
+            result = _lost_prepare_job(
+                path, value, f"prepare child identity became {identity}",
+            )
+    result["process_liveness"] = identity
+    cancel = path.with_suffix(".cancel")
+    result["cancellation_state"] = (
+        "requested" if cancel.is_file() and not cancel.is_symlink()
+        else str(result.get("cancellation_state") or "not_requested")
+    )
+    return result
+
+
+def _retain_prepare_jobs(cfg: Config) -> dict[str, int]:
+    """Bound terminal job records; never remove active or untrusted paths."""
+    root = _prepare_job_dir(cfg)
+    now = time.time()
+    terminal: list[tuple[float, Path]] = []
+    for path in root.glob("*.json"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            value = _reconcile_prepare_job(path, _load_prepare_job(path))
+            if value.get("state") in {"completed", "partial", "failed", "cancelled", "lost"}:
+                terminal.append((path.stat().st_mtime, path))
+        except (DecompError, OSError):
+            continue
+    terminal.sort(reverse=True)
+    selected = [
+        path for index, (mtime, path) in enumerate(terminal)
+        if index >= PREPARE_JOB_MAX_RETAINED or now - mtime > PREPARE_JOB_MAX_AGE
+    ]
+    removed_bytes = 0
+    for path in selected:
+        for candidate in (path, path.with_suffix(".log"), path.with_suffix(".cancel")):
+            if candidate.is_file() and not candidate.is_symlink():
+                with contextlib.suppress(OSError):
+                    removed_bytes += candidate.stat().st_size
+                    candidate.unlink()
+    return {"removed_jobs": len(selected), "removed_bytes": removed_bytes}
+
+
+def start_prepare_background(
+    cfg: Config, *, modules: list[str] | tuple[str, ...], analysis_timeout: int = 900,
+    force_enrichment: bool = False,
+) -> dict[str, Any]:
+    """Launch an offline prepare child and persist a durable token."""
+    if isinstance(analysis_timeout, bool) or not isinstance(analysis_timeout, int):
+        raise DecompError("analysis_timeout must be an integer", code="invalid_argument")
+    if not 5 <= analysis_timeout <= 1800:
+        raise DecompError(
+            "analysis_timeout must be between 5 and 1800 seconds",
+            code="invalid_argument",
+        )
+    if not isinstance(force_enrichment, bool):
+        raise DecompError("force_enrichment must be a boolean", code="invalid_argument")
+    selected = _prepare_modules(cfg, list(modules))
+    token = secrets.token_hex(16)
+    nonce = secrets.token_hex(16)
+    root = _prepare_job_dir(cfg)
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    retention = _retain_prepare_jobs(cfg)
+    initial_path = root / f"{token}.json"
+    initial = {
+        "schema": PREPARE_JOB_SCHEMA,
+        "token": token, "state": "starting", "pid": None,
+        "nonce": nonce, "modules": selected, "started_at": time.time(),
+        "heartbeat_at": time.time(), "launcher_pid": os.getpid(),
+        "launcher_start_ticks": _process_start_ticks(os.getpid()),
+        "analysis_timeout": analysis_timeout,
+        "force_enrichment": force_enrichment,
+    }
+    _write_prepare_job(initial_path, initial)
+    command = [
+        sys.executable, "-m", "winbox.kdbg.decomp.prewarm",
+        "--state-root", str(cfg.winbox_dir), "--token", token,
+        "--nonce", nonce,
+        "--analysis-timeout", str(analysis_timeout),
+    ]
+    if force_enrichment:
+        command.append("--force-enrichment")
+    for name in selected:
+        command.extend(["--module", name])
+    log_path = root / f"{token}.log"
+    try:
+        with log_path.open("ab", buffering=0) as output:
+            process = subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                close_fds=True, start_new_session=True,
+            )
+    except OSError as exc:
+        failed = {
+            **initial,
+            "token": token, "state": "failed", "pid": None,
+            "modules": selected, "completed_at": time.time(),
+            "error": {"code": "worker_start_failed", "message": str(exc)[:2048]},
+        }
+        _write_prepare_job(initial_path, failed)
+        raise DecompError(
+            f"could not start background preparation: {exc}",
+            code="worker_start_failed", retryable=True,
+        ) from exc
+    threading.Thread(target=process.wait, daemon=True).start()
+    return {
+        "schema": PREPARE_JOB_SCHEMA,
+        "token": token, "state": "starting", "pid": process.pid,
+        "modules": selected, "analysis_timeout": analysis_timeout,
+        "force_enrichment": force_enrichment,
+        "retention": retention,
+    }
+
+
+def prepare_status(cfg: Config, *, token: str = "") -> dict[str, Any]:
+    root = _prepare_job_dir(cfg)
+    if token:
+        if not _PREPARE_TOKEN.fullmatch(token):
+            raise DecompError("invalid prepare token", code="invalid_argument")
+        path = root / f"{token}.json"
+    else:
+        candidates = []
+        for candidate in root.glob("*.json"):
+            try:
+                if candidate.is_file() and not candidate.is_symlink():
+                    candidates.append((candidate.stat().st_mtime, candidate))
+            except OSError:
+                continue
+        candidates.sort(reverse=True)
+        if not candidates:
+            return {"schema": PREPARE_JOB_SCHEMA, "state": "none"}
+        path = candidates[0][1]
+    return _reconcile_prepare_job(path, _load_prepare_job(path))
+
+
+def cancel_prepare_job(cfg: Config, *, token: str) -> dict[str, Any]:
+    if not _PREPARE_TOKEN.fullmatch(str(token or "")):
+        raise DecompError("invalid prepare token", code="invalid_argument")
+    path = _prepare_job_path(cfg, token)
+    value = _reconcile_prepare_job(path, _load_prepare_job(path))
+    if value.get("state") not in {"starting", "running", "cancelling"}:
+        raise DecompError(
+            f"prepare job is not active ({value.get('state', 'unknown')})",
+            code="not_running",
+        )
+    marker = path.with_suffix(".cancel")
+    if marker.is_symlink():
+        raise DecompError("unsafe prepare cancellation marker", code="invalid_argument")
+    _write_prepare_job(marker, {
+        "schema": "winbox.decomp-prepare-cancel/1",
+        "token": token, "nonce": value["nonce"], "requested_at": time.time(),
+    })
+    return {
+        "schema": "winbox.decomp-prepare-cancel/1",
+        "cancel_requested": True, "token": token,
+        "state": value.get("state"), "pid": value.get("pid"),
+    }
+
+
+def cancel_decomp(
+    cfg: Config, *, request_id: str = "", token: str = "",
+) -> dict[str, Any]:
+    if request_id and token:
+        raise DecompError(
+            "request_id and token are mutually exclusive", code="invalid_argument",
+        )
+    if token:
+        return cancel_prepare_job(cfg, token=token)
+    return DecompClient(cfg).cancel(request_id)
 
 
 def install_service(cfg: Config, *, pull: bool = True) -> dict[str, Any]:
@@ -90,6 +516,7 @@ def query_decomp(
     full: bool = False,
     binary: str = "",
     timeout: int = 60,
+    analysis_timeout: int = 900,
     detail: str = "compact",
     lines: str = "",
     assembly: str = "nearby",
@@ -107,6 +534,7 @@ def query_decomp(
     before = _bounded_int("before", before, 0, MAX_CONTEXT_LINES)
     after = _bounded_int("after", after, 0, MAX_CONTEXT_LINES)
     timeout = _bounded_int("timeout", timeout, 5, 300)
+    analysis_timeout = _bounded_int("analysis_timeout", analysis_timeout, 5, 1800)
     detail = _detail_level(detail)
     cursor_data = _decode_cursor(cursor) if cursor else None
     coordinates = sum(bool(value and str(value).strip()) for value in (addr, symbol))
@@ -162,7 +590,9 @@ def query_decomp(
             raise ValueError("address outside uint64 range")
     except DecompError:
         raise
-    except (ClientError, KeyError, TypeError, ValueError) as exc:
+    except ClientError as exc:
+        raise _wrapped_decomp_error("could not resolve live address", exc) from exc
+    except (KeyError, TypeError, ValueError) as exc:
         raise DecompError(f"could not resolve live address: {exc}") from exc
 
     try:
@@ -191,7 +621,13 @@ def query_decomp(
                     session_id=epoch_session, stop_id=epoch_stop,
                 )
                 chunk = bytes.fromhex(str(reply["bytes"]))
-            except (ClientError, KeyError, ValueError) as exc:
+            except ClientError as exc:
+                error = IdentityError(str(getattr(exc, "message", exc)))
+                error.code = exc.code
+                error.retryable = exc.retryable
+                error.details = exc.details
+                raise error from exc
+            except (KeyError, ValueError) as exc:
                 raise IdentityError(str(exc)) from exc
             if len(chunk) != size:
                 raise IdentityError(f"short daemon memory read: {len(chunk)}/{size}")
@@ -205,16 +641,18 @@ def query_decomp(
             cfg, str(module.get("name", "")), binary, live_identity, module_size,
         )
     except IdentityError as exc:
-        raise DecompError(str(exc)) from exc
+        raise _wrapped_decomp_error("could not verify live module", exc) from exc
 
     runtime_symbol = symbolicate_va(store, runtime_va)
     symbol_hint = _nearest_symbol_hint(
         store, str(module.get("name", "")), rva, build=live_identity.pdb_key,
     )
 
+    from winbox.kdbg.decomp.enrichment import enrichment_path
+    sidecar = enrichment_path(cfg, static_identity.sha256)
     result = worker.call(
         "decompile",
-        timeout=float(timeout) + 840.0,
+        timeout=float(timeout + analysis_timeout) + 90.0,
         binary=str(binary_path),
         binary_name=str(module.get("name") or binary_path.name),
         sha256=static_identity.sha256,
@@ -223,6 +661,8 @@ def query_decomp(
         after=after,
         full=bool(full),
         decompile_timeout=timeout,
+        analysis_timeout=analysis_timeout,
+        enrichment=str(sidecar) if sidecar.is_file() and not sidecar.is_symlink() else "",
         symbol_hint=symbol_hint,
         line_start=line_range[0] if line_range else None,
         line_end=line_range[1] if line_range else None,
@@ -302,7 +742,9 @@ def query_decomp(
     try:
         final_status = daemon.call("status")
     except ClientError as exc:
-        raise DecompError(f"could not revalidate debugger stop: {exc}") from exc
+        raise _wrapped_decomp_error(
+            "could not revalidate debugger stop", exc,
+        ) from exc
     if (
         final_status.get("state") != "halted"
         or final_status.get("session_id") != epoch_session

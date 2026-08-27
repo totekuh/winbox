@@ -14,6 +14,7 @@ from winbox.kdbg.decomp.client import (
     DecompError,
     WORKER_API,
     discover_pyghidra_python,
+    session_path,
 )
 from winbox.kdbg.decomp.identity import (
     IdentityError,
@@ -119,7 +120,7 @@ def test_pyghidra_discovery_preserves_venv_python_symlink(monkeypatch, tmp_path)
     assert discover_pyghidra_python() != system_python.resolve()
 
 
-def test_worker_status_reports_busy_lock_as_alive(monkeypatch, tmp_path):
+def test_worker_status_never_queues_api_probe_for_legacy_session(monkeypatch, tmp_path):
     monkeypatch.setenv("WINBOX_DECOMP_BACKEND", "host")
     client = DecompClient(Config(winbox_dir=tmp_path))
     monkeypatch.setattr(client, "worker_alive", lambda: True)
@@ -135,7 +136,123 @@ def test_worker_status_reports_busy_lock_as_alive(monkeypatch, tmp_path):
     result = client.status()
     assert result["running"] is True
     assert result["responsive"] is False
-    assert result["busy"] is True
+    assert result["busy"] is False
+    assert result["health"] == "unknown"
+    assert result["status_source"] == "legacy_session"
+
+
+def test_worker_status_reads_busy_phase_from_fresh_heartbeat(monkeypatch, tmp_path):
+    import json
+    import time
+
+    monkeypatch.setenv("WINBOX_DECOMP_BACKEND", "host")
+    cfg = Config(winbox_dir=tmp_path)
+    client = DecompClient(cfg)
+    session_path(cfg).parent.mkdir(parents=True)
+    session_path(cfg).write_text(json.dumps({
+        "worker_api": WORKER_API,
+        "heartbeat_at": time.time(),
+        "analysis_profile": "profile",
+        "worker_state": {"jvm_started": True, "open_programs": 2},
+        "current_operation": {
+            "request_id": "a" * 32, "op": "decompile",
+            "phase": "importing_and_analyzing", "started_at": time.time() - 8,
+            "phase_started_at": time.time() - 4,
+            "last_progress_at": time.time() - 4,
+            "cancellation_state": "not_requested",
+            "binary_sha256": "b" * 64, "binary_name": "safe.exe",
+            "host_path": "/must/not/leak",
+            "progress": {"completed": 3, "total": 7, "unit": "phases"},
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(client, "worker_alive", lambda: True)
+    monkeypatch.setattr(client, "active_backend", lambda: "host")
+    monkeypatch.setattr(client, "active_worker_api", lambda: WORKER_API)
+    monkeypatch.setattr(
+        "winbox.kdbg.decomp.client.discover_pyghidra_python",
+        lambda: Path("/venv/bin/python"),
+    )
+    monkeypatch.setattr(
+        client, "call", lambda *a, **k: pytest.fail("status queued an API request")
+    )
+
+    result = client.status()
+
+    assert result["health"] == "busy"
+    assert result["responsive"] is True
+    assert result["current_operation"]["phase"] == "importing_and_analyzing"
+    assert result["current_operation"]["binary_name"] == "safe.exe"
+    assert result["current_operation"]["phase_elapsed_seconds"] >= 3
+    assert result["current_operation"]["progress_age_seconds"] >= 3
+    assert "host_path" not in result["current_operation"]
+    assert result["jvm_started"] is True
+
+
+def test_worker_status_classifies_stale_heartbeat_and_dead_worker(
+    monkeypatch, tmp_path,
+):
+    import json
+    import time
+
+    monkeypatch.setenv("WINBOX_DECOMP_BACKEND", "host")
+    cfg = Config(winbox_dir=tmp_path)
+    client = DecompClient(cfg)
+    session_path(cfg).parent.mkdir(parents=True)
+    session_path(cfg).write_text(json.dumps({
+        "worker_api": WORKER_API, "heartbeat_at": time.time() - 30,
+        "current_operation": {"op": "decompile", "started_at": time.time() - 60},
+    }), encoding="utf-8")
+    monkeypatch.setattr(client, "active_backend", lambda: "host")
+    monkeypatch.setattr(client, "active_worker_api", lambda: WORKER_API)
+    monkeypatch.setattr(
+        "winbox.kdbg.decomp.client.discover_pyghidra_python",
+        lambda: Path("/venv/bin/python"),
+    )
+    alive = {"value": True}
+    monkeypatch.setattr(client, "worker_alive", lambda: alive["value"])
+
+    stale = client.status()
+    assert stale["health"] == "stale"
+    assert stale["status_error"]["code"] == "stale_heartbeat"
+    alive["value"] = False
+    dead = client.status()
+    assert dead["health"] == "stopped"
+    assert dead["busy"] is False
+
+
+def test_worker_status_bounds_invalid_sidecar(monkeypatch, tmp_path):
+    monkeypatch.setenv("WINBOX_DECOMP_BACKEND", "host")
+    cfg = Config(winbox_dir=tmp_path)
+    client = DecompClient(cfg)
+    session_path(cfg).parent.mkdir(parents=True)
+    session_path(cfg).write_text("x" * (64 * 1024 + 1), encoding="utf-8")
+    monkeypatch.setattr(client, "worker_alive", lambda: True)
+    monkeypatch.setattr(client, "active_backend", lambda: "host")
+    monkeypatch.setattr(client, "active_worker_api", lambda: WORKER_API)
+    monkeypatch.setattr(
+        "winbox.kdbg.decomp.client.discover_pyghidra_python",
+        lambda: Path("/venv/bin/python"),
+    )
+    result = client.status()
+    assert result["health"] == "unknown"
+    assert result["status_error"]["code"] == "invalid_heartbeat"
+
+
+def test_worker_reports_validation_phase_before_typed_failure(tmp_path):
+    from winbox.kdbg.decomp.worker import Worker
+
+    worker = Worker(tmp_path / "cache", tmp_path / "projects", None)
+    phases = []
+    worker.progress_callback = lambda phase, details: phases.append((phase, details))
+    with pytest.raises(WorkerError) as captured:
+        worker.decompile({
+            "binary": str(tmp_path / "missing.exe"),
+            "binary_name": "safe.exe", "sha256": "a" * 64,
+        })
+    assert phases == [("validating_input", {
+        "binary_name": "safe.exe", "binary_sha256": "a" * 64,
+    })]
+    assert captured.value.code == "prerequisite_missing"
 
 
 @pytest.mark.parametrize(

@@ -34,6 +34,9 @@ PyGhidra service and verifies the upstream Ghidra and PyGhidra SHA-256 values.
 winbox kdbg ghidra install       # one-time image build (~570 MB download)
 winbox kdbg ghidra run           # optional; decomp starts it lazily
 winbox kdbg ghidra status
+winbox kdbg ghidra prepare all   # analyze/enrich exact artifacts offline
+winbox kdbg ghidra prepare-status
+winbox kdbg ghidra cancel --token TOKEN  # cancel one exact background job
 winbox kdbg ghidra stop          # keeps analyzed projects and binaries
 ```
 
@@ -54,20 +57,29 @@ old external-interpreter path; `WINBOX_PYGHIDRA_PYTHON` and
 ## Use
 
 `kdbg_attach` automatically walks both native and WoW64 loader views before it
-takes the gdbstub, copies every bounded user image into content-addressed
-storage, and enriches exact PDB metadata when available. Manual
+takes the gdbstub. Its default `full` policy copies every bounded user image
+into content-addressed storage and enriches exact PDB metadata when available.
+Choose `binaries` to copy images while reusing only already-present symbols, or
+`cached-only` for no guest copy and no download. `preflight=true` returns a
+bounded, non-mutating work summary without attaching. The frozen manifest
+records the policy and artifact source so reduced staging cannot masquerade as
+a complete snapshot. Manual
 `kdbg_user_symbols_load(pid, module)` is now optional prewarming or an explicit
 single-module lookup. An exact host path can still be supplied for a private
 binary that is not present in the live loader inventory.
 
 ```bash
 winbox kdbg attach 1234
+winbox kdbg attach 1234 --prewarm
+winbox kdbg attach 1234 --staging-policy cached-only --preflight
 winbox kdbg cont --timeout 30
+winbox kdbg target-status
 winbox kdbg decomp                             # current RIP
 winbox kdbg decomp 0x7ff712341234 --before 5 --after 8
 winbox kdbg decomp --symbol 'services!RQueryServiceStatus'
 winbox kdbg decomp --module services.exe --rva 0xfae0
 winbox kdbg decomp --lines 1-22 --assembly mapped
+winbox kdbg decomp --analysis-timeout 900
 winbox kdbg decomp --full --binary /path/to/exact.exe
 ```
 
@@ -75,36 +87,86 @@ The MCP equivalents are:
 
 ```text
 kdbg_decomp(addr="", symbol="", module="", rva="", cursor="", before=3,
-            after=5, full=false, binary="", timeout=60, detail="compact",
+            after=5, full=false, binary="", timeout=60, analysis_timeout=900,
+            detail="compact",
             lines="", assembly="nearby", instruction_bytes=false,
             runtime_vas=false)
 kdbg_decomp_status()
+kdbg_decomp_prepare(module="all", analysis_timeout=900, background=false,
+                     force_enrichment=false)
+kdbg_decomp_prepare_status(token="")
+kdbg_decomp_cancel(request_id="", token="")
 kdbg_decomp_cache()
-kdbg_decomp_cache_prune(max_bytes=0, older_than_days=0, dry_run=true)
+kdbg_decomp_cache_prune(max_bytes=0, older_than_days=0,
+                         sha256=[], project=[], module=[], dry_run=true)
+kdbg_decomp_cache_repair(sha256)
 kdbg_ghidra_install(pull=true)
 kdbg_ghidra_run()
 kdbg_ghidra_stop()
 ```
 
 All `kdbg_*` MCP calls return structured content using the common
-`winbox.mcp/1` envelope: `{schema, ok, result, error}`. Errors contain a stable
-`code`, message, `retryable` flag, operation, and at most three bounded recovery
-hints. Interactive CLI commands retain readable pretty JSON; MCP does not send
-indented JSON strings.
+`winbox.mcp/1` envelope: `{schema, ok, result, error}`. Daemon and worker
+protocols carry additive `winbox.error/1` objects, so new clients preserve a
+stable `code`, message, `retryable` flag, bounded details, operation, and at
+most three recovery hints without inferring meaning from prose. The legacy
+error string remains present during mixed-version upgrades. Interactive CLI
+errors prefix the stable code; MCP does not send indented JSON strings.
 
-The first request for a binary starts the container/JVM lazily and runs Ghidra
-analysis, which can take minutes for a kernel image. Later queries reuse the
-open program; worker restarts reuse its durable SHA-256-and-Ghidra-version keyed
-project. Requests are serialized because Ghidra projects and decompiler APIs
-are not safely concurrent. The warm-program LRU defaults to two entries and is
-bounded to four via `WINBOX_GHIDRA_OPEN_PROGRAMS`. Docker defaults to 4 GiB and
-2 CPUs with bounded logs; `WINBOX_GHIDRA_MEMORY` and `WINBOX_GHIDRA_CPUS` tune
-those limits.
+The first request for a binary starts the container/JVM lazily. Import and
+auto-analysis have a separate 5-1800 second `analysis_timeout`, publish distinct
+heartbeat phases, and run under a cooperative Ghidra task monitor. Explicit
+cancel, a disconnected client, or timeout leaves partial work unmarked so the
+next exact request can resume it safely. `kdbg_decomp_prepare` moves that work
+out of debugger stop time; background mode and attach's optional `prewarm`
+return durable status tokens. Later queries reuse the open program, and worker
+restarts reuse its durable SHA-256/Ghidra/profile-keyed project. Requests remain
+serialized because Ghidra projects and decompiler APIs are not safely
+concurrent. The warm-program LRU defaults to two entries and is bounded to four
+via `WINBOX_GHIDRA_OPEN_PROGRAMS`. Docker defaults to 4 GiB and 2 CPUs with
+bounded logs; `WINBOX_GHIDRA_MEMORY` and `WINBOX_GHIDRA_CPUS` tune those limits.
+
+Exact-PDB prewarming also builds the bounded
+`winbox-pdb-enrichment-v3` profile. It imports verified function names, named
+globals, and only finite primitive/pointer signatures that the PDB records
+render unambiguously. Existing non-default Ghidra names/signatures win every
+conflict. Every applied, reused, invalid, and preserved-conflict decision is
+written atomically to a digest-keyed `cache/enrichment-results/` provenance
+record. Public Microsoft PDBs often omit private procedure types; zero applied
+signatures is therefore an honest result, not a fallback to guessed types.
+
+`llvm-pdbutil` output is drained concurrently through hard-capped stdout and
+stderr buffers. Crossing the symbol-output cap terminates and reaps the exact
+child immediately; timeout and abnormal-exit paths do the same, so the cap is
+an allocation bound rather than a check performed after unbounded capture.
+
+Background prepare records bind their random token and nonce to the child PID
+plus Linux process start time and a periodic heartbeat. Status classifies a
+dead or PID-reused child as `lost` instead of leaving `starting`/`running`
+forever. `kdbg_decomp_cancel(token=...)` and `winbox kdbg ghidra cancel
+--token TOKEN` forward cancellation only to that job's current exact worker
+request. Completed, partial, failed, cancelled, and lost records are retained
+at most 30 days/128 jobs; starting or running jobs are never retention-pruned.
 
 Use `winbox kdbg ghidra cache` to inspect content-keyed usage and
 `winbox kdbg ghidra prune --older-than-days 30` to preview reclamation. Add
-`--apply` only after stopping the worker. MCP pruning is likewise a dry-run
-unless `dry_run=false` is explicit.
+`--sha256`, `--project`, or `--module` for exact targeted recovery; each option
+is repeatable and combines as a union with age/size selection. Inventory
+separates entry-owned bytes from overhead and lists bounded unattributed files
+using relative paths. Prune previews report unmatched selectors and any
+residual that cannot meet `--max-bytes`. Add `--apply` only after stopping the
+worker. MCP pruning is likewise a dry-run unless `dry_run=false` is explicit.
+Exact digest ownership includes enrichment input sidecars and per-decision
+result provenance, so SHA/module/project pruning removes those files together
+and no longer leaves them as unexplained overhead.
+
+If Ghidra proves that an exact digest/profile project is malformed or
+truncated, the worker deletes only that project's `.gpr`, `.rep`, `.lock`, and
+`.lock~`, revalidates and retains the content-addressed binary, and rebuilds
+once. It never loops and does not create a backup cache area. Non-corruption
+open failures do not trigger deletion. Use
+`winbox kdbg ghidra repair --sha256 DIGEST` or
+`kdbg_decomp_cache_repair(sha256)` to request the same exact reset explicitly.
 
 Every live read is pinned to the daemon's random `session_id` and monotonic
 `stop_id`. Resuming immediately clears the current stop; a query fails as stale
@@ -263,7 +325,11 @@ The kdbg module walk restores the complete selected-vCPU register packet,
 invalidates its thread-selection cache, and poisons the debugger session if
 restoration fails so the VM can never resume under a borrowed CR3.
 `~/.winbox/decomp/docker-build.log` contains bounded build diagnostics;
-`decomp-status`/`ghidra status` do not start the JVM.
+`decomp-status`/`ghidra status` do not start the JVM or enter the serialized
+worker request queue. They read an atomic heartbeat sidecar and immediately
+report `idle|busy|stale|unknown|stopped`, the active phase, coarse phase
+progress, elapsed/progress age, cancellation state, safe binary identity, and
+bounded last failure. Caller-supplied host paths are not published there.
 
 ## Performance expectations
 

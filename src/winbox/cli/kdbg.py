@@ -858,6 +858,12 @@ def _print_stop(reason: str, info: dict) -> None:
     """Render a stop summary returned by cont/step."""
     if reason == "timeout":
         console.print("[yellow][!][/] cont timed out (no hit in target)")
+        liveness = info.get("target_liveness")
+        if isinstance(liveness, dict):
+            console.print(
+                f"    target={liveness.get('state', 'unknown')} "
+                f"({liveness.get('reason', 'no evidence')})"
+            )
         return
     if reason == "interrupt":
         console.print("[yellow][!][/] interrupted")
@@ -878,8 +884,24 @@ def _print_stop(reason: str, info: dict) -> None:
 @click.argument("pid", type=int)
 @click.option("--port", default=1234, show_default=True,
               help="gdbstub port the daemon will connect to.")
+@click.option(
+    "--staging-policy", type=click.Choice(("full", "binaries", "cached-only")),
+    default="full", show_default=True,
+    help="Artifact work before attach; full preserves complete unwind quality.",
+)
+@click.option(
+    "--preflight", is_flag=True,
+    help="Print a bounded staging plan without copying artifacts or attaching.",
+)
+@click.option(
+    "--prewarm", is_flag=True,
+    help="Start offline Ghidra analysis in the background after attach.",
+)
 @click.pass_context
-def kdbg_attach(ctx: click.Context, pid: int, port: int) -> None:
+def kdbg_attach(
+    ctx: click.Context, pid: int, port: int, staging_policy: str,
+    preflight: bool, prewarm: bool,
+) -> None:
     """Attach a kdbg debugging session to PID via the gdbstub.
 
     Forks a daemon that holds the gdb connection alive across CLI
@@ -912,9 +934,29 @@ def kdbg_attach(ctx: click.Context, pid: int, port: int) -> None:
 
     ga = GuestAgent(cfg)
     try:
-        from winbox.kdbg.staging import prepare_user_module_manifest
+        import json as _json
+        from winbox.kdbg.staging import (
+            preflight_user_module_staging, prepare_user_module_manifest,
+        )
+        store = SymbolStore(cfg.symbols_dir)
+        if preflight:
+            plan = preflight_user_module_staging(
+                cfg, store, pid, policy=staging_policy,
+            )
+            plan["prewarm_requested"] = bool(prewarm)
+            click.echo(_json.dumps(plan, indent=2))
+            return
+
+        def report(item: dict) -> None:
+            console.print(
+                f"    [dim]stage {item['index']}/{item['total']} "
+                f"{item['name']}@{item['architecture']}: {item['state']} "
+                f"({item['symbol_state']}, {item['elapsed_seconds']:.3f}s)[/]"
+            )
+
         manifest = prepare_user_module_manifest(
-            cfg, ga, SymbolStore(cfg.symbols_dir), pid, enrich_symbols=True,
+            cfg, ga, store, pid, enrich_symbols=staging_policy == "full",
+            policy=staging_policy, progress=report,
         )
     except Exception as e:
         console.print(f"[red][-][/] automatic module staging failed: {e}")
@@ -947,12 +989,28 @@ def kdbg_attach(ctx: click.Context, pid: int, port: int) -> None:
     console.print(f"    [dim]bp / cont / regs / mem / stack / bt / detach[/]")
     summary = manifest.summary()
     console.print(
-        f"    [dim]auto-staged {summary['staged']} exact module(s), "
+        f"    [dim]{summary['staging_policy']} policy staged "
+        f"{summary['staged']} available artifact(s), "
         f"{summary['symbol_enriched']} symbol-enriched, "
         f"{summary['symbol_failed']} PDB miss(es), "
         f"{summary['symbol_warning_count']} symbol warning(s), "
         f"{summary['failed']} failed[/]"
     )
+    if prewarm:
+        from winbox.kdbg.decomp import DecompError, start_prepare_background
+        modules = sorted({
+            item.store_name for item in manifest.modules if item.store_build
+        })
+        try:
+            if not modules:
+                raise DecompError("no symbol-enriched exact modules are available")
+            job = start_prepare_background(cfg, modules=modules)
+            console.print(
+                f"    [dim]offline Ghidra prewarm token={job['token']} "
+                f"modules={len(modules)}[/]"
+            )
+        except DecompError as exc:
+            console.print(f"[yellow][!][/] background prewarm not started: {exc}")
 
     # Warn if HVCI is on — kernel breakpoints will not fire.
     try:
@@ -986,6 +1044,19 @@ def kdbg_session(ctx: click.Context) -> None:
         f"bps={result['bps']}  halted={result['halted']}  "
         f"uptime={result['uptime_s']:.1f}s  daemon_pid={result['daemon_pid']}"
     )
+
+
+@kdbg.command("target-status")
+@click.pass_context
+def kdbg_target_status(ctx: click.Context) -> None:
+    """Probe whether the originally attached process is alive, exiting, or gone."""
+    import json as _json
+    try:
+        result = _client(ctx.obj["cfg"]).call("target_status")
+    except ClientError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    click.echo(_json.dumps(result, indent=2))
 
 
 @kdbg.command("bp")
@@ -1339,6 +1410,10 @@ def kdbg_regs(ctx: click.Context) -> None:
 )
 @click.option("--timeout", type=click.IntRange(5, 300), default=60, show_default=True)
 @click.option(
+    "--analysis-timeout", type=click.IntRange(5, 1800), default=900,
+    show_default=True, help="Cold import/auto-analysis budget.",
+)
+@click.option(
     "--detail",
     type=click.Choice(["compact", "standard", "diagnostic"]),
     default="compact",
@@ -1373,6 +1448,7 @@ def kdbg_decomp(
     full: bool,
     binary: Path | None,
     timeout: int,
+    analysis_timeout: int,
     detail: str,
     lines: str,
     assembly: str,
@@ -1403,6 +1479,7 @@ def kdbg_decomp(
             full=full,
             binary=str(binary) if binary else "",
             timeout=timeout,
+            analysis_timeout=analysis_timeout,
             detail=detail,
             lines=lines,
             assembly=assembly,
@@ -1501,18 +1578,111 @@ def kdbg_ghidra_cache(ctx: click.Context) -> None:
 @kdbg_ghidra.command("prune")
 @click.option("--max-bytes", type=click.IntRange(min=0), default=0)
 @click.option("--older-than-days", type=click.FloatRange(min=0), default=0.0)
+@click.option("--sha256", "sha256s", multiple=True, help="Select an exact binary digest.")
+@click.option("--project", "projects", multiple=True, help="Select an exact project name.")
+@click.option("--module", "modules", multiple=True, help="Select an exact module name.")
 @click.option("--apply", is_flag=True, help="Delete selected entries; default is dry-run.")
 @click.pass_context
 def kdbg_ghidra_prune(
-    ctx: click.Context, max_bytes: int, older_than_days: float, apply: bool,
+    ctx: click.Context, max_bytes: int, older_than_days: float,
+    sha256s: tuple[str, ...], projects: tuple[str, ...], modules: tuple[str, ...],
+    apply: bool,
 ) -> None:
-    """Preview or apply bounded LRU cache pruning."""
+    """Preview or apply exact-selector and bounded LRU cache pruning."""
     import json as _json
     from winbox.kdbg.decomp import DecompError, prune_cache
     try:
         result = prune_cache(
             ctx.obj["cfg"], max_bytes=max_bytes,
-            older_than_days=older_than_days, dry_run=not apply,
+            older_than_days=older_than_days, sha256=sha256s,
+            project=projects, module=modules, dry_run=not apply,
+        )
+    except DecompError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    click.echo(_json.dumps(result, indent=2))
+
+
+@kdbg_ghidra.command("repair")
+@click.option("--sha256", "digest", required=True, help="Exact cached binary digest.")
+@click.pass_context
+def kdbg_ghidra_repair(ctx: click.Context, digest: str) -> None:
+    """Delete and rebuild one exact digest-keyed Ghidra project cache."""
+    import json as _json
+    from winbox.kdbg.decomp import DecompError, repair_cache
+    try:
+        result = repair_cache(ctx.obj["cfg"], sha256=digest)
+    except DecompError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    click.echo(_json.dumps(result, indent=2))
+
+
+@kdbg_ghidra.command("prepare")
+@click.argument("module", default="all")
+@click.option(
+    "--analysis-timeout", type=click.IntRange(5, 1800), default=900,
+    show_default=True,
+)
+@click.option("--background", is_flag=True, help="Return a durable job token immediately.")
+@click.option("--force-enrichment", is_flag=True, help="Re-extract the exact PDB sidecar.")
+@click.pass_context
+def kdbg_ghidra_prepare(
+    ctx: click.Context, module: str, analysis_timeout: int,
+    background: bool, force_enrichment: bool,
+) -> None:
+    """Analyze one cached MODULE (or all) without a debugger stop."""
+    import json as _json
+    from winbox.kdbg.decomp import (
+        DecompError, prepare_decomp, start_prepare_background,
+    )
+    try:
+        if background:
+            from winbox.kdbg.decomp.service import _prepare_modules
+            selected = _prepare_modules(ctx.obj["cfg"], module)
+            result = start_prepare_background(
+                ctx.obj["cfg"], modules=selected,
+                analysis_timeout=analysis_timeout,
+                force_enrichment=force_enrichment,
+            )
+        else:
+            result = prepare_decomp(
+                ctx.obj["cfg"], module=module,
+                analysis_timeout=analysis_timeout,
+                force_enrichment=force_enrichment,
+            )
+    except DecompError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    click.echo(_json.dumps(result, indent=2))
+
+
+@kdbg_ghidra.command("prepare-status")
+@click.argument("token", default="")
+@click.pass_context
+def kdbg_ghidra_prepare_status(ctx: click.Context, token: str) -> None:
+    """Read the latest or token-selected background prepare job."""
+    import json as _json
+    from winbox.kdbg.decomp import DecompError, prepare_status
+    try:
+        result = prepare_status(ctx.obj["cfg"], token=token)
+    except DecompError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    click.echo(_json.dumps(result, indent=2))
+
+
+@kdbg_ghidra.command("cancel")
+@click.option("--request-id", default="", help="Require this active request identity.")
+@click.option("--token", default="", help="Cancel this exact background prepare job.")
+@click.pass_context
+def kdbg_ghidra_cancel(ctx: click.Context, request_id: str, token: str) -> None:
+    """Cooperatively cancel the active analysis or decompilation."""
+    import json as _json
+    from winbox.kdbg.decomp import DecompError, cancel_decomp
+    try:
+        result = cancel_decomp(
+            ctx.obj["cfg"], request_id=request_id, token=token,
         )
     except DecompError as exc:
         console.print(f"[red][-][/] {exc}")

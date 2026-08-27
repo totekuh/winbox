@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import socket
+import ipaddress
 import subprocess
 import threading
 from pathlib import Path
@@ -383,12 +384,26 @@ def _hex_to_ipv4(hex_addr: str) -> str | None:
     return ".".join(str(o) for o in octets)
 
 
-def _listening_sockets() -> set[tuple[str | None, int]] | None:
+def _hex_to_ipv6(hex_addr: str) -> str | None:
+    """Decode Linux ``/proc/net/tcp6``'s four little-endian 32-bit words."""
+    if len(hex_addr) != 32:
+        return None
+    try:
+        raw = bytes.fromhex(hex_addr)
+        network_order = b"".join(
+            raw[index:index + 4][::-1] for index in range(0, 16, 4)
+        )
+        return str(ipaddress.IPv6Address(network_order))
+    except (ValueError, ipaddress.AddressValueError):
+        return None
+
+
+def _listening_sockets() -> set[tuple[str, int]] | None:
     """``(address, port)`` pairs in LISTEN state, read passively from /proc.
 
-    Address is the decoded dotted-quad for IPv4, or ``None`` for IPv6 and
-    anything unparseable — callers treat ``None`` as "matches any host", which
-    keeps a v6 wildcard listener from reading as absent.
+    Addresses retain their family. Malformed rows are ignored rather than
+    becoming wildcard matches; confusing an unrelated listener for QEMU's
+    gdbstub is worse than reporting the stub absent.
 
     Returns None if /proc is unavailable, so callers can fall back.
     """
@@ -414,7 +429,9 @@ def _listening_sockets() -> set[tuple[str | None, int]] | None:
                 port = int(port_hex, 16)
             except ValueError:
                 continue
-            sockets.add((_hex_to_ipv4(addr_hex) if is_v4 else None, port))
+            address = _hex_to_ipv4(addr_hex) if is_v4 else _hex_to_ipv6(addr_hex)
+            if address is not None:
+                sockets.add((address, port))
     return sockets if found_any else None
 
 
@@ -463,10 +480,15 @@ def probe_port(host: str, port: int, timeout: float = 0.5) -> bool:
     """
     sockets = _listening_sockets()
     if sockets is not None:
+        try:
+            requested = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        wildcard = "0.0.0.0" if requested.version == 4 else "::"
         return any(
             sock_port == port
-            # None (IPv6/unparsed) and 0.0.0.0 both cover the requested host.
-            and (sock_addr is None or sock_addr in (host, "0.0.0.0"))
+            and sock_addr in (requested.compressed, wildcard)
+            and ipaddress.ip_address(sock_addr).version == requested.version
             for sock_addr, sock_port in sockets
         )
     try:

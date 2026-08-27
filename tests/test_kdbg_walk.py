@@ -447,6 +447,54 @@ def test_process_layout_supports_pre_kpti_without_user_dtb():
     assert len(layout.spans) == 3
 
 
+def test_process_entry_preserves_create_and_exit_identity_fields(monkeypatch):
+    types = {
+        **_PROC_TYPES,
+        "_EPROCESS": {
+            **_PROC_TYPES["_EPROCESS"],
+            "fields": {
+                **_PROC_TYPES["_EPROCESS"]["fields"],
+                "CreateTime": {"off": 0x468, "type": ""},
+                "ExitTime": {"off": 0x840 - 0x48, "type": ""},
+            },
+            "size": 0x900,
+        },
+    }
+
+    class S:
+        def struct(self, type_name, field=None, *, module="nt"):
+            return types[type_name]
+
+    layout = walk._process_layout(S())
+    eprocess = 0xFFFFE00000100000
+    values = {
+        layout.active_links: 0xFFFFF80000C26340,
+        layout.pid: 4242,
+        layout.dtb: 0x12345000,
+        layout.user_dtb: 0x12344000,
+        layout.create_time: 0x112233445566,
+        layout.exit_time: 0x778899,
+    }
+
+    def read_span(_vm, _cr3, va, length, *, cache):
+        raw = bytearray(length)
+        for offset, value in values.items():
+            start = eprocess + offset - va
+            if 0 <= start and start + 8 <= length:
+                raw[start:start + 8] = value.to_bytes(8, "little")
+        name_start = eprocess + layout.image_name - va
+        if 0 <= name_start and name_start + 8 <= length:
+            raw[name_start:name_start + 8] = b"live.exe"
+        return bytes(raw)
+
+    monkeypatch.setattr(walk, "read_virt_cr3", read_span)
+    record, _ = walk._read_process_entry(
+        "vm", 0x999000, eprocess, layout, walk.WalkCache(),
+    )
+    assert record.create_time == 0x112233445566
+    assert record.exit_time == 0x778899
+
+
 def test_process_entry_rejects_short_coalesced_read(monkeypatch):
     class S:
         def struct(self, type_name, field=None, *, module="nt"):

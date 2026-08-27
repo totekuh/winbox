@@ -26,6 +26,7 @@ from winbox.jobs import Job, JobMode, JobStatus, JobStore
 # plain text and is a no-op on anything else, so job_result can apply it to
 # both python and powershell job output without knowing which is which.
 from winbox.vm.guest import _clixml_to_text
+from winbox.kdbg.errors import bounded_details
 
 mcp = FastMCP(
     "winbox",
@@ -54,12 +55,34 @@ def _research_ok(result: Any) -> dict[str, Any]:
 
 def _research_error(exc: BaseException | str, *, operation: str) -> dict[str, Any]:
     """Classify common failures so an agent can recover without prose parsing."""
-    message = str(exc)
+    message = str(getattr(exc, "message", exc))
     lower = message.lower()
     code = "operation_failed"
     retryable = False
     recovery: list[str] = []
-    if ("no kdbg session" in lower or "no session is attached" in lower
+    details: dict[str, Any] = {}
+    typed_code = getattr(exc, "code", None)
+    if (
+        isinstance(typed_code, str)
+        and 1 <= len(typed_code) <= 64
+        and all(c.islower() or c.isdigit() or c == "_" for c in typed_code)
+    ):
+        code = typed_code
+        retryable = bool(getattr(exc, "retryable", False))
+        details = bounded_details(getattr(exc, "details", {}))
+        recovery_by_code = {
+            "no_session": ["Call kdbg_attach with the target PID, then retry."],
+            "stale_stop": ["Call kdbg_context at the current halt and retry without the stale cursor."],
+            "busy": ["Poll the active operation or interrupt it before retrying."],
+            "timeout": ["Check status before retrying with a bounded larger timeout."],
+            "worker_version_mismatch": ["Reload the MCP client or run kdbg_decomp_status, then retry."],
+            "identity_mismatch": ["Refresh the target module and symbols, then retry with the verified binary."],
+            "worker_not_running": ["Run kdbg_ghidra_run or retry the decompilation request."],
+            "stale_heartbeat": ["Inspect kdbg_decomp_status and restart the worker if the heartbeat remains stale."],
+            "cr3_poisoned": ["Detach without resuming and restore a safe VM snapshot or original CR3."],
+        }
+        recovery = recovery_by_code.get(code, [])
+    elif ("no kdbg session" in lower or "no session is attached" in lower
             or "no kdbg daemon" in lower or "daemon is not running" in lower):
         code = "no_session"
         recovery = ["Call kdbg_attach with the target PID, then retry."]
@@ -95,17 +118,20 @@ def _research_error(exc: BaseException | str, *, operation: str) -> dict[str, An
           or "invalid" in lower or "not a valid" in lower or "too large" in lower
           or "does not match the current job" in lower):
         code = "invalid_argument"
+    error = {
+        "code": code,
+        "message": message[:2048],
+        "operation": operation,
+        "retryable": retryable,
+        "recovery": recovery[:3],
+    }
+    if details:
+        error["details"] = details
     return {
         "schema": _RESEARCH_ENVELOPE,
         "ok": False,
         "result": None,
-        "error": {
-            "code": code,
-            "message": message[:2048],
-            "operation": operation,
-            "retryable": retryable,
-            "recovery": recovery[:3],
-        },
+        "error": error,
     }
 
 # ─── Shared state ───────────────────────────────────────────────────────────
@@ -3466,7 +3492,10 @@ def _kdbg_cfg_only():
 
 
 @mcp.tool()
-def kdbg_attach(pid: int, port: int = 1234) -> dict[str, Any]:
+def kdbg_attach(
+    pid: int, port: int = 1234, staging_policy: str = "full",
+    preflight: bool = False, prewarm: bool = False,
+) -> dict[str, Any]:
     """Attach a kdbg debugging session to a Windows process via the gdbstub.
 
     Before taking QEMU's single RSP connection, freezes the target's native
@@ -3482,6 +3511,12 @@ def kdbg_attach(pid: int, port: int = 1234) -> dict[str, Any]:
     Args:
         pid: Target Windows process PID (find via ``kdbg_ps``).
         port: gdbstub TCP port the daemon should connect to.
+        staging_policy: ``full`` (copy + enrich), ``binaries`` (copy/reuse
+            only), or ``cached-only`` (no guest copies or downloads).
+        preflight: Return the bounded loader/staging plan without copying
+            artifacts, taking the gdbstub, or attaching a daemon.
+        prewarm: After attach, start background Ghidra preparation for every
+            exact symbol-enriched module; the VM is not held for this work.
 
     Returns:
         The common envelope with daemon PID, target, gdbstub metadata, and
@@ -3503,11 +3538,19 @@ def kdbg_attach(pid: int, port: int = 1234) -> dict[str, Any]:
     # is too late to discover and copy a decommitted unwind dependency.
     from winbox.kdbg.staging import (
         StagingError as _KdbgStagingError,
+        preflight_user_module_staging as _kdbg_preflight_staging,
         prepare_user_module_manifest as _kdbg_prepare_manifest,
     )
     try:
+        if preflight:
+            plan = _kdbg_preflight_staging(
+                cfg, _kdbg_get_store(), pid, policy=staging_policy,
+            )
+            plan["prewarm_requested"] = bool(prewarm)
+            return _research_ok(plan)
         manifest = _kdbg_prepare_manifest(
-            cfg, ga, _kdbg_get_store(), pid, enrich_symbols=True,
+            cfg, ga, _kdbg_get_store(), pid,
+            enrich_symbols=staging_policy == "full", policy=staging_policy,
         )
     except (_KdbgStagingError, _KdbgStoreError, _KdbgSymbolLoadError) as e:
         return _research_error(e, operation="kdbg_attach")
@@ -3540,6 +3583,19 @@ def kdbg_attach(pid: int, port: int = 1234) -> dict[str, Any]:
         "gdbstub_port": info.get("gdbstub_port", port),
         "auto_stage": manifest.summary(),
     }
+    if prewarm:
+        from winbox.kdbg.decomp import DecompError, start_prepare_background
+        modules = sorted({
+            item.store_name for item in manifest.modules if item.store_build
+        })
+        try:
+            if not modules:
+                raise DecompError("no symbol-enriched exact modules are available")
+            result["prewarm"] = start_prepare_background(cfg, modules=modules)
+        except DecompError as exc:
+            result["prewarm_error"] = _research_error(
+                exc, operation="kdbg_decomp_prepare",
+            )["error"]
 
     # Warn if HVCI is on — kernel breakpoints will not fire.
     try:
@@ -3573,6 +3629,20 @@ def kdbg_session() -> dict[str, Any]:
     except _ClientError as e:
         return _research_error(e, operation="kdbg_session")
     return _research_ok({"attached": True, **result})
+
+
+@mcp.tool()
+def kdbg_target_status() -> dict[str, Any]:
+    """Probe the captured target identity as alive, exiting, gone, or unknown.
+
+    The probe is bounded and compares EPROCESS plus create-time evidence. It
+    reports PID reuse as the original target being gone and never rebinds the
+    debugger session to the replacement process.
+    """
+    try:
+        return _research_ok(_kdbg_client(_kdbg_cfg_only()).call("target_status"))
+    except _ClientError as exc:
+        return _research_error(exc, operation="kdbg_target_status")
 
 
 @mcp.tool()
@@ -3987,6 +4057,7 @@ def kdbg_decomp(
     full: bool = False,
     binary: str = "",
     timeout: int = 60,
+    analysis_timeout: int = 900,
     detail: str = "compact",
     lines: str = "",
     assembly: str = "nearby",
@@ -4021,6 +4092,7 @@ def kdbg_decomp(
         full: Include the whole containing function (bounded to 256 KiB).
         binary: Exact host-side PE path. Empty uses the winbox symbols cache.
         timeout: Per-function Ghidra decompilation timeout (5..300 seconds).
+        analysis_timeout: Cold import/auto-analysis budget (5..1800 seconds).
         detail: Response detail: compact (default), standard, or diagnostic.
         lines: Absolute pseudocode line or range (for example ``1-22``).
             Empty uses ``before``/``after`` context around the mapped RIP.
@@ -4045,6 +4117,7 @@ def kdbg_decomp(
             full=full,
             binary=binary,
             timeout=timeout,
+            analysis_timeout=analysis_timeout,
             detail=detail,
             lines=lines,
             assembly=assembly,
@@ -4077,23 +4150,95 @@ def kdbg_decomp_cache() -> dict[str, Any]:
 
 @mcp.tool()
 def kdbg_decomp_cache_prune(
-    max_bytes: int = 0, older_than_days: float = 0.0, dry_run: bool = True,
+    max_bytes: int = 0, older_than_days: float = 0.0,
+    sha256: list[str] | None = None, project: list[str] | None = None,
+    module: list[str] | None = None, dry_run: bool = True,
 ) -> dict[str, Any]:
     """Preview or prune cold Ghidra caches; dry-run is the safe default.
 
     Args:
         max_bytes: Reduce aggregate cache usage to this many bytes; zero disables.
         older_than_days: Select entries unused for this many days; zero disables.
+        sha256: Select exact immutable binary digests.
+        project: Select exact Ghidra project names.
+        module: Select exact module basenames (case-insensitive).
         dry_run: Preview only. Set false explicitly to delete while worker is stopped.
     """
     from winbox.kdbg.decomp import DecompError, prune_cache
     try:
         return _research_ok(prune_cache(
             _kdbg_cfg_only(), max_bytes=int(max_bytes),
-            older_than_days=float(older_than_days), dry_run=bool(dry_run),
+            older_than_days=float(older_than_days), sha256=sha256,
+            project=project, module=module, dry_run=bool(dry_run),
         ))
     except (DecompError, TypeError, ValueError) as exc:
         return _research_error(exc, operation="kdbg_decomp_cache_prune")
+
+
+@mcp.tool()
+def kdbg_decomp_cache_repair(sha256: str) -> dict[str, Any]:
+    """Delete and rebuild one exact digest-keyed Ghidra project cache.
+
+    The exact hash-addressed binary is retained. Only that digest's project
+    pair is removed, then one clean rebuild is attempted; rebuilds never loop.
+    """
+    from winbox.kdbg.decomp import DecompError, repair_cache
+    try:
+        return _research_ok(repair_cache(_kdbg_cfg_only(), sha256=sha256))
+    except DecompError as exc:
+        return _research_error(exc, operation="kdbg_decomp_cache_repair")
+
+
+@mcp.tool()
+def kdbg_decomp_prepare(
+    module: str = "all", analysis_timeout: int = 900,
+    background: bool = False, force_enrichment: bool = False,
+) -> dict[str, Any]:
+    """Analyze exact cached modules while the VM runs.
+
+    This performs PDB enrichment plus import/auto-analysis without requiring
+    a debugger session or stop. Background mode returns a durable token.
+    """
+    from winbox.kdbg.decomp import (
+        DecompError, prepare_decomp, start_prepare_background,
+    )
+    from winbox.kdbg.decomp.service import _prepare_modules
+    cfg = _kdbg_cfg_only()
+    try:
+        if background:
+            selected = _prepare_modules(cfg, module)
+            return _research_ok(start_prepare_background(
+                cfg, modules=selected, analysis_timeout=analysis_timeout,
+                force_enrichment=force_enrichment,
+            ))
+        return _research_ok(prepare_decomp(
+            cfg, module=module, analysis_timeout=analysis_timeout,
+            force_enrichment=force_enrichment,
+        ))
+    except (DecompError, TypeError, ValueError) as exc:
+        return _research_error(exc, operation="kdbg_decomp_prepare")
+
+
+@mcp.tool()
+def kdbg_decomp_prepare_status(token: str = "") -> dict[str, Any]:
+    """Read the latest or token-selected background preparation result."""
+    from winbox.kdbg.decomp import DecompError, prepare_status
+    try:
+        return _research_ok(prepare_status(_kdbg_cfg_only(), token=token))
+    except DecompError as exc:
+        return _research_error(exc, operation="kdbg_decomp_prepare_status")
+
+
+@mcp.tool()
+def kdbg_decomp_cancel(request_id: str = "", token: str = "") -> dict[str, Any]:
+    """Cancel an active request or one exact background preparation token."""
+    from winbox.kdbg.decomp import DecompError, cancel_decomp
+    try:
+        return _research_ok(cancel_decomp(
+            _kdbg_cfg_only(), request_id=request_id, token=token,
+        ))
+    except DecompError as exc:
+        return _research_error(exc, operation="kdbg_decomp_cancel")
 
 
 @mcp.tool()

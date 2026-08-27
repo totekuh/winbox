@@ -201,6 +201,7 @@ class TargetInfo:
                        # Shadow / KPTI builds). 0 means "field absent or
                        # read failed; we only know one CR3".
     eprocess: int = 0  # VA of the EPROCESS struct (for PEB.Ldr walks)
+    create_time: int = 0  # captured EPROCESS.CreateTime identity evidence
 
     @property
     def cr3_set(self) -> tuple[int, ...]:
@@ -285,8 +286,12 @@ class DaemonSession:
     """Long-lived debugger session. One target, one gdb connection."""
 
     # Public for tests; tests can subclass to inject FakeRsp.
-    BUSY_REPLY = reply_err("BUSY: another op in progress")
-    SHUTDOWN_REPLY = reply_err("daemon shutting down")
+    BUSY_REPLY = reply_err(
+        "BUSY: another op in progress", code="busy", retryable=True,
+    )
+    SHUTDOWN_REPLY = reply_err(
+        "daemon shutting down", code="daemon_shutting_down", retryable=True,
+    )
     _RUNNING_OPS = frozenset({
         "status", "interrupt", "bp_list", "bp_trace", "detach",
     })
@@ -319,6 +324,10 @@ class DaemonSession:
         self.stop_id = 0
         self.run_state = "indeterminate"
         self.attach_time = time.monotonic()
+        self._last_target_liveness: dict[str, Any] = {
+            "state": "unknown", "checked": False,
+            "identity": "create_time" if target.create_time else "eprocess",
+        }
 
         # Set when an op accesses gdb so other ops can detect "in flight".
         self._busy = False
@@ -351,15 +360,31 @@ class DaemonSession:
     def handle_op(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
         """Route a parsed request to its op_<name> method."""
         if op not in OPS:
-            return reply_err(f"unknown op: {op!r}")
+            return reply_err(
+                f"unknown op: {op!r}", code="unknown_operation",
+                details={"operation": op},
+            )
         method = getattr(self, f"op_{op}", None)
         if method is None:
-            return reply_err(f"op not implemented: {op!r}")
+            return reply_err(
+                f"op not implemented: {op!r}", code="unsupported_operation",
+                details={"operation": op},
+            )
         state_error = self._operation_state_error(op)
         if state_error is not None:
-            reply = reply_err(state_error)
+            code = "cr3_poisoned" if self._cr3_corrupted else "state_conflict"
+            reply = reply_err(
+                state_error,
+                code=code,
+                retryable=not self._cr3_corrupted,
+                details={
+                    "operation": op,
+                    "state": self.run_state,
+                    "allowed_operations": sorted(self._allowed_operations()),
+                },
+            )
             reply.update({
-                "code": "cr3_poisoned" if self._cr3_corrupted else "state_conflict",
+                "code": code,
                 "state": self.run_state,
                 "allowed_operations": sorted(self._allowed_operations()),
             })
@@ -367,9 +392,30 @@ class DaemonSession:
         try:
             result = method(**args)
         except TypeError as e:
-            return reply_err(f"bad args for {op!r}: {e}")
+            return reply_err(
+                f"bad args for {op!r}: {e}", code="invalid_argument",
+                details={"operation": op},
+            )
+        except ValueError as e:
+            return reply_err(
+                f"{type(e).__name__}: {e}", code="invalid_argument",
+                details={"operation": op},
+            )
+        except TimeoutError as e:
+            return reply_err(
+                f"{type(e).__name__}: {e}", code="timeout", retryable=True,
+                details={"operation": op},
+            )
+        except CR3RestoreError as e:
+            return reply_err(
+                f"{type(e).__name__}: {e}", code="cr3_poisoned",
+                details={"operation": op, "state": self.run_state},
+            )
         except Exception as e:  # noqa: BLE001 — surface any op-level failure
-            return reply_err(f"{type(e).__name__}: {e}")
+            return reply_err(
+                f"{type(e).__name__}: {e}", code="operation_failed",
+                details={"operation": op, "exception_type": type(e).__name__},
+            )
         if isinstance(result, dict):
             return reply_ok(result)
         return reply_ok({"value": result})
@@ -510,6 +556,10 @@ class DaemonSession:
                 "pid": self.target.pid,
                 "dtb": f"0x{self.target.dtb:x}",
                 "name": self.target.name,
+                "eprocess": f"0x{self.target.eprocess:x}",
+                "create_time": (
+                    f"0x{self.target.create_time:x}" if self.target.create_time else None
+                ),
             },
             "bps": len(self.bps),
             "state": self.run_state,
@@ -522,6 +572,7 @@ class DaemonSession:
             "cr3_poisoned": self._cr3_corrupted,
             "resume_safe": resume_safe,
             "allowed_operations": sorted(self._allowed_operations()),
+            "target_liveness": self._last_target_liveness,
         }
         if self._cr3_corrupted:
             result["recovery"] = (
@@ -536,6 +587,10 @@ class DaemonSession:
         if self.module_manifest is not None:
             result["auto_stage"] = self.module_manifest.summary()
         return result
+
+    def op_target_status(self) -> dict[str, Any]:
+        """Probe the captured process identity without rebinding a reused PID."""
+        return self._probe_target_liveness()
 
     _VALID_WP_TYPES = frozenset(WATCHPOINT_TYPES)
     _VALID_WP_SIZES = frozenset(WATCHPOINT_SIZES)
@@ -981,6 +1036,7 @@ class DaemonSession:
                 result = {"reason": "timeout"}
                 if self.run_state == "halted" and self.stop is not None:
                     result.update(self._stop_summary())
+                    result["target_liveness"] = self._probe_target_liveness()
                 result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
                 return result
 
@@ -1004,6 +1060,8 @@ class DaemonSession:
                     except RspError:
                         self._mark_indeterminate()
                     result = {"reason": "timeout", **self._stop_summary()}
+                    if self.run_state == "halted" and self.stop is not None:
+                        result["target_liveness"] = self._probe_target_liveness()
                     result.update(self._unfired_hw_bp_warnings(time.monotonic() - _cont_start))
                     return result
                 self._mark_indeterminate()
@@ -1059,6 +1117,7 @@ class DaemonSession:
                 self._capture_stop_with_regs(sr, regs, vcpu=firing_vcpu)
                 if time.monotonic() >= deadline:
                     result = {"reason": "timeout", **self._stop_summary()}
+                    result["target_liveness"] = self._probe_target_liveness()
                     result.update(self._unfired_hw_bp_warnings(
                         time.monotonic() - _cont_start
                     ))
@@ -1091,6 +1150,7 @@ class DaemonSession:
                     self._capture_stop_with_regs(sr, regs, vcpu=firing_vcpu)
                     if time.monotonic() >= deadline:
                         result = {"reason": "timeout", **self._stop_summary()}
+                        result["target_liveness"] = self._probe_target_liveness()
                         result.update(self._unfired_hw_bp_warnings(
                             time.monotonic() - _cont_start
                         ))
@@ -1111,6 +1171,7 @@ class DaemonSession:
                 self._append_action_trace(bp, regs, action_values or {})
                 if time.monotonic() >= deadline:
                     result = {"reason": "timeout", **self._stop_summary()}
+                    result["target_liveness"] = self._probe_target_liveness()
                     result.update(self._unfired_hw_bp_warnings(
                         time.monotonic() - _cont_start
                     ))
@@ -1627,7 +1688,10 @@ class DaemonSession:
                     )
                 raw_path = manifest_entry.pe_path
                 expected_sha = manifest_entry.pe_sha256
-                artifact_source = "attach-manifest"
+                artifact_source = (
+                    f"attach-manifest:{self.module_manifest.staging_policy}:"
+                    f"{manifest_entry.artifact_source}"
+                )
             else:
                 stem = str(module.name).rsplit(".", 1)[0].lower()
                 if stem.startswith("ntoskrnl") or stem.startswith("ntkrnl"):
@@ -2213,8 +2277,10 @@ class DaemonSession:
                     frame_data=frame_data,
                     function_starts=tuple(sorted(starts)),
                     metadata=(
-                        f"verified-pdb:{confidence}:attach-manifest"
-                        if record else f"verified-pe:{confidence}:attach-manifest"
+                        f"verified-pdb:{confidence}:attach-manifest:"
+                        f"{self.module_manifest.staging_policy}"
+                        if record else f"verified-pe:{confidence}:attach-manifest:"
+                        f"{self.module_manifest.staging_policy}"
                     ) if self.module_manifest is not None else (
                         f"verified-pdb:{confidence}"
                     ),
@@ -2433,6 +2499,111 @@ class DaemonSession:
             raise RuntimeError(f"live module walk failed: {exc}") from exc
         finally:
             self._last_selected_vcpu = None
+
+    def _probe_target_liveness(self) -> dict[str, Any]:
+        """Classify the originally captured EPROCESS without PID rebinding."""
+        from types import SimpleNamespace
+        from winbox.kdbg.debugger.reader import use_local_rsp
+        from winbox.kdbg.memory import WalkCache
+        from winbox.kdbg.walk import find_process, read_process_identity
+
+        wall_clock = getattr(time, "time", None)
+        checked_at = wall_clock() if callable(wall_clock) else 0.0
+        result: dict[str, Any] = {
+            "state": "unknown", "checked": True, "checked_at": checked_at,
+            "pid": self.target.pid,
+            "captured_eprocess": f"0x{self.target.eprocess:x}",
+            "identity": "create_time" if self.target.create_time else "eprocess",
+            "advisory": True,
+        }
+        if self.target.eprocess <= 0:
+            result["reason"] = "attach identity lacks EPROCESS evidence"
+            self._last_target_liveness = result
+            return result
+        if self.run_state != "halted" or self.stop is None:
+            result["reason"] = f"probe requires halted state (state={self.run_state})"
+            self._last_target_liveness = result
+            return result
+        vcpu = self._pick_vcpu()
+        stop = SimpleNamespace(thread=vcpu)
+        direct = None
+        current = None
+        errors = []
+        try:
+            with use_local_rsp(self.cfg.vm_name, self.rsp, stop):
+                cache = WalkCache()
+                try:
+                    direct = read_process_identity(
+                        self.cfg.vm_name, self.store,
+                        eprocess=self.target.eprocess, cache=cache,
+                    )
+                except Exception as exc:
+                    errors.append(f"captured EPROCESS read: {type(exc).__name__}: {exc}")
+                try:
+                    current = find_process(
+                        self.cfg.vm_name, self.store, pid=self.target.pid,
+                        cache=WalkCache(),
+                    )
+                except Exception as exc:
+                    errors.append(f"active process walk: {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            errors.append(f"snapshot probe: {type(exc).__name__}: {exc}")
+        finally:
+            self._last_selected_vcpu = None
+
+        same_direct = bool(
+            direct is not None
+            and direct.eprocess == self.target.eprocess
+            and direct.pid == self.target.pid
+            and (
+                not self.target.create_time or not direct.create_time
+                or direct.create_time == self.target.create_time
+            )
+        )
+        same_current = bool(
+            current is not None
+            and current.eprocess == self.target.eprocess
+            and (
+                not self.target.create_time or not current.create_time
+                or current.create_time == self.target.create_time
+            )
+        )
+        if current is not None and not same_current:
+            result.update({
+                "state": "gone", "reason": "pid_reused",
+                "replacement": {
+                    "eprocess": f"0x{current.eprocess:x}",
+                    "create_time": (
+                        f"0x{current.create_time:x}" if current.create_time else None
+                    ),
+                    "name": current.name,
+                },
+            })
+        elif same_current:
+            exit_time = max(
+                int(getattr(current, "exit_time", 0) or 0),
+                int(getattr(direct, "exit_time", 0) or 0),
+            )
+            if exit_time:
+                result.update({
+                    "state": "exiting", "reason": "exit_time_set",
+                    "exit_time": f"0x{exit_time:x}",
+                })
+            else:
+                result.update({"state": "alive", "reason": "identity_active"})
+        elif current is None and same_direct and int(getattr(direct, "exit_time", 0) or 0):
+            result.update({
+                "state": "exiting", "reason": "unlinked_exit_time_set",
+                "exit_time": f"0x{direct.exit_time:x}",
+            })
+        elif current is None and not errors:
+            result.update({"state": "gone", "reason": "not_in_active_process_list"})
+        elif current is None and direct is not None and not same_direct:
+            result.update({"state": "gone", "reason": "captured_eprocess_reused"})
+        if errors:
+            result["probe_errors"] = [error[:512] for error in errors[:4]]
+        self._last_target_liveness = result
+        return result
 
     @staticmethod
     def _module_payload(module, *, kind: str, va: int) -> dict[str, Any]:
@@ -3102,20 +3273,24 @@ class DaemonSession:
             # sends nothing used to let socket.timeout escape all the way
             # out of serve() and kill the daemon.
             with suppress(OSError):
-                conn.sendall(encode(reply_err(f"protocol: {e}")))
+                conn.sendall(encode(reply_err(
+                    f"protocol: {e}", code="invalid_request",
+                )))
             return
         try:
             req = decode(line)
         except ProtocolError as e:
             with suppress(OSError):
-                conn.sendall(encode(reply_err(str(e))))
+                conn.sendall(encode(reply_err(str(e), code="invalid_request")))
             return
 
         op = req.get("op")
         args = req.get("args") or {}
         if not isinstance(op, str) or not isinstance(args, dict):
             with suppress(OSError):
-                conn.sendall(encode(reply_err("malformed request")))
+                conn.sendall(encode(reply_err(
+                    "malformed request", code="invalid_request",
+                )))
             return
 
         # Passive/lightweight ops bypass the busy lock so they
@@ -3832,6 +4007,7 @@ def fork_daemon(
             name=target_rec.name,
             user_dtb=target_rec.user_directory_table_base,
             eprocess=target_rec.eprocess,
+            create_time=target_rec.create_time,
         )
 
         with use_local_rsp(cfg.vm_name, rsp, initial_sr):
@@ -3842,6 +4018,10 @@ def fork_daemon(
             "target_pid": target.pid,
             "target_dtb": f"0x{target.dtb:x}",
             "target_name": target.name,
+            "target_eprocess": f"0x{target.eprocess:x}",
+            "target_create_time": (
+                f"0x{target.create_time:x}" if target.create_time else None
+            ),
             "daemon_pid": os.getpid(),
             "gdbstub_port": gdbstub_port,
             "attach_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),

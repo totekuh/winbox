@@ -89,3 +89,46 @@ def test_gdbstub_has_client_no_match():
     with patch("builtins.open", side_effect=lambda f, *a, **k:
                __import__("io").StringIO(fake_tcp) if "tcp" in f else (_ for _ in ()).throw(OSError)):
         assert gdbstub_has_client(1234) is False
+
+
+def test_tcp6_decoder_preserves_address_family_and_word_order():
+    assert hmp_module._hex_to_ipv6(
+        "00000000000000000000000001000000"
+    ) == "::1"
+    assert hmp_module._hex_to_ipv6("not-hex") is None
+
+
+def test_ipv6_listener_never_matches_ipv4_probe(monkeypatch):
+    monkeypatch.setattr(
+        hmp_module, "_listening_sockets", lambda: {("::", 1234), ("::1", 1235)},
+    )
+    assert hmp_module.probe_port("127.0.0.1", 1234) is False
+    assert hmp_module.probe_port("::1", 1234) is True
+    assert hmp_module.probe_port("::1", 1235) is True
+
+
+def test_ipv4_listener_never_matches_ipv6_probe(monkeypatch):
+    monkeypatch.setattr(
+        hmp_module, "_listening_sockets",
+        lambda: {("0.0.0.0", 1234), ("127.0.0.1", 1235)},
+    )
+    assert hmp_module.probe_port("::1", 1234) is False
+    assert hmp_module.probe_port("127.0.0.1", 1234) is True
+    assert hmp_module.probe_port("127.0.0.1", 1235) is True
+
+
+def test_unparseable_listener_row_is_not_a_wildcard_match(monkeypatch):
+    import io
+
+    tcp = "sl local_address rem_address st\n"
+    tcp6 = (
+        "sl local_address rem_address st\n"
+        "0: NOTHEX:04D2 00000000000000000000000000000000:0000 0A\n"
+    )
+
+    def opened(path, *_args, **_kwargs):
+        return io.StringIO(tcp6 if str(path).endswith("tcp6") else tcp)
+
+    monkeypatch.setattr("builtins.open", opened)
+    assert hmp_module._listening_sockets() == set()
+    assert hmp_module.probe_port("127.0.0.1", 1234) is False

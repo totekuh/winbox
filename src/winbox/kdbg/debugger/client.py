@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from winbox.config import Config
+from winbox.kdbg.errors import bounded_details, parse_error_info
 from winbox.kdbg.debugger.daemon import (
     lock_path,
     session_path,
@@ -31,6 +32,23 @@ from winbox.kdbg.debugger.protocol import (
 
 class ClientError(RuntimeError):
     """Raised when no daemon is reachable, or the daemon returns an error."""
+
+    def __init__(
+        self,
+        message: object,
+        *,
+        code: str | None = None,
+        retryable: bool = False,
+        details: Any = None,
+    ) -> None:
+        self.message = str(message)[:2048]
+        super().__init__(self.message)
+        self.code = code
+        self.retryable = bool(retryable)
+        self.details = bounded_details(details)
+
+    def __str__(self) -> str:
+        return f"{self.code}: {self.message}" if self.code else self.message
 
 
 class DaemonClient:
@@ -95,7 +113,8 @@ class DaemonClient:
         # needed to re-run ``kdbg attach``.
         if not self.session_alive():
             raise ClientError(
-                "no kdbg session is attached (run `winbox kdbg attach <pid>`)"
+                "no kdbg session is attached (run `winbox kdbg attach <pid>`)",
+                code="no_session",
             )
 
         # A negative socket timeout is reachable from callers that derive
@@ -103,7 +122,10 @@ class DaemonClient:
         # socket.settimeout() would raise a bare ValueError that escapes the
         # ClientError contract, so reject it here as a clean ClientError.
         if sock_timeout < 0:
-            raise ClientError(f"socket timeout must be non-negative, got {sock_timeout}")
+            raise ClientError(
+                f"socket timeout must be non-negative, got {sock_timeout}",
+                code="invalid_argument",
+            )
 
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -117,13 +139,16 @@ class DaemonClient:
                 # the attach, so spell that out.
                 raise ClientError(
                     f"kdbg daemon unreachable ({e}); "
-                    "the daemon may have died — re-run `winbox kdbg attach <pid>`"
+                    "the daemon may have died — re-run `winbox kdbg attach <pid>`",
+                    code="daemon_unreachable", retryable=True,
                 ) from e
             try:
                 s.sendall(encode(request(op, **args)))
                 line = read_line(s)
             except ProtocolError as e:
-                raise ClientError(f"reply parse: {e}") from e
+                raise ClientError(
+                    f"reply parse: {e}", code="invalid_response", retryable=True,
+                ) from e
             except OSError as e:
                 # The daemon can die *after* we connect — tearing down a
                 # session is exactly when that happens. Without this the
@@ -131,7 +156,8 @@ class DaemonClient:
                 # something it could act on.
                 raise ClientError(
                     f"kdbg daemon went away mid-request ({e}); "
-                    "re-run `winbox kdbg attach <pid>` if you still need a session"
+                    "re-run `winbox kdbg attach <pid>` if you still need a session",
+                    code="daemon_unreachable", retryable=True,
                 ) from e
         finally:
             try:
@@ -142,8 +168,16 @@ class DaemonClient:
         try:
             reply = decode(line)
         except ProtocolError as e:
-            raise ClientError(f"reply parse: {e}") from e
+            raise ClientError(
+                f"reply parse: {e}", code="invalid_response", retryable=True,
+            ) from e
 
         if not reply.get("ok"):
+            info = parse_error_info(reply.get("error_info"))
+            if info is not None:
+                raise ClientError(
+                    info["message"], code=info["code"],
+                    retryable=info["retryable"], details=info["details"],
+                )
             raise ClientError(reply.get("error") or "daemon returned error")
         return reply.get("result") or {}

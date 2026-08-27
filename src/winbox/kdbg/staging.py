@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+import time
+from typing import TYPE_CHECKING, Any, Callable
 
 from winbox.kdbg.debugger.reader import debug_snapshot
 from winbox.kdbg.memory import WalkCache
@@ -37,6 +38,8 @@ MAX_MODULE_FILE_SIZE = 512 * 1024 * 1024
 MAX_TOTAL_IMAGE_SIZE = 2 * 1024 * 1024 * 1024
 MAX_FAILURES = 64
 MAX_ERROR_CHARS = 512
+STAGING_POLICIES = ("full", "binaries", "cached-only")
+MAX_PROGRESS_RECORDS = 64
 
 
 class StagingError(RuntimeError):
@@ -66,6 +69,7 @@ class StagedUserModule:
     store_build: str | None = None
     pdb_build: str | None = None
     symbol_error: str | None = None
+    artifact_source: str = "guest-copy"
 
     def to_json(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -82,6 +86,7 @@ class StagedUserModule:
         }
         if self.symbol_error:
             result["symbol_error"] = self.symbol_error
+        result["artifact_source"] = self.artifact_source
         return result
 
 
@@ -104,6 +109,10 @@ class UserModuleManifest:
     failures: tuple[str, ...] = ()
     total_file_bytes: int = 0
     failure_count: int | None = None
+    staging_policy: str = "full"
+    elapsed_seconds: float = 0.0
+    module_progress: tuple[dict[str, Any], ...] = ()
+    progress_truncated: bool = False
     schema: str = "winbox.kdbg-user-manifest/1"
 
     def by_base(self, base: int, architecture: str | None = None) -> StagedUserModule | None:
@@ -143,6 +152,13 @@ class UserModuleManifest:
             "symbol_failures": symbol_failures[:16],
             "symbol_warnings": symbol_warnings[:16],
             "failures": list(self.failures[:16]),
+            "staging_policy": self.staging_policy,
+            "complete_exact_snapshot": self.staging_policy == "full" and (
+                len(self.modules) == len(self.inventory) and not self.failure_count
+            ),
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "module_progress": list(self.module_progress),
+            "progress_truncated": self.progress_truncated,
         }
 
     def loader_modules(self) -> tuple[FrozenUserModule | StagedUserModule, ...]:
@@ -168,20 +184,7 @@ def _matching_store_build(
     return build or None
 
 
-def prepare_user_module_manifest(
-    cfg: Config,
-    ga: GuestAgent,
-    store: SymbolStore,
-    pid: int,
-    *,
-    enrich_symbols: bool = True,
-) -> UserModuleManifest:
-    """Freeze target loader entries into exact immutable PE artifacts.
-
-    Inventory corruption is fatal because it would make the snapshot
-    ambiguous.  Individual copy/PDB failures are retained in the manifest and
-    attach continues with truthful partial-unwind behavior.
-    """
+def _validate_pid(pid: object) -> int:
     if isinstance(pid, bool):
         raise StagingError("pid must be an integer between 1 and 0xffffffff")
     try:
@@ -192,14 +195,21 @@ def prepare_user_module_manifest(
         ) from exc
     if not 0 < parsed_pid <= 0xFFFFFFFF:
         raise StagingError("pid must be an integer between 1 and 0xffffffff")
+    return parsed_pid
 
+
+def _freeze_loader_inventory(
+    cfg: Config, store: SymbolStore, pid: object, *, ensure_types: bool,
+) -> tuple[int, tuple[FrozenUserModule, ...]]:
+    parsed_pid = _validate_pid(pid)
     try:
-        ensure_types_loaded(
-            cfg, store, [
-                "_PEB", "_PEB_LDR_DATA", "_EWOW64PROCESS", "_KPCR",
-                "_KPRCB", "_KTHREAD", "_KTRAP_FRAME",
-            ], module="nt",
-        )
+        if ensure_types:
+            ensure_types_loaded(
+                cfg, store, [
+                    "_PEB", "_PEB_LDR_DATA", "_EWOW64PROCESS", "_KPCR",
+                    "_KPRCB", "_KTHREAD", "_KTRAP_FRAME",
+                ], module="nt",
+            )
         with debug_snapshot(cfg):
             cache = WalkCache()
             target = find_process(cfg.vm_name, store, pid=parsed_pid, cache=cache)
@@ -246,21 +256,122 @@ def prepare_user_module_manifest(
             raise StagingError(
                 f"combined mapped image size exceeds {MAX_TOTAL_IMAGE_SIZE}"
             )
-
-    staged: list[StagedUserModule] = []
-    inventory = tuple(FrozenUserModule(
+    return parsed_pid, tuple(FrozenUserModule(
         name=module.name,
         full_path=module.full_path,
         architecture=module.architecture,
         base=module.base,
         size=module.size,
     ) for module in live_modules)
+
+
+def preflight_user_module_staging(
+    cfg: Config, store: SymbolStore, pid: object, *, policy: str = "full",
+) -> dict[str, Any]:
+    """Return a bounded, mutation-free attach staging plan."""
+    if policy not in STAGING_POLICIES:
+        raise StagingError(f"staging policy must be one of {', '.join(STAGING_POLICIES)}")
+    started = time.monotonic()
+    parsed_pid, inventory = _freeze_loader_inventory(
+        cfg, store, pid, ensure_types=False,
+    )
+    total = sum(module.size for module in inventory)
+    return {
+        "schema": "winbox.kdbg-staging-preflight/1",
+        "pid": parsed_pid,
+        "staging_policy": policy,
+        "discovered": len(inventory),
+        "mapped_image_bytes": total,
+        "guest_copies": policy != "cached-only",
+        "network_symbol_enrichment": policy == "full",
+        "modules": [
+            {
+                "name": module.name,
+                "architecture": module.architecture,
+                "base": f"0x{module.base:x}",
+                "size": module.size,
+            }
+            for module in inventory[:MAX_PROGRESS_RECORDS]
+        ],
+        "modules_truncated": len(inventory) > MAX_PROGRESS_RECORDS,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "dry_run": True,
+    }
+
+
+def _cached_module(
+    store: SymbolStore, module: FrozenUserModule,
+) -> StagedUserModule:
+    """Reuse one self-consistent store artifact without guest I/O or downloads."""
+    store_name = store_name_for(module.name, module.architecture)
+    record = store.load(store_name)
+    if str(record.get("architecture") or "").lower() != module.architecture:
+        raise StagingError("cached symbol record architecture does not match")
+    raw_path = str(record.get("pe_path") or "")
+    digest = str(record.get("pe_sha256") or "").lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise StagingError("cached symbol record has no valid PE digest")
+    path = Path(raw_path).resolve(strict=True)
+    if not path.is_file() or _sha256(path) != digest:
+        raise StagingError("cached PE is missing or fails its recorded digest")
+    try:
+        pdb_build = read_pdb_ref(path).build_key
+    except (PeError, OSError, ValueError):
+        pdb_build = None
+    build = str(record.get("build") or "") or None
+    return StagedUserModule(
+        name=module.name, full_path=module.full_path,
+        architecture=module.architecture, base=module.base, size=module.size,
+        pe_path=str(path), pe_sha256=digest, store_name=store_name,
+        store_build=build, pdb_build=pdb_build,
+        artifact_source="cached-store",
+    )
+
+
+def prepare_user_module_manifest(
+    cfg: Config,
+    ga: GuestAgent,
+    store: SymbolStore,
+    pid: int,
+    *,
+    enrich_symbols: bool = True,
+    policy: str = "full",
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> UserModuleManifest:
+    """Freeze target loader entries into exact immutable PE artifacts.
+
+    Inventory corruption is fatal because it would make the snapshot
+    ambiguous.  Individual copy/PDB failures are retained in the manifest and
+    attach continues with truthful partial-unwind behavior.
+    """
+    if policy not in STAGING_POLICIES:
+        raise StagingError(f"staging policy must be one of {', '.join(STAGING_POLICIES)}")
+    if policy != "full":
+        enrich_symbols = False
+    started = time.monotonic()
+    parsed_pid, inventory = _freeze_loader_inventory(
+        cfg, store, pid, ensure_types=True,
+    )
+
+    staged: list[StagedUserModule] = []
     failures: list[str] = []
+    progress_records: list[dict[str, Any]] = []
     failure_count = 0
     total_files = 0
-    for module in live_modules:
+    for index, module in enumerate(inventory, 1):
+        module_started = time.monotonic()
+        state = "failed"
+        symbol_state = "not-requested"
         store_name = store_name_for(module.name, module.architecture)
         try:
+            if policy == "cached-only":
+                cached = _cached_module(store, module)
+                staged.append(cached)
+                total_files += Path(cached.pe_path).stat().st_size
+                state = "reused"
+                symbol_state = "reused" if cached.store_build else "missing"
+                continue
+
             remaining = MAX_TOTAL_IMAGE_SIZE - total_files
             path = copy_user_module(
                 cfg, ga, module.full_path, module.name,
@@ -289,9 +400,12 @@ def prepare_user_module_manifest(
                         base=module.base, wanted_types=(),
                     )
                     store_build = info.build
+                    symbol_state = "enriched"
                 except Exception as exc:  # exact PE remains independently useful
                     symbol_error = _bounded_error(exc)
+                    symbol_state = "failed"
             elif store_build is not None:
+                symbol_state = "reused"
                 # ASLR relocation does not change the exact artifact or PDB.
                 try:
                     store.set_base(store_name, module.base)
@@ -313,16 +427,36 @@ def prepare_user_module_manifest(
                 store_build=store_build,
                 pdb_build=pdb_build,
                 symbol_error=symbol_error,
+                artifact_source="guest-copy",
             ))
+            state = "copied"
         except Exception as exc:
             failure_count += 1
             if len(failures) < MAX_FAILURES:
                 failures.append(
                     f"{module.name}@{module.architecture}: {_bounded_error(exc)}"
                 )
+        finally:
+            item = {
+                "index": index, "total": len(inventory),
+                "name": module.name[:260], "architecture": module.architecture,
+                "state": state, "symbol_state": symbol_state,
+                "elapsed_seconds": round(time.monotonic() - module_started, 3),
+            }
+            if len(progress_records) < MAX_PROGRESS_RECORDS:
+                progress_records.append(item)
+            if progress is not None:
+                try:
+                    progress(item)
+                except Exception:
+                    pass
 
     return UserModuleManifest(
         pid=parsed_pid, modules=tuple(staged), inventory=inventory,
         failures=tuple(failures),
         total_file_bytes=total_files, failure_count=failure_count,
+        staging_policy=policy,
+        elapsed_seconds=time.monotonic() - started,
+        module_progress=tuple(progress_records),
+        progress_truncated=len(inventory) > len(progress_records),
     )

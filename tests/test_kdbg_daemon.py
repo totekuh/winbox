@@ -172,6 +172,29 @@ def _make_session(rsp=None, store=None, target=None, manifest=None) -> DaemonSes
     return session
 
 
+def _install_liveness_probe(monkeypatch, *, direct=None, current=None,
+                            direct_error=None, walk_error=None):
+    from contextlib import nullcontext
+    import winbox.kdbg.debugger.reader as reader
+    import winbox.kdbg.walk as walk
+
+    monkeypatch.setattr(reader, "use_local_rsp", lambda *_a, **_k: nullcontext())
+    if direct_error is not None:
+        monkeypatch.setattr(
+            walk, "read_process_identity",
+            lambda *_a, **_k: (_ for _ in ()).throw(direct_error),
+        )
+    else:
+        monkeypatch.setattr(walk, "read_process_identity", lambda *_a, **_k: direct)
+    if walk_error is not None:
+        monkeypatch.setattr(
+            walk, "find_process",
+            lambda *_a, **_k: (_ for _ in ()).throw(walk_error),
+        )
+    else:
+        monkeypatch.setattr(walk, "find_process", lambda *_a, **_k: current)
+
+
 # ── op dispatch / unknown ops ───────────────────────────────────────────
 
 
@@ -180,6 +203,8 @@ def test_handle_op_returns_err_for_unknown():
     reply = session.handle_op("not_a_real_op", {})
     assert reply["ok"] is False
     assert "unknown op" in reply["error"]
+    assert reply["error_info"]["code"] == "unknown_operation"
+    assert reply["error_info"]["details"]["operation"] == "not_a_real_op"
 
 
 def test_handle_op_returns_err_for_bad_args():
@@ -187,6 +212,17 @@ def test_handle_op_returns_err_for_bad_args():
     reply = session.handle_op("bp_add", {"wrong_kw": "x"})
     assert reply["ok"] is False
     assert "bad args" in reply["error"]
+    assert reply["error_info"]["code"] == "invalid_argument"
+
+
+def test_handle_op_does_not_infer_error_code_from_exception_message():
+    session = _make_session()
+    session.op_regs = lambda: (_ for _ in ()).throw(
+        RuntimeError("contains timeout busy stale and not found")
+    )
+    reply = session.handle_op("regs", {})
+    assert reply["error_info"]["code"] == "operation_failed"
+    assert reply["error_info"]["retryable"] is False
 
 
 def test_running_state_matrix_allows_only_passive_control_ops():
@@ -205,6 +241,8 @@ def test_running_state_matrix_allows_only_passive_control_ops():
         reply = session.handle_op(op, args)
         assert reply["ok"] is False
         assert reply["code"] == "state_conflict"
+        assert reply["error_info"]["code"] == "state_conflict"
+        assert reply["error_info"]["retryable"] is True
         assert reply["state"] == "running"
         assert "state is running" in reply["error"]
 
@@ -753,6 +791,84 @@ def test_status_reports_target_and_uptime():
     assert r["bps"] == 0
     assert "uptime_s" in r
     assert "daemon_pid" in r
+
+
+def test_target_status_reports_alive_for_same_eprocess_and_create_time(monkeypatch):
+    from types import SimpleNamespace
+    target = TargetInfo(
+        pid=4584, dtb=0x4d6bb000, name="notepad.exe",
+        eprocess=0xffff800001234000, create_time=0x112233,
+    )
+    current = SimpleNamespace(
+        pid=4584, name="notepad.exe", eprocess=target.eprocess,
+        create_time=target.create_time, exit_time=0,
+    )
+    _install_liveness_probe(monkeypatch, direct=current, current=current)
+    result = _make_session(target=target).handle_op("target_status", {})
+    assert result["ok"] is True
+    assert result["result"]["state"] == "alive"
+    assert result["result"]["identity"] == "create_time"
+
+
+def test_target_status_reports_unlinked_exiting_process(monkeypatch):
+    from types import SimpleNamespace
+    target = TargetInfo(
+        pid=4584, dtb=0x4d6bb000, name="notepad.exe",
+        eprocess=0xffff800001234000, create_time=0x112233,
+    )
+    direct = SimpleNamespace(
+        pid=4584, name="notepad.exe", eprocess=target.eprocess,
+        create_time=target.create_time, exit_time=0x9988,
+    )
+    _install_liveness_probe(monkeypatch, direct=direct, current=None)
+    result = _make_session(target=target).op_target_status()
+    assert result["state"] == "exiting"
+    assert result["reason"] == "unlinked_exit_time_set"
+
+
+def test_target_status_refuses_to_rebind_reused_pid(monkeypatch):
+    from types import SimpleNamespace
+    target = TargetInfo(
+        pid=4584, dtb=0x4d6bb000, name="old.exe",
+        eprocess=0xffff800001234000, create_time=0x112233,
+    )
+    replacement = SimpleNamespace(
+        pid=4584, name="new.exe", eprocess=0xffff800009999000,
+        create_time=0x445566, exit_time=0,
+    )
+    _install_liveness_probe(monkeypatch, direct=None, current=replacement)
+    result = _make_session(target=target).op_target_status()
+    assert result["state"] == "gone"
+    assert result["reason"] == "pid_reused"
+    assert result["replacement"]["name"] == "new.exe"
+    assert result["replacement"]["eprocess"] != result["captured_eprocess"]
+
+
+def test_target_status_is_advisory_unknown_when_reads_fail(monkeypatch):
+    target = TargetInfo(
+        pid=4584, dtb=0x4d6bb000, name="old.exe",
+        eprocess=0xffff800001234000, create_time=0x112233,
+    )
+    _install_liveness_probe(
+        monkeypatch, direct_error=RuntimeError("x" * 2000),
+        walk_error=RuntimeError("walk failed"),
+    )
+    result = _make_session(target=target).op_target_status()
+    assert result["state"] == "unknown"
+    assert result["advisory"] is True
+    assert len(result["probe_errors"]) == 2
+    assert all(len(item) <= 512 for item in result["probe_errors"])
+
+
+def test_target_status_refuses_probe_while_running():
+    session = _make_session(target=TargetInfo(
+        pid=4584, dtb=0x4d6bb000, name="old.exe", eprocess=0xffff800001234000,
+    ))
+    session.run_state = "running"
+    session.stop = None
+    reply = session.handle_op("target_status", {})
+    assert reply["ok"] is False
+    assert reply["error_info"]["code"] == "state_conflict"
 
 
 # ── op_bp_add (kernel) ──────────────────────────────────────────────────
@@ -1685,6 +1801,8 @@ def test_filtered_cr3_timeout_captures_the_received_stop(monkeypatch):
     )
     rsp = FakeRsp(regs_blob=_blob(rip=_KERNEL_VA, cr3=0xDEADBEEF000))
     session = _make_session(rsp=rsp, target=target)
+    liveness = MagicMock(return_value={"state": "gone", "reason": "unlinked"})
+    monkeypatch.setattr(session, "_probe_target_liveness", liveness)
     monkeypatch.setattr(daemon_mod, "time", _Clock)
 
     result = session.op_cont(timeout=0.5)
@@ -1694,6 +1812,8 @@ def test_filtered_cr3_timeout_captures_the_received_stop(monkeypatch):
     assert result["cr3"] == "0xdeadbeef000"
     assert session.stop is not None
     assert session.run_state == "halted"
+    assert result["target_liveness"]["state"] == "gone"
+    liveness.assert_called_once_with()
 
 
 def test_deadline_expires_after_filter_check_before_next_resume(monkeypatch):

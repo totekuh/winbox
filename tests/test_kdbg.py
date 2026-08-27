@@ -140,6 +140,73 @@ class TestKdbgStart:
         assert "detach" in result.output
 
 
+class TestKdbgAttachPolicies:
+    def test_preflight_forwards_policy_without_forking(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+
+        daemon = MagicMock()
+        daemon.session_alive.return_value = False
+        plan = {
+            "schema": "winbox.kdbg-staging-preflight/1",
+            "staging_policy": "cached-only", "dry_run": True,
+        }
+        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
+             patch(
+                 "winbox.kdbg.staging.preflight_user_module_staging",
+                 return_value=plan,
+             ) as preflight, \
+             patch("winbox.cli.kdbg.fork_daemon") as fork:
+            result = runner.invoke(cli, [
+                "kdbg", "attach", "4584", "--staging-policy", "cached-only",
+                "--preflight", "--prewarm",
+            ])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["dry_run"] is True
+        assert json.loads(result.output)["prewarm_requested"] is True
+        assert preflight.call_args.kwargs["policy"] == "cached-only"
+        fork.assert_not_called()
+
+    def test_invalid_policy_is_rejected_by_click(self, runner, kdbg_env):
+        from winbox.cli import cli
+        result = runner.invoke(cli, [
+            "kdbg", "attach", "4584", "--staging-policy", "guess",
+        ])
+        assert result.exit_code == 2
+        assert "Invalid value" in result.output
+
+
+class TestKdbgTargetStatus:
+    def test_emits_machine_safe_liveness_json(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+        daemon = MagicMock()
+        daemon.call.return_value = {
+            "state": "gone", "reason": "pid_reused", "advisory": True,
+        }
+        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon):
+            result = runner.invoke(cli, ["kdbg", "target-status"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["state"] == "gone"
+        daemon.call.assert_called_once_with("target_status")
+
+
+def test_ghidra_cancel_forwards_exact_background_token(runner, kdbg_env):
+    import json
+    from winbox.cli import cli
+
+    with patch(
+        "winbox.kdbg.decomp.cancel_decomp",
+        return_value={"schema": "winbox.decomp-prepare-cancel/1", "cancel_requested": True},
+    ) as cancel:
+        result = runner.invoke(cli, [
+            "kdbg", "ghidra", "cancel", "--token", "a" * 32,
+        ])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["cancel_requested"] is True
+    assert cancel.call_args.kwargs == {"request_id": "", "token": "a" * 32}
+
+
 class TestKdbgStop:
     def test_stop_sends_gdbserver_none(self, runner, kdbg_env):
         from winbox.cli import cli

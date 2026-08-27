@@ -1203,6 +1203,11 @@ class TestKdbg:
             pid = self._target_pid(tool)
             loaded = self._result(tool, "kdbg_user_symbols_load", pid, "ntdll")
             assert loaded["module"] == "ntdll" and loaded["symbol_count"] > 0
+            prepared = self._result(tool, "kdbg_decomp_prepare", "ntdll", 900)
+            assert prepared["prepared"] == 1
+            assert self._result(tool, "kdbg_decomp_prepare_status")["state"] in {
+                "none", "starting", "running", "completed", "partial", "failed",
+            }
             nt_close = self._result(
                 tool, "kdbg_sym", "ntdll!NtClose"
             )["matches"][0].split()[-1]
@@ -1214,6 +1219,8 @@ class TestKdbg:
             assert session["target"]["pid"] == pid
 
             assert self._result(tool, "kdbg_session")["attached"] is True
+            liveness = self._result(tool, "kdbg_target_status")
+            assert liveness["state"] == "alive"
             self._result(tool, "kdbg_regs")
             self._result(tool, "kdbg_stack")
             self._result(tool, "kdbg_bt")
@@ -1449,12 +1456,15 @@ class TestKdbg:
             pid = str(self._target_pid(tool))
             loaded = self._result(tool, "kdbg_user_symbols_load", int(pid), "ntdll")
             assert loaded["module"] == "ntdll" and loaded["symbol_count"] > 0
+            assert '"prepared": 1' in run("kdbg", "ghidra", "prepare", "ntdll").output
+            assert '"state"' in run("kdbg", "ghidra", "prepare-status").output
             nt_close = self._result(
                 tool, "kdbg_sym", "ntdll!NtClose"
             )["matches"][0].split()[-1]
             run("kdbg", "attach", pid)
             try:
                 run("kdbg", "regs")
+                assert '"state": "alive"' in run("kdbg", "target-status").output
                 decomp_status = run("kdbg", "decomp-status")
                 assert "image_installed" in decomp_status.output
                 decomp = run("kdbg", "decomp", nt_close,

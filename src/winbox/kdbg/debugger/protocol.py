@@ -26,12 +26,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from winbox.kdbg.errors import make_error_info
+
 
 # Single source of truth for valid operations. The daemon validates
 # requests against this set before dispatching, and the CLI uses these
 # constants directly.
 OPS: frozenset[str] = frozenset({
     "status",       # daemon health + target info
+    "target_status", # bounded EPROCESS/PID/create-time liveness probe
     "bp_add",       # install bp at sym/VA
     "bp_list",      # enumerate installed bps
     "bp_remove",    # remove bp by id
@@ -96,8 +99,27 @@ def reply_ok(result: dict[str, Any] | None = None) -> dict[str, Any]:
     return {"ok": True, "result": result if result is not None else {}}
 
 
-def reply_err(message: str) -> dict[str, Any]:
-    return {"ok": False, "error": str(message)}
+def reply_err(
+    message: object,
+    *,
+    code: str | None = None,
+    retryable: bool = False,
+    details: Any = None,
+) -> dict[str, Any]:
+    """Build an additive typed error while retaining the legacy message.
+
+    A reply without ``code`` deliberately retains the original exact wire
+    shape for helpers and legacy call sites. Protocol producers pass a code;
+    old clients continue reading ``error`` while new clients use
+    ``error_info`` without parsing prose.
+    """
+    bounded_message = str(message)[:2048]
+    reply: dict[str, Any] = {"ok": False, "error": bounded_message}
+    if code is not None:
+        reply["error_info"] = make_error_info(
+            bounded_message, code=code, retryable=retryable, details=details,
+        )
+    return reply
 
 
 # ── socket helpers ──────────────────────────────────────────────────────

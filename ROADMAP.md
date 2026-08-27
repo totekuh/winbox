@@ -21,8 +21,11 @@ The major kdbg execution, symbol, decompilation, exact-artifact staging, x64
 unwind, ordinary WoW64 x86 unwind, and bidirectional transition stitching paths
 are implemented and live-verified. A post-v1.6.0 stability/usability review on
 2026-08-25 opened items 71-84; items 71-73 and 76-78 were implemented the same
-day. Items 74-75 and 79-84 remain open. Item 26 remains an accepted minor
-trade-off, and item 8 remains a watch condition.
+day, items 75 and 79-83 were completed on 2026-08-26, and items 74 and 84's
+bounded first phase were completed on 2026-08-27. Item 26's IPv6 listener
+residual is fixed; its `DirectoryTableBase` trade-off remains accepted. Item 8
+remains a watch condition. A follow-up review the same day opened and completed
+items 85-87 for cache ownership, subprocess bounds, and prepare-job lifecycle.
 
 ### Completed top-three sequence (2026-08-25)
 
@@ -74,7 +77,7 @@ at stop ID 2, and detach certified `resume_safe=true` and `cr3_poisoned=false`.
 Final cleanup stopped the gdbstub, reaped both observed host child PIDs, retained
 no attached session, and left the VM running and guest agent responsive.
 
-### Selected third top-three sequence (2026-08-25)
+### Completed third top-three sequence (2026-08-26)
 
 This batch establishes the observable and typed control plane needed before the
 larger cancellation/prewarming and corrupt-project recovery changes. It also
@@ -83,14 +86,99 @@ work is fresh.
 
 | Rank | Item | Ease | ROI | Status |
 |---:|---|---:|---:|---|
-| 1 | **80 — non-blocking decompiler status with phase and progress** | 4 | 5 | Selected; immediate operator feedback and a prerequisite for item 74. |
-| 2 | **79 — typed errors from daemon and worker through MCP** | 3 | 5 | Selected; removes substring-based retry/recovery decisions and supports items 74-75. |
-| 3 | **81 — targeted cache removal and accounting reconciliation** | 5 | 4 | Selected; precise low-risk recovery built directly on item 76's maintenance lock. |
+| 1 | **80 — non-blocking decompiler status with phase and progress** | 4 | 5 | Completed with atomic heartbeats, phase progress, and immediate sidecar-only status. |
+| 2 | **79 — typed errors from daemon and worker through MCP** | 3 | 5 | Completed with additive versioned errors and bounded legacy fallback. |
+| 3 | **81 — targeted cache removal and accounting reconciliation** | 5 | 4 | Completed with exact selectors, reconciled ownership, and explicit residuals. |
 
 Item 75 is the narrow miss: its reliability payoff is high, but implementing
-typed worker errors and exact cache targeting first makes quarantine/rebuild
+typed worker errors and exact cache targeting first makes exact reset/rebuild
 safer and its recovery contract substantially cleaner. Item 74 remains the
-largest payoff and largest effort; item 80 supplies the progress model it needs.
+largest payoff and largest effort; item 80 now supplies the progress model it
+needs.
+
+Verification: the complete default suite passes (`2618 passed, 5 skipped, 141
+deselected`) and the focused daemon/decompiler/cache/CLI set passes (`616
+passed, 1 skipped`). Real-process heartbeat/cancellation coverage and the real
+Docker/PyGhidra integration both pass against the rebuilt API-5 image. The
+public MCP status endpoint reports a fresh, idle, responsive heartbeat without
+starting the JVM. Its cache inventory attributes all 339,766,562 bytes across
+four entries with zero unexplained overhead; exact module, SHA-256, and project
+dry runs each selected only the intended `services.exe` entry and removed
+nothing. After MCP reload, the public exact-module selector again selected one
+entry, and a malformed digest returned the new bounded `invalid_argument`
+envelope. A live Server 2022 attach staged and symbol-enriched all 26 exact
+modules with zero misses, warnings, or failures; an invalid memory address then
+crossed the real daemon and public MCP boundary as typed `invalid_argument`
+with `retryable=false` and `operation=mem`. Final detach stopped the gdbstub and
+left the VM running with its guest agent responsive; no cache data was deleted.
+
+### Completed fourth top-three sequence (2026-08-26)
+
+This batch closes the next three high-return reliability and operator-feedback
+gaps while preserving the existing safe defaults.
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **75 — exact corrupt-project reset and deterministic rebuild** | 4 | 5 | Completed with hash revalidation, exact deletion, one rebuild, and explicit repair. |
+| 2 | **82 — observable and selectable attach-time artifact staging** | 4 | 4 | Completed with three policies, bounded progress, and non-mutating preflight. |
+| 3 | **83 — target-liveness and exit diagnostics** | 4 | 4 | Completed with captured EPROCESS/create-time identity and PID-reuse refusal. |
+
+Verification: the complete default suite passes (`2653 passed, 5 skipped, 141
+deselected`), the focused changed-surface set passes (`583 passed, 1 skipped`),
+the Docker worker unit suite passes (`13 passed`), and real Docker/PyGhidra
+corruption/reset/rebuild integration passes against the rebuilt API-5 image.
+Live Server 2022 checks exercised full, binaries-only, and cached-only staging;
+all three attached successfully, and preflight performed no guest copies or
+network enrichment. A temporary `PING.EXE` target then exited during a durable
+continue: the timeout reported the original captured EPROCESS as `exiting`
+with a real exit time rather than silently following the PID. Cleanup stopped
+the gdbstub and left the VM running and agent-responsive. The corruption test
+used only disposable test cache state; no operator cache was deleted.
+
+### Completed fifth top-three sequence (2026-08-27)
+
+This batch removes the final false-positive listener hazard and moves expensive
+Ghidra work out of live stop time while improving exact-PDB output.
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **26a — exact IPv6 listener matching** | 5 | 4 | Completed with address-family-aware `/proc/net/tcp6` decoding and malformed-row rejection. |
+| 2 | **74 — cancellable offline Ghidra preparation** | 2 | 5 | Completed with API-6 phases, cancellable analysis monitors, durable jobs, attach prewarming, and partial-project resume. |
+| 3 | **84 — exact-PDB signatures and named globals** | 2 | 5 | Completed as the bounded first enrichment profile with per-decision provenance and conflict preservation. |
+
+Verification: the complete default suite passes (`2682 passed, 5 skipped, 141
+deselected`), the focused changed-surface set passes (`802 passed`), the API-6
+Docker policy suite passes (`13 passed`), and a real PyGhidra fixture stripped
+of ELF/DWARF names and types passes. Live Server
+2022 validation analyzed `services` without halting the running VM, applied
+1,417 exact function names and 1,716 named globals, persisted 3,359 bounded
+provenance events, and reused the warm project in 0.006 seconds. A detached
+prewarm job completed with a durable token. A cold `apphelp` analysis was
+cancelled by exact request ID during `analyzing_program`, returned typed
+`cancelled`, then safely resumed the same partial project and completed. A real
+IPv6-only listener matched `::1` and did not falsely match `127.0.0.1`.
+
+### Completed sixth top-three sequence (2026-08-27)
+
+This follow-up closes the concrete correctness gaps exposed by the first live
+use of enrichment sidecars and detached preparation jobs.
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **85 — enrichment cache ownership and exact pruning** | 5 | 5 | Completed; every digest sidecar/result is owned, inventoried, and removed by the same exact selector. |
+| 2 | **86 — truly bounded PDB extraction** | 4 | 5 | Completed with concurrent capped drains, cooperative cancellation, timeout termination, and exact child reaping. |
+| 3 | **87 — durable prepare-job lifecycle** | 3 | 5 | Completed with nonce/start-time identity, heartbeats, lost detection, token cancellation, and terminal retention. |
+
+Verification: the complete default suite passes (`2692 passed, 5 skipped, 141
+deselected`), focused changed-surface coverage passes (`812 passed`), the API-6
+Docker policy suite passes (`13 passed`), and real Docker/PyGhidra integration passes. Live cache
+inventory moved from 1,842,202 unexplained bytes/four files to zero without
+deletion. Real `services` extraction completed through the bounded path. A
+background cold `ntdll` job exposed the same request ID in its token record and
+worker heartbeat, transitioned `running` → `cancelling` → `cancelled`, and
+returned typed `cancelled`; resuming its partial project then completed and
+applied 2,431 function names and 1,809 globals. The live VM remained running
+and agent-responsive throughout.
 
 ### Completed final unwind batch (2026-08-24)
 
@@ -494,19 +582,16 @@ stores use a separate `<module>_x86` key. Live Server 2025 validation against
 KERNEL32, KERNELBASE, ucrtbase, and sechost beside the native WoW64 support
 DLLs. The native services process remained x64-only.
 
-### 26. kdbg read-surface residuals from the 2026-08-10 audit (accepted / minor)
+### 26. kdbg read-surface residuals from the 2026-08-10 audit (partly fixed / minor)
 
-Two findings from the read-surface audit were left as-is, deliberately:
+Two findings came from the read-surface audit:
 
-* **`probe_port` treats every IPv6/unparsed listener as matching any host**
-  (`hmp.py`). `_listening_sockets` records tcp6 LISTEN sockets as `(None,
-  port)` and `probe_port` matches `None` against any host — a *deliberate*
-  false-positive-over-false-negative choice (documented in the function's
-  docstring) so a v6-wildcard gdbstub isn't read as absent. The cost is that an
-  unrelated tcp6 listener on the same port reads as "stub up", and
-  `ensure_not_paused` may connect to a foreign socket. A proper fix decodes the
-  v6 address and does host-family-aware matching; until then the trade-off
-  stands.
+* **Fixed 2026-08-27 — exact IPv6 listener matching.** `_listening_sockets`
+  now decodes Linux tcp6's four little-endian words into a real IPv6 address,
+  ignores malformed rows, and `probe_port` matches only within the requested
+  address family (including that family's wildcard). Unit edge cases and a
+  real IPv6-only listener verify that `::1` no longer makes `127.0.0.1` appear
+  occupied.
 * **`DirectoryTableBase` is recorded with no sanity check** (`walk.py`) while
   the adjacent `UserDirectoryTableBase` gets a page-aligned/`<2^52` guard. This
   is the same class as item 18 (offset assumptions with no runtime check).
@@ -711,7 +796,7 @@ CR3, a false predicate, action auto-continue, and expiry before another resume.
 Every branch now leaves `run_state=halted`, a non-null stop, and truthful target
 membership in the returned summary.
 
-### 74. Open — cancellable asynchronous Ghidra analysis and offline prewarming
+### 74. Completed — cancellable asynchronous Ghidra analysis and offline prewarming
 
 The public timeout bounds `decompileFunction`, but the client allows another
 840 seconds for first-use work. Cancellation checks bracket `_open`, while
@@ -731,23 +816,41 @@ byte check a short stop-pinned operation. Test disconnect, cancel, worker
 restart, forced termination, stale-stop completion, and cold/warm latency.
 Large effort, very high stability and usability payoff.
 
-### 75. Open — corrupt-project quarantine and deterministic rebuild
+Implemented on 2026-08-27 in worker API 6. Import, analysis, enrichment,
+decompilation, mapping, and saving publish distinct heartbeat phases. Ghidra
+auto-analysis runs under a cancellable task monitor with its own 5-1800 second
+budget; exact request markers handle explicit cancellation and client
+disconnects. A cancelled/terminated partial project is retained without being
+marked analyzed, so the next exact request resumes it rather than deleting or
+trusting incomplete work.
 
-An existing digest/profile-keyed Ghidra project is opened directly. If Ghidra
-rejects a corrupt or half-written `.gpr`/`.rep`, the worker returns an
-application error; the client deliberately retries only transport failures, so
-every later query for that digest fails the same way. There is no automatic
-quarantine, one-shot clean rebuild, typed corrupt-cache result, or exact repair
-command. Age/size pruning is an awkward and potentially over-broad recovery.
+`kdbg_decomp_prepare(module|all)` and `winbox kdbg ghidra prepare` perform exact
+PDB extraction/import/analysis while the VM runs. Detached jobs persist a
+bounded token/status record, attach has opt-in `prewarm`, and warm live queries
+reuse the completed project. Tests cover phase monitors, cancellation,
+timeouts, exact request identity, disconnect markers, invalid budgets,
+background option forwarding, warm reuse, cache residue/rebuild, Docker
+isolation, and real PyGhidra. Live cold/cancel/resume and background workflows
+completed without stopping the running Server 2022 VM.
 
-Classify project-open corruption separately from analysis failure, atomically
-move the exact project pair into a bounded quarantine, and attempt one clean
-rebuild under the project lock. Add `cache repair --sha256` and report the
-quarantined path, original failure, rebuild result, and retained exact binary.
-Never loop rebuilds or delete the only artifact automatically. Cover truncated
-GPR, malformed repository, forced-kill residue, failed quarantine, failed
-rebuild, and successful reuse. Moderate effort, high long-term reliability
-payoff.
+### 75. Completed — corrupt-project reset and deterministic rebuild
+
+Implemented on 2026-08-26. A bounded corruption classifier separates malformed
+or truncated Ghidra project state from permissions, cancellation, resource
+exhaustion, and other ordinary open failures. Proven corruption deletes only
+the exact digest/profile-keyed `.gpr`, `.rep`, `.lock`, and `.lock~` entries,
+retains and revalidates the hash-addressed binary, and attempts exactly one
+clean rebuild under the existing project lock. A second failure returns typed
+`cache_rebuild_failed`; reset failures are typed and partial deletion is
+reported rather than hidden. There is no backup or alternate cache area.
+
+`winbox kdbg ghidra repair --sha256 DIGEST` and
+`kdbg_decomp_cache_repair(sha256)` provide the same exact operation explicitly.
+Tests cover truncated metadata, malformed and repository-only forced-kill
+residue, lock remnants, partial reset, failed rebuild without looping,
+non-corruption failures without deletion, digest validation, symlink refusal,
+retained binary identity, CLI/MCP forwarding, and real Docker/PyGhidra rebuild
+and reuse.
 
 ### 76. Completed — serialize Ghidra cache maintenance with worker lifecycle
 
@@ -802,7 +905,7 @@ actions, watch widths, ignored execution-bp size, every query bound, compact
 rendering, JSON parseability, and watchpoint list rendering; the existing real
 daemon-socket trace integration covers the backend query path.
 
-### 79. Open — typed errors from daemon and worker through MCP
+### 79. Completed — typed errors from daemon and worker through MCP
 
 The MCP envelope advertises stable error codes, but daemon and PyGhidra worker
 errors are prose. `_research_error` infers categories from substrings such as
@@ -810,14 +913,18 @@ errors are prose. `_research_error` infers categories from substrings such as
 word can silently change retryability and recovery advice. Worker protocol
 version mismatch is structured only indirectly through its message.
 
-Define versioned `{code,message,retryable,details}` errors in both internal
-protocols and preserve them through clients, CLI rendering, and MCP. Keep a
-bounded `operation_failed` fallback for legacy peers. Cover every documented
-category, malicious/oversized detail, old/new peers in both directions, and
-messages containing misleading keywords. Moderate effort, high agent
-reliability payoff.
+Implemented on 2026-08-26. Daemon and worker replies retain the legacy `error`
+string and add a validated `winbox.error/1` object containing stable code,
+message, retryability, and bounded details. New clients preserve that object
+through CLI rendering and MCP; old peers remain readable, and new clients use
+the bounded `operation_failed` fallback for old string-only replies. Producer-
+side classifications cover state, poison, argument, timeout, transport,
+identity, cancellation, worker lifecycle, and generic failures without message
+keyword inference. Tests cover mixed peers in both directions, misleading
+keywords, malformed schemas, oversized messages/details, and real JSON-line
+daemon/worker transport.
 
-### 80. Open — non-blocking decompiler status with phase and progress
+### 80. Completed — non-blocking decompiler status with phase and progress
 
 While the serialized worker is analyzing, status first attempts to queue an
 API request and waits five seconds before declaring the worker busy. The
@@ -826,14 +933,18 @@ distinguish staging, JVM startup, import, auto-analysis, decompilation,
 mapping, cancellation, or project save. Operators see a delay followed by
 little evidence about whether progress is healthy.
 
-Publish an atomic heartbeat/phase snapshot from the worker and have status
-return it immediately without entering the serialized request queue. Include
-request id, phase, elapsed time, last progress time, cancellation state,
-binary digest/name, and bounded failure detail; never expose caller-supplied
-host paths unnecessarily. Add stale-heartbeat and dead-worker classification.
-Small-to-moderate effort, high operational usability payoff.
+Implemented on 2026-08-26. A dedicated worker heartbeat publishes atomic
+session snapshots while the serialized request thread is inside JVM startup,
+project import/analysis, decompilation, mapping, or save. Status reads only
+that bounded sidecar and returns immediately with health, request/phase elapsed
+time, last-progress age, coarse phase progress, cancellation state, safe binary
+identity, worker/JVM state, and redacted last failure. It never queues a worker
+API call. Fresh, stale, legacy, invalid, and dead-worker sidecars are classified
+explicitly. A real-process integration holds the worker in a two-second JVM
+phase, observes status in under 0.5 seconds, and sees cancellation transition to
+`requested` without leaking the supplied host path.
 
-### 81. Open — targeted cache removal and accounting reconciliation
+### 81. Completed — targeted cache removal and accounting reconciliation
 
 Cache inventory is useful, but mutation selects only by aggregate byte target
 or age. Recovering one known-bad digest, removing one obsolete build, or
@@ -842,43 +953,50 @@ usage also includes unowned metadata/log/temporary overhead that per-entry
 sizes cannot reclaim, so `estimated_remaining_bytes` may not reach the
 requested ceiling without explaining why.
 
-Add exact SHA/project/module selectors, show owned versus overhead bytes, list
-unattributed files safely, and report an explicit residual when selected
-entries cannot satisfy `max_bytes`. Keep preview as the default and route all
-applied changes through item 76's maintenance lock. Small effort, medium-to-high
-usability payoff.
+Implemented on 2026-08-26. CLI and MCP pruning accept repeatable exact SHA-256,
+project, and case-insensitive module selectors in addition to age/LRU limits.
+Inventory accounts for binaries, verified snapshots, metadata, provenance,
+projects, repositories, and project lock files per entry; it reports owned and
+overhead bytes plus a bounded, relative-path-only unattributed-file inventory.
+Prune results expose unmatched selectors, remaining owned/overhead bytes, and
+the residual above `max_bytes`. Preview remains the default, applied selection
+is recomputed under item 76's maintenance lock, and a live worker still blocks
+all deletion. Tests cover exact union behavior, malformed selectors, symlink
+escapes, corrupt/non-finite LRU metadata, bounded unattributed output, targeted
+apply, live refusal, concurrency, and unreclaimable overhead.
 
-### 82. Open — observable and selectable attach-time artifact staging
+### 82. Completed — observable and selectable attach-time artifact staging
 
-Attach always copies every bounded user image and attempts symbol enrichment
-serially before the daemon takes RSP ownership. This maximizes unwind quality,
-but a cold attach can take tens of seconds with no progress and gives callers
-no supported way to prefer fast binary-only staging, reuse-only operation, or
-full enrichment. A transient PDB service delay is paid on the critical attach
-path even when the immediate task needs only kernel state.
+Implemented on 2026-08-26. Attach accepts `full`, `binaries`, or `cached-only`.
+`full` remains the default and preserves copy plus symbol enrichment;
+`binaries` copies exact guest images but only reuses existing symbols; and
+`cached-only` performs no guest copy or network download, accepting only
+self-consistent hash-bound store artifacts. Every frozen manifest records its
+policy and per-module artifact source, so later unwind provenance stays honest.
+CLI and MCP return bounded per-module progress, failures, truncation, and
+elapsed time. `--preflight` freezes only the bounded loader inventory and
+predicts work without copying, downloading, mutating types, or attaching.
+Tests cover all policies, unchanged default behavior, invalid policy before
+guest work, callback and copy interruption, partial completion, bounded
+progress, cached misses, and later full enrichment. All three policies and the
+non-mutating preflight were also exercised against the live Server 2022 VM.
 
-Expose explicit `full|binaries|cached-only` staging policies, per-module
-progress, elapsed timings, and a dry preflight summary. Preserve `full` as the
-safe default for complete mixed-mode unwind; label reduced policies in the
-frozen manifest so later traces remain truthful about missing artifacts. Add
-CLI/MCP parity and tests for interruption, partial completion, and subsequent
-offline enrichment. Moderate effort, medium-to-high usability payoff.
+### 83. Completed — target-liveness and exit diagnostics
 
-### 83. Open — target-liveness and exit diagnostics
+Implemented on 2026-08-26. Attach captures the target EPROCESS and optional
+exact-PDB `_EPROCESS.CreateTime`; the process walker also exposes `ExitTime`.
+`kdbg target-status` and `kdbg_target_status()` perform a bounded advisory
+identity probe and return `alive|exiting|gone|unknown`. They compare the
+original object and create time against both the active list and a direct read,
+so an unlinked exiting process remains identifiable and a reused numeric PID is
+reported as replacement evidence without rebinding the debugger session.
+Every continue timeout path includes the same evidence, including CR3,
+predicate, and action filtering. Tests cover live, unlinked/exiting, gone, PID
+reuse, unreadable/unknown, running-state refusal, optional PDB fields, and all
+timeout renderers. Live target termination returned `exiting` with the captured
+EPROCESS and nonzero exit time.
 
-A target that exits during continue currently looks like an ordinary timeout;
-live testing proved detach remains safe, but the operator receives no signal
-that the original EPROCESS is terminating, unlinked, or replaced by PID reuse.
-Repeated continues can therefore waste time against a dead target and produce
-confusing module/symbol errors later.
-
-On timeout or explicit status request, offer a bounded liveness check keyed by
-the captured EPROCESS plus PID/create-time evidence, without turning the hot
-breakpoint path into a full process walk. Report `alive|exiting|gone|unknown`
-and refuse to silently bind a reused PID. Keep failures advisory unless
-identity is conclusive. Moderate effort, medium usability payoff.
-
-### 84. Open — deeper exact-PDB enrichment for Ghidra
+### 84. Completed (bounded first phase) — deeper exact-PDB enrichment for Ghidra
 
 Exact PDB function-public flags and durable synthetic-boundary provenance now
 improve names without laundering inferred analysis. Ghidra still receives few
@@ -892,6 +1010,74 @@ applied source and conflict, preserve Ghidra originals, include the profile in
 project identity, and make the cost separately controllable during prewarming.
 Start with function signatures and named globals before broad type graphs.
 Large effort, high analysis-quality payoff.
+
+Implemented on 2026-08-27 as profile `winbox-pdb-enrichment-v3`. The host
+extracts a hash-bound, size/count-capped sidecar from the exact cached PE/PDB;
+only a finite primitive/pointer signature grammar is accepted. The isolated
+worker applies exact public/private function names, safe signatures, and named
+globals while preserving non-default Ghidra names and signatures. Project
+identity includes the profile. Every applied, reused, invalid, or conflicting
+decision and its source is atomically persisted in a digest-keyed bounded
+provenance record. Broad recursive type graphs and heuristic parameter recovery
+remain deliberately outside this first profile rather than being presented as
+exact evidence.
+
+Unit cases cover malformed/truncated signatures, pointer/parameter limits,
+section RVA conversion, changed PE identity, sidecar bounds/symlinks, conflicts,
+and atomic provenance. A stripped real Docker/PyGhidra fixture verifies one
+signature and named global actually alter decompilation. Microsoft's public
+`services` PDB exposed no procedure type records, truthfully producing zero
+signatures while still applying 1,417 function names and 1,716 globals.
+
+### 85. Completed — enrichment cache ownership and exact pruning
+
+The v3 input sidecars and per-decision result provenance were introduced after
+cache accounting was reconciled, so they appeared as global overhead and
+survived exact SHA/module/project pruning. A live inventory reproduced four
+unattributed files totaling 1,842,202 bytes.
+
+Digest-suffixed enrichment, enrichment-result, and recovery-provenance files
+now belong to the same entry as its immutable binary and projects. Orphan
+sidecars without metadata still create a digest-addressable inventory entry.
+Exact applied pruning removes only matching regular files, refuses symlinks,
+and leaves other digests untouched. Unit coverage exercises accounting,
+orphan discovery, dry-run estimates, exact apply, unrelated files, and symlink
+boundaries. The same live inventory now reconciles every byte with zero
+unattributed overhead.
+
+### 86. Completed — truly bounded PDB extraction
+
+The old `subprocess.run(capture_output=True)` checked the 64-MiB limit only
+after `llvm-pdbutil` had allocated its complete output. The nominal cap did not
+bound memory, and timeout/interrupt cleanup depended on the convenience API.
+
+Extraction now concurrently drains stdout and stderr while retaining at most
+their explicit caps. Overflow, timeout, caller cancellation, interruption, and
+abnormal pipe lifetime terminate and deterministically reap the exact child;
+stderr remains bounded for diagnostics. Real-process tests cover success,
+output amplification, oversized stderr, nonzero exit, timeout, cancellation,
+and reaping. Live forced extraction of the exact `services` PDB completed
+through this path with unchanged enrichment evidence.
+
+### 87. Completed — durable prepare-job lifecycle
+
+The first detached job record carried a token and PID but no process birth
+identity or heartbeat. A killed/reused child could leave `starting`/`running`
+forever; active cancellation addressed only a worker request ID, and terminal
+records/logs accumulated without a bound.
+
+Version-2 records bind token+nonce to PID plus `/proc` start ticks and publish
+one-second heartbeats with the current exact worker request. Status detects
+dead/reused launchers and children and atomically marks them `lost`.
+`kdbg_decomp_cancel(token=...)` and CLI `ghidra cancel --token` use a nonce-bound
+marker that the child forwards only to its own request; cancellation also
+interrupts bounded PDB extraction before Ghidra starts. Signals use the same
+cooperative path. Terminal jobs are capped at 128/30 days on subsequent starts,
+while active and untrusted/symlink records are never removed. Tests cover
+starting/running/terminal states, PID reuse, real child death, marker identity,
+mutually exclusive selectors, exact request forwarding, cancellation cleanup,
+retention pairs, and CLI/MCP envelopes. Live cold cancellation and safe partial
+project resume both completed.
 
 ---
 

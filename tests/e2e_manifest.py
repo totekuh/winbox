@@ -159,6 +159,7 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg lm": (LIVE, ""),
     "kdbg base": (LIVE, ""),
     "kdbg session": (LIVE, ""),
+    "kdbg target-status": (LIVE, "bounded captured-process identity probe"),
     "kdbg attach": (LIVE, ""),
     "kdbg detach": (LIVE, "asserts the guest is not left paused"),
     "kdbg resume": (LIVE, ""),
@@ -173,6 +174,10 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg ghidra status": (LIVE, "read-only image/container/API status"),
     "kdbg ghidra cache": (LIVE, "read-only content-cache inventory"),
     "kdbg ghidra prune": (EXCLUDED, "destructive apply requires explicit policy; unit-tested dry-run and deletion"),
+    "kdbg ghidra repair": (EXCLUDED, "resets one exact Ghidra project cache; unit and real Docker integration tested"),
+    "kdbg ghidra prepare": (LIVE, "offline exact-artifact analysis while the VM runs"),
+    "kdbg ghidra prepare-status": (LIVE, "durable background preparation status"),
+    "kdbg ghidra cancel": (EXCLUDED, "requires an active analysis/job; request and token cancellation are unit, real-process, Docker, and manual-live tested"),
     "kdbg ghidra stop": (LIVE, "stop container while preserving caches"),
     "kdbg mem": (LIVE, ""),
     "kdbg stack": (LIVE, ""),
@@ -244,6 +249,7 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg_stop": (LIVE, ""),
     "kdbg_status": (LIVE, ""),
     "kdbg_session": (LIVE, ""),
+    "kdbg_target_status": (LIVE, "bounded captured-process identity probe"),
     "kdbg_symbols_load": (LIVE, ""),
     "kdbg_sym": (LIVE, ""),
     "kdbg_struct": (LIVE, ""),
@@ -273,6 +279,10 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg_decomp_status": (LIVE, "read-only Docker/API/cache status"),
     "kdbg_decomp_cache": (LIVE, "read-only content-cache inventory"),
     "kdbg_decomp_cache_prune": (EXCLUDED, "destructive apply requires explicit policy; unit-tested dry-run and deletion"),
+    "kdbg_decomp_cache_repair": (EXCLUDED, "resets one exact Ghidra project cache; unit and real Docker integration tested"),
+    "kdbg_decomp_prepare": (LIVE, "offline exact-artifact analysis while the VM runs"),
+    "kdbg_decomp_prepare_status": (LIVE, "durable background preparation status"),
+    "kdbg_decomp_cancel": (EXCLUDED, "requires an active analysis/job; request and token cancellation are unit, real-process, Docker, and manual-live tested"),
     "kdbg_ghidra_install": (EXCLUDED, "one-time 570 MB network image build; covered by the dedicated real Docker integration"),
     "kdbg_ghidra_run": (LIVE, "start and API-check the private container"),
     "kdbg_ghidra_stop": (LIVE, "stop container while preserving caches"),
@@ -325,6 +335,8 @@ CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "kdbg bp-trace": "tests/test_kdbg.py",
     "kdbg ghidra install": "tests/test_kdbg_decomp_docker.py",
     "kdbg ghidra prune": "tests/test_kdbg_decomp_hardening.py",
+    "kdbg ghidra repair": "tests/test_kdbg_decomp_hardening.py",
+    "kdbg ghidra cancel": "tests/test_kdbg_decomp_prepare.py",
 }
 
 MCP_EXCLUSION_UNIT_TESTS: dict[str, str] = {
@@ -338,4 +350,6 @@ MCP_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "kdbg_bp_trace": "tests/test_kdbg_trace.py",
     "kdbg_ghidra_install": "tests/test_kdbg_decomp_docker.py",
     "kdbg_decomp_cache_prune": "tests/test_kdbg_decomp_hardening.py",
+    "kdbg_decomp_cache_repair": "tests/test_kdbg_decomp_hardening.py",
+    "kdbg_decomp_cancel": "tests/test_kdbg_decomp_prepare.py",
 }
