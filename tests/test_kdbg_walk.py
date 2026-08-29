@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from winbox.kdbg import walk
+from winbox.kdbg.store import SymbolStoreError
 from winbox.kdbg.walk import (
     ProcessRecord,
     ThreadRecord,
@@ -261,13 +262,14 @@ _PROC_TYPES = {
     "_EPROCESS": {
         "size": 0x800,
         "fields": {
+            "Pcb": {"off": 0, "type": ""},
             "ImageFileName": {"off": 0x5a8, "type": ""},
             "UniqueProcessId": {"off": 0x440, "type": ""},
             "ActiveProcessLinks": {"off": 0x448, "type": ""},
         },
     },
     "_KPROCESS": {
-        "size": 0x300,
+        "size": 0x400,
         "fields": {
             "DirectoryTableBase": {"off": 0x28, "type": ""},
             "UserDirectoryTableBase": {"off": 0x388, "type": ""},
@@ -397,7 +399,7 @@ def test_process_entry_coalesces_adjacent_fields_without_sparse_overread(monkeyp
         for span in layout.spans
     ]
     assert len(calls) == 4
-    assert sum(span.size for span in layout.spans) == 47
+    assert sum(span.size for span in layout.spans) == 55
     assert any(
         span.start <= layout.pid
         and layout.active_links + 8 <= span.start + span.size
@@ -429,7 +431,7 @@ def test_process_layout_rejects_out_of_bounds_symbol_offset():
         def struct(self, type_name, field=None, *, module="nt"):
             return types[type_name]
 
-    with pytest.raises(walk.HmpError, match="exceeds struct size"):
+    with pytest.raises(SymbolStoreError, match="invalid _EPROCESS.ImageFileName span"):
         walk._process_layout(S())
 
 
@@ -816,7 +818,10 @@ def test_list_processes_no_switch_when_system_dtb_matches(monkeypatch):
 _THREAD_TYPES = {
     "_EPROCESS": {
         "size": 0x800,
-        "fields": {"ThreadListHead": {"off": 0x380, "type": ""}},
+        "fields": {
+            "Pcb": {"off": 0, "type": ""},
+            "ThreadListHead": {"off": 0x380, "type": ""},
+        },
     },
     "_ETHREAD": {
         "size": 0x700,
@@ -874,6 +879,9 @@ def _thread_backing(monkeypatch, target: ProcessRecord):
     memory: dict[int, int] = {}
     qwords: dict[int, int] = {}
     calls = []
+    head = target.eprocess + layout.thread_list_head
+    qwords[head + 8] = head
+    last_link = head
 
     def put(addr: int, size: int, value: int, *, signed: bool = False):
         raw = value.to_bytes(size, "little", signed=signed)
@@ -898,13 +906,17 @@ def _thread_backing(monkeypatch, target: ProcessRecord):
         next_flink: int,
         tid: int,
         *,
+        blink: int | None = None,
         client_pid: int | None = None,
         owner: int | None = None,
         state: int = 5,
         wait_reason: int = 6,
     ) -> None:
+        nonlocal last_link
         fields = layout.fields
         put(ethread + fields["thread_list_entry"].offset, 8, next_flink)
+        link = ethread + fields["thread_list_entry"].offset
+        put(link + 8, 8, last_link if blink is None else blink)
         put(ethread + fields["cid"].offset, 8, target.pid if client_pid is None else client_pid)
         put(ethread + fields["cid"].offset + 8, 8, tid)
         put(ethread + fields["process"].offset, 8, target.eprocess if owner is None else owner)
@@ -921,6 +933,9 @@ def _thread_backing(monkeypatch, target: ProcessRecord):
         put(ethread + fields["win32_start_address"].offset, 8, 0x00007FF7_40001000)
         put(ethread + fields["create_time"].offset, 8, 0x0102030405060708)
         put(ethread + fields["exit_status"].offset, 4, 259, signed=True)
+        if next_flink == head:
+            qwords[head + 8] = link
+        last_link = link
 
     return layout, qwords, add, calls
 
@@ -1026,7 +1041,208 @@ def test_list_threads_reports_cap_as_partial_result(monkeypatch):
 
     assert [thread.tid for thread in result.threads] == [4816]
     assert result.complete is False
-    assert result.truncated_reason == "hit MAX_THREADS_PER_PROCESS=1"
+    assert result.truncated_reason == "hit thread cap=1"
+    assert result.truncation is not None
+    assert result.truncation.public() == {
+        "stage": "cap",
+        "link": f"0x{second + layout.thread_list_entry:016x}",
+        "ethread": None,
+        "returned": 1,
+        "reason": "hit thread cap=1",
+    }
+
+
+def test_thread_layout_refuses_nonzero_eprocess_pcb():
+    types = {
+        name: {**value, "fields": dict(value["fields"])}
+        for name, value in _THREAD_TYPES.items()
+    }
+    types["_EPROCESS"]["fields"]["Pcb"] = {"off": 0x10, "type": ""}
+    with pytest.raises(SymbolStoreError, match="EPROCESS.Pcb offset"):
+        walk._thread_layout(_ThreadStore(types))
+
+
+def test_thread_layout_rejects_boolean_or_type_width_corruption():
+    boolean_types = {
+        name: {**value, "fields": dict(value["fields"])}
+        for name, value in _THREAD_TYPES.items()
+    }
+    boolean_types["_ETHREAD"]["fields"]["Cid"] = {"off": True, "type": ""}
+    with pytest.raises(SymbolStoreError, match="invalid _ETHREAD.Cid.off"):
+        walk._thread_layout(_ThreadStore(boolean_types))
+
+    width_types = {
+        name: {**value, "fields": dict(value["fields"])}
+        for name, value in _THREAD_TYPES.items()
+    }
+    width_types["_KTHREAD"]["fields"]["State"] = {
+        "off": 0x184, "type": "unsigned long",
+    }
+    with pytest.raises(SymbolStoreError, match="KTHREAD.State declares 4 bytes"):
+        walk._thread_layout(_ThreadStore(width_types))
+
+
+def test_walk_layout_refuses_non_x64_symbol_store():
+    class X86Store(_ThreadStore):
+        def load(self, name):
+            assert name == "nt"
+            return {"architecture": "x86"}
+
+    with pytest.raises(SymbolStoreError, match="unsupported nt symbol-store architecture"):
+        walk._thread_layout(X86Store(_THREAD_TYPES))
+
+
+def _wait_layout_for_test() -> walk._WaitLayout:
+    thread = walk._thread_layout(_thread_store())
+    return walk._WaitLayout(
+        thread=thread,
+        wait_block_list=walk._ThreadField("WaitBlockList", 0xD0, 8),
+        embedded_wait_block=0x140,
+        wait_block_thread=walk._ThreadField("Thread", 0x18, 8),
+        wait_block_object=walk._ThreadField("Object", 0x20, 8),
+        dispatcher_type=walk._ThreadField("Type", 0, 1),
+        mutant_owner_thread=walk._ThreadField("OwnerThread", 0x28, 8),
+    )
+
+
+def _install_wait_reads(monkeypatch, values: dict[int, tuple[int, int]]) -> None:
+    """Install exact-width byte reads keyed by address for wait tests."""
+    def read(_vm, _cr3, address, length, *, cache):
+        value, width = values[address]
+        assert width == length
+        return value.to_bytes(width, "little")
+    monkeypatch.setattr(walk, "read_virt_cr3", read)
+    monkeypatch.setattr(
+        walk, "_read_kernel_list_head",
+        lambda *_args: (0x1AE000, 0xFFFFE001_00000000, walk.WalkCache()),
+    )
+
+
+def test_wait_object_evidence_returns_only_proven_mutant_owner_chain(monkeypatch):
+    target = _thread_target()
+    thread = ThreadRecord(
+        tid=4816, ethread=0xFFFFE001_00200000, state=5, state_name="Waiting",
+        wait_reason=29, wait_reason_name="WrMutex", priority=8, base_priority=8,
+        context_switches=1, teb=0, kernel_stack=0, stack_limit=0, stack_base=0,
+        start_address=0, win32_start_address=0, create_time=1, exit_status=259,
+    )
+    owner = 0xFFFFE001_00300000
+    mutant = 0xFFFFE001_00400000
+    layout = _wait_layout_for_test()
+    monkeypatch.setattr(walk, "_wait_layout", lambda _store: layout)
+    values = {
+        thread.ethread + 0xD0: (thread.ethread + 0x140, 8),
+        thread.ethread + 0x140 + 0x18: (thread.ethread, 8),
+        thread.ethread + 0x140 + 0x20: (mutant, 8),
+        mutant: (2, 1),
+        mutant + 0x28: (owner, 8),
+        owner + layout.thread.fields["cid"].offset: ((7212 << 64) | 4, 16),
+        owner + layout.thread.fields["process"].offset: (0xFFFFE001_00500000, 8),
+        owner + layout.thread.fields["state"].offset: (1, 1),
+    }
+    _install_wait_reads(monkeypatch, values)
+
+    result = walk.resolve_thread_wait_objects("vm", _thread_store(), target, [thread])
+
+    assert result["scope"]["waiting_threads"] == 1
+    evidence = result["records"][thread.ethread]
+    assert evidence["complete"] is True
+    assert evidence["object"] == {
+        "address": f"0x{mutant:016x}",
+        "dispatcher_type": {"raw": 2, "name": "mutant"},
+    }
+    assert evidence["owner_chain"][0]["pid"] == 4
+    assert evidence["owner_chain"][0]["tid"] == 7212
+    assert evidence["reason"] == "owner is not waiting"
+
+
+def test_wait_object_evidence_refuses_external_blocks_and_owner_cycles(monkeypatch):
+    target = _thread_target()
+    thread = ThreadRecord(
+        tid=4816, ethread=0xFFFFE001_00200000, state=5, state_name="Waiting",
+        wait_reason=29, wait_reason_name="WrMutex", priority=8, base_priority=8,
+        context_switches=1, teb=0, kernel_stack=0, stack_limit=0, stack_base=0,
+        start_address=0, win32_start_address=0, create_time=1, exit_status=259,
+    )
+    layout = _wait_layout_for_test()
+    monkeypatch.setattr(walk, "_wait_layout", lambda _store: layout)
+    _install_wait_reads(monkeypatch, {
+        thread.ethread + 0xD0: (0xFFFFE001_00BAD000, 8),
+    })
+    external = walk.resolve_thread_wait_objects("vm", _thread_store(), target, [thread])
+    assert external["records"][thread.ethread]["complete"] is False
+    assert "external/multi-object" in external["records"][thread.ethread]["reason"]
+
+    mutant = 0xFFFFE001_00400000
+    _install_wait_reads(monkeypatch, {
+        thread.ethread + 0xD0: (thread.ethread + 0x140, 8),
+        thread.ethread + 0x140 + 0x18: (thread.ethread, 8),
+        thread.ethread + 0x140 + 0x20: (mutant, 8),
+        mutant: (2, 1),
+        mutant + 0x28: (thread.ethread, 8),
+    })
+    cycle = walk.resolve_thread_wait_objects("vm", _thread_store(), target, [thread])
+    assert cycle["records"][thread.ethread]["complete"] is False
+    assert cycle["records"][thread.ethread]["reason"] == "owner chain cycle detected"
+
+
+def test_list_threads_rejects_bad_blink_with_exact_failed_entry(monkeypatch):
+    target = _thread_target()
+    layout, qwords, add, _ = _thread_backing(monkeypatch, target)
+    head = target.eprocess + layout.thread_list_head
+    ethread = 0xFFFFE001_00200000
+    link = ethread + layout.thread_list_entry
+    qwords[head] = link
+    add(ethread, head, 4816, blink=0xFFFFE001_00BAD000)
+
+    result = list_threads("vm", _thread_store(), target)
+
+    assert result.threads == []
+    assert result.complete is False
+    assert result.truncation is not None
+    assert result.truncation.stage == "entry"
+    assert result.truncation.link == link
+    assert result.truncation.ethread == ethread
+    assert "Blink" in result.truncated_reason
+
+
+def test_list_threads_rejects_bad_head_blink(monkeypatch):
+    target = _thread_target()
+    layout, qwords, add, _ = _thread_backing(monkeypatch, target)
+    head = target.eprocess + layout.thread_list_head
+    ethread = 0xFFFFE001_00200000
+    qwords[head] = ethread + layout.thread_list_entry
+    add(ethread, head, 4816)
+    qwords[head + 8] = 0xFFFFE001_00BAD000
+
+    result = list_threads("vm", _thread_store(), target)
+
+    assert [thread.tid for thread in result.threads] == [4816]
+    assert result.complete is False
+    assert result.truncation is not None
+    assert result.truncation.stage == "head"
+    assert result.truncation.link == head
+    assert "ThreadListHead Blink" in result.truncated_reason
+
+
+def test_list_threads_rejects_duplicate_live_tids(monkeypatch):
+    target = _thread_target()
+    layout, qwords, add, _ = _thread_backing(monkeypatch, target)
+    head = target.eprocess + layout.thread_list_head
+    first = 0xFFFFE001_00200000
+    second = 0xFFFFE001_00300000
+    qwords[head] = first + layout.thread_list_entry
+    add(first, second + layout.thread_list_entry, 4816)
+    add(second, head, 4816)
+
+    result = list_threads("vm", _thread_store(), target)
+
+    assert [thread.tid for thread in result.threads] == [4816]
+    assert result.complete is False
+    assert result.truncation is not None
+    assert result.truncation.stage == "identity"
+    assert result.truncation.ethread == second
+    assert "duplicate live ETHREAD client thread id 4816" == result.truncated_reason
 
 
 def test_list_threads_accepts_empty_ring(monkeypatch):
@@ -1149,9 +1365,42 @@ def test_resolve_thread_start_addresses_does_not_guess_private_or_jit(monkeypatc
         "vm", FakeStore(_THREAD_TYPES), target, [thread], cache=walk.WalkCache(),
     )
 
-    assert warnings == ()
+    assert any("VAD enrichment unavailable" in warning for warning in warnings)
     assert resolved[thread.ethread].start_address.mapping == "user_not_in_loader_module"
+    assert resolved[thread.ethread].start_address.vad == {"status": "not_checked"}
     assert resolved[thread.ethread].win32_start_address.mapping == "null"
+
+
+def test_resolve_thread_start_addresses_adds_validated_vad_without_rewriting_loader_lead(monkeypatch):
+    target = _thread_target()
+    thread = ThreadRecord(
+        tid=4816, ethread=0xFFFFE001_00200000, state=1, state_name="Ready",
+        wait_reason=0, wait_reason_name=None, priority=8, base_priority=8,
+        context_switches=0, teb=0, kernel_stack=0, stack_limit=0, stack_base=0,
+        start_address=0x00007FF7_50000000, win32_start_address=0, create_time=1,
+        exit_status=259,
+    )
+    monkeypatch.setattr(walk, "list_modules", lambda *_a, **_k: [])
+    monkeypatch.setattr(walk, "list_user_modules", lambda *_a, **_k: [])
+    import winbox.kdbg.vad as vad
+
+    record = SimpleNamespace(public=lambda: {
+        "start": "0x00007ff750000000", "end": "0x00007ff75000ffff",
+        "kind": "private", "provenance": {"layout": "exact_nt_pdb"},
+    })
+    monkeypatch.setattr(
+        vad, "lookup_addresses",
+        lambda _vm, _store, _target, addresses, **_kw: {address: record for address in addresses},
+    )
+
+    resolved, warnings = resolve_thread_start_addresses(
+        "vm", FakeStore(_THREAD_TYPES), target, [thread], cache=walk.WalkCache(),
+    )
+
+    value = resolved[thread.ethread].start_address
+    assert warnings == ()
+    assert value.mapping == "user_not_in_loader_module"
+    assert value.vad == {"status": "mapped", "record": record.public()}
 
 
 def test_list_current_vcpu_threads_validates_kpcr_prcb_and_ethread(monkeypatch):

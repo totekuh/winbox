@@ -16,14 +16,18 @@ from winbox.config import Config
 from winbox.kdbg.decomp.client import (
     DecompClient,
     DecompError,
+    backend,
     cache_dir,
     maintenance_lock,
+    project_dir as host_project_dir,
 )
+from winbox.kdbg.decomp.enrichment import ANALYSIS_PROFILE
 from winbox.kdbg.decomp.docker import project_dir
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _PROJECT = re.compile(r"^[A-Za-z0-9_]+$")
 _MAX_UNATTRIBUTED = 100
+_MAX_METADATA_BYTES = 64 * 1024
 
 
 def _safe_float(value: Any) -> float:
@@ -142,6 +146,74 @@ def _project_names(root: Path, digest: str, preferred: str = "") -> list[str]:
         if _PROJECT.fullmatch(path.stem) and path.stem not in names:
             names.append(path.stem)
     return names
+
+
+def _active_project_dir(cfg: Config) -> Path:
+    """Match the project root used by the selected worker backend."""
+    return project_dir(cfg) if backend() == "docker" else host_project_dir()
+
+
+def analysis_readiness(cfg: Config, sha256: str) -> dict[str, Any]:
+    """Whether an exact digest has a complete current-profile analysis project.
+
+    This is intentionally a cheap host-side assertion.  A missing/corrupt or
+    profile-mismatched project is *not* treated as warm merely because some
+    cache residue exists; callers can then avoid silently analyzing it while a
+    debugger has the guest stopped.
+    """
+    digest = str(sha256 or "").lower()
+    result: dict[str, Any] = {
+        "schema": "winbox.decomp-analysis-readiness/1",
+        "sha256": digest,
+        "ready": False,
+        "reason": "invalid_digest",
+        "analysis_profile": ANALYSIS_PROFILE,
+        "project_name": None,
+    }
+    if not _DIGEST.fullmatch(digest):
+        return result
+    metadata_path = cache_dir(cfg) / "metadata" / f"{digest}.json"
+    try:
+        if metadata_path.is_symlink():
+            result["reason"] = "metadata_symlink"
+            return result
+        if metadata_path.stat().st_size > _MAX_METADATA_BYTES:
+            result["reason"] = "metadata_oversized"
+            return result
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        result["reason"] = "metadata_missing"
+        return result
+    except (OSError, ValueError, TypeError):
+        result["reason"] = "metadata_invalid"
+        return result
+    if not isinstance(metadata, dict) or metadata.get("sha256") != digest:
+        result["reason"] = "metadata_identity_mismatch"
+        return result
+    name = str(metadata.get("project_name") or "")
+    result["project_name"] = name or None
+    if not _PROJECT.fullmatch(name):
+        result["reason"] = "project_name_invalid"
+        return result
+    if metadata.get("analysis_profile") != ANALYSIS_PROFILE:
+        result["reason"] = "analysis_profile_mismatch"
+        result["cached_analysis_profile"] = str(metadata.get("analysis_profile") or "")[:128]
+        return result
+    root = _active_project_dir(cfg)
+    project_file = root / f"{name}.gpr"
+    project_repo = root / f"{name}.rep"
+    if project_file.is_symlink() or project_repo.is_symlink():
+        result["reason"] = "project_symlink"
+        return result
+    if not project_file.is_file() or not project_repo.is_dir():
+        result["reason"] = "project_missing"
+        return result
+    result.update(
+        ready=True,
+        reason="ready",
+        ghidra_version=str(metadata.get("ghidra_version") or "")[:128] or None,
+    )
+    return result
 
 
 def cache_inventory(cfg: Config) -> dict[str, Any]:

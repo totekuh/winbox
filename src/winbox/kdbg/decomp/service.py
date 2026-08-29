@@ -522,6 +522,7 @@ def query_decomp(
     assembly: str = "nearby",
     instruction_bytes: bool = False,
     runtime_vas: bool = False,
+    allow_cold: bool = False,
     daemon_client: DaemonClient | None = None,
     decomp_client: DecompClient | None = None,
 ) -> dict[str, Any]:
@@ -555,6 +556,8 @@ def query_decomp(
         page_size = int(cursor_data["page_size"])
         line_range = (start, start + page_size - 1)
     assembly = _assembly_mode(assembly)
+    if not isinstance(allow_cold, bool):
+        raise DecompError("allow_cold must be a boolean", code="invalid_argument")
     daemon = daemon_client or DaemonClient(cfg)
     worker = decomp_client or DecompClient(cfg)
 
@@ -647,6 +650,23 @@ def query_decomp(
     symbol_hint = _nearest_symbol_hint(
         store, str(module.get("name", "")), rva, build=live_identity.pdb_key,
     )
+
+    from winbox.kdbg.decomp.cache import analysis_readiness
+    readiness = analysis_readiness(cfg, static_identity.sha256)
+    module_name = str(module.get("name") or "")[:260]
+    if not readiness["ready"] and not allow_cold:
+        raise DecompError(
+            "exact Ghidra analysis is cold; refusing to hold the target stopped. "
+            "Detach or continue the debugger, run kdbg_decomp_prepare for the "
+            "verified module, then retry (or set allow_cold=true explicitly).",
+            code="analysis_required", retryable=True,
+            details={
+                "module": module_name,
+                "sha256": static_identity.sha256,
+                "readiness": readiness,
+                "next_action": "kdbg_decomp_prepare",
+            },
+        )
 
     from winbox.kdbg.decomp.enrichment import enrichment_path
     sidecar = enrichment_path(cfg, static_identity.sha256)
@@ -772,6 +792,11 @@ def query_decomp(
         "runtime_symbol": runtime_symbol,
         "symbol_hint": symbol_hint,
         "next_cursor": next_cursor,
+        "analysis_admission": {
+            "policy": "allow_cold" if allow_cold else "warm_required",
+            "cache": readiness,
+            "cold_analysis": not readiness["ready"],
+        },
         **result,
         "warnings": warnings,
     }
@@ -920,6 +945,8 @@ def _format_result(
         },
         "cache_hit": result.get("cache_hit"),
         "decompile_cache_hit": result.get("decompile_cache_hit"),
+        "analysis_admission": result.get("analysis_admission"),
+        "operation_metadata": result.get("operation_metadata"),
         "warnings": result.get("warnings") or [],
     }
     if "code" in result:

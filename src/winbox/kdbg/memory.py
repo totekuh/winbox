@@ -140,6 +140,14 @@ PTE_PRESENT = 1 << 0
 PTE_LARGE = 1 << 7  # 2 MiB (PD) or 1 GiB (PDPT)
 
 
+def _is_canonical_x64_4level(va: int) -> bool:
+    """True only for the 48-bit canonical form this translator implements."""
+    if not 0 <= va < (1 << 64):
+        return False
+    sign = (va >> 47) & 1
+    return (va >> 48) == (0xFFFF if sign else 0)
+
+
 def _pte_index(va: int, level: int) -> int:
     """Extract the 9-bit index at paging level ``level`` (PML4=4..PT=1)."""
     shift = PAGE_SHIFT + 9 * (level - 1)
@@ -197,6 +205,14 @@ def virt_to_phys(
     """
     if cache is None:
         cache = WalkCache()
+
+    if isinstance(va, bool) or not isinstance(va, int) or not _is_canonical_x64_4level(va):
+        raise PageWalkError(
+            f"unsupported non-canonical/LA57 virtual address {va!r}; "
+            "the retained translator supports x64 four-level paging only"
+        )
+    if isinstance(cr3, bool) or not isinstance(cr3, int) or not 0 <= cr3 < (1 << 64):
+        raise PageWalkError("invalid x64 CR3 value")
 
     # Strip CR3's low flags (PCID bits, etc.) to get the PML4 physical base.
     pml4_pa = cr3 & ~PAGE_MASK & PHYS_ADDR_MASK

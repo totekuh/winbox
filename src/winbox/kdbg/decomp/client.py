@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from winbox.config import Config
+from winbox.kdbg.admission import OperationBusyError, active_admission, admit_operation
 from winbox.kdbg.errors import bounded_details, make_error_info, parse_error_info
 from winbox.kdbg.decomp.locking import exclusive_file_lock
 
@@ -94,6 +95,11 @@ def maintenance_lock_path(cfg: Config) -> Path:
 def maintenance_lock(cfg: Config):
     """Serialize cache mutation, worker startup, and project ownership."""
     return exclusive_file_lock(maintenance_lock_path(cfg))
+
+
+def operation_admission(cfg: Config) -> dict[str, Any] | None:
+    """Current non-queueing worker admission, independent of JVM heartbeat."""
+    return active_admission(runtime_dir(cfg), f"decomp-{protocol_family()}")
 
 
 def project_dir() -> Path:
@@ -200,13 +206,15 @@ class DecompClient:
         declared = value.get("worker_api")
         return str(declared) if declared is not None else None
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, quick: bool = False) -> dict[str, Any]:
         selected = backend()
         if selected == "docker":
             from winbox.kdbg.decomp.docker import DockerManager, project_dir as docker_projects
 
             manager = DockerManager(self.cfg)
-            result = manager.status()
+            # Doctor must stay a readiness probe, even with a wedged Docker
+            # daemon. Full status keeps the normal diagnostic timeout.
+            result = manager.status(timeout=2.0 if quick else 15.0)
             result.update({
                 "running": self.worker_alive(),
                 "active_backend": self.active_backend(),
@@ -216,6 +224,9 @@ class DecompClient:
                 "project_dir": str(docker_projects(self.cfg)),
             })
             result.update(self._session_liveness(running=result["running"]))
+            admission = operation_admission(self.cfg)
+            result["admission"] = admission
+            result["busy"] = bool(result.get("busy") or admission)
             if result["running"] and not (
                 result["active_backend"] in {None, "docker"}
                 and result["active_worker_api"] == WORKER_API
@@ -254,6 +265,9 @@ class DecompClient:
             "project_dir": str(project_dir()),
         }
         result.update(self._session_liveness(running=result["running"]))
+        admission = operation_admission(self.cfg)
+        result["admission"] = admission
+        result["busy"] = bool(result.get("busy") or admission)
         if discovery_error:
             result["error"] = discovery_error
         if result["running"] and not (
@@ -287,6 +301,41 @@ class DecompClient:
             )
 
     def call(
+        self,
+        op: str,
+        *,
+        start: bool = True,
+        timeout: float = 900.0,
+        request_id: str = "",
+        **args: Any,
+    ) -> dict[str, Any]:
+        """Run one worker operation with immediate, visible admission control."""
+        if op == "status":
+            return self._call(
+                op, start=start, timeout=timeout, request_id=request_id, **args,
+            )
+        details = {
+            "request_id": request_id[:64],
+            "binary_sha256": str(args.get("sha256") or "")[:64],
+            "binary_name": Path(str(args.get("binary_name") or "")).name[:260],
+        }
+        try:
+            with admit_operation(
+                runtime_dir(self.cfg), f"decomp-{protocol_family()}",
+                operation=op, owner="decomp_worker", details=details,
+            ) as lease:
+                result = self._call(
+                    op, start=start, timeout=timeout, request_id=request_id, **args,
+                )
+                result = dict(result)
+                result["operation_metadata"] = lease.metadata()
+                return result
+        except OperationBusyError as exc:
+            raise DecompError(
+                exc, code=exc.code, retryable=exc.retryable, details=exc.details,
+            ) from exc
+
+    def _call(
         self,
         op: str,
         *,

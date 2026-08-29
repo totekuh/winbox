@@ -1145,9 +1145,9 @@ class TestJobs:
 
 class TestKdbg:
     @staticmethod
-    def _result(tool, name, *args, **kwargs):
+    def _result(tool, tool_name, *args, **kwargs):
         """Unwrap and validate the common structured KDBG MCP envelope."""
-        response = tool(name)(*args, **kwargs)
+        response = tool(tool_name)(*args, **kwargs)
         assert response["schema"] == "winbox.mcp/1", response
         assert response["ok"] is True, response
         assert response["error"] is None, response
@@ -1265,12 +1265,196 @@ class TestKdbg:
             assert triage["current_vcpus"]
             assert triage["user_modules"]["count"] >= triage["user_modules"]["returned"]
             assert triage["unmapped_starts_scope"] == "top_rows_only"
+            normalized = triage["threads"][0]
+            assert normalized["create_time_filetime"] == normalized["create_time"]
+            assert normalized["create_time_utc"].endswith("Z")
+            assert normalized["exit_status_ntstatus"].startswith("0x")
+            assert normalized["kernel_stack_semantics"] == "KTHREAD.KernelStack field; not a saved RSP"
+            assert set(normalized["pointer_values"]) == {
+                "teb", "kernel_stack", "stack_limit", "stack_base",
+                "start_address", "win32_start_address",
+            }
 
             cli = json.loads(run("kdbg", "triage", str(pid), "--json", "--thread-limit", "16").output)
             assert cli["snapshot"] == "single_rsp_stop"
             assert cli["process"]["pid"] == pid
             assert cli["thread_summary"]["walk_complete"] is True, cli
             assert 0 < len(cli["threads"]) <= 16
+
+            global_triage = self._result(
+                tool, "kdbg_thread_triage", process_cap=128,
+                total_thread_cap=2048, sample_per_process=1, result_limit=8,
+                resolve=False, require_complete=True,
+            )
+            assert global_triage["schema"] == "winbox.kdbg-global-thread-triage/1"
+            assert global_triage["scope"]["complete"] is True, global_triage
+            assert global_triage["scope"]["process_list_complete"] is True
+            assert global_triage["scope"]["processes_examined"] > 1
+            assert global_triage["rankings"]["by_thread_count"]
+            assert global_triage["snapshot_metadata"]["admission"] == "accepted"
+
+            global_cli = json.loads(run("kdbg", "thread-triage", "--json", "--process-cap", "128",
+                "--total-thread-cap", "2048", "--sample-per-process", "1",
+                "--limit", "8", "--no-resolve", "--require-complete",
+            ).output)
+            assert global_cli["scope"]["complete"] is True, global_cli
+            assert global_cli["snapshot_metadata"]["admission"] == "accepted"
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+
+    def test_explicit_thread_baseline_and_diff_are_live_and_cleanup_host_state(self, run, tool, cfg):
+        """No polling: two requested stops and one exact temporary host file."""
+        from winbox.kdbg.thread_baseline import ThreadBaselineStore
+
+        name = f"e2e-thread-{os.getpid()}"
+        host_store = ThreadBaselineStore(cfg)
+        host_store.delete(name)
+        run("kdbg", "stop", expect_ok=False)
+        run("kdbg", "start")
+        try:
+            baseline = self._result(tool, "kdbg_thread_baseline", 4, name)
+            assert baseline["process"]["pid"] == 4
+            assert baseline["thread_count"] > 0
+
+            cli_baseline = json.loads(run("kdbg", "thread-baseline", "4", "--name", name, "--json").output)
+            assert cli_baseline["process"]["pid"] == 4
+            assert cli_baseline["thread_count"] > 0
+
+            diff = self._result(tool, "kdbg_thread_diff", 4, name, 8)
+            assert diff["schema"] == "winbox.kdbg-thread-diff/1"
+            assert diff["process"]["pid"] == 4
+            assert diff["current"]["thread_count"] > 0
+            assert diff["limit"] == 8
+            assert all(key in diff for key in ("created", "exited", "changed"))
+
+            cli_diff = json.loads(run("kdbg", "thread-diff", "4", "--name", name, "--limit", "8", "--json").output)
+            assert cli_diff["schema"] == "winbox.kdbg-thread-diff/1"
+            assert cli_diff["process"]["pid"] == 4
+        finally:
+            host_store.delete(name)
+            run("kdbg", "stop", expect_ok=False)
+
+    def test_vad_token_handle_object_and_capture_evidence_are_live(self, run, tool, cfg):
+        """Exercise the evidence surface through both transports.
+
+        The token body is deliberately obtained from the proven EPROCESS
+        token field before it is submitted to the generic object-header
+        decoder.  That keeps this a real relationship test, not a blind
+        kernel-pointer probe.
+        """
+        from winbox.kdbg.capture import CaptureStore
+
+        suffix = f"e2e-evidence-{os.getpid()}"
+        mcp_name = f"{suffix}-mcp"
+        cli_name = f"{suffix}-cli"
+        captures = CaptureStore(cfg)
+        for name in (mcp_name, cli_name):
+            captures.path(name).unlink(missing_ok=True)
+
+        run("kdbg", "stop", expect_ok=False)
+        run("kdbg", "start")
+        try:
+            pid = self._target_pid(tool)
+
+            vad = self._result(
+                tool, "kdbg_vad", pid, executable=True, limit=1,
+                probe_header=True,
+            )
+            assert vad["returned"] == len(vad["records"]) == 1, vad
+            assert vad["records"][0]["protection"]["executable"] is True
+            assert vad["snapshot_metadata"]["admission"] == "accepted"
+            cli_vad = json.loads(run("kdbg", "vad", str(pid), "--executable", "--limit", "1",
+                "--probe-header", "--json",
+            ).output)
+            assert cli_vad["returned"] == 1
+
+            token = self._result(tool, "kdbg_token", pid)
+            body = token["token"]["body"]
+            assert token["object_header"]["body"] == body
+            cli_token = json.loads(run("kdbg", "token", str(pid), "--json").output)
+            assert cli_token["token"]["body"] == body
+
+            object_header = self._result(tool, "kdbg_object", body)
+            assert object_header["body"] == body
+            cli_object = json.loads(run("kdbg", "object", body, "--json").output)
+            assert cli_object["body"] == body
+
+            handles = self._result(tool, "kdbg_handles", pid)
+            assert handles["handle_table"]["address"].startswith("0xffff")
+            assert handles["enumeration"]["available"] is False
+            cli_handles = json.loads(run("kdbg", "handles", str(pid), "--json").output)
+            assert cli_handles["handle_table"]["address"] == handles["handle_table"]["address"]
+
+            system_capture = self._result(tool, "kdbg_capture", profile="system")
+            assert system_capture["capture"]["capture"]["profile"] == "system"
+            assert system_capture["capture"]["capture"]["boot_identity"]["system"]["pid"] == 4
+
+            mcp_capture = self._result(
+                tool, "kdbg_capture", profile="process", pid=pid, name=mcp_name,
+            )
+            assert mcp_capture["saved"]["name"] == mcp_name
+            assert mcp_capture["capture"]["capture"]["profile"] == "process"
+            assert mcp_capture["capture"]["snapshot_metadata"]["phases_ms"]
+            cli_capture = json.loads(run("kdbg", "capture", "--profile", "process", "--pid", str(pid),
+                "--name", cli_name, "--json",
+            ).output)
+            assert cli_capture["saved"]["name"] == cli_name
+            assert cli_capture["capture"]["capture"]["profile"] == "process"
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+
+        try:
+            # Diff requires no RSP endpoint and must remain usable after stop.
+            diff = self._result(tool, "kdbg_capture_diff", mcp_name, cli_name, limit=8)
+            assert diff["profile"] == "process"
+            assert diff["identity_match"] is True
+            cli_diff = json.loads(run("kdbg", "capture", "diff", mcp_name, cli_name, "--limit", "8", "--json",
+            ).output)
+            assert cli_diff["identity_match"] is True
+        finally:
+            for name in (mcp_name, cli_name):
+                captures.path(name).unlink(missing_ok=True)
+
+    def test_real_mcp_stdio_evidence_surface_is_fresh(self, run):
+        """Cross the actual MCP process after registration, not its .fn shim."""
+        import anyio
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        async def exercise_server():
+            server = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "winbox", "mcp"],
+                cwd=os.getcwd(),
+                env=os.environ.copy(),
+            )
+            async with stdio_client(server) as (read_stream, write_stream):
+                async with ClientSession(
+                    read_stream, write_stream,
+                    read_timeout_seconds=timedelta(seconds=120),
+                ) as session:
+                    await session.initialize()
+                    names = {item.name for item in (await session.list_tools()).tools}
+                    assert {
+                        "kdbg_vad", "kdbg_token", "kdbg_handles", "kdbg_object",
+                        "kdbg_capture", "kdbg_capture_diff",
+                    } <= names
+                    processes = await session.call_tool("kdbg_ps", {})
+                    assert not processes.isError, processes
+                    rows = json.loads(processes.content[0].text)["result"]["processes"]
+                    pid = next(row["pid"] for row in rows if row["name"].lower() == "winlogon.exe")
+                    vad = await session.call_tool("kdbg_vad", {
+                        "pid": pid, "executable": True, "limit": 1,
+                    })
+                    assert not vad.isError, vad
+                    result = json.loads(vad.content[0].text)["result"]
+                    assert result["returned"] == 1
+                    assert result["snapshot_metadata"]["admission"] == "accepted"
+
+        run("kdbg", "stop", expect_ok=False)
+        run("kdbg", "start")
+        try:
+            anyio.run(exercise_server)
         finally:
             run("kdbg", "stop", expect_ok=False)
 

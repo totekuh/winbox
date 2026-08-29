@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import ANY, MagicMock, patch, PropertyMock
 
 import pytest
 from click.testing import CliRunner
@@ -82,7 +82,7 @@ def mock_mcp(cfg):
     # Unit tests must never touch a real VM monitor. Transaction behavior has
     # dedicated tests in test_kdbg_snapshot.py; individual MCP tests can
     # override this stub when asserting the operation boundary.
-    mcp_mod._kdbg_debug_snapshot = lambda _cfg: nullcontext()
+    mcp_mod._kdbg_debug_snapshot = lambda *_args, **_kwargs: nullcontext()
     staging_mod.prepare_user_module_manifest = lambda _cfg, _ga, _store, pid, **_kw: SimpleNamespace(
         pid=pid,
         summary=lambda: {
@@ -172,7 +172,10 @@ class TestEnsureVmReady:
              patch("winbox.mcp._kdbg_list_processes", return_value=[]):
             mock_store.return_value = MagicMock()
             result = kdbg_ps()
-        assert _mcp_result(result) == {"processes": [], "count": 0}
+        payload = _mcp_result(result)
+        assert payload["processes"] == []
+        assert payload["count"] == 0
+        assert payload["snapshot_metadata"]["admission"] == "unknown"
         vm.resume.assert_not_called()
 
     def test_paused_with_kdbg_session_refuses(self, mock_mcp):
@@ -3003,7 +3006,12 @@ class TestKdbgListTools:
         assert result["count"] == 1
         assert result["complete"] is False
         assert result["truncated_reason"] == walked.truncated_reason
-        assert result["threads"] == [{
+        assert result["truncation"] == {
+            "stage": "unknown", "link": None, "ethread": None,
+            "returned": 1,
+            "reason": walked.truncated_reason,
+        }
+        expected_legacy = {
             "tid": 4321,
             "ethread": "0xffffae0012345000",
             "state": {"raw": 5, "name": "Waiting"},
@@ -3019,7 +3027,77 @@ class TestKdbgListTools:
             "win32_start_address": "0x00007ff740001000",
             "create_time": 0x1234,
             "exit_status": 259,
-        }]
+        }
+        thread = result["threads"][0]
+        assert {key: thread[key] for key in expected_legacy} == expected_legacy
+        assert thread["create_time_filetime"] == 0x1234
+        assert thread["create_time_utc"] == "1601-01-01T00:00:00.000466Z"
+        assert (thread["exit_status_ntstatus"], thread["exit_status_name"]) == (
+            "0x00000103", "STATUS_PENDING",
+        )
+        assert thread["kernel_stack_semantics"] == "KTHREAD.KernelStack field; not a saved RSP"
+        assert thread["pointer_values"]["teb"] == "0x000000007ffde000"
+
+    def test_kdbg_threads_require_complete_returns_typed_partial_error(self, mock_mcp):
+        from winbox.kdbg.walk import ProcessRecord, ThreadWalkResult
+        from winbox.mcp import kdbg_threads
+
+        _, _, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+        target = ProcessRecord(
+            pid=1234, name="target.exe", eprocess=0xffffae00abcdef00,
+            directory_table_base=0x7fa000, create_time=0x11223344,
+        )
+        walked = ThreadWalkResult(
+            threads=[], complete=False, truncated_reason="ThreadListHead contained a null link",
+        )
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_list_threads", return_value=walked):
+            result = kdbg_threads(1234, require_complete=True)
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "incomplete_result"
+        assert result["error"]["retryable"] is True
+        assert result["error"]["details"]["truncation"]["reason"] == walked.truncated_reason
+
+    def test_kdbg_global_thread_triage_forwards_bounds_and_snapshot_metadata(self, mock_mcp):
+        from winbox.mcp import kdbg_thread_triage
+
+        expected = {
+            "schema": "winbox.kdbg-global-thread-triage/1",
+            "scope": {"complete": True, "reasons": []},
+            "rankings": {},
+        }
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_triage_all_process_threads", return_value=expected) as triage:
+            result = _mcp_result(kdbg_thread_triage(
+                process_cap=7, total_thread_cap=99, sample_per_process=3,
+                result_limit=5, resolve=False,
+            ))
+
+        assert result["snapshot_metadata"]["admission"] == "unknown"
+        assert triage.call_args.kwargs == {
+            "cache": ANY, "process_cap": 7, "total_thread_cap": 99,
+            "sample_per_process": 3, "result_limit": 5, "resolve": False,
+        }
+
+    def test_kdbg_global_thread_triage_require_complete_is_typed(self, mock_mcp):
+        from winbox.mcp import kdbg_thread_triage
+
+        expected = {
+            "schema": "winbox.kdbg-global-thread-triage/1",
+            "scope": {"complete": False, "reasons": ["process cap"]},
+            "rankings": {},
+        }
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_triage_all_process_threads", return_value=expected):
+            result = kdbg_thread_triage(require_complete=True)
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "incomplete_result"
+        assert result["error"]["details"]["scope_complete"] is False
+        assert result["error"]["details"]["scope_reasons"] == expected["scope"]["reasons"]
 
     def test_kdbg_threads_rejects_missing_pid_without_walking(self, mock_mcp):
         from winbox.mcp import kdbg_threads
@@ -3098,6 +3176,68 @@ class TestKdbgListTools:
             "in_target_process": True, "reason": None,
         }]
 
+    def test_kdbg_threads_wait_objects_preloads_layouts_and_preserves_evidence(self, mock_mcp):
+        from winbox.kdbg.walk import ProcessRecord, ThreadRecord, ThreadWalkResult
+        from winbox.mcp import kdbg_threads
+
+        _, _, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+        target = ProcessRecord(1234, "target.exe", 0xffffae00abcdef00, 0x7fa000)
+        thread = ThreadRecord(
+            tid=4321, ethread=0xffffae0012345000, state=5, state_name="Waiting",
+            wait_reason=6, wait_reason_name="UserRequest", priority=13, base_priority=8,
+            context_switches=1, teb=0, kernel_stack=0, stack_limit=0, stack_base=0,
+            start_address=0, win32_start_address=0, create_time=0, exit_status=0,
+        )
+        evidence = {
+            "scope": {
+                "waiting_threads": 1, "examined": 1, "output_truncated": False,
+                "wait_object_limit": 1, "wait_owner_depth": 2,
+                "external_wait_blocks": "not_chased", "owner_relation": "mutant_only",
+            },
+            "records": {thread.ethread: {"complete": True, "owner_chain": []}},
+        }
+        with patch("winbox.mcp._kdbg_get_store") as store, \
+             patch("winbox.mcp._kdbg_ensure_types_loaded") as ensure, \
+             patch("winbox.mcp._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_list_threads", return_value=ThreadWalkResult([thread], True)), \
+             patch("winbox.mcp._kdbg_resolve_thread_wait_objects", return_value=evidence) as resolved, \
+             patch("winbox.mcp._kdbg_list_current_vcpu_threads", return_value=[]):
+            result = _mcp_result(kdbg_threads(
+                1234, wait_objects=True, wait_object_limit=1, wait_owner_depth=2,
+            ))
+
+        ensure.assert_called_once_with(
+            cfg, store.return_value,
+            ["_KWAIT_BLOCK", "_DISPATCHER_HEADER", "_KMUTANT"], module="nt",
+        )
+        assert resolved.call_args.kwargs["limit"] == 1
+        assert resolved.call_args.kwargs["owner_depth"] == 2
+        assert result["wait_objects"]["enabled"] is True
+        assert result["threads"][0]["wait_object"] == evidence["records"][thread.ethread]
+
+    def test_kdbg_threads_wait_objects_refuse_summary_before_snapshot(self, mock_mcp):
+        from winbox.mcp import kdbg_threads
+
+        with patch("winbox.mcp._kdbg_debug_snapshot") as snapshot, \
+             patch("winbox.mcp._kdbg_ensure_types_loaded") as ensure:
+            error = _mcp_error(kdbg_threads(1234, detail="summary", wait_objects=True))
+
+        assert error["code"] == "invalid_argument"
+        assert "requires detail='full'" in error["message"]
+        ensure.assert_not_called()
+        snapshot.assert_not_called()
+
+    def test_kdbg_threads_wait_object_bounds_refuse_before_snapshot(self, mock_mcp):
+        from winbox.mcp import kdbg_threads
+
+        with patch("winbox.mcp._kdbg_debug_snapshot") as snapshot:
+            error = _mcp_error(kdbg_threads(1234, wait_object_limit=0))
+
+        assert error["code"] == "invalid_argument"
+        assert "between 1 and 128" in error["message"]
+        snapshot.assert_not_called()
+
     def test_kdbg_threads_rejects_invalid_bounded_view(self, mock_mcp):
         from winbox.kdbg.walk import ProcessRecord, ThreadWalkResult
         from winbox.mcp import kdbg_threads
@@ -3127,14 +3267,14 @@ class TestKdbgListTools:
             "cet": {"safe_for_debug": True, "summary": "safe", "error": None},
             "symbols": {"nt": {"identity": "cached_unverified", "live_base": "not_checked"}},
             "debugger": {"state": "stopped", "owner": None},
-            "mcp": {"catalog_revision": "test", "tool_count": 83},
+            "mcp": {"catalog_revision": "test", "tool_count": 85},
             "notes": [],
         }
         with patch("winbox.mcp._kdbg_collect_doctor", return_value=report) as doctor:
             result = _mcp_result(kdbg_doctor())
 
         assert result is report
-        assert doctor.call_args.kwargs["tool_count"] == 83
+        assert doctor.call_args.kwargs["tool_count"] == 92
 
     def test_kdbg_triage_is_single_snapshot_and_bounds_unmapped_leads(self, mock_mcp):
         from contextlib import nullcontext
@@ -3200,6 +3340,58 @@ class TestKdbgListTools:
         error = _mcp_error(kdbg_triage(1234, thread_limit=65))
         assert error["code"] == "invalid_argument"
         assert "between 1 and 64" in error["message"]
+
+    def test_kdbg_thread_baseline_captures_once_then_saves_host_state(self, mock_mcp):
+        from winbox.mcp import kdbg_thread_baseline
+
+        _, _, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+        baseline = MagicMock()
+        capture = object()
+        baseline.save.return_value = {"name": "case", "thread_count": 3}
+        with patch("winbox.mcp._KdbgThreadBaselineStore", return_value=baseline), \
+             patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_capture_thread_baseline", return_value=capture) as collected:
+            result = _mcp_result(kdbg_thread_baseline(1234, name="case"))
+
+        assert result["name"] == "case"
+        assert result["thread_count"] == 3
+        assert result["snapshot_metadata"]["admission"] == "unknown"
+        collected.assert_called_once()
+        baseline.validate_name.assert_called_once_with("case")
+        baseline.save.assert_called_once_with("case", capture)
+
+    def test_kdbg_thread_diff_checks_missing_baseline_before_stopping_vm(self, mock_mcp):
+        from winbox.kdbg.thread_baseline import BaselineNotFoundError
+        from winbox.mcp import kdbg_thread_diff
+
+        baseline = MagicMock()
+        baseline.load.side_effect = BaselineNotFoundError("baseline 'case' was not found")
+        with patch("winbox.mcp._KdbgThreadBaselineStore", return_value=baseline), \
+             patch("winbox.mcp._kdbg_debug_snapshot") as snapshot, \
+             patch("winbox.mcp._kdbg_capture_thread_baseline") as collected:
+            error = _mcp_error(kdbg_thread_diff(1234, name="case"))
+
+        assert error["code"] == "baseline_not_found"
+        snapshot.assert_not_called()
+        collected.assert_not_called()
+
+    def test_kdbg_thread_diff_returns_bounded_delta_contract(self, mock_mcp):
+        from winbox.mcp import kdbg_thread_diff
+
+        _, _, cfg = mock_mcp
+        cfg.vm_name = "winbox"
+        baseline = MagicMock()
+        capture = object()
+        baseline.diff.return_value = {"created_count": 0, "exited_count": 0, "changed_count": 1}
+        with patch("winbox.mcp._KdbgThreadBaselineStore", return_value=baseline), \
+             patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_capture_thread_baseline", return_value=capture):
+            result = _mcp_result(kdbg_thread_diff(1234, name="case", limit=8))
+
+        assert result["changed_count"] == 1
+        baseline.load.assert_called_once_with("case")
+        baseline.diff.assert_called_once_with("case", capture, limit=8)
 
     def test_kdbg_lm_returns_json_array(self, mock_mcp):
         import json as _json
@@ -3350,6 +3542,76 @@ class TestKdbgListTools:
 
         assert _mcp_result(result)["bytes"] == "4f4b"
         assert events == ["enter", "find", "read", "exit"]
+
+
+class TestKdbgEvidenceTools:
+    """MCP adapter contracts for the bounded evidence/capture surface."""
+
+    @staticmethod
+    def _target():
+        from winbox.kdbg.walk import ProcessRecord
+
+        return ProcessRecord(
+            pid=1234, name="target.exe", eprocess=0xffffae00abcdef00,
+            directory_table_base=0x7fa000, create_time=1,
+        )
+
+    def test_vad_token_handles_and_object_preserve_provenance(self, mock_mcp):
+        from winbox.mcp import kdbg_handles, kdbg_object, kdbg_token, kdbg_vad
+
+        target = self._target()
+        walked = SimpleNamespace(public=lambda: {
+            "records": [{"start": "0x0000000010000000", "protection": {"executable": True}}],
+            "returned": 1, "complete": True, "truncation": None,
+        })
+        token = {"token": {"body": "0xffff800000123450"}, "object_header": {"body": "0xffff800000123450"}}
+        handles = {"handle_table": {"address": "0xffff800000223000"}, "enumeration": {"available": False}}
+        header = SimpleNamespace(public=lambda: {"body": "0xffff800000123450", "type_index": 5})
+
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_ensure_vad_layouts"), \
+             patch("winbox.mcp._kdbg_ensure_object_layouts"), \
+             patch("winbox.mcp._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_list_vads", return_value=walked) as listed, \
+             patch("winbox.mcp._kdbg_token_evidence", return_value=token), \
+             patch("winbox.mcp._kdbg_handle_table_status", return_value=handles), \
+             patch("winbox.mcp._kdbg_object_header", return_value=header):
+            vad = _mcp_result(kdbg_vad(1234, executable=True, limit=1))
+            primary = _mcp_result(kdbg_token(1234))
+            table = _mcp_result(kdbg_handles(1234))
+            object_result = _mcp_result(kdbg_object("0xffff800000123450"))
+
+        assert vad["returned"] == 1 and vad["snapshot_metadata"]["admission"] == "unknown"
+        assert listed.call_args.kwargs["executable_only"] is True
+        assert primary["token"]["body"] == object_result["body"]
+        assert table["enumeration"]["available"] is False
+
+    def test_capture_and_offline_diff_are_separate_boundaries(self, mock_mcp):
+        from winbox.mcp import kdbg_capture, kdbg_capture_diff
+
+        capture = {
+            "schema": "winbox.kdbg-capture/1", "capture": {"profile": "process"},
+            "snapshot_metadata": {"phases_ms": {"capture": 1.0}},
+        }
+        expected_diff = {"schema": "winbox.kdbg-capture-diff/1", "profile": "process", "identity_match": True}
+        with patch("winbox.mcp._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_capture_live", return_value=capture) as live:
+            result = _mcp_result(kdbg_capture(profile="process", pid=1234))
+        assert result == {"capture": capture, "saved": None}
+        assert live.call_args.kwargs == {
+            "profile": "process", "pid": 1234, "require_complete": False,
+        }
+
+        capture_store = MagicMock()
+        capture_store.load.side_effect = [{"schema": "left"}, {"schema": "right"}]
+        with patch("winbox.mcp._KdbgCaptureStore", return_value=capture_store), \
+             patch("winbox.mcp._kdbg_diff_captures", return_value=expected_diff) as diff:
+            result = _mcp_result(kdbg_capture_diff("left", "right", limit=8))
+        assert result == expected_diff
+        diff.assert_called_once_with(
+            {"schema": "left"}, {"schema": "right"}, limit=8,
+            allow_identity_mismatch=False,
+        )
 
 
 # ─── kdbg session daemon tools (Tool 14) ───────────────────────────────────

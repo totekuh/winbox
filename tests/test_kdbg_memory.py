@@ -200,3 +200,10 @@ def test_page_walk_error_on_missing_pml4e(fake_mem):
     from winbox.kdbg.memory import PageWalkError
     with pytest.raises(PageWalkError):
         virt_to_phys("vm", cr3=0x200000, va=0x7FF600000000)
+
+
+@pytest.mark.parametrize("va", [0x0001_0000_0000_0000, 0x00FF_8000_0000_0000, -1])
+def test_page_walker_refuses_noncanonical_or_la57_addresses(fake_mem, va):
+    from winbox.kdbg.memory import PageWalkError
+    with pytest.raises(PageWalkError, match="four-level paging only"):
+        virt_to_phys("vm", cr3=0x200000, va=va)

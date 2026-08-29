@@ -51,6 +51,7 @@ from winbox.kdbg.debugger.reader import (
     ReaderError,
     debug_snapshot,
     reader_info,
+    snapshot_metadata as _snapshot_metadata,
     stop_reader,
 )
 from winbox.kdbg.debugger.protocol import WATCHPOINT_SIZES, WATCHPOINT_TYPES
@@ -64,6 +65,36 @@ from winbox.kdbg.cet import (
 )
 from winbox.kdbg.doctor import collect_doctor
 from winbox.kdbg.format import format_struct as _format_struct, format_sym as _format_sym
+from winbox.kdbg.presentation import filetime_utc, thread_presentation_fields
+from winbox.kdbg.thread_baseline import (
+    ThreadBaselineError,
+    ThreadBaselineStore,
+    capture_threads as capture_thread_baseline,
+)
+from winbox.kdbg.thread_triage import (
+    GlobalThreadTriageError,
+    GlobalThreadTriageIncomplete,
+    triage_all_process_threads,
+)
+from winbox.kdbg.capture import (
+    CaptureError,
+    CaptureStore,
+    capture_live,
+    diff_captures,
+)
+from winbox.kdbg.objects import (
+    ObjectEvidenceError,
+    ensure_object_layouts,
+    handle_table_status,
+    object_header,
+    token_evidence,
+)
+from winbox.kdbg.vad import (
+    VadError,
+    ensure_vad_layouts,
+    list_vads,
+    lookup_vad,
+)
 from winbox.kdbg.hmp import (
     HmpError,
     ensure_not_paused,
@@ -71,21 +102,22 @@ from winbox.kdbg.hmp import (
     probe_port,
 )
 from winbox.kdbg.walk import (
+    ThreadWalkIncomplete,
     find_process,
     list_current_vcpu_threads,
     list_modules,
     list_processes,
     list_threads,
     list_user_modules,
+    resolve_thread_wait_objects,
     resolve_thread_start_addresses,
     select_threads,
+    thread_walk_truncation,
 )
 from winbox.vm import VM, GuestAgent, VMState
 from winbox import __version__
+from winbox.kdbg.catalog import MCP_CATALOG_REVISION, MCP_TOOL_COUNT
 
-
-_MCP_CATALOG_REVISION = "2026-08-27.kdbg-doctor-triage.1"
-_MCP_TOOL_COUNT = 83
 
 # Use the canonical HMP wrapper in tuple-mode for start/stop/status so the
 # raw virsh stderr lands in the user's terminal verbatim — the default
@@ -253,17 +285,18 @@ def kdbg_cet_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
 
 @kdbg.command("doctor")
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.option("--verbose", is_flag=True, help="Show active admission and recent metadata-only operations.")
 @click.option("--port", default=1234, show_default=True, help="GDB stub port to inspect.")
 @click.pass_context
-def kdbg_doctor(ctx: click.Context, as_json: bool, port: int) -> None:
+def kdbg_doctor(ctx: click.Context, as_json: bool, verbose: bool, port: int) -> None:
     """Report kdbg readiness without attaching to or stopping the guest."""
     import json as _json
 
     cfg: Config = ctx.obj["cfg"]
     report = collect_doctor(
         cfg, VM(cfg), GuestAgent(cfg), port=port,
-        catalog_revision=_MCP_CATALOG_REVISION,
-        tool_count=_MCP_TOOL_COUNT,
+        catalog_revision=MCP_CATALOG_REVISION,
+        tool_count=MCP_TOOL_COUNT,
         version=__version__,
     )
     if as_json:
@@ -289,6 +322,42 @@ def kdbg_doctor(ctx: click.Context, as_json: bool, port: int) -> None:
     )
     mcp = report["mcp"]
     console.print(f"  MCP: {mcp['version']} / {mcp['catalog_revision']} ({mcp['tool_count']} tools)")
+    decomp = report["decomp"]
+    decomp_status = "ready" if decomp["available"] else f"unavailable — {decomp['reason']}"
+    console.print(f"  decomp: {decomp_status}")
+    if decomp.get("next_action"):
+        console.print(f"    next: {decomp['next_action']}")
+    runtime = report["runtime"]
+    if not runtime["version_consistent"]:
+        console.print(
+            "[yellow][!][/] runtime/distribution/source versions differ; "
+            "reload or reinstall before trusting a stale catalog[/]"
+        )
+    capabilities = report["capabilities"]
+    console.print(
+        "  capabilities: " + ", ".join(
+            f"{name}={'yes' if item['available'] else 'no'}"
+            for name, item in capabilities.items()
+        )
+    )
+    operations = report["operations"]
+    timing = operations["stop_duration_ms"]
+    console.print(
+        f"  recent operations: {operations['record_count']}/{operations['retention']} "
+        f"(stop p50={timing['p50']} ms p95={timing['p95']} ms)"
+    )
+    captures = report["captures"]
+    console.print(f"  captures: {captures['count']}")
+    if verbose:
+        active = debugger.get("reader", {}) or {}
+        if active.get("snapshot"):
+            console.print(f"  active snapshot admission: {active['snapshot']}")
+        for record in operations["recent"]:
+            snapshot = record.get("snapshot", {})
+            console.print(
+                f"    {record.get('at')} {record.get('operation')} {record.get('outcome')} "
+                f"{snapshot.get('stop_duration_ms')}ms/{snapshot.get('read_count')} reads"
+            )
 
 
 @kdbg.command("prepare")
@@ -484,6 +553,256 @@ def kdbg_ps(ctx: click.Context) -> None:
     console.print(f"[dim]({len(procs)} processes)[/]")
 
 
+@kdbg.command("vad")
+@click.argument("pid", type=int)
+@click.option("--address", type=str, help="Resolve one canonical user virtual address.")
+@click.option("--executable", is_flag=True, help="Return executable mappings only in map mode.")
+@click.option("--limit", type=click.IntRange(1, 4096), default=128, show_default=True)
+@click.option("--probe-header", is_flag=True, help="Probe each returned range base for MZ evidence.")
+@click.option("--require-complete", is_flag=True, help="Refuse a map prefix at a cap/corruption boundary.")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_vad(
+    ctx: click.Context, pid: int, address: str | None, executable: bool, limit: int,
+    probe_header: bool, require_complete: bool, as_json: bool,
+) -> None:
+    """Resolve one user VAD or list a bounded executable VAD map."""
+    import json as _json
+
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+    parsed: int | None = None
+    if address:
+        try:
+            parsed = int(address, 0)
+        except ValueError as exc:
+            raise click.BadParameter(f"invalid address: {address}") from exc
+    try:
+        store = _get_store(cfg)
+        ensure_vad_layouts(cfg, store)
+        with debug_snapshot(cfg, operation="vad") as snapshot:
+            cache = WalkCache()
+            target = find_process(cfg.vm_name, store, pid=pid, cache=cache)
+            if target is None:
+                raise VadError(f"pid {pid} not found")
+            if parsed is not None:
+                record = lookup_vad(
+                    cfg.vm_name, store, target, parsed, cache=cache,
+                    probe_header=probe_header,
+                )
+                payload = {
+                    "pid": pid, "address": f"0x{parsed:016x}", "found": record is not None,
+                    "vad": record.public() if record else None, "complete": True,
+                }
+            else:
+                walked = list_vads(
+                    cfg.vm_name, store, target, cache=cache, executable_only=executable,
+                    limit=limit, probe_header=probe_header,
+                )
+                if require_complete and not walked.complete:
+                    raise VadError(f"incomplete VAD map: {walked.truncation}")
+                payload = {"pid": pid, "executable_only": executable, **walked.public()}
+            payload["snapshot_metadata"] = _snapshot_metadata(snapshot)
+    except (VadError, SymbolStoreError, HmpError, ReaderError) as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(payload, indent=2))
+        return
+    if parsed is not None:
+        if payload["vad"] is None:
+            console.print(f"[yellow][!][/] 0x{parsed:x} is not covered by a validated user VAD")
+        else:
+            record = payload["vad"]
+            console.print(f"0x{parsed:016x} -> {record['kind']} {record['start']}..{record['end']}")
+            console.print(f"  protection: {record['protection']['name'] or record['protection']['raw']}")
+        return
+    console.print(f"[dim]pid {pid}: {payload['returned']} VAD row(s); complete={payload['complete']}[/]")
+    for record in payload["records"]:
+        protection = record["protection"]["name"] or str(record["protection"]["raw"])
+        console.print(f"  {record['start']}..{record['end']}  {record['kind']:11}  {protection}")
+    if not payload["complete"]:
+        console.print(f"[yellow][!][/] VAD map incomplete: {payload['truncation']}")
+
+
+@kdbg.command("token")
+@click.argument("pid", type=int)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_token(ctx: click.Context, pid: int, as_json: bool) -> None:
+    """Show exact-PDB primary-token identity and raw privilege masks."""
+    import json as _json
+
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+    try:
+        store = _get_store(cfg)
+        ensure_object_layouts(cfg, store)
+        with debug_snapshot(cfg, operation="token") as snapshot:
+            target = find_process(cfg.vm_name, store, pid=pid, cache=WalkCache())
+            if target is None:
+                raise ObjectEvidenceError(f"pid {pid} not found")
+            payload = token_evidence(cfg.vm_name, store, target)
+            payload["snapshot_metadata"] = _snapshot_metadata(snapshot)
+    except (ObjectEvidenceError, SymbolStoreError, HmpError, ReaderError) as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(payload, indent=2))
+        return
+    token = payload["token"]
+    console.print(f"pid {payload['process']['pid']} ({payload['process']['name']}) token {token['body']}")
+    console.print(f"  token-id={token['token_id']} auth-id={token['authentication_id']} session={token['session_id']}")
+    console.print(f"  privileges: present={token['privileges']['present']} enabled={token['privileges']['enabled']}")
+
+
+@kdbg.command("handles")
+@click.argument("pid", type=int)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_handles(ctx: click.Context, pid: int, as_json: bool) -> None:
+    """Show validated handle-table root and enumeration support state."""
+    import json as _json
+
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+    try:
+        store = _get_store(cfg)
+        ensure_object_layouts(cfg, store)
+        with debug_snapshot(cfg, operation="handles") as snapshot:
+            target = find_process(cfg.vm_name, store, pid=pid, cache=WalkCache())
+            if target is None:
+                raise ObjectEvidenceError(f"pid {pid} not found")
+            payload = handle_table_status(cfg.vm_name, store, target)
+            payload["snapshot_metadata"] = _snapshot_metadata(snapshot)
+    except (ObjectEvidenceError, SymbolStoreError, HmpError, ReaderError) as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(payload, indent=2))
+        return
+    table = payload["handle_table"]
+    console.print(f"pid {pid}: handle table {table['address']} level={table['level']} root={table['root']}")
+    state = payload["enumeration"]
+    console.print(f"  enumeration: {'available' if state['available'] else 'refused'} — {state['reason']}")
+
+
+@kdbg.command("object")
+@click.argument("body", type=str)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_object(ctx: click.Context, body: str, as_json: bool) -> None:
+    """Decode the header of a caller-proven kernel object body pointer."""
+    import json as _json
+
+    try:
+        pointer = int(body, 0)
+    except ValueError as exc:
+        raise click.BadParameter(f"invalid object body: {body}") from exc
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+    try:
+        store = _get_store(cfg)
+        ensure_object_layouts(cfg, store)
+        with debug_snapshot(cfg, operation="object") as snapshot:
+            payload = object_header(cfg.vm_name, store, pointer).public()
+            payload["snapshot_metadata"] = _snapshot_metadata(snapshot)
+    except (ObjectEvidenceError, SymbolStoreError, HmpError, ReaderError) as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(payload, indent=2))
+        return
+    console.print(f"object {payload['body']} header={payload['header']} type-index={payload['type_index']}")
+
+
+@kdbg.group("capture", invoke_without_command=True)
+@click.option("--profile", type=click.Choice(["process", "system"]), default="process", show_default=True)
+@click.option("--pid", type=int, help="Target PID (required for --profile process).")
+@click.option("--name", help="Optional bounded host-side capture name.")
+@click.option("--require-complete", is_flag=True, help="Refuse explicit partial capture evidence.")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_capture(
+    ctx: click.Context, profile: str, pid: int | None, name: str | None,
+    require_complete: bool, as_json: bool,
+) -> None:
+    """Capture one immutable process/system research artifact; `capture diff` is offline."""
+    import json as _json
+
+    if ctx.invoked_subcommand is not None:
+        return
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+    try:
+        store = _get_store(cfg)
+        capture = capture_live(
+            cfg, store, profile=profile, pid=pid, require_complete=require_complete,
+        )
+        saved = CaptureStore(cfg).save(name, capture) if name else None
+        payload = {"capture": capture, "saved": saved}
+    except (CaptureError, VadError, ObjectEvidenceError, SymbolStoreError, HmpError, ReaderError) as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(payload, indent=2))
+        return
+    capture_info = capture["capture"]
+    console.print(f"[green][+][/] captured {capture_info['profile']} evidence; complete={capture_info['complete']}")
+    if saved:
+        console.print(f"  saved: {saved['name']} -> {saved['path']}")
+    metadata = capture["snapshot_metadata"]
+    console.print(f"  stop: {metadata.get('stop_duration_ms')} ms, {metadata.get('read_count')} reads")
+
+
+@kdbg_capture.command("diff")
+@click.argument("left")
+@click.argument("right")
+@click.option("--limit", type=click.IntRange(1, 1024), default=128, show_default=True)
+@click.option("--allow-identity-mismatch", is_flag=True, help="Permit a forensic comparison across different capture identities.")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_capture_diff(
+    ctx: click.Context, left: str, right: str, limit: int,
+    allow_identity_mismatch: bool, as_json: bool,
+) -> None:
+    """Diff two named capture artifacts entirely offline."""
+    import json as _json
+
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        store = CaptureStore(cfg)
+        payload = diff_captures(
+            store.load(left), store.load(right), limit=limit,
+            allow_identity_mismatch=allow_identity_mismatch,
+        )
+    except CaptureError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(payload, indent=2))
+        return
+    console.print(f"capture diff ({payload['profile']}): identity_match={payload['identity_match']}")
+    for key, value in payload.items():
+        if isinstance(value, dict) and {"created", "removed", "changed"} <= set(value):
+            console.print(f"  {key}: +{len(value['created'])} -{len(value['removed'])} ~{len(value['changed'])}")
+
+
 def _thread_address_json(attribution) -> dict:
     """Serialize a conservative start-address attribution."""
     result = {
@@ -506,6 +825,8 @@ def _thread_address_json(attribution) -> dict:
             if attribution.symbol_offset is not None else None
         ),
     }
+    if getattr(attribution, "vad", None) is not None:
+        result["vad"] = attribution.vad
     return result
 
 
@@ -523,7 +844,9 @@ def _current_vcpu_json(record) -> dict:
     }
 
 
-def _thread_json_record(thread, *, attribution=None, running_on_vcpus=()) -> dict:
+def _thread_json_record(
+    thread, *, attribution=None, running_on_vcpus=(), wait_evidence=None,
+) -> dict:
     """Render a ThreadRecord without losing raw scheduler enum values."""
     result = {
         "tid": thread.tid,
@@ -545,6 +868,7 @@ def _thread_json_record(thread, *, attribution=None, running_on_vcpus=()) -> dic
         "create_time": thread.create_time,
         "exit_status": thread.exit_status,
     }
+    result.update(thread_presentation_fields(thread))
     if attribution is not None:
         result["start_attribution"] = {
             "start_address": _thread_address_json(attribution.start_address),
@@ -554,6 +878,8 @@ def _thread_json_record(thread, *, attribution=None, running_on_vcpus=()) -> dic
         }
     if running_on_vcpus:
         result["running_on_vcpus"] = list(running_on_vcpus)
+    if wait_evidence is not None:
+        result["wait_object"] = wait_evidence
     return result
 
 
@@ -596,6 +922,22 @@ def _thread_address_text(address: int, attribution) -> str:
     "--current/--no-current", "include_current", default=True, show_default=True,
     help="Map each halted vCPU to its validated current ETHREAD.",
 )
+@click.option(
+    "--wait-objects", is_flag=True,
+    help="Resolve exact-PDB wait-object and mutant-owner evidence for returned Waiting rows.",
+)
+@click.option(
+    "--wait-object-limit", type=click.IntRange(1, 128), default=32, show_default=True,
+    help="Maximum Waiting rows receiving wait-object evidence.",
+)
+@click.option(
+    "--wait-owner-depth", type=click.IntRange(1, 4), default=2, show_default=True,
+    help="Maximum proven mutant-owner hops per Waiting row.",
+)
+@click.option(
+    "--require-complete", is_flag=True,
+    help="Refuse a validated partial kernel-list prefix instead of returning it.",
+)
 @click.pass_context
 def kdbg_threads(
     ctx: click.Context,
@@ -608,6 +950,10 @@ def kdbg_threads(
     limit: int,
     resolve_addresses: bool,
     include_current: bool,
+    wait_objects: bool,
+    wait_object_limit: int,
+    wait_owner_depth: int,
+    require_complete: bool,
 ) -> None:
     """Walk EPROCESS.ThreadListHead for PID without entering the guest.
 
@@ -621,8 +967,30 @@ def kdbg_threads(
         console.print(f"[red][-][/] VM not running ({vm.state().value})")
         raise SystemExit(1)
 
+    if wait_objects and detail != "full":
+        console.print("[red][-][/] --wait-objects requires --detail full")
+        raise SystemExit(1)
+    if wait_objects:
+        try:
+            # PDB extraction is host-side work. Finish it before the reader
+            # stops Windows; the snapshot consumes only exact cached layouts.
+            ensure_types_loaded(
+                cfg, _get_store(cfg),
+                ["_KWAIT_BLOCK", "_DISPATCHER_HEADER", "_KMUTANT"], module="nt",
+            )
+        except (SymbolStoreError, SymbolLoadError) as exc:
+            console.print(f"[red][-][/] wait-object layouts unavailable: {exc}")
+            raise SystemExit(1)
+    if resolve_addresses:
+        try:
+            ensure_vad_layouts(cfg, _get_store(cfg))
+        except (VadError, SymbolStoreError, SymbolLoadError):
+            # Preserve the loader result when optional VAD enrichment is
+            # unavailable; the resolver returns a visible boundary.
+            pass
+
     try:
-        with debug_snapshot(cfg):
+        with debug_snapshot(cfg) as snapshot:
             store = _get_store(cfg)
             cache = WalkCache()
             target = find_process(cfg.vm_name, store, pid=pid, cache=cache)
@@ -630,6 +998,8 @@ def kdbg_threads(
                 console.print(f"[red][-][/] pid {pid} not found in process list")
                 raise SystemExit(1)
             result = list_threads(cfg.vm_name, store, target, cache=cache)
+            if require_complete and not result.complete:
+                raise ThreadWalkIncomplete(result)
             selected = select_threads(
                 result.threads, state=state, wait_reason=wait_reason,
                 sort=sort, limit=limit,
@@ -641,6 +1011,15 @@ def kdbg_threads(
                 attributions, attribution_warnings = resolve_thread_start_addresses(
                     cfg.vm_name, store, target, displayed, cache=cache,
                 )
+            wait_view = {"enabled": False}
+            wait_records: dict[int, dict] = {}
+            if wait_objects:
+                wait_result = resolve_thread_wait_objects(
+                    cfg.vm_name, store, target, displayed, cache=cache,
+                    limit=wait_object_limit, owner_depth=wait_owner_depth,
+                )
+                wait_view = {"enabled": True, **wait_result["scope"]}
+                wait_records = wait_result["records"]
             current_vcpus = []
             current_vcpus_error = None
             if include_current:
@@ -653,7 +1032,23 @@ def kdbg_threads(
                     # stop in an unusual GS/KPCR state. Make that absence
                     # visible rather than failing a completed ETHREAD list.
                     current_vcpus_error = str(exc)
-    except (SymbolStoreError, HmpError, ReaderError) as e:
+            snapshot_metadata = _snapshot_metadata(snapshot)
+    except ThreadWalkIncomplete as e:
+        if as_json:
+            import json as _json
+            click.echo(_json.dumps({
+                "ok": False,
+                "error": {
+                    "code": e.code,
+                    "retryable": e.retryable,
+                    "message": str(e),
+                    "details": e.details,
+                },
+            }, indent=2))
+        else:
+            console.print(f"[red][-][/] {e}")
+        raise SystemExit(1)
+    except (VadError, SymbolStoreError, HmpError, ReaderError) as e:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
 
@@ -667,11 +1062,14 @@ def kdbg_threads(
         "name": target.name,
         "eprocess": f"0x{target.eprocess:016x}",
         "process_create_time": target.create_time,
+        "process_create_time_filetime": target.create_time,
+        "process_create_time_utc": filetime_utc(target.create_time),
         "threads": [
             _thread_json_record(
                 thread,
                 attribution=attributions.get(thread.ethread),
                 running_on_vcpus=running_by_ethread.get(thread.ethread, ()),
+                wait_evidence=wait_records.get(thread.ethread),
             )
             for thread in displayed
         ],
@@ -693,7 +1091,10 @@ def kdbg_threads(
         "complete": result.complete,
         "walk_complete": result.complete,
         "truncated_reason": result.truncated_reason,
+        "truncation": thread_walk_truncation(result),
         "current_vcpus": [_current_vcpu_json(current) for current in current_vcpus],
+        "wait_objects": wait_view,
+        "snapshot_metadata": snapshot_metadata,
     }
     if attribution_warnings:
         payload["attribution_warnings"] = list(attribution_warnings)
@@ -727,6 +1128,15 @@ def kdbg_threads(
                 f"  {thread.tid:6d}  {state_name:13.13}  {wait:15.15}  {thread.priority:3d}  "
                 f"{current:4.4}  {start}"
             )
+            evidence = wait_records.get(thread.ethread)
+            if evidence is not None:
+                obj = evidence.get("object") or {}
+                owners = evidence.get("owner_chain") or []
+                owner_text = (
+                    f"owner tid {owners[0]['tid']} (pid {owners[0]['pid']})"
+                    if owners else str(evidence.get("reason") or "unavailable")
+                )
+                console.print(f"           wait {obj.get('address') or 'unavailable'}: {owner_text}")
         if not displayed:
             console.print("[dim](no matching threads)[/]")
     console.print(
@@ -740,8 +1150,108 @@ def kdbg_threads(
             console.print(f"[yellow][!][/] {warning}")
     if current_vcpus_error:
         console.print(f"[yellow][!][/] current-vCPU attribution unavailable: {current_vcpus_error}")
+    if wait_objects:
+        console.print(
+            f"[dim]wait objects: {wait_view['examined']}/{wait_view['waiting_threads']} "
+            "Waiting rows (mutant-owner only)[/]"
+        )
     if not result.complete:
         console.print(f"[yellow][!][/] incomplete thread walk: {result.truncated_reason}")
+
+
+def _thread_baseline_vm_ready(cfg: Config) -> None:
+    state = VM(cfg).state()
+    if state not in (VMState.RUNNING, VMState.PAUSED):
+        raise ThreadBaselineError(f"VM is not running (state: {state.value})")
+
+
+@kdbg.command("thread-baseline")
+@click.argument("pid", type=int)
+@click.option("--name", "baseline_name", default="default", show_default=True,
+              help="Host-side baseline label (letters, digits, dot, dash, underscore).")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_thread_baseline(
+    ctx: click.Context, pid: int, baseline_name: str, as_json: bool,
+) -> None:
+    """Save one explicit, complete host-side ETHREAD baseline for PID."""
+    import json as _json
+
+    cfg: Config = ctx.obj["cfg"]
+    try:
+        _thread_baseline_vm_ready(cfg)
+        baseline = ThreadBaselineStore(cfg)
+        # Validate the name before halting the VM for the live snapshot.
+        baseline.validate_name(baseline_name)
+        with debug_snapshot(cfg) as snapshot:
+            store = _get_store(cfg)
+            capture = capture_thread_baseline(cfg, store, pid)
+            snapshot_metadata = _snapshot_metadata(snapshot)
+        result = baseline.save(baseline_name, capture)
+        result["snapshot_metadata"] = snapshot_metadata
+    except (ThreadBaselineError, SymbolStoreError, HmpError, ReaderError) as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+        return
+    console.print(
+        f"[green][+][/] baseline {baseline_name!r}: pid {result['process']['pid']} "
+        f"({result['process']['name']}), {result['thread_count']} complete threads"
+    )
+    console.print(f"    captured: {result['captured_at']}")
+
+
+@kdbg.command("thread-diff")
+@click.argument("pid", type=int)
+@click.option("--name", "baseline_name", default="default", show_default=True,
+              help="Host-side baseline label to compare.")
+@click.option("--limit", type=click.IntRange(1, 1024), default=128, show_default=True,
+              help="Maximum rows returned per created/exited/changed category.")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_thread_diff(
+    ctx: click.Context, pid: int, baseline_name: str, limit: int, as_json: bool,
+) -> None:
+    """Compare one explicit current ETHREAD snapshot to a named baseline."""
+    import json as _json
+
+    cfg: Config = ctx.obj["cfg"]
+    baseline = ThreadBaselineStore(cfg)
+    try:
+        _thread_baseline_vm_ready(cfg)
+        # A missing/corrupt name should not briefly stop a guest merely to
+        # discover the local prerequisite was absent.
+        baseline.load(baseline_name)
+        with debug_snapshot(cfg) as snapshot:
+            store = _get_store(cfg)
+            capture = capture_thread_baseline(cfg, store, pid)
+            snapshot_metadata = _snapshot_metadata(snapshot)
+        result = baseline.diff(baseline_name, capture, limit=limit)
+        result["snapshot_metadata"] = snapshot_metadata
+    except (ThreadBaselineError, SymbolStoreError, HmpError, ReaderError) as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+        return
+    console.print(
+        f"[dim]baseline {baseline_name!r}: {result['baseline']['thread_count']} → "
+        f"{result['current']['thread_count']} threads[/]"
+    )
+    console.print(
+        f"  created={result['created_count']} exited={result['exited_count']} "
+        f"changed={result['changed_count']}"
+    )
+    for category in ("created", "exited"):
+        for thread in result[category]:
+            console.print(f"  {category[:-1]:7} tid {thread['tid']:6d} {thread['ethread']}")
+    for row in result["changed"]:
+        thread = row["thread"]
+        labels = ", ".join(row["changes"])
+        console.print(f"  changed  tid {thread['tid']:6d} {thread['ethread']} — {labels}")
+    if any(result[f"{category}_truncated"] for category in ("created", "exited", "changed")):
+        console.print(f"[yellow][!][/] output limited to {limit} rows per category")
 
 
 def _module_json_record(module) -> dict:
@@ -784,8 +1294,15 @@ def _unmapped_start_rows(threads, attributions) -> list[dict]:
     "--thread-limit", type=click.IntRange(1, 64), default=16, show_default=True,
     help="Top context-switch thread rows to resolve and return.",
 )
+@click.option(
+    "--require-complete", is_flag=True,
+    help="Refuse a validated partial kernel-list prefix instead of returning it.",
+)
 @click.pass_context
-def kdbg_triage(ctx: click.Context, pid: int, as_json: bool, thread_limit: int) -> None:
+def kdbg_triage(
+    ctx: click.Context, pid: int, as_json: bool, thread_limit: int,
+    require_complete: bool,
+) -> None:
     """Capture one bounded, coherent kernel-research view for PID."""
     import json as _json
 
@@ -795,7 +1312,11 @@ def kdbg_triage(ctx: click.Context, pid: int, as_json: bool, thread_limit: int) 
         console.print(f"[red][-][/] VM not running ({vm.state().value})")
         raise SystemExit(1)
     try:
-        with debug_snapshot(cfg):
+        try:
+            ensure_vad_layouts(cfg, _get_store(cfg))
+        except (VadError, SymbolStoreError, SymbolLoadError):
+            pass
+        with debug_snapshot(cfg) as snapshot:
             store = _get_store(cfg)
             cache = WalkCache()
             target = find_process(cfg.vm_name, store, pid=pid, cache=cache)
@@ -803,6 +1324,8 @@ def kdbg_triage(ctx: click.Context, pid: int, as_json: bool, thread_limit: int) 
                 console.print(f"[red][-][/] pid {pid} not found in process list")
                 raise SystemExit(1)
             walked = list_threads(cfg.vm_name, store, target, cache=cache)
+            if require_complete and not walked.complete:
+                raise ThreadWalkIncomplete(walked)
             selected = select_threads(
                 walked.threads, sort="context-switches", limit=thread_limit,
             )
@@ -828,7 +1351,20 @@ def kdbg_triage(ctx: click.Context, pid: int, as_json: bool, thread_limit: int) 
                 )
             except (SymbolStoreError, HmpError, ReaderError) as exc:
                 current_vcpus_error = str(exc)
-    except (SymbolStoreError, SymbolLoadError, HmpError, ReaderError) as exc:
+            snapshot_metadata = _snapshot_metadata(snapshot)
+    except ThreadWalkIncomplete as exc:
+        if as_json:
+            click.echo(_json.dumps({
+                "ok": False,
+                "error": {
+                    "code": exc.code, "retryable": exc.retryable,
+                    "message": str(exc), "details": exc.details,
+                },
+            }, indent=2))
+        else:
+            console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    except (VadError, SymbolStoreError, SymbolLoadError, HmpError, ReaderError) as exc:
         console.print(f"[red][-][/] {exc}")
         raise SystemExit(1)
 
@@ -844,11 +1380,14 @@ def kdbg_triage(ctx: click.Context, pid: int, as_json: bool, thread_limit: int) 
             "eprocess": f"0x{target.eprocess:016x}",
             "dtb": f"0x{target.directory_table_base:012x}",
             "create_time": target.create_time,
+            "create_time_filetime": target.create_time,
+            "create_time_utc": filetime_utc(target.create_time),
         },
         "thread_summary": {
             "total_count": selected.total_count,
             "walk_complete": walked.complete,
             "truncated_reason": walked.truncated_reason,
+            "truncation": thread_walk_truncation(walked),
             "states": selected.state_counts,
             "wait_reasons": selected.wait_reason_counts,
             "top_rows_returned": len(selected.threads),
@@ -870,6 +1409,7 @@ def kdbg_triage(ctx: click.Context, pid: int, as_json: bool, thread_limit: int) 
         },
         "unmapped_starts": _unmapped_start_rows(selected.threads, attributions),
         "unmapped_starts_scope": "top_rows_only",
+        "snapshot_metadata": snapshot_metadata,
     }
     if module_error:
         payload["user_modules"]["error"] = module_error
@@ -898,6 +1438,108 @@ def kdbg_triage(ctx: click.Context, pid: int, as_json: bool, thread_limit: int) 
         console.print(f"[yellow][!][/] user module view unavailable: {module_error}")
     if not walked.complete:
         console.print(f"[yellow][!][/] incomplete thread walk: {walked.truncated_reason}")
+
+
+@kdbg.command("thread-triage")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.option(
+    "--process-cap", type=click.IntRange(1, 256), default=128, show_default=True,
+    help="Maximum process records to examine from one active-process snapshot.",
+)
+@click.option(
+    "--total-thread-cap", type=click.IntRange(1, 8192), default=4096, show_default=True,
+    help="Maximum ETHREAD records examined across all selected processes.",
+)
+@click.option(
+    "--sample-per-process", type=click.IntRange(1, 32), default=8, show_default=True,
+    help="Top context-switch thread rows sampled per process for start attribution.",
+)
+@click.option(
+    "--limit", "result_limit", type=click.IntRange(1, 64), default=32, show_default=True,
+    help="Maximum rows returned in each ranking.",
+)
+@click.option(
+    "--resolve/--no-resolve", default=True, show_default=True,
+    help="Resolve only the bounded sample's thread starts against live modules.",
+)
+@click.option(
+    "--require-complete", is_flag=True,
+    help="Refuse a cap- or corruption-limited global scope instead of returning it.",
+)
+@click.pass_context
+def kdbg_thread_triage(
+    ctx: click.Context,
+    as_json: bool,
+    process_cap: int,
+    total_thread_cap: int,
+    sample_per_process: int,
+    result_limit: int,
+    resolve: bool,
+    require_complete: bool,
+) -> None:
+    """Rank bounded process-wide scheduler evidence from one RSP stop."""
+    import json as _json
+
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+    try:
+        if resolve:
+            try:
+                ensure_vad_layouts(cfg, _get_store(cfg))
+            except (VadError, SymbolStoreError, SymbolLoadError):
+                pass
+        with debug_snapshot(cfg) as snapshot:
+            store = _get_store(cfg)
+            result = triage_all_process_threads(
+                cfg.vm_name, store, cache=WalkCache(), process_cap=process_cap,
+                total_thread_cap=total_thread_cap, sample_per_process=sample_per_process,
+                result_limit=result_limit, resolve=resolve,
+            )
+            if require_complete and not result["scope"]["complete"]:
+                raise GlobalThreadTriageIncomplete(result)
+            result["snapshot_metadata"] = _snapshot_metadata(snapshot)
+    except GlobalThreadTriageIncomplete as exc:
+        if as_json:
+            click.echo(_json.dumps({
+                "ok": False,
+                "error": {
+                    "code": exc.code, "retryable": exc.retryable,
+                    "message": str(exc), "details": exc.details,
+                },
+            }, indent=2))
+        else:
+            console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    except (GlobalThreadTriageError, VadError, SymbolStoreError, HmpError, ReaderError) as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+        return
+    scope = result["scope"]
+    console.print(
+        f"[dim]examined {scope['processes_examined']} processes / "
+        f"{scope['total_threads_examined']} threads; complete={scope['complete']}[/]"
+    )
+    console.print("[dim]  PID     Threads  Run  Wait  Process[/]")
+    for row in result["rankings"]["by_thread_count"]:
+        console.print(
+            f"  {row['pid']:6d}  {row['thread_count']:7d}  "
+            f"{row['runnable_count']:3d}  {row['waiting_count']:4d}  {row['name']}"
+        )
+    if result["rankings"]["suspicious_starts"]:
+        console.print("[yellow]  suspicious starts (bounded samples only):[/]")
+        for row in result["rankings"]["suspicious_starts"]:
+            console.print(
+                f"    pid {row['pid']} tid {row['tid']} {row['field']} "
+                f"{row['address']} ({row['mapping']})"
+            )
+    if not scope["complete"]:
+        console.print(f"[yellow][!][/] scope incomplete: {'; '.join(scope['reasons'])}")
 
 
 @kdbg.command("lm")
@@ -1901,6 +2543,10 @@ def kdbg_regs(ctx: click.Context) -> None:
 )
 @click.option("--instruction-bytes", is_flag=True, help="Include raw instruction bytes.")
 @click.option("--runtime-vas", is_flag=True, help="Include repeated static/runtime VAs.")
+@click.option(
+    "--allow-cold", is_flag=True,
+    help="Permit cold Ghidra analysis while the debugger target remains halted.",
+)
 @click.pass_context
 def kdbg_decomp(
     ctx: click.Context,
@@ -1920,13 +2566,15 @@ def kdbg_decomp(
     assembly: str,
     instruction_bytes: bool,
     runtime_vas: bool,
+    allow_cold: bool,
 ) -> None:
     """Show Ghidra pseudocode at ADDRESS, or at the current RIP.
 
     Resolves the live loaded module, converts the runtime VA to an RVA,
     verifies the cached PE against live CodeView/PE identity, and queries an
-    isolated persistent PyGhidra worker. The first request for a binary runs
-    Ghidra analysis; later requests reuse its project cache.
+    isolated persistent PyGhidra worker. Cold analysis is refused by default
+    so a first-time import cannot silently hold the target stopped; prepare it
+    offline first or pass --allow-cold deliberately.
     """
     import json as _json
     from winbox.kdbg.decomp import DecompError, query_decomp
@@ -1951,6 +2599,7 @@ def kdbg_decomp(
             assembly=assembly,
             instruction_bytes=instruction_bytes,
             runtime_vas=runtime_vas,
+            allow_cold=allow_cold,
         )
     except DecompError as exc:
         console.print(f"[red][-][/] {exc}")

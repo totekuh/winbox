@@ -33,12 +33,19 @@ import signal
 import socket
 import struct
 import time
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
 from winbox.config import Config
+from winbox.kdbg.admission import (
+    OperationBusyError,
+    OperationLease,
+    active_admission,
+    admit_operation,
+)
 from winbox.kdbg.debugger.install import _CR3_OFFSET_IN_G
 from winbox.kdbg.debugger.protocol import ProtocolError, decode, encode, read_line
 from winbox.kdbg.debugger.rsp import RspClient, RspError, StopReply
@@ -53,9 +60,92 @@ _MAX_READ = 1 << 20
 _DEFAULT_PORT = 1234
 _READER_STARTUP_TIMEOUT = 30.0
 _STARTUP_STATUS_MAX_BYTES = 64 * 1024
+_DEFAULT_SNAPSHOT_DURATION_MS = 15_000
+_DEFAULT_SNAPSHOT_MAX_READS = 16_384
+_DEFAULT_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
+_SNAPSHOT_CACHE_MAX_BYTES = 2 * 1024 * 1024
 _active_snapshot: ContextVar["DebugSnapshot | None"] = ContextVar(
     "winbox_kdbg_snapshot", default=None,
 )
+
+
+@dataclass(frozen=True)
+class SnapshotBudget:
+    """Hard upper bounds for one coherent stopped-guest transaction.
+
+    The reader broker enforces these limits, so an abandoned or unusually
+    expensive client cannot hold Windows at an RSP stop indefinitely.  The
+    duration bound is also the socket-idle deadline in the broker: a client
+    doing CPU work after its final read cannot strand the guest merely by
+    forgetting to close its snapshot.
+    """
+
+    max_duration_ms: int = _DEFAULT_SNAPSHOT_DURATION_MS
+    max_reads: int = _DEFAULT_SNAPSHOT_MAX_READS
+    max_bytes: int = _DEFAULT_SNAPSHOT_MAX_BYTES
+
+    def __post_init__(self) -> None:
+        if not 100 <= self.max_duration_ms <= 60_000:
+            raise ValueError("snapshot max_duration_ms must be between 100 and 60000")
+        if not 1 <= self.max_reads <= 65_536:
+            raise ValueError("snapshot max_reads must be between 1 and 65536")
+        if not 1 <= self.max_bytes <= 64 * 1024 * 1024:
+            raise ValueError("snapshot max_bytes must be between 1 and 67108864")
+
+    def public(self) -> dict[str, int]:
+        return {
+            "max_duration_ms": self.max_duration_ms,
+            "max_reads": self.max_reads,
+            "max_bytes": self.max_bytes,
+        }
+
+    @classmethod
+    def from_wire(cls, raw: object) -> "SnapshotBudget":
+        if raw is None:
+            return cls()
+        if not isinstance(raw, dict):
+            raise ReaderError("snapshot budget must be an object")
+        try:
+            values = {
+                key: int(raw[key])
+                for key in ("max_duration_ms", "max_reads", "max_bytes")
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReaderError("snapshot budget has invalid fields") from exc
+        if any(isinstance(raw[key], bool) for key in values):
+            raise ReaderError("snapshot budget fields must be integers")
+        try:
+            return cls(**values)
+        except ValueError as exc:
+            raise ReaderError(str(exc)) from exc
+
+
+class SnapshotBudgetError(ReaderError):
+    """A stopped snapshot reached its explicit cooperative safety bound."""
+
+    code = "snapshot_budget_exceeded"
+    retryable = True
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        budget: SnapshotBudget,
+        read_count: int,
+        bytes_read: int,
+        elapsed_ms: float,
+    ) -> None:
+        self.details = {
+            "reason": reason,
+            "budget": budget.public(),
+            "read_count": read_count,
+            "bytes_read": bytes_read,
+            "elapsed_ms": round(max(0.0, elapsed_ms), 3),
+        }
+        super().__init__(
+            f"snapshot budget exceeded ({reason}); guest was resumed after "
+            f"{read_count} reads / {bytes_read} bytes"
+        )
 
 
 def _runtime_dir(cfg: Config) -> Path:
@@ -85,17 +175,58 @@ def _reply_ok(result: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def _reply_err(exc: BaseException | str) -> dict[str, Any]:
+    """Serialize typed broker failures without breaking legacy string peers."""
+    if isinstance(exc, BaseException):
+        error: dict[str, Any] = {"message": str(exc)}
+        code = getattr(exc, "code", None)
+        if isinstance(code, str) and code:
+            error["code"] = code[:64]
+        retryable = getattr(exc, "retryable", None)
+        if isinstance(retryable, bool):
+            error["retryable"] = retryable
+        details = getattr(exc, "details", None)
+        if isinstance(details, dict):
+            error["details"] = details
+        return {"ok": False, "error": error}
     return {"ok": False, "error": str(exc)}
+
+
+def _bounded_counter(value: object, fallback: int) -> int:
+    """Accept broker-owned non-negative counters without trusting wire junk."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return fallback
+    return value
 
 
 def _request(sock: socket.socket, op: str, **args: Any) -> dict[str, Any]:
     try:
         sock.sendall(encode({"op": op, "args": args}))
-        reply = decode(read_line(sock, max_bytes=(_MAX_READ * 2) + 65536))
-    except (OSError, ProtocolError) as exc:
-        raise ReaderError(f"RSP reader broker communication failed: {exc}") from exc
+    except OSError as write_exc:
+        # The broker may have hit its idle duration while this client was
+        # computing. It queues a typed budget error before resuming/closing;
+        # consume that final frame instead of laundering it into Broken pipe.
+        try:
+            reply = decode(read_line(sock, max_bytes=(_MAX_READ * 2) + 65536))
+        except (OSError, ProtocolError) as exc:
+            raise ReaderError(f"RSP reader broker communication failed: {exc}") from write_exc
+    else:
+        try:
+            reply = decode(read_line(sock, max_bytes=(_MAX_READ * 2) + 65536))
+        except (OSError, ProtocolError) as exc:
+            raise ReaderError(f"RSP reader broker communication failed: {exc}") from exc
     if not reply.get("ok"):
-        raise ReaderError(reply.get("error") or "RSP reader broker failed")
+        raw_error = reply.get("error")
+        if isinstance(raw_error, dict):
+            error = ReaderError(str(raw_error.get("message") or "RSP reader broker failed"))
+            code = raw_error.get("code")
+            if isinstance(code, str):
+                error.code = code
+            if isinstance(raw_error.get("retryable"), bool):
+                error.retryable = raw_error["retryable"]
+            if isinstance(raw_error.get("details"), dict):
+                error.details = raw_error["details"]
+            raise error
+        raise ReaderError(raw_error or "RSP reader broker failed")
     result = reply.get("result")
     if not isinstance(result, dict):
         raise ReaderError("RSP reader broker returned a malformed result")
@@ -121,13 +252,85 @@ class DebugSnapshot:
     def read_physical(self, addr: int, length: int) -> bytes:
         raise NotImplementedError
 
+    def phase_started(self, name: str) -> None:
+        """Record an operator-visible phase; adapters may implement this."""
+
+    def phase_finished(self, name: str, elapsed_ms: float) -> None:
+        """Record one completed phase; adapters may implement this."""
+
+    def operation_metadata(self) -> dict[str, Any]:
+        """Additive timing/ownership evidence for a coherent RSP stop."""
+        return {
+            "snapshot_id": None,
+            "reader_owner": "embedded_snapshot",
+            "admission": "embedded",
+            "queue_delay_ms": 0.0,
+            "stop_duration_ms": None,
+            "read_count": None,
+            "bytes_read": None,
+            "logical_read_count": None,
+            "logical_bytes_read": None,
+            "cache_hits": None,
+            "budget": None,
+            "budget_exhausted": False,
+            "phases_ms": {},
+        }
+
+
+def snapshot_metadata(snapshot: DebugSnapshot | None) -> dict[str, Any]:
+    """Return safe timing evidence even for legacy/mock snapshot contexts."""
+    if snapshot is None:
+        return {
+            "snapshot_id": None,
+            "reader_owner": "unknown",
+            "admission": "unknown",
+            "queue_delay_ms": None,
+            "stop_duration_ms": None,
+            "read_count": None,
+            "bytes_read": None,
+            "budget": None,
+            "budget_exhausted": False,
+        }
+    try:
+        value = snapshot.operation_metadata()
+    except (AttributeError, TypeError, ValueError):
+        value = None
+    return value if isinstance(value, dict) else {
+        "snapshot_id": None,
+        "reader_owner": "unknown",
+        "admission": "unknown",
+        "queue_delay_ms": None,
+        "stop_duration_ms": None,
+        "read_count": None,
+        "bytes_read": None,
+        "logical_read_count": None,
+        "logical_bytes_read": None,
+        "cache_hits": None,
+        "budget": None,
+        "budget_exhausted": False,
+        "phases_ms": {},
+    }
+
 
 class _RemoteSnapshot(DebugSnapshot):
-    def __init__(self, cfg: Config, sock: socket.socket, begin: dict[str, Any]):
+    def __init__(
+        self, cfg: Config, sock: socket.socket, begin: dict[str, Any],
+        admission: ExitStack, lease: OperationLease, budget: SnapshotBudget,
+    ):
         self.cfg = cfg
         self.vm_name = cfg.vm_name
         self._sock = sock
         self._closed = False
+        self._admission = admission
+        self._lease = lease
+        self._budget = budget
+        self._read_count = 0
+        self._bytes_read = 0
+        self._logical_read_count = 0
+        self._logical_bytes_read = 0
+        self._cache_hits = 0
+        self._phases_ms: dict[str, float] = {}
+        self._budget_error: dict[str, Any] | None = None
         self.current_cr3 = int(begin["current_cr3"], 0)
         self.cr3_candidates = tuple(int(value, 0) for value in begin["cr3s"])
         self.kernel_gs_bases = tuple(
@@ -147,15 +350,45 @@ class _RemoteSnapshot(DebugSnapshot):
         self.vcpu_kernel_gs_bases = tuple(vcpu_bases)
 
     @classmethod
-    def connect(cls, cfg: Config, *, timeout: float = 15.0) -> "_RemoteSnapshot":
+    def connect(
+        cls,
+        cfg: Config,
+        *,
+        timeout: float = 15.0,
+        budget: SnapshotBudget | None = None,
+    ) -> "_RemoteSnapshot":
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        admission = ExitStack()
+        selected_budget = budget or SnapshotBudget()
         try:
+            lease = admission.enter_context(admit_operation(
+                _runtime_dir(cfg), "kdbg-snapshot", operation="snapshot",
+                owner="persistent_reader", details={
+                    "vm_name": cfg.vm_name,
+                    # Doctor exposes the live admission record. Include the
+                    # hard stop contract there too, so an active reader is
+                    # observable without having to wait for its result.
+                    "budget": selected_budget.public(),
+                },
+            ))
             sock.settimeout(timeout)
             sock.connect(str(sock_path(cfg)))
-            begin = _request(sock, "begin")
-            return cls(cfg, sock, begin)
+            begin = _request(
+                sock, "begin", snapshot_id=lease.token,
+                budget=selected_budget.public(),
+            )
+            return cls(cfg, sock, begin, admission, lease, selected_budget)
+        except OperationBusyError as exc:
+            sock.close()
+            admission.close()
+            error = ReaderError(str(exc))
+            error.code = exc.code
+            error.retryable = exc.retryable
+            error.details = exc.details
+            raise error from exc
         except BaseException:
             sock.close()
+            admission.close()
             raise
 
     def read_virtual(self, cr3: int, addr: int, length: int) -> bytes:
@@ -163,35 +396,111 @@ class _RemoteSnapshot(DebugSnapshot):
             return b""
         if length > _MAX_READ:
             raise ReaderError(f"single debugger read capped at {_MAX_READ} bytes")
-        result = _request(
-            self._sock, "read", cr3=f"0x{cr3:x}", addr=f"0x{addr:x}", length=length,
-        )
         try:
-            return bytes.fromhex(result["bytes"])
+            result = _request(
+                self._sock, "read", cr3=f"0x{cr3:x}", addr=f"0x{addr:x}", length=length,
+            )
+        except ReaderError as exc:
+            self._record_budget_error(exc)
+            raise
+        try:
+            data = bytes.fromhex(result["bytes"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ReaderError("RSP reader returned invalid memory bytes") from exc
+        self._account_read(data, result)
+        return data
 
     def read_physical(self, addr: int, length: int) -> bytes:
         if length <= 0:
             return b""
         if length > _MAX_READ:
             raise ReaderError(f"single debugger read capped at {_MAX_READ} bytes")
-        result = _request(
-            self._sock, "read_phys", addr=f"0x{addr:x}", length=length,
-        )
         try:
-            return bytes.fromhex(result["bytes"])
+            result = _request(
+                self._sock, "read_phys", addr=f"0x{addr:x}", length=length,
+            )
+        except ReaderError as exc:
+            self._record_budget_error(exc)
+            raise
+        try:
+            data = bytes.fromhex(result["bytes"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ReaderError("RSP reader returned invalid physical bytes") from exc
+        self._account_read(data, result)
+        return data
+
+    def _account_read(self, data: bytes, result: dict[str, Any]) -> None:
+        self._logical_read_count += 1
+        self._logical_bytes_read += len(data)
+        # The broker owns the actual RSP connection and cache, so only it can
+        # distinguish a client request from a physical transport fill.  Do not
+        # turn a cache hit into a fictitious wire read in operator accounting.
+        self._read_count = _bounded_counter(
+            result.get("transport_read_count"), self._read_count,
+        )
+        self._bytes_read = _bounded_counter(
+            result.get("transport_bytes_read"), self._bytes_read,
+        )
+        cache_hits = result.get("cache_hits")
+        self._cache_hits = _bounded_counter(cache_hits, self._cache_hits)
+
+    def _record_budget_error(self, exc: ReaderError) -> None:
+        if getattr(exc, "code", None) != SnapshotBudgetError.code:
+            return
+        details = getattr(exc, "details", None)
+        if isinstance(details, dict):
+            self._budget_error = dict(details)
+            self._read_count = int(details.get("read_count", self._read_count))
+            self._bytes_read = int(details.get("bytes_read", self._bytes_read))
+
+    def phase_started(self, name: str) -> None:
+        return None
+
+    def phase_finished(self, name: str, elapsed_ms: float) -> None:
+        safe = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in name)[:64]
+        if not safe or elapsed_ms < 0:
+            return
+        self._phases_ms[safe] = round(self._phases_ms.get(safe, 0.0) + elapsed_ms, 3)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         try:
-            _request(self._sock, "end")
+            result = _request(self._sock, "end")
+            self._read_count = _bounded_counter(
+                result.get("transport_read_count"), self._read_count,
+            )
+            self._bytes_read = _bounded_counter(
+                result.get("transport_bytes_read"), self._bytes_read,
+            )
+            self._cache_hits = _bounded_counter(
+                result.get("cache_hits"), self._cache_hits,
+            )
         finally:
-            self._sock.close()
+            try:
+                self._sock.close()
+            finally:
+                self._admission.close()
+
+    def operation_metadata(self) -> dict[str, Any]:
+        timing = self._lease.metadata()
+        return {
+            "snapshot_id": timing["id"],
+            "reader_owner": "persistent_reader",
+            "admission": timing["admission"],
+            "queue_delay_ms": timing["queue_delay_ms"],
+            "stop_duration_ms": timing["elapsed_ms"],
+            "read_count": self._read_count,
+            "bytes_read": self._bytes_read,
+            "logical_read_count": self._logical_read_count,
+            "logical_bytes_read": self._logical_bytes_read,
+            "cache_hits": self._cache_hits,
+            "budget": self._budget.public(),
+            "budget_exhausted": self._budget_error is not None,
+            "budget_error": self._budget_error,
+            "phases_ms": dict(self._phases_ms),
+        }
 
 
 class _LocalRspSnapshot(DebugSnapshot):
@@ -255,6 +564,14 @@ class _LocalRspSnapshot(DebugSnapshot):
         self._physical = False
         self._poisoned = False
         self._registers_dirty = False
+        self._virtual_cache: dict[tuple[int, int, int], bytes] = {}
+        self._virtual_cache_bytes = 0
+        self._transport_read_count = 0
+        self._transport_bytes_read = 0
+        self._logical_read_count = 0
+        self._logical_bytes_read = 0
+        self._cache_hits = 0
+        self._phases_ms: dict[str, float] = {}
 
     def _set_cr3(self, cr3: int) -> None:
         if self._physical:
@@ -275,16 +592,80 @@ class _LocalRspSnapshot(DebugSnapshot):
         self.rsp.set_physical_memory_mode(enabled)
         self._physical = enabled
 
+    def virtual_cache_hit(self, cr3: int, addr: int, length: int) -> bool:
+        """Whether the exact requested range can avoid another RSP read.
+
+        The broker checks this before budget admission.  A cached repeat has
+        no wire cost, while a new fill must remain within the transport caps.
+        """
+        return (cr3, addr, length) in self._virtual_cache
+
+    def transport_counters(self) -> dict[str, int]:
+        return {
+            "transport_read_count": self._transport_read_count,
+            "transport_bytes_read": self._transport_bytes_read,
+            "logical_read_count": self._logical_read_count,
+            "logical_bytes_read": self._logical_bytes_read,
+            "cache_hits": self._cache_hits,
+        }
+
     def read_virtual(self, cr3: int, addr: int, length: int) -> bytes:
+        self._logical_read_count += 1
+        self._logical_bytes_read += max(0, length)
+        key = (cr3, addr, length)
+        cached = self._virtual_cache.get(key)
+        if cached is not None:
+            self._cache_hits += 1
+            return cached
         self._set_cr3(cr3)
-        return self.rsp.read_memory(addr, length)
+        data = self.rsp.read_memory(addr, length)
+        self._transport_read_count += 1
+        self._transport_bytes_read += len(data)
+        # Exact-range caching is intentionally conservative.  It cannot change
+        # read semantics, only collapse duplicate reads within one halted stop.
+        if 0 < len(data) <= 4096 and self._virtual_cache_bytes + len(data) <= _SNAPSHOT_CACHE_MAX_BYTES:
+            self._virtual_cache[key] = data
+            self._virtual_cache_bytes += len(data)
+        return data
 
     def read_physical(self, addr: int, length: int) -> bytes:
         self._set_physical(True)
         try:
-            return self.rsp.read_memory(addr, length)
+            data = self.rsp.read_memory(addr, length)
+            self._transport_read_count += 1
+            self._transport_bytes_read += len(data)
+            self._logical_read_count += 1
+            self._logical_bytes_read += max(0, length)
+            return data
         finally:
             self._set_physical(False)
+
+    def phase_started(self, name: str) -> None:
+        # Kept for the protocol symmetry; accumulation occurs on finish.
+        return None
+
+    def phase_finished(self, name: str, elapsed_ms: float) -> None:
+        safe = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in name)[:64]
+        if not safe or elapsed_ms < 0:
+            return
+        self._phases_ms[safe] = round(self._phases_ms.get(safe, 0.0) + elapsed_ms, 3)
+
+    def operation_metadata(self) -> dict[str, Any]:
+        return {
+            "snapshot_id": None,
+            "reader_owner": "interactive_daemon",
+            "admission": "embedded",
+            "queue_delay_ms": 0.0,
+            "stop_duration_ms": None,
+            "read_count": self._transport_read_count,
+            "bytes_read": self._transport_bytes_read,
+            "logical_read_count": self._logical_read_count,
+            "logical_bytes_read": self._logical_bytes_read,
+            "cache_hits": self._cache_hits,
+            "budget": None,
+            "budget_exhausted": False,
+            "phases_ms": dict(self._phases_ms),
+        }
 
     def restore(self) -> None:
         try:
@@ -312,6 +693,24 @@ def current_snapshot(vm_name: str | None = None) -> DebugSnapshot | None:
     if snapshot is not None and vm_name is not None and snapshot.vm_name != vm_name:
         return None
     return snapshot
+
+
+@contextmanager
+def snapshot_phase(name: str) -> Iterator[None]:
+    """Attribute caller work to a named phase of the active stop.
+
+    The phase is advisory accounting only; it never starts a snapshot and is
+    intentionally harmless in unit fixtures or code outside a debug stop.
+    """
+    snapshot = current_snapshot()
+    started = time.monotonic()
+    if snapshot is not None:
+        snapshot.phase_started(name)
+    try:
+        yield
+    finally:
+        if snapshot is not None:
+            snapshot.phase_finished(name, (time.monotonic() - started) * 1000)
 
 
 @contextmanager
@@ -366,13 +765,14 @@ class _ReaderBroker:
                     if first.get("op") != "begin":
                         conn.sendall(encode(_reply_err("expected begin or shutdown")))
                         continue
-                    self._serve_snapshot_after_begin(conn)
+                    self._serve_snapshot_after_begin(conn, first)
                 except (OSError, ProtocolError):
                     continue
 
-    def _serve_snapshot_after_begin(self, conn: socket.socket) -> None:
+    def _serve_snapshot_after_begin(self, conn: socket.socket, begin: dict[str, Any]) -> None:
         snapshot: _LocalRspSnapshot | None = None
         try:
+            budget = SnapshotBudget.from_wire((begin.get("args") or {}).get("budget"))
             try:
                 stop, snapshot = self._halt_snapshot()
             except BaseException as exc:
@@ -385,6 +785,27 @@ class _ReaderBroker:
                     )))
                 self.shutdown_requested = True
                 return
+            started = time.monotonic()
+
+            def budget_error(reason: str) -> SnapshotBudgetError:
+                counters = snapshot.transport_counters()
+                return SnapshotBudgetError(
+                    reason, budget=budget,
+                    read_count=counters["transport_read_count"],
+                    bytes_read=counters["transport_bytes_read"],
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                )
+
+            def check_transport_fill(length: int) -> None:
+                elapsed_ms = (time.monotonic() - started) * 1000
+                counters = snapshot.transport_counters()
+                if elapsed_ms >= budget.max_duration_ms:
+                    raise budget_error("duration")
+                if counters["transport_read_count"] >= budget.max_reads:
+                    raise budget_error("read_count")
+                if counters["transport_bytes_read"] + length > budget.max_bytes:
+                    raise budget_error("bytes")
+
             conn.sendall(encode(_reply_ok({
                 "stop": stop.raw,
                 "current_cr3": f"0x{snapshot.current_cr3:x}",
@@ -401,7 +822,20 @@ class _ReaderBroker:
                 ],
             })))
             while True:
-                request = decode(read_line(conn))
+                remaining = (budget.max_duration_ms / 1000) - (time.monotonic() - started)
+                if remaining <= 0:
+                    conn.sendall(encode(_reply_err(budget_error("duration"))))
+                    return
+                conn.settimeout(min(30.0, max(0.001, remaining)))
+                try:
+                    request = decode(read_line(conn))
+                except TimeoutError:
+                    # A client may be doing CPU work between reads. Queue a
+                    # typed reply before cleanup; its next receive observes
+                    # the cause instead of a mysterious closed socket.
+                    with suppress(OSError):
+                        conn.sendall(encode(_reply_err(budget_error("duration"))))
+                    return
                 op = request.get("op")
                 args = request.get("args") or {}
                 try:
@@ -409,17 +843,27 @@ class _ReaderBroker:
                         length = int(args["length"])
                         if not 0 <= length <= _MAX_READ:
                             raise ReaderError(f"invalid read length {length}")
+                        cr3 = int(args["cr3"], 0)
+                        address = int(args["addr"], 0)
+                        if not snapshot.virtual_cache_hit(cr3, address, length):
+                            check_transport_fill(length)
                         data = snapshot.read_virtual(
-                            int(args["cr3"], 0), int(args["addr"], 0), length,
+                            cr3, address, length,
                         )
-                        conn.sendall(encode(_reply_ok({"bytes": data.hex()})))
+                        conn.sendall(encode(_reply_ok({
+                            "bytes": data.hex(), **snapshot.transport_counters(),
+                        })))
                     elif op == "read_phys":
                         length = int(args["length"])
                         if not 0 <= length <= _MAX_READ:
                             raise ReaderError(f"invalid read length {length}")
+                        check_transport_fill(length)
                         data = snapshot.read_physical(int(args["addr"], 0), length)
-                        conn.sendall(encode(_reply_ok({"bytes": data.hex()})))
+                        conn.sendall(encode(_reply_ok({
+                            "bytes": data.hex(), **snapshot.transport_counters(),
+                        })))
                     elif op == "end":
+                        counters = snapshot.transport_counters()
                         snapshot.restore()
                         snapshot = None
                         try:
@@ -430,13 +874,16 @@ class _ReaderBroker:
                             # against an indeterminate/halted guest.
                             self.poisoned = True
                             raise
-                        conn.sendall(encode(_reply_ok()))
+                        conn.sendall(encode(_reply_ok({
+                            **counters,
+                            "budget": budget.public(),
+                        })))
                         return
                     else:
                         conn.sendall(encode(_reply_err(f"unknown reader op {op!r}")))
                 except BaseException as exc:
                     with suppress(OSError):
-                        conn.sendall(encode(_reply_err(f"{type(exc).__name__}: {exc}")))
+                        conn.sendall(encode(_reply_err(exc)))
                     if snapshot is not None and snapshot._poisoned:
                         self.poisoned = True
                         return
@@ -480,13 +927,23 @@ def reader_info(cfg: Config) -> dict[str, Any] | None:
     """
     if not _reader_alive(cfg):
         return None
+    admission = active_admission(_runtime_dir(cfg), "kdbg-snapshot")
     try:
         info = json.loads(session_path(cfg).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"active": True}
+        result = {"active": True}
+        if admission is not None:
+            result["snapshot"] = admission
+        return result
     if not isinstance(info, dict):
-        return {"active": True}
-    return {"active": True, **info}
+        result = {"active": True}
+        if admission is not None:
+            result["snapshot"] = admission
+        return result
+    result = {"active": True, **info}
+    if admission is not None:
+        result["snapshot"] = admission
+    return result
 
 
 def _acquire_lock(cfg: Config) -> int:
@@ -711,7 +1168,20 @@ def stop_reader(cfg: Config, *, timeout: float = 5.0) -> bool:
 
 
 @contextmanager
-def debug_snapshot(cfg: Config, *, port: int = _DEFAULT_PORT) -> Iterator[DebugSnapshot]:
+def debug_snapshot(
+    cfg: Config,
+    *,
+    port: int = _DEFAULT_PORT,
+    budget: SnapshotBudget | None = None,
+    operation: str = "snapshot",
+) -> Iterator[DebugSnapshot]:
+    """Yield one budgeted coherent RSP stop.
+
+    Callers normally use the conservative default.  The optional budget is
+    deliberately an internal typed object rather than loosely parsed tool
+    arguments, keeping every public snapshot path bounded even when a caller
+    does not expose tuning knobs.
+    """
     existing = current_snapshot(cfg.vm_name)
     if existing is not None:
         yield existing
@@ -720,9 +1190,14 @@ def debug_snapshot(cfg: Config, *, port: int = _DEFAULT_PORT) -> Iterator[DebugS
     for attempt in range(2):
         ensure_reader(cfg, port=port)
         try:
-            snapshot = _RemoteSnapshot.connect(cfg)
+            snapshot = (
+                _RemoteSnapshot.connect(cfg)
+                if budget is None else _RemoteSnapshot.connect(cfg, budget=budget)
+            )
             break
-        except (OSError, ReaderError):
+        except (OSError, ReaderError) as exc:
+            if getattr(exc, "code", None) == "busy":
+                raise
             if attempt:
                 raise
             # A reboot can leave the old broker/socket observable just long
@@ -731,12 +1206,30 @@ def debug_snapshot(cfg: Config, *, port: int = _DEFAULT_PORT) -> Iterator[DebugS
             stop_reader(cfg)
     assert snapshot is not None
     token = _active_snapshot.set(snapshot)
+    outcome = "ok"
+    error_code: str | None = None
     try:
         yield snapshot
+    except BaseException as exc:
+        outcome = "error"
+        raw_code = getattr(exc, "code", None)
+        error_code = raw_code if isinstance(raw_code, str) else None
+        raise
     finally:
         try:
             snapshot.close()
         finally:
+            # The telemetry writer is intentionally best effort and records
+            # only transport metadata; it cannot leak a read payload or mask
+            # a primary snapshot failure.
+            try:
+                from winbox.kdbg.telemetry import record_snapshot_operation
+                record_snapshot_operation(
+                    cfg, operation=operation, outcome=outcome,
+                    snapshot_metadata=snapshot.operation_metadata(), error_code=error_code,
+                )
+            except Exception:
+                pass
             _active_snapshot.reset(token)
 
 

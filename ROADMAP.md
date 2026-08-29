@@ -27,9 +27,173 @@ residual is fixed; its `DirectoryTableBase` trade-off remains accepted. Item 8
 remains a watch condition. A follow-up review the same day opened and completed
 items 85-87 for cache ownership, subprocess bounds, and prepare-job lifecycle.
 A live thread-research review after the PDB-backed `kdbg_threads` launch opened
-items 88-101 below. Items 88-91 and 100-101 were completed and live-verified
+items 88-101 below. Items 88-91 and 96-97 and 100-101 were completed and live-verified
 the same day; the remaining items are deliberately scoped to make stopped-kernel
 thread evidence more intelligible and bounded without requiring an in-guest Frida agent.
+The follow-up research-control-plane pass completed items 95, 102, and 103 on
+2026-08-28: it now refuses cold decompilation by default, makes both snapshot
+and decomp contention explicit rather than silently queueing, and exposes
+runtime/decompiler provenance in the doctor report.
+A second pass completed items 93, 94, and 98: the ETHREAD walker now proves
+its backward links and ownership assumptions, strict callers can reject any
+partial prefix, and one capped global scheduler view makes cross-process work
+visible without presenting a subset as the whole kernel.
+The final thread-evidence hardening pass completed items 92, 99, and 104:
+wait relationships are exact-PDB and evidence-only, symbol/paging assumptions
+fail closed, and every persistent-reader stop now has broker-enforced time,
+read, and byte limits with accounting visible in results and doctor admission.
+
+The investigation-evidence/control-plane pass completed items 105–109 on
+2026-08-29. It adds exact-PDB VAD/token/object evidence, immutable one-stop
+captures, metadata-only operation telemetry, and transport accounting without
+turning a loader miss or public-PDB omission into invented certainty.
+
+### Completed sequence — investigation evidence and operator visibility
+
+| Rank | Item | Ease | ROI | Status |
+|---:|---|---:|---:|---|
+| 1 | **105 — VAD-backed executable-memory and thread-start attribution** | 3 | 5 | Completed — bounded exact-PDB VAD lookup/map plus selected `--resolve` enrichment. |
+| 2 | **106 — atomic kdbg evidence captures and offline comparison** | 4 | 5 | Completed — versioned one-stop process/system artifacts and offline diff. |
+| 3 | **107 — human control-plane visibility and recent-operation telemetry** | 5 | 5 | Completed — doctor/capture metadata and a redacted timing ring. |
+
+### 105. Completed — VAD-backed executable-memory and thread-start attribution
+
+Implemented as exact-PDB x64 `kdbg_vad` / `winbox kdbg vad`: validated AVL
+links/ranges, raw VAD flags/protection, bounded map/lookup behavior, and an
+optional MZ probe. Selected non-loader user starts in `--resolve` preserve the
+loader lead and add bounded VAD evidence only when it can be proven. Live Win11
+validation returned an executable image VAD with MZ evidence and resumed cleanly.
+
+`kdbg_threads`, `kdbg_triage`, and `kdbg_thread_triage` correctly label a
+start outside the PEB loader lists as `user_not_in_loader_module`, not as
+private, JIT, injected, or malicious.  That is a deliberately conservative
+lead, but it leaves the most valuable follow-up entirely manual.  Add a
+PDB-backed, x64-only `kdbg_vad(pid, address?, executable?, limit?)` / `winbox
+kdbg vad` view.  An address lookup is the default; full executable-map
+enumeration is explicit and hard-capped.
+
+The walker must validate the exact `_EPROCESS.VadRoot` representation and each
+balanced-tree link before following it.  For each proven range return its
+inclusive bounds, allocation kind (`private`, `mapped`, `image`, or
+`unknown`), protection and executable/writable properties, and file/section
+identity only when the relevant kernel object is structurally validated.  An
+optional bounded first-page probe may report PE-header evidence and a digest;
+it must never imply that a missing header is benign.  Integrate only selected,
+presentation-bounded thread starts into existing `--resolve` output and retain
+the raw loader result plus explicit VAD confidence/provenance.
+
+Test short/cyclic/malformed VAD trees, version/layout variants, user and WoW64
+addresses, private RX/RWX, mapped images, absent backing names, caps, and all
+partial/error paths.  Live validation must leave the guest resumed and prove
+that a normal loader miss remains a lead when no VAD conclusion is available.
+
+### 106. Completed — atomic kdbg evidence captures and offline comparison
+
+Implemented as one-stop process/system captures with versioned mode-0600
+artifacts, boot/PDB identity, completion boundaries, VAD/token/handle evidence,
+and phase/read metadata. Named capture diffs are offline-only and identity-gated.
+Live same-boot captures were complete in 372–397 ms; their offline diff made no
+RSP connection and returned an empty delta.
+
+Individual read surfaces are each coherent, but a manual investigation often
+chains process, thread, module, scheduler, and future VAD queries across
+separate stops.  Add `kdbg_capture(profile, pid?, output?, require_complete?)`
+and `winbox kdbg capture --profile process PID|system`; each profile declares
+its complete, bounded read plan before Windows is stopped.  Persist an
+immutable, versioned host-side evidence artifact containing only facts already
+captured during that one snapshot: scope/caps, raw and rendered records,
+snapshot accounting, VM/boot/process identity, active symbol/PDB identity,
+runtime/catalog provenance, and any partial evidence.
+
+Add `kdbg_capture_diff(left, right)` / `winbox kdbg capture diff` as a purely
+offline operation.  It should compare matching VM/boot identities by default,
+report process/thread/module/VAD changes with the same identity constraints as
+thread baselines, and refuse an unsafe cross-boot or incomplete comparison
+unless an explicit forensic override is supplied.  Captures do not retain a
+live RSP handle and must never read target memory after the guest has resumed.
+Existing thread baselines remain supported; this is the general case-artifact
+layer above them.
+
+Test deterministic serialization, atomic write/locking, corrupt artifact
+refusal, identity mismatch, bounded profiles, strict incomplete captures, and
+offline diffs with no VM/RSP access.  Live tests must prove one halt/resume per
+capture and no hidden extra snapshot during diffing.
+
+### 107. Completed — human control-plane visibility and recent-operation telemetry
+
+Implemented as logical-vs-transport read/byte/cache accounting, phase timing,
+and a redacted 50-record local operation ring. Doctor reports p50/p95, recent
+records, capture inventory, reader/admission, and runtime drift; `--verbose`
+exposes recent records without collecting memory, paths, arguments, or errors.
+
+MCP/JSON results already carry snapshot IDs, admission ownership, queue delay,
+budget consumption, partial-result evidence, decompiler capability, and
+runtime provenance.  Normal CLI output reduces much of that to a few lines,
+making an operator hunt through JSON to answer why a command was slow, busy,
+or incomplete.  Add one shared compact status footer for every snapshot-backed
+CLI command, plus `--verbose` for the full control-plane record.  It must show
+snapshot ID, stop duration, read/byte budget use, lease owner/admission,
+completeness, source/PDB/boot identity, and the precise next recovery action.
+
+Extend doctor/status with active snapshot/decomp admission details, capability
+blockers, baseline/capture inventory summaries, and source-versus-installed
+runtime drift.  Maintain a bounded local, metadata-only operation ring (for
+example the last 50 records) with operation, timings, budget reason,
+admission/busy outcome, and result completeness.  Expose aggregate count and
+p50/p95 timings through doctor; raw memory, module paths, and dumped evidence
+never enter this telemetry by default.
+
+Test CLI/JSON/MCP parity, bounded retention, concurrent writer safety,
+redaction, malformed old records, and that status/doctor never attach to the
+gdbstub.  The human renderer must never turn an incomplete/busy/error result
+green through a lossy summary.
+
+### 108. Completed (safe public-PDB phase) — bounded handle, token, and kernel-object relationships
+
+`kdbg_token`, `kdbg_object`, and `kdbg_handles` prove the primary token,
+caller-proven object header, and handle-table root from exact public-PDB fields.
+This Win11 public nt PDB omits `_HANDLE_TABLE_ENTRY`, so entry decoding is
+explicitly refused rather than guessing a private slot layout.
+
+Thread and VAD evidence explains execution; it does not explain who can
+control whom.  Add exact-PDB `kdbg_handles(pid, type?, access?, limit?)`,
+`kdbg_token(pid)`, and a narrowly scoped object-reference resolver for already
+validated object pointers.  Prioritize process/thread, token, section, file,
+ALPC, registry, and synchronization-object facts.  Every returned object must
+carry a proven type, access-mask interpretation, and name/target only when
+the corresponding object-header and pointer chain validate.
+
+Handle-table traversal is a hostile-memory parser: hard-cap entries and object
+name bytes, validate encoded table levels and object-header boundaries, expose
+unknown types/accesses as raw values, and retain partial boundaries.  Do not
+promise a complete global handle graph or infer that a handle is exploitably
+usable from a raw access mask.  This should reuse the VAD/object validation
+machinery where possible and integrate selected cross-process handles into
+process captures.
+
+### 109. Completed — phase-accounted snapshot transport optimization
+
+The broker now uses a bounded per-stop exact-range virtual cache. Cache fills
+consume real RSP budgets, while metadata separately reports logical requests,
+transport reads/bytes, and hits. A broker integration test proves a repeated
+read succeeds under a one-read budget with one physical transport read; live
+process captures showed 282 cache hits while remaining below 400 ms.
+
+The reader currently reports aggregate duration, read count, and bytes, while
+walkers already coalesce known nearby ETHREAD fields.  Add named per-phase
+accounting (halt/setup, process walk, ETHREAD walk, loader joins, VAD lookup,
+wait-object resolution, serialization) to captures and operation telemetry
+before changing the transport.  Use that data to choose the actual hot path.
+
+If reads—not guest stop latency or rendering—are the cost, add a bounded
+per-snapshot virtual-range cache and vector/coalesced reads keyed by CR3.  It
+exists only while the guest is halted, has an explicit byte cap, counts both
+logical and transport reads, and is discarded before resume.  Preserve the
+broker's duration/read/byte contract: cache fills count against real transport
+budget, hits are visible in accounting, and no optimization may extend a stop
+or hide a budget failure.  Benchmark against representative system and
+high-thread captures; retain it only if the measured stop-time reduction is
+material.
 
 ### Completed top-three sequence (2026-08-25)
 
@@ -301,67 +465,131 @@ semantics prove one. Cycles, freed objects, unknown object types, and absent
 owners must remain explicit partial evidence; never manufacture a deadlock
 graph from a raw pointer.
 
-### 93. Planned — strengthen thread-list integrity invariants
+### 93. Completed — strengthen thread-list integrity invariants
 
-The forward-list, CID, and `KTHREAD.Process` checks are good but leave several
-cheap stopped-snapshot invariants unused. Validate `_EPROCESS.Pcb == 0` before
-equating a `PKPROCESS` with an EPROCESS address; read and check `LIST_ENTRY`
-back-links including the head; reject duplicate live TIDs; and return the exact
-link/ETHREAD that failed. Add corrupt-head, bad-Blink, duplicate-TID, and
-nonzero-Pcb tests.
+The walker now refuses a nonzero exact-PDB `_EPROCESS.Pcb` before treating
+`KTHREAD.Process` as an EPROCESS pointer. It verifies every `LIST_ENTRY.Blink`
+against its predecessor, verifies the head's final `Blink`, and rejects a
+duplicate live client TID. A malformed walk preserves only the prior validated
+prefix and identifies the exact failure stage, link, and ETHREAD. Nonzero-Pcb,
+bad entry/head back-links, duplicate TIDs, cycles, foreign owner/CID, and cap
+fixtures are covered; live PID 4 and a complete 82-process sweep passed these
+invariants on the running Windows 11 guest.
 
-### 94. Planned — strict partial-result controls and structured truncation
+### 94. Completed — strict partial-result controls and structured truncation
 
-Best-effort prefix data is useful interactively but unsafe for automation that
-requires a complete list. Add CLI `--require-complete` and MCP
-`require_complete`; preserve the prefix only in explicit best-effort mode.
-Replace a lone truncation string with bounded structured evidence (`stage`,
-`link`, `ethread`, `returned`, `reason`) while retaining a human summary. Test
-every malformed/read/cap path and ensure strict callers receive a typed error.
+`kdbg_threads` and per-process `kdbg_triage` now retain their legacy
+`truncated_reason` while adding `{stage, link, ethread, returned, reason}`
+evidence. CLI `--require-complete` and MCP `require_complete=true` reject a
+partial prefix with retryable typed `incomplete_result`, instead of making an
+automation consumer inspect a successful response. The global triage uses the
+same rule for process-list, process-cap, thread-budget, and per-process thread
+walk boundaries. Unit contracts cover legacy/manual prefixes, every strict
+error path, cap boundaries, and structured error detail; live checks exercised
+both an accepted complete scope and an intentionally cap-refused one.
 
-### 95. Planned — snapshot queueing, duration, and ownership visibility
+### 95. Completed — nonqueueing snapshot/decomp admission and ownership visibility
 
-The RSP broker intentionally serializes complete snapshot transactions, but a
-concurrent MCP caller currently has no queue/duration/owner visibility. Add
-per-VM bounded queueing or a typed `busy` result, cancellation before a snapshot
-begins, and response metadata for queue delay, stop duration, snapshot ID, and
-reader owner. Stress simultaneous CLI/MCP walks and cancellation; prove the
-guest resumes and no interactive debugger session is disturbed.
+The RSP broker and decomp worker now take independent, per-runtime operation
+leases before beginning work. A concurrent caller gets a stable retryable
+`busy` response immediately—no invisible socket or JVM backlog. Snapshot
+results include a unique snapshot ID, persistent-reader owner, explicit
+admission, queue delay (`0` by design), and stop duration. Decomp results carry
+the matching worker lease/timing metadata; `kdbg_decomp_status` and doctor
+expose an active admission. Same-process and cross-process contention,
+reader-cleanup, and the guarantee that a rejected second snapshot cannot retire
+the live reader are covered by focused tests.
 
-### 96. Planned — normalized timestamp, status, and pointer presentation
+### 102. Completed — default cold-analysis interlock for stopped targets
 
-Expose raw FILETIME and NTSTATUS values for forensics but add unambiguous UTC
-timestamps, hexadecimal status, common status names, and explicit `null` for
-unavailable values. Rename or annotate the raw `KernelStack` field so users do
-not mistake it for a saved RSP. Zero/terminating/system-thread cases and JSON
-schema compatibility require coverage.
+`kdbg_decomp` verifies exact cached analysis readiness after the live module
+identity check. If the Ghidra project/profile is absent or stale, its default
+path returns retryable `analysis_required` before invoking the worker, with the
+digest, readiness reason, and offline preparation recovery action. This avoids
+holding a stopped target through first-open analysis. `allow_cold=true` remains
+an explicit escape hatch and response metadata states whether cold analysis was
+allowed. Tests cover absent project data, stale/missing metadata, profile
+mismatch, malformed cache artifacts, explicit opt-in, and exact project
+identity.
 
-### 97. Planned — baseline and diffable thread snapshots
+### 103. Completed — doctor capability matrix and runtime provenance
 
-One list describes one stop; research often needs what changed. Persist a
-bounded, host-side baseline keyed by EPROCESS, ETHREAD, and creation time, then
-report created/exited threads, state/priority transitions, and context-switch
-deltas on a later explicit snapshot. Baselines must expire across reboot,
-PID/EPROCESS reuse, and symbol-store changes. Do not turn this into aggressive
-polling: each sample remains an explicit CET-gated stop transaction.
+`kdbg_doctor` now separates basic snapshot readiness from thread research,
+interactive debugging, live decompilation, and offline preparation. It reports
+the selected decomp backend, its next recovery action, worker/admission state,
+and source-manifest versus installed-package versions, paths, PID, git revision,
+and dirty state. This makes an editable-install/version drift and a missing
+PyGhidra image visible rather than presenting a deceptively green generic
+readiness bit. Tests cover unavailable decomp prerequisites and deliberate
+source/installed version mismatch.
 
-### 98. Planned — all-process thread triage summary
+### 96. Completed — normalized timestamp, status, and pointer presentation
 
-Add a bounded summary view that ranks processes by total/runnable/waiting
-threads, newest threads, private-or-unmapped starts, and optionally high
-context-switch deltas. It should return counts and small ranked samples first,
-not an all-process dump of every ETHREAD. Test global caps, process exits during
-selection, empty filters, and a live multi-process summary.
+Thread JSON retains legacy raw `create_time`, signed `exit_status`, and pointer
+strings for compatibility while adding explicit FILETIME/UTC pairs, normalized
+unsigned NTSTATUS hex plus a small exact-name map, and null-aware pointer
+values. `KernelStack` is annotated as a `KTHREAD.KernelStack` field, never a
+fabricated saved RSP; zero/unavailable values stay `null` in the additive typed
+view rather than becoming fake addresses or dates.
 
-### 99. Planned — malformed-PDB and architecture-assumption hardening
+### 97. Completed — explicit baseline and diffable thread snapshots
 
-Thread layout derivation is PDB-driven but still assumes parseable numeric
-field records, x64 pointer widths, and the current canonical-address form.
-Normalize malformed symbol-store data to `SymbolStoreError`, validate field
-width/type where extraction exposes it, and state/refuse unsupported paging or
-architecture modes rather than decoding them as x64. Fuzz malformed layouts and
-add unsupported-architecture, five-level-address-policy, and stale-symbol
-fixtures.
+`kdbg_thread_baseline(pid, name?)` / `winbox kdbg thread-baseline PID` saves a
+complete bounded host-side ETHREAD set only after one validated stop. The later
+`kdbg_thread_diff` / `winbox kdbg thread-diff` performs one new explicit stop
+and reports bounded created/exited threads, state/wait/priority/exit changes,
+and wrap-aware 32-bit context-switch deltas. Baselines bind VM, target
+PID/EPROCESS/CreateTime, System/boot identity, and active nt symbol-store
+revision; a mismatch returns typed `baseline_expired` rather than comparing
+across reboot, PID reuse, or changed symbol data. Neither command polls.
+
+### 98. Completed — all-process thread triage summary
+
+`kdbg_thread_triage` / `winbox kdbg thread-triage` takes one RSP stop and
+returns bounded rankings by thread count and runnable count, newest threads,
+high-context-switch samples, and conservatively attributed loader/module
+mismatches. It never claims arbitrary-thread registers or turns an untrusted
+loader failure into a suspicious start. `process_cap`, `total_thread_cap`,
+`sample_per_process`, and `result_limit` all have hard bounds; the response
+states whether the active process list, selected process scope, and every
+thread walk completed. Tests cover cap exhaustion, partial process lists,
+untrusted attribution, empty/filter-like edge cases, CLI/MCP propagation, and
+strict refusal. Live validation found 82 complete process records / 705 threads
+in a 1.2-second stopped snapshot, while a 64-process run truthfully refused
+strict mode rather than claiming global coverage.
+
+### 92. Completed — bounded wait-object and owner-chain evidence
+
+`kdbg_threads(..., wait_objects=true)` / `winbox kdbg threads --wait-objects`
+adds PDB-derived evidence only for the displayed Waiting rows. It accepts only
+the thread's embedded `_KWAIT_BLOCK`, confirms that block names that exact
+ETHREAD, labels the actual `_DISPATCHER_HEADER.Type`, and follows only a real
+`_KMUTANT.OwnerThread` relation. External/multi-object blocks, unknown
+dispatcher types, stale owner IDs, cycles, and configured-depth exhaustion stay
+explicit reasons — never a made-up lock graph. The scan and owner chain are
+hard-capped (128 rows, four hops), PDB extraction happens before the RSP stop,
+and live validation returned a real synchronization-event wait with no claimed
+owner.
+
+### 99. Completed — malformed-PDB and architecture-assumption hardening
+
+Layout derivation now rejects malformed/boolean/implausible offsets, missing or
+zero-sized structures, incompatible declared scalar widths, non-zero `_EPROCESS`
+`Pcb` embeddings, and non-x64 symbol stores as `SymbolStoreError`. The page
+walker rejects non-canonical / LA57 virtual addresses rather than treating them
+as four-level x64. Focused malformed-layout and paging-policy tests cover the
+refusal paths; live process/thread walks still completed with the active nt PDB.
+
+### 104. Completed — broker-enforced snapshot stop budgets and accounting
+
+Every persistent-reader snapshot carries a hard broker-enforced 15-second,
+16,384-read, 16-MiB contract by default. The broker accounts reads and returned
+bytes, treats client idle time as part of the stop budget, resumes Windows on
+expiry, and returns typed retryable `snapshot_budget_exceeded` evidence instead
+of silently stranding the guest. Snapshot results expose the budget, counters,
+exhaustion state, and error; the active reader admission shown by doctor also
+identifies its budget. Unit socket tests cover read-count and idle-duration
+expiry plus guest resume, while live checks record the normal stop accounting.
 
 ### Completed final unwind batch (2026-08-24)
 

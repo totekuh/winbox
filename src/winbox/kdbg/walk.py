@@ -17,8 +17,8 @@ regardless of which process was scheduled at halt time.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterator
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, Iterator
 
 import logging
 import threading
@@ -46,6 +46,7 @@ MAX_PROCESSES = 4096
 MAX_MODULES = 1024
 MAX_USER_MODULES = 1024
 MAX_THREADS_PER_PROCESS = 8192
+_MAX_PDB_STRUCT_SIZE = 1 << 20
 
 
 # Values from nt!KTHREAD_STATE / nt!KWAIT_REASON.  The raw byte is always
@@ -131,6 +132,34 @@ class ProcessRecord:
                                         # back to filtering on directory_table_base alone.
     create_time: int = 0       # EPROCESS.CreateTime when present in exact types
     exit_time: int = 0         # EPROCESS.ExitTime; non-zero means termination began
+
+
+@dataclass(frozen=True)
+class ProcessWalkTruncation:
+    """Bounded provenance for a partial active-process-list walk."""
+
+    stage: str
+    reason: str
+    returned: int
+    link: int | None = None
+    eprocess: int | None = None
+
+    def public(self) -> dict[str, int | str | None]:
+        return {
+            "stage": self.stage,
+            "link": f"0x{self.link:016x}" if self.link is not None else None,
+            "eprocess": f"0x{self.eprocess:016x}" if self.eprocess is not None else None,
+            "returned": self.returned,
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class ProcessWalkResult:
+    processes: list[ProcessRecord]
+    complete: bool
+    truncated_reason: str | None = None
+    truncation: ProcessWalkTruncation | None = None
 
 
 @dataclass(frozen=True)
@@ -221,6 +250,60 @@ class ThreadWalkResult:
     threads: list[ThreadRecord]
     complete: bool
     truncated_reason: str | None = None
+    truncation: "ThreadWalkTruncation | None" = None
+
+
+@dataclass(frozen=True)
+class ThreadWalkTruncation:
+    """Machine-safe provenance for a validated but incomplete thread prefix."""
+
+    stage: str
+    reason: str
+    returned: int
+    link: int | None = None
+    ethread: int | None = None
+
+    def public(self) -> dict[str, int | str | None]:
+        return {
+            "stage": self.stage,
+            "link": f"0x{self.link:016x}" if self.link is not None else None,
+            "ethread": f"0x{self.ethread:016x}" if self.ethread is not None else None,
+            "returned": self.returned,
+            "reason": self.reason,
+        }
+
+
+class ThreadWalkIncomplete(HmpError):
+    """Strict callers refused a partial kernel-thread prefix."""
+
+    code = "incomplete_result"
+    retryable = True
+
+    def __init__(self, result: ThreadWalkResult) -> None:
+        self.result = result
+        evidence = thread_walk_truncation(result) or {}
+        self.details = {"truncation": evidence}
+        super().__init__(
+            "thread walk is incomplete; retry after the kernel list is stable "
+            "or omit require_complete to inspect the validated prefix"
+        )
+
+
+def thread_walk_truncation(
+    result: ThreadWalkResult,
+) -> dict[str, int | str | None] | None:
+    """Return structured partial evidence, including legacy/manual results."""
+    if result.complete:
+        return None
+    if result.truncation is not None:
+        return result.truncation.public()
+    return {
+        "stage": "unknown",
+        "link": None,
+        "ethread": None,
+        "returned": len(result.threads),
+        "reason": result.truncated_reason or "thread walk is incomplete",
+    }
 
 
 class ThreadFilterError(HmpError):
@@ -259,6 +342,10 @@ class ThreadAddressAttribution:
     architecture: str | None = None
     symbol: str | None = None
     symbol_offset: int | None = None
+    # The loader result is deliberately retained even when a selected lead is
+    # checked against the VAD tree.  A loader miss and a private/image VAD are
+    # different kernel facts, not competing verdicts.
+    vad: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -528,34 +615,168 @@ def _read_unicode_string(
 ) -> str:
     """Read a ``_UNICODE_STRING`` at ``va``, looking up field offsets from
     the symbol store and delegating the actual reads to memory.read_unicode_string."""
-    fields = store.struct("_UNICODE_STRING")["fields"]
+    layout = _layout_struct(store, "_UNICODE_STRING")
     return read_unicode_string(
         vm_name, cr3, va,
-        length_off=fields["Length"]["off"],
-        buffer_off=fields["Buffer"]["off"],
+        length_off=_layout_field(layout, "_UNICODE_STRING", "Length", 2).offset,
+        buffer_off=_layout_field(layout, "_UNICODE_STRING", "Buffer", 8).offset,
         cache=cache,
     )
+
+
+def _layout_int(raw: object, label: str, *, maximum: int = _MAX_PDB_STRUCT_SIZE) -> int:
+    """Normalize an untrusted JSON PDB numeric field or fail closed.
+
+    Symbol-store JSON is cached across versions and can be manually edited.
+    ``bool`` is deliberately rejected even though Python considers it an int:
+    accepting ``true`` as an offset of one is exactly the sort of polished
+    nonsense a kernel walker must not produce.
+    """
+    if isinstance(raw, bool):
+        raise SymbolStoreError(f"invalid {label} in nt types")
+    try:
+        value = int(raw, 0) if isinstance(raw, str) else int(raw)
+    except (TypeError, ValueError) as exc:
+        raise SymbolStoreError(f"invalid {label} in nt types") from exc
+    if not 0 <= value <= maximum:
+        raise SymbolStoreError(f"implausible {label} 0x{value:x} in nt types")
+    return value
+
+
+def _layout_struct(store: SymbolStore, name: str) -> dict[str, Any]:
+    """Return one exact layout after validating its outer JSON shape."""
+    try:
+        layout = store.struct(name)
+    except (KeyError, TypeError, ValueError, SymbolStoreError) as exc:
+        raise SymbolStoreError(
+            f"{name} is absent or malformed in nt types — re-run `winbox kdbg symbols`"
+        ) from exc
+    if not isinstance(layout, dict) or not isinstance(layout.get("fields"), dict):
+        raise SymbolStoreError(f"invalid {name} layout in nt types")
+    size = _layout_int(layout.get("size"), f"{name}.size")
+    if size == 0:
+        raise SymbolStoreError(f"invalid zero {name}.size in nt types")
+    return layout
+
+
+def _field_declared_width(entry: object) -> int | None:
+    """Infer a width only where llvm-pdbutil exposed an unambiguous type."""
+    if not isinstance(entry, dict):
+        return None
+    hint = entry.get("type")
+    if not isinstance(hint, str) or not hint.strip():
+        return None
+    normalized = " ".join(hint.casefold().replace("*", " * ").split())
+    if "[" in normalized or "]" in normalized:
+        return None
+    if "*" in normalized:
+        return 8
+    if "__int64" in normalized or "long long" in normalized:
+        return 8
+    if "short" in normalized or "wchar_t" in normalized:
+        return 2
+    if "char" in normalized or "bool" in normalized:
+        return 1
+    # Windows PDB `long` and `int` are fixed-width 32-bit scalar types.
+    if "long" in normalized or normalized in {"int", "unsigned int"}:
+        return 4
+    return None
+
+
+def _layout_field(
+    layout: dict[str, Any],
+    struct_name: str,
+    field_name: str,
+    size: int,
+    *,
+    base: int = 0,
+) -> _ThreadField:
+    """Validate a fixed-width field before it can become a memory read."""
+    fields = layout.get("fields")
+    entry = fields.get(field_name) if isinstance(fields, dict) else None
+    if not isinstance(entry, dict) or "off" not in entry:
+        raise SymbolStoreError(
+            f"{struct_name}.{field_name} is absent from nt types — "
+            "re-run `winbox kdbg symbols`"
+        )
+    relative_offset = _layout_int(entry.get("off"), f"{struct_name}.{field_name}.off")
+    struct_size = _layout_int(layout.get("size"), f"{struct_name}.size")
+    if size <= 0 or relative_offset + size > struct_size:
+        raise SymbolStoreError(f"invalid {struct_name}.{field_name} span in nt types")
+    declared_width = _field_declared_width(entry)
+    if declared_width is not None and declared_width != size:
+        raise SymbolStoreError(
+            f"{struct_name}.{field_name} declares {declared_width} bytes, "
+            f"expected {size}"
+        )
+    offset = relative_offset + base
+    if offset < base or offset > _MAX_PDB_STRUCT_SIZE:
+        raise SymbolStoreError(f"invalid {struct_name}.{field_name} offset in nt types")
+    return _ThreadField(field_name, offset, size)
+
+
+def _require_x64_four_level_store(store: SymbolStore) -> None:
+    """Reject a symbol store we cannot safely decode with this x64 walker.
+
+    Test doubles intentionally need only ``struct()``. Real SymbolStore
+    instances expose ``load()`` and must declare their architecture; silently
+    assuming x64 after an x86/ARM store was selected is worse than refusing.
+    """
+    load = getattr(store, "load", None)
+    if not callable(load):
+        return
+    try:
+        data = load("nt")
+    except (OSError, ValueError, TypeError, SymbolStoreError) as exc:
+        raise SymbolStoreError("cannot validate nt symbol-store architecture") from exc
+    if not isinstance(data, dict):
+        raise SymbolStoreError("invalid nt symbol-store record")
+    architecture = str(data.get("architecture") or "").casefold()
+    if architecture not in {"x64", "amd64"}:
+        raise SymbolStoreError(
+            f"unsupported nt symbol-store architecture {architecture or 'unknown'!r}; "
+            "this walker requires x64 four-level paging"
+        )
 
 
 # ── Process list ────────────────────────────────────────────────────────
 
 
 def _process_layout(store: SymbolStore) -> _ProcessLayout:
-    eproc = store.struct("_EPROCESS")
-    eproc_fields = eproc["fields"]
-    kproc_fields = store.struct("_KPROCESS")["fields"]
-    active_links = int(eproc_fields["ActiveProcessLinks"]["off"])
-    image_name = int(eproc_fields["ImageFileName"]["off"])
-    pid = int(eproc_fields["UniqueProcessId"]["off"])
-    dtb = int(kproc_fields["DirectoryTableBase"]["off"])
+    _require_x64_four_level_store(store)
+    eproc = _layout_struct(store, "_EPROCESS")
+    kproc = _layout_struct(store, "_KPROCESS")
+    # DirectoryTableBase belongs to the embedded KPROCESS.  Its offset is
+    # meaningful relative to EPROCESS only when Pcb is proven to start at 0.
+    pcb = _layout_field(eproc, "_EPROCESS", "Pcb", 1)
+    if pcb.offset != 0:
+        raise SymbolStoreError(
+            f"unsupported _EPROCESS.Pcb offset 0x{pcb.offset:x} — "
+            "refusing to treat PKPROCESS offsets as EPROCESS offsets"
+        )
+    active_links = _layout_field(eproc, "_EPROCESS", "ActiveProcessLinks", 16).offset
+    image_name = _layout_field(eproc, "_EPROCESS", "ImageFileName", 15).offset
+    pid = _layout_field(eproc, "_EPROCESS", "UniqueProcessId", 8).offset
+    dtb = _layout_field(kproc, "_KPROCESS", "DirectoryTableBase", 8).offset
+    kproc_fields = kproc["fields"]
     raw_user_dtb = kproc_fields.get("UserDirectoryTableBase", {}).get("off")
-    user_dtb = int(raw_user_dtb) if raw_user_dtb is not None else None
+    user_dtb = (
+        _layout_field(kproc, "_KPROCESS", "UserDirectoryTableBase", 8).offset
+        if raw_user_dtb is not None else None
+    )
+    eproc_fields = eproc["fields"]
     raw_create_time = eproc_fields.get("CreateTime", {}).get("off")
     raw_exit_time = eproc_fields.get("ExitTime", {}).get("off")
-    create_time = int(raw_create_time) if raw_create_time is not None else None
-    exit_time = int(raw_exit_time) if raw_exit_time is not None else None
+    create_time = (
+        _layout_field(eproc, "_EPROCESS", "CreateTime", 8).offset
+        if raw_create_time is not None else None
+    )
+    exit_time = (
+        _layout_field(eproc, "_EPROCESS", "ExitTime", 8).offset
+        if raw_exit_time is not None else None
+    )
 
-    fields = [(active_links, 8), (image_name, 15), (pid, 8), (dtb, 8)]
+    fields = [(active_links, 16), (image_name, 15), (pid, 8), (dtb, 8)]
     if user_dtb is not None:
         fields.append((user_dtb, 8))
     if create_time is not None:
@@ -564,10 +785,10 @@ def _process_layout(store: SymbolStore) -> _ProcessLayout:
         fields.append((exit_time, 8))
     field_start = min(offset for offset, _ in fields)
     field_end = max(offset + size for offset, size in fields)
-    eproc_size = int(eproc.get("size") or 0)
+    eproc_size = _layout_int(eproc.get("size"), "_EPROCESS.size")
     if field_start < 0 or field_end <= field_start:
         raise HmpError("invalid negative/empty EPROCESS field span")
-    if eproc_size and field_end > eproc_size:
+    if field_end > eproc_size:
         raise HmpError(
             f"EPROCESS field span 0x{field_start:x}-0x{field_end:x} exceeds "
             f"struct size 0x{eproc_size:x}"
@@ -740,6 +961,66 @@ def list_processes(
 
 
 @snapshot_operation
+def list_processes_detailed(
+    vm_name: str,
+    store: SymbolStore,
+    *,
+    cr3: int | None = None,
+    cache: WalkCache | None = None,
+) -> ProcessWalkResult:
+    """Walk the active process list with an explicit partial-result contract.
+
+    ``list_processes`` remains a compatibility list API. New global research
+    views need to know whether their process scope was complete, so they use
+    this additive variant rather than inferring completion from a count.
+    """
+    head = store.resolve("PsActiveProcessHead")
+    layout = _process_layout(store)
+    cr3, flink, cache = _read_kernel_list_head(vm_name, head, cr3)
+    records: list[ProcessRecord] = []
+    seen: set[int] = set()
+
+    def partial(
+        stage: str, reason: str, *, link: int | None = None, eprocess: int | None = None,
+    ) -> ProcessWalkResult:
+        return ProcessWalkResult(
+            records, False, reason,
+            ProcessWalkTruncation(
+                stage=stage, reason=reason, returned=len(records),
+                link=link, eprocess=eprocess,
+            ),
+        )
+
+    while flink != head:
+        if flink == 0:
+            return partial("link", "PsActiveProcessHead contained a null link", link=flink)
+        if not _is_kernel_pointer(flink):
+            return partial("link", f"invalid EPROCESS list pointer 0x{flink:x}", link=flink)
+        if flink in seen:
+            return partial("link", f"cycle detected at EPROCESS list entry 0x{flink:x}", link=flink)
+        if len(records) >= MAX_PROCESSES:
+            return partial("cap", f"hit MAX_PROCESSES={MAX_PROCESSES}", link=flink)
+        seen.add(flink)
+        eprocess = flink - layout.active_links
+        if not _is_kernel_pointer(eprocess):
+            return partial(
+                "entry", f"invalid EPROCESS pointer 0x{eprocess:x}",
+                link=flink, eprocess=eprocess,
+            )
+        try:
+            record, flink = _read_process_entry(vm_name, cr3, eprocess, layout, cache)
+        except (HmpError, PageWalkError) as exc:
+            return partial("entry", str(exc), link=flink, eprocess=eprocess)
+        records.append(record)
+        if len(records) == 1 and record.pid == 4 and record.directory_table_base != cr3:
+            cr3 = record.directory_table_base
+            cache = WalkCache()
+        if record.pid == 4 and cr3 is not None:
+            _remember_kernel_cr3(vm_name, record.directory_table_base)
+    return ProcessWalkResult(records, True)
+
+
+@snapshot_operation
 def find_process(
     vm_name: str,
     store: SymbolStore,
@@ -808,8 +1089,41 @@ class _ThreadField:
 class _ThreadLayout:
     thread_list_head: int
     thread_list_entry: int
+    eprocess_pcb: int
     fields: dict[str, _ThreadField]
     spans: tuple[_ProcessSpan, ...]
+
+
+@dataclass(frozen=True)
+class _WaitLayout:
+    """The small exact-PDB subset needed for conservative wait evidence."""
+
+    thread: _ThreadLayout
+    wait_block_list: _ThreadField
+    embedded_wait_block: int
+    wait_block_thread: _ThreadField
+    wait_block_object: _ThreadField
+    dispatcher_type: _ThreadField
+    mutant_owner_thread: _ThreadField
+
+
+MAX_WAIT_OBJECT_THREADS = 128
+MAX_WAIT_OWNER_DEPTH = 4
+
+# KOBJECTS / DISPATCHER_HEADER.Type values. These byte values are stable
+# scheduler metadata, but only Mutant has an owner field we resolve here.
+_DISPATCHER_OBJECT_TYPES = {
+    0: "notification_event",
+    1: "synchronization_event",
+    2: "mutant",
+    3: "process",
+    4: "queue",
+    5: "semaphore",
+    6: "thread",
+    7: "gate",
+    8: "notification_timer",
+    9: "synchronization_timer",
+}
 
 
 def _thread_field(
@@ -821,25 +1135,7 @@ def _thread_field(
     base: int = 0,
 ) -> _ThreadField:
     """Resolve and validate one exact-PDB field before reading memory."""
-    raw = struct.get("fields", {}).get(field_name, {}).get("off")
-    if raw is None:
-        raise SymbolStoreError(
-            f"{struct_name}.{field_name} is absent from nt types — "
-            "re-run `winbox kdbg symbols`"
-        )
-    try:
-        offset = int(raw) + base
-    except (TypeError, ValueError) as exc:
-        raise SymbolStoreError(
-            f"invalid {struct_name}.{field_name} offset in nt types"
-        ) from exc
-    struct_size = int(struct.get("size") or 0)
-    relative_end = offset - base + size
-    if offset < base or size <= 0 or (struct_size and relative_end > struct_size):
-        raise SymbolStoreError(
-            f"invalid {struct_name}.{field_name} span in nt types"
-        )
-    return _ThreadField(field_name, offset, size)
+    return _layout_field(struct, struct_name, field_name, size, base=base)
 
 
 def _compact_spans(fields: list[_ThreadField]) -> tuple[_ProcessSpan, ...]:
@@ -862,41 +1158,35 @@ def _thread_layout(store: SymbolStore) -> _ThreadLayout:
     us both offsets, and the walker rejects a non-zero Tcb instead of assuming
     a layout it has not verified.
     """
-    eproc = store.struct("_EPROCESS")
-    ethread = store.struct("_ETHREAD")
-    kthread = store.struct("_KTHREAD")
-    eproc_size = int(eproc.get("size") or 0)
+    _require_x64_four_level_store(store)
+    eproc = _layout_struct(store, "_EPROCESS")
+    ethread = _layout_struct(store, "_ETHREAD")
+    kthread = _layout_struct(store, "_KTHREAD")
+    thread_list_head = _layout_field(
+        eproc, "_EPROCESS", "ThreadListHead", 16,
+    ).offset
 
-    raw_head = eproc.get("fields", {}).get("ThreadListHead", {}).get("off")
-    if raw_head is None:
+    pcb = _layout_field(eproc, "_EPROCESS", "Pcb", 1)
+    eprocess_pcb = pcb.offset
+    if eprocess_pcb != 0:
         raise SymbolStoreError(
-            "_EPROCESS.ThreadListHead is absent from nt types — "
-            "re-run `winbox kdbg symbols`"
+            f"unsupported _EPROCESS.Pcb offset 0x{eprocess_pcb:x} — "
+            "refusing to equate PKPROCESS with EPROCESS"
         )
-    try:
-        thread_list_head = int(raw_head)
-    except (TypeError, ValueError) as exc:
-        raise SymbolStoreError("invalid _EPROCESS.ThreadListHead offset in nt types") from exc
-    if thread_list_head < 0 or (eproc_size and thread_list_head + 16 > eproc_size):
-        raise SymbolStoreError("invalid _EPROCESS.ThreadListHead span in nt types")
 
-    raw_tcb = ethread.get("fields", {}).get("Tcb", {}).get("off")
-    try:
-        tcb = int(raw_tcb)
-    except (TypeError, ValueError) as exc:
-        raise SymbolStoreError("_ETHREAD.Tcb is absent or invalid in nt types") from exc
+    tcb = _layout_field(ethread, "_ETHREAD", "Tcb", 1).offset
     if tcb != 0:
         raise SymbolStoreError(
             f"unsupported _ETHREAD.Tcb offset 0x{tcb:x} — refusing to guess KTHREAD base"
         )
-    ethread_size = int(ethread.get("size") or 0)
-    kthread_size = int(kthread.get("size") or 0)
-    if ethread_size and kthread_size and kthread_size > ethread_size:
+    ethread_size = _layout_int(ethread.get("size"), "_ETHREAD.size")
+    kthread_size = _layout_int(kthread.get("size"), "_KTHREAD.size")
+    if kthread_size > ethread_size:
         raise SymbolStoreError("_KTHREAD exceeds _ETHREAD in nt types")
 
     fields = {
         "thread_list_entry": _thread_field(
-            ethread, "_ETHREAD", "ThreadListEntry", 8,
+            ethread, "_ETHREAD", "ThreadListEntry", 16,
         ),
         # CLIENT_ID is a documented pair of pointer-width HANDLEs on x64.
         # It is embedded in ETHREAD; the PDB parser intentionally stores
@@ -942,8 +1232,35 @@ def _thread_layout(store: SymbolStore) -> _ThreadLayout:
     return _ThreadLayout(
         thread_list_head=thread_list_head,
         thread_list_entry=fields["thread_list_entry"].offset,
+        eprocess_pcb=eprocess_pcb,
         fields=fields,
         spans=_compact_spans(list(fields.values())),
+    )
+
+
+def _wait_layout(store: SymbolStore) -> _WaitLayout:
+    """Load only wait fields whose exact type/layout is available.
+
+    ``WaitBlockList`` may refer to an external block for multi-object waits.
+    This implementation intentionally refuses to chase that arbitrary list:
+    it resolves the one embedded KTHREAD.WaitBlock only after the pointer
+    proves it is the active block.  That yields real object/owner facts for
+    ordinary waits without turning a corrupted object queue into a fake
+    deadlock graph.
+    """
+    thread = _thread_layout(store)
+    kthread = _layout_struct(store, "_KTHREAD")
+    wait_block = _layout_struct(store, "_KWAIT_BLOCK")
+    header = _layout_struct(store, "_DISPATCHER_HEADER")
+    mutant = _layout_struct(store, "_KMUTANT")
+    return _WaitLayout(
+        thread=thread,
+        wait_block_list=_layout_field(kthread, "_KTHREAD", "WaitBlockList", 8),
+        embedded_wait_block=_layout_field(kthread, "_KTHREAD", "WaitBlock", 1).offset,
+        wait_block_thread=_layout_field(wait_block, "_KWAIT_BLOCK", "Thread", 8),
+        wait_block_object=_layout_field(wait_block, "_KWAIT_BLOCK", "Object", 8),
+        dispatcher_type=_layout_field(header, "_DISPATCHER_HEADER", "Type", 1),
+        mutant_owner_thread=_layout_field(mutant, "_KMUTANT", "OwnerThread", 8),
     )
 
 
@@ -958,6 +1275,7 @@ def _read_thread_entry(
     target: ProcessRecord,
     layout: _ThreadLayout,
     cache: WalkCache,
+    previous_link: int,
 ) -> tuple[ThreadRecord, int]:
     """Read one ETHREAD/KTHREAD prefix in compact, exact-PDB spans."""
     chunks: list[tuple[_ProcessSpan, bytes]] = []
@@ -980,9 +1298,16 @@ def _read_thread_entry(
                 return raw[start:start + wanted.size]
         raise HmpError(f"ETHREAD field {name} is outside read spans")
 
-    next_flink = int.from_bytes(field("thread_list_entry"), "little")
+    list_entry = field("thread_list_entry")
+    next_flink = int.from_bytes(list_entry[:8], "little")
+    previous_blink = int.from_bytes(list_entry[8:], "little")
     if next_flink != target.eprocess + layout.thread_list_head and not _is_kernel_pointer(next_flink):
         raise HmpError(f"invalid ETHREAD list pointer 0x{next_flink:x}")
+    if previous_blink != previous_link:
+        raise HmpError(
+            f"ETHREAD list Blink 0x{previous_blink:x} at link "
+            f"0x{ethread + layout.thread_list_entry:x}, expected 0x{previous_link:x}"
+        )
 
     cid = field("cid")
     client_pid = int.from_bytes(cid[:8], "little")
@@ -1034,6 +1359,7 @@ def list_threads(
     target: ProcessRecord,
     *,
     cache: WalkCache | None = None,
+    max_threads: int | None = None,
 ) -> ThreadWalkResult:
     """Walk one process's ``EPROCESS.ThreadListHead`` safely.
 
@@ -1044,6 +1370,14 @@ def list_threads(
     """
     if target.pid <= 0 or target.eprocess <= 0:
         raise HmpError("invalid target process record for thread walk")
+    if max_threads is not None and (
+        not isinstance(max_threads, int) or isinstance(max_threads, bool)
+        or not 1 <= max_threads <= MAX_THREADS_PER_PROCESS
+    ):
+        raise ThreadFilterError(
+            f"max_threads must be an integer between 1 and {MAX_THREADS_PER_PROCESS}"
+        )
+    thread_cap = max_threads or MAX_THREADS_PER_PROCESS
     layout = _thread_layout(store)
     process_head = store.resolve("PsActiveProcessHead")
     kernel_cr3, _, selected_cache = _read_kernel_list_head(
@@ -1054,39 +1388,312 @@ def list_threads(
     try:
         flink = _read_u64(vm_name, kernel_cr3, head, cache)
     except (HmpError, PageWalkError) as exc:
-        return ThreadWalkResult([], False, f"could not read ThreadListHead: {exc}")
+        reason = f"could not read ThreadListHead: {exc}"
+        return _partial_thread_walk([], "head", reason, link=head)
+
+    try:
+        head_blink = _read_u64(vm_name, kernel_cr3, head + 8, cache)
+    except (HmpError, PageWalkError) as exc:
+        reason = f"could not read ThreadListHead Blink: {exc}"
+        return _partial_thread_walk([], "head", reason, link=head)
 
     results: list[ThreadRecord] = []
     seen: set[int] = set()
+    seen_tids: set[int] = set()
+    previous_link = head
     while flink != head:
         if flink == 0:
-            return ThreadWalkResult(results, False, "ThreadListHead contained a null link")
+            return _partial_thread_walk(
+                results, "link", "ThreadListHead contained a null link", link=flink,
+            )
         if not _is_kernel_pointer(flink):
-            return ThreadWalkResult(
-                results, False, f"invalid ETHREAD list pointer 0x{flink:x}",
+            return _partial_thread_walk(
+                results, "link", f"invalid ETHREAD list pointer 0x{flink:x}", link=flink,
             )
         if flink in seen:
-            return ThreadWalkResult(
-                results, False, f"cycle detected at ETHREAD list entry 0x{flink:x}",
+            return _partial_thread_walk(
+                results, "link", f"cycle detected at ETHREAD list entry 0x{flink:x}", link=flink,
             )
-        if len(results) >= MAX_THREADS_PER_PROCESS:
-            return ThreadWalkResult(
-                results, False, f"hit MAX_THREADS_PER_PROCESS={MAX_THREADS_PER_PROCESS}",
+        if len(results) >= thread_cap:
+            return _partial_thread_walk(
+                results, "cap", f"hit thread cap={thread_cap}", link=flink,
             )
         seen.add(flink)
         ethread = flink - layout.thread_list_entry
         if not _is_kernel_pointer(ethread):
-            return ThreadWalkResult(
-                results, False, f"invalid ETHREAD pointer 0x{ethread:x}",
+            return _partial_thread_walk(
+                results, "entry", f"invalid ETHREAD pointer 0x{ethread:x}",
+                link=flink, ethread=ethread,
             )
         try:
             record, flink = _read_thread_entry(
-                vm_name, kernel_cr3, ethread, target, layout, cache,
+                vm_name, kernel_cr3, ethread, target, layout, cache, previous_link,
             )
         except (HmpError, PageWalkError, SymbolStoreError) as exc:
-            return ThreadWalkResult(results, False, str(exc))
+            return _partial_thread_walk(
+                results, "entry", str(exc), link=flink, ethread=ethread,
+            )
+        if record.tid in seen_tids:
+            return _partial_thread_walk(
+                results, "identity",
+                f"duplicate live ETHREAD client thread id {record.tid}",
+                link=flink, ethread=ethread,
+            )
+        seen_tids.add(record.tid)
         results.append(record)
+        previous_link = ethread + layout.thread_list_entry
+    if head_blink != previous_link:
+        return _partial_thread_walk(
+            results, "head",
+            f"ThreadListHead Blink 0x{head_blink:x}, expected 0x{previous_link:x}",
+            link=head,
+        )
     return ThreadWalkResult(results, True)
+
+
+def _partial_thread_walk(
+    threads: list[ThreadRecord],
+    stage: str,
+    reason: str,
+    *,
+    link: int | None = None,
+    ethread: int | None = None,
+) -> ThreadWalkResult:
+    return ThreadWalkResult(
+        threads, False, reason,
+        ThreadWalkTruncation(
+            stage=stage, reason=reason, returned=len(threads), link=link, ethread=ethread,
+        ),
+    )
+
+
+def _wait_identity(
+    vm_name: str,
+    cr3: int,
+    ethread: int,
+    layout: _WaitLayout,
+    cache: WalkCache,
+) -> dict[str, int] | None:
+    """Return a minimal owner identity only after its ETHREAD fields agree."""
+    cid = read_virt_cr3(
+        vm_name, cr3, ethread + layout.thread.fields["cid"].offset, 16, cache=cache,
+    )
+    process = read_virt_cr3(
+        vm_name, cr3, ethread + layout.thread.fields["process"].offset, 8, cache=cache,
+    )
+    state = read_virt_cr3(
+        vm_name, cr3, ethread + layout.thread.fields["state"].offset, 1, cache=cache,
+    )
+    if len(cid) != 16 or len(process) != 8 or len(state) != 1:
+        raise HmpError(f"short owner ETHREAD identity read at 0x{ethread:x}")
+    pid = int.from_bytes(cid[:8], "little")
+    tid = int.from_bytes(cid[8:], "little")
+    owner_process = int.from_bytes(process, "little")
+    if pid == 0 or tid == 0 or not _is_kernel_pointer(owner_process):
+        return None
+    return {"ethread": ethread, "pid": pid, "tid": tid, "state": state[0]}
+
+
+def _wait_block_for_thread(
+    vm_name: str,
+    cr3: int,
+    ethread: int,
+    layout: _WaitLayout,
+    cache: WalkCache,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve one proven embedded wait block; never chase external pointers."""
+    active_raw = read_virt_cr3(
+        vm_name, cr3, ethread + layout.wait_block_list.offset, 8, cache=cache,
+    )
+    if len(active_raw) != 8:
+        raise HmpError(f"short KTHREAD.WaitBlockList read at 0x{ethread:x}")
+    active = int.from_bytes(active_raw, "little")
+    embedded = ethread + layout.embedded_wait_block
+    if active != embedded:
+        return None, (
+            "WaitBlockList does not reference this thread's embedded KWAIT_BLOCK; "
+            "external/multi-object wait blocks are not chased"
+        )
+    thread_raw = read_virt_cr3(
+        vm_name, cr3, embedded + layout.wait_block_thread.offset, 8, cache=cache,
+    )
+    object_raw = read_virt_cr3(
+        vm_name, cr3, embedded + layout.wait_block_object.offset, 8, cache=cache,
+    )
+    if len(thread_raw) != 8 or len(object_raw) != 8:
+        raise HmpError(f"short KWAIT_BLOCK read at 0x{embedded:x}")
+    block_thread = int.from_bytes(thread_raw, "little")
+    object_address = int.from_bytes(object_raw, "little")
+    if block_thread != ethread:
+        return None, "KWAIT_BLOCK.Thread does not identify the waiting ETHREAD"
+    if not _is_kernel_pointer(object_address):
+        return None, f"KWAIT_BLOCK.Object is not a canonical kernel pointer (0x{object_address:x})"
+    kind_raw = read_virt_cr3(
+        vm_name, cr3, object_address + layout.dispatcher_type.offset, 1, cache=cache,
+    )
+    if len(kind_raw) != 1:
+        raise HmpError(f"short DISPATCHER_HEADER.Type read at 0x{object_address:x}")
+    kind = kind_raw[0]
+    return {
+        "wait_block": embedded,
+        "object": object_address,
+        "dispatcher_type_raw": kind,
+        "dispatcher_type": _DISPATCHER_OBJECT_TYPES.get(kind),
+    }, None
+
+
+@snapshot_operation
+def resolve_thread_wait_objects(
+    vm_name: str,
+    store: SymbolStore,
+    target: ProcessRecord,
+    threads: tuple[ThreadRecord, ...] | list[ThreadRecord],
+    *,
+    cache: WalkCache | None = None,
+    limit: int = 32,
+    owner_depth: int = 2,
+) -> dict[str, Any]:
+    """Return bounded, exact-PDB wait-object and mutant-owner evidence.
+
+    This is intentionally an opt-in annotation for already selected Waiting
+    rows.  It does not infer a dispatcher type from an arbitrary pointer, does
+    not chase external/multi-object wait blocks, and follows only an exact
+    ``_KMUTANT.OwnerThread`` relation.  Every unavailable edge stays visible
+    as a reason rather than becoming a speculative deadlock claim.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_WAIT_OBJECT_THREADS:
+        raise ThreadFilterError(
+            f"wait_object_limit must be an integer between 1 and {MAX_WAIT_OBJECT_THREADS}"
+        )
+    if not isinstance(owner_depth, int) or isinstance(owner_depth, bool) or not 1 <= owner_depth <= MAX_WAIT_OWNER_DEPTH:
+        raise ThreadFilterError(
+            f"wait_owner_depth must be an integer between 1 and {MAX_WAIT_OWNER_DEPTH}"
+        )
+    if target.eprocess <= 0 or target.pid <= 0:
+        raise HmpError("invalid target process record for wait-object evidence")
+
+    layout = _wait_layout(store)
+    cache = cache or WalkCache()
+    head = target.eprocess + layout.thread.thread_list_head
+    kernel_cr3, _, kernel_cache = _read_kernel_list_head(vm_name, head, None)
+    if cache is not kernel_cache:
+        # The verified CR3's page-table cache is intentionally retained. The
+        # passed cache may have originated from the same target but through a
+        # provisional KPTI root.
+        cache = kernel_cache
+
+    waiting = sorted(
+        (thread for thread in threads if thread.state == 5),
+        key=lambda thread: (thread.tid, thread.ethread),
+    )
+    selected = waiting[:limit]
+    records: dict[int, dict[str, Any]] = {}
+    for thread in selected:
+        evidence: dict[str, Any] = {
+            "tid": thread.tid,
+            "ethread": f"0x{thread.ethread:016x}",
+            "state": {"raw": thread.state, "name": thread.state_name},
+            "complete": False,
+            "wait_block": None,
+            "object": None,
+            "owner_chain": [],
+            "reason": None,
+        }
+        current = thread.ethread
+        seen = {current}
+        for depth in range(owner_depth):
+            try:
+                block, reason = _wait_block_for_thread(
+                    vm_name, kernel_cr3, current, layout, cache,
+                )
+            except (HmpError, PageWalkError, SymbolStoreError) as exc:
+                evidence["reason"] = f"wait evidence read failed: {exc}"
+                break
+            if block is None:
+                evidence["reason"] = reason
+                break
+            object_view = {
+                "address": f"0x{block['object']:016x}",
+                "dispatcher_type": {
+                    "raw": block["dispatcher_type_raw"],
+                    "name": block["dispatcher_type"],
+                },
+            }
+            if depth == 0:
+                evidence["wait_block"] = f"0x{block['wait_block']:016x}"
+                evidence["object"] = object_view
+            if block["dispatcher_type_raw"] != 2:
+                evidence["reason"] = (
+                    "dispatcher object type has no proven owner relation"
+                    if block["dispatcher_type"] is not None
+                    else "unknown dispatcher object type; owner was not inferred"
+                )
+                break
+            try:
+                owner_raw = read_virt_cr3(
+                    vm_name, kernel_cr3,
+                    block["object"] + layout.mutant_owner_thread.offset,
+                    8, cache=cache,
+                )
+            except (HmpError, PageWalkError) as exc:
+                evidence["reason"] = f"KMUTANT.OwnerThread read failed: {exc}"
+                break
+            if len(owner_raw) != 8:
+                evidence["reason"] = "short KMUTANT.OwnerThread read"
+                break
+            owner = int.from_bytes(owner_raw, "little")
+            if owner == 0:
+                evidence["complete"] = True
+                evidence["reason"] = "mutant has no owner (unowned or abandoned)"
+                break
+            if not _is_kernel_pointer(owner):
+                evidence["reason"] = f"KMUTANT.OwnerThread is not a kernel pointer (0x{owner:x})"
+                break
+            if owner in seen:
+                evidence["reason"] = "owner chain cycle detected"
+                break
+            try:
+                identity = _wait_identity(vm_name, kernel_cr3, owner, layout, cache)
+            except (HmpError, PageWalkError) as exc:
+                evidence["reason"] = f"owner ETHREAD identity read failed: {exc}"
+                break
+            if identity is None:
+                evidence["reason"] = "owner ETHREAD identity is invalid or stale"
+                break
+            owner_view = {
+                "ethread": f"0x{owner:016x}",
+                "pid": identity["pid"],
+                "tid": identity["tid"],
+                "state": {
+                    "raw": identity["state"],
+                    "name": _KTHREAD_STATES.get(identity["state"]),
+                },
+                "via_object": object_view,
+            }
+            evidence["owner_chain"].append(owner_view)
+            if identity["state"] != 5:
+                evidence["complete"] = True
+                evidence["reason"] = "owner is not waiting"
+                break
+            seen.add(owner)
+            current = owner
+        else:
+            evidence["reason"] = f"owner chain reached configured depth={owner_depth}"
+        records[thread.ethread] = evidence
+
+    return {
+        "enabled": True,
+        "scope": {
+            "waiting_threads": len(waiting),
+            "examined": len(selected),
+            "output_truncated": len(waiting) > len(selected),
+            "wait_object_limit": limit,
+            "wait_owner_depth": owner_depth,
+            "external_wait_blocks": "not_chased",
+            "owner_relation": "mutant_only",
+        },
+        "records": records,
+    }
 
 
 # ── Module list ─────────────────────────────────────────────────────────
@@ -1101,15 +1708,17 @@ def list_modules(
     cache: WalkCache | None = None,
 ) -> list[ModuleRecord]:
     """Walk ``PsLoadedModuleList`` and return every loaded kernel module."""
+    _require_x64_four_level_store(store)
     explicit_cr3 = cr3
 
     head = store.resolve("PsLoadedModuleList")
-    ldr_fields = store.struct("_KLDR_DATA_TABLE_ENTRY")["fields"]
+    ldr = _layout_struct(store, "_KLDR_DATA_TABLE_ENTRY")
+    ldr_fields = ldr["fields"]
     # _KLDR_DATA_TABLE_ENTRY starts with InLoadOrderLinks at offset 0.
-    inload_off = ldr_fields.get("InLoadOrderLinks", {}).get("off", 0)
-    dll_base_off = ldr_fields["DllBase"]["off"]
-    size_off = ldr_fields["SizeOfImage"]["off"]
-    base_name_off = ldr_fields["BaseDllName"]["off"]
+    inload_off = _layout_field(ldr, "_KLDR_DATA_TABLE_ENTRY", "InLoadOrderLinks", 16).offset
+    dll_base_off = _layout_field(ldr, "_KLDR_DATA_TABLE_ENTRY", "DllBase", 8).offset
+    size_off = _layout_field(ldr, "_KLDR_DATA_TABLE_ENTRY", "SizeOfImage", 4).offset
+    base_name_off = _layout_field(ldr, "_KLDR_DATA_TABLE_ENTRY", "BaseDllName", 16).offset
 
     cr3, flink, cache = _read_kernel_list_head(vm_name, head, explicit_cr3)
     results: list[ModuleRecord] = []
@@ -1280,6 +1889,7 @@ def list_user_modules(
     WoW64 processes return both loader views.  Native support modules are
     labelled ``x64`` and the 32-bit PEB list is labelled ``x86``.
     """
+    _require_x64_four_level_store(store)
     if cache is None:
         cache = WalkCache()
     target_cr3 = target.directory_table_base
@@ -1511,22 +2121,61 @@ def resolve_thread_start_addresses(
         except (HmpError, PageWalkError, SymbolStoreError) as exc:
             user_modules = []
             warnings.append(f"user module attribution unavailable: {exc}")
-    return {
-        thread.ethread: ThreadStartAttribution(
-            start_address=_attribute_thread_address(
-                thread.start_address,
-                kernel_modules=kernel_modules,
-                user_modules=user_modules,
-                store=store,
-            ),
-            win32_start_address=_attribute_thread_address(
-                thread.win32_start_address,
-                kernel_modules=kernel_modules,
-                user_modules=user_modules,
-                store=store,
-            ),
+    resolved: dict[int, ThreadStartAttribution] = {}
+    unmatched_user_addresses: list[int] = []
+    for thread in threads:
+        start = _attribute_thread_address(
+            thread.start_address, kernel_modules=kernel_modules,
+            user_modules=user_modules, store=store,
         )
-        for thread in threads
+        win32_start = _attribute_thread_address(
+            thread.win32_start_address, kernel_modules=kernel_modules,
+            user_modules=user_modules, store=store,
+        )
+        resolved[thread.ethread] = ThreadStartAttribution(start, win32_start)
+        for value in (start, win32_start):
+            if value.mapping == "user_not_in_loader_module" and value.address not in unmatched_user_addresses:
+                unmatched_user_addresses.append(value.address)
+
+    # VAD lookup remains presentation-bounded: selected rows contribute at
+    # most 128 distinct user addresses.  VAD type extraction is intentionally
+    # expected to happen before the caller starts the RSP snapshot; a missing
+    # layout therefore degrades this enrichment to a visible warning rather
+    # than invalidating the already-proven ETHREAD/loader result.
+    vad_by_address: dict[int, Any] = {}
+    if unmatched_user_addresses:
+        if len(unmatched_user_addresses) > 128:
+            warnings.append(
+                f"VAD enrichment limited to 128 of {len(unmatched_user_addresses)} unmatched user starts"
+            )
+        try:
+            from winbox.kdbg.vad import VadError, lookup_addresses
+
+            vad_by_address = lookup_addresses(
+                vm_name, store, target, unmatched_user_addresses[:128], cache=cache,
+            )
+        except (
+            VadError, HmpError, PageWalkError, SymbolStoreError,
+            AttributeError, KeyError, TypeError, ValueError,
+        ) as exc:
+            warnings.append(f"VAD enrichment unavailable: {exc}")
+
+    def add_vad(value: ThreadAddressAttribution) -> ThreadAddressAttribution:
+        if value.mapping != "user_not_in_loader_module":
+            return value
+        if value.address not in vad_by_address:
+            return replace(value, vad={"status": "not_checked"})
+        record = vad_by_address[value.address]
+        return replace(value, vad={
+            "status": "not_found" if record is None else "mapped",
+            "record": None if record is None else record.public(),
+        })
+
+    return {
+        ethread: ThreadStartAttribution(
+            add_vad(value.start_address), add_vad(value.win32_start_address),
+        )
+        for ethread, value in resolved.items()
     }, tuple(warnings)
 
 

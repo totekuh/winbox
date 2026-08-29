@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 
@@ -43,23 +44,39 @@ def test_live_process_walk_survives_repeated_coherent_snapshots():
     assert min(counts) > 10
 
 
-def test_live_parallel_walkers_are_serialized_across_cli_processes():
+def test_live_parallel_walkers_get_visible_nonqueueing_admission():
     _require_safe_live_vm()
 
-    ps = subprocess.Popen(
-        ["winbox", "kdbg", "ps"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True,
-    )
-    lm = subprocess.Popen(
-        ["winbox", "kdbg", "lm"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True,
-    )
-    ps_out, ps_err = ps.communicate(timeout=30)
-    lm_out, lm_err = lm.communicate(timeout=30)
-    assert ps.returncode == 0, ps_err or ps_out
-    assert lm.returncode == 0, lm_err or lm_out
-    assert " processes)" in ps_out
-    assert " modules)" in lm_out
+    # A full thread summary is deliberately long enough to make overlapping
+    # admission observable.  The safe contract is now immediate typed busy,
+    # not invisible serial socket backlog.
+    walkers = [
+        subprocess.Popen(
+            ["winbox", "kdbg", "threads", "4", "--detail", "summary", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for _ in range(4)
+    ]
+    completed = [
+        (*walker.communicate(timeout=30), walker.returncode)
+        for walker in walkers
+    ]
+    accepted = [
+        json.loads(stdout) for stdout, _stderr, returncode in completed
+        if returncode == 0
+    ]
+    busy = [
+        (stdout, stderr) for stdout, stderr, returncode in completed
+        if returncode != 0 and "snapshot is busy" in (stdout + stderr)
+    ]
+    assert accepted, completed
+    assert busy, completed
+    for payload in accepted:
+        metadata = payload["snapshot_metadata"]
+        assert metadata["admission"] == "accepted"
+        assert metadata["snapshot_id"]
+        assert metadata["queue_delay_ms"] == 0.0
+        assert metadata["stop_duration_ms"] >= 0
 
 
 def test_live_pid4_lookup_exits_after_first_eprocess(monkeypatch):
@@ -151,6 +168,8 @@ def test_live_thread_research_view_is_bounded_resolved_and_vcpu_aware():
     assert compact["total_count"] == compact["matched_count"] > 0
     assert compact["summary"]["states"]
     assert compact["current_vcpus"]
+    assert compact["snapshot_metadata"]["admission"] == "accepted"
+    assert compact["snapshot_metadata"]["snapshot_id"]
     assert {current["status"] for current in compact["current_vcpus"]} <= {
         "current", "idle", "unavailable",
     }
@@ -172,6 +191,81 @@ def test_live_thread_research_view_is_bounded_resolved_and_vcpu_aware():
     ), starts
 
 
+def test_live_wait_object_evidence_is_bounded_and_never_infers_an_owner():
+    """Exercise the optional PDB evidence path against a real Waiting row."""
+    _require_safe_live_vm()
+
+    result = _winbox(
+        "kdbg", "threads", "4", "--json", "--detail", "full",
+        "--state", "Waiting", "--limit", "1", "--no-current",
+        "--wait-objects", "--wait-object-limit", "1", "--wait-owner-depth", "2",
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["walk_complete"] is True, payload
+    assert payload["wait_objects"] == {
+        "enabled": True, "waiting_threads": 1, "examined": 1,
+        "output_truncated": False, "wait_object_limit": 1,
+        "wait_owner_depth": 2, "external_wait_blocks": "not_chased",
+        "owner_relation": "mutant_only",
+    }
+    evidence = payload["threads"][0]["wait_object"]
+    assert evidence["ethread"] == payload["threads"][0]["ethread"]
+    assert evidence["state"]["name"] == "Waiting"
+    assert isinstance(evidence["owner_chain"], list)
+    # A relationship is useful only if the resolver can prove it from an
+    # embedded wait block and KMUTANT.OwnerThread; unknown objects remain a
+    # reason rather than a deadlock fairy tale.
+    if evidence["owner_chain"]:
+        assert evidence["object"]["dispatcher_type"]["raw"] == 2
+        assert all("via_object" in owner for owner in evidence["owner_chain"])
+    else:
+        assert evidence["reason"]
+    metadata = payload["snapshot_metadata"]
+    assert metadata["budget_exhausted"] is False
+    assert metadata["read_count"] > 0
+    assert metadata["bytes_read"] > 0
+
+
+def test_live_reader_budget_expiry_resumes_the_guest_with_typed_evidence():
+    """Deliberately spend a one-read RSP budget; Windows must resume."""
+    _require_safe_live_vm()
+
+    from contextlib import suppress
+    from winbox.config import Config
+    from winbox.kdbg.debugger.reader import (
+        ReaderError, SnapshotBudget, _RemoteSnapshot, ensure_reader, stop_reader,
+    )
+
+    cfg = Config.load()
+    # The reader is intentionally persistent. Replace any daemon launched by
+    # an older installed build so this test exercises this source tree's
+    # broker-side enforcement rather than merely its client serializer.
+    stop_reader(cfg)
+    ensure_reader(cfg)
+    snapshot = _RemoteSnapshot.connect(
+        cfg, budget=SnapshotBudget(max_duration_ms=1_000, max_reads=1, max_bytes=16),
+    )
+    try:
+        assert len(snapshot.read_physical(0, 1)) == 1
+        with pytest.raises(ReaderError) as raised:
+            snapshot.read_physical(0, 1)
+        assert getattr(raised.value, "code", None) == "snapshot_budget_exceeded"
+        assert raised.value.details["reason"] == "read_count"
+        metadata = snapshot.operation_metadata()
+        assert metadata["budget_exhausted"] is True
+        assert (metadata["read_count"], metadata["bytes_read"]) == (1, 1)
+    finally:
+        # The broker has already restored/resumed after the typed failure.
+        # Its closed peer can reject a redundant end request, which is fine.
+        with suppress(ReaderError):
+            snapshot.close()
+
+    status = _winbox("status")
+    assert status.returncode == 0, status.stderr or status.stdout
+    assert "running" in status.stdout.lower()
+
+
 def test_live_doctor_and_triage_are_bounded_and_leave_a_usable_vm():
     """CLI-only smoke for the one-call operator views on the installed build."""
     _require_safe_live_vm()
@@ -185,6 +279,9 @@ def test_live_doctor_and_triage_are_bounded_and_leave_a_usable_vm():
     assert report["symbols"]["nt"]["available"] is True
     assert report["symbols"]["nt"]["live_base"] == "not_checked"
     assert report["mcp"]["catalog_revision"]
+    assert report["capabilities"]["snapshot_research"]["available"] is True
+    assert report["capabilities"]["live_decompilation"]["cold_policy"] == "warm_required"
+    assert "version_consistent" in report["runtime"]
 
     triage = _winbox("kdbg", "triage", "4", "--json", "--thread-limit", "8")
     assert triage.returncode == 0, triage.stderr or triage.stdout
@@ -195,3 +292,61 @@ def test_live_doctor_and_triage_are_bounded_and_leave_a_usable_vm():
     assert 0 < len(payload["threads"]) <= 8
     assert payload["current_vcpus"]
     assert payload["unmapped_starts_scope"] == "top_rows_only"
+    assert payload["snapshot_metadata"]["admission"] == "accepted"
+
+
+def test_live_global_thread_triage_is_bounded_and_strictly_scope_aware():
+    _require_safe_live_vm()
+
+    complete = _winbox(
+        "kdbg", "thread-triage", "--json", "--process-cap", "128",
+        "--total-thread-cap", "2048", "--sample-per-process", "1",
+        "--limit", "8", "--no-resolve", "--require-complete",
+    )
+    assert complete.returncode == 0, complete.stderr or complete.stdout
+    payload = json.loads(complete.stdout)
+    assert payload["schema"] == "winbox.kdbg-global-thread-triage/1"
+    assert payload["scope"]["complete"] is True, payload
+    assert payload["scope"]["process_list_complete"] is True
+    assert payload["scope"]["processes_examined"] > 1
+    assert payload["scope"]["total_threads_examined"] > 0
+    assert payload["rankings"]["by_thread_count"]
+    assert payload["snapshot_metadata"]["admission"] == "accepted"
+
+    strict_partial = _winbox(
+        "kdbg", "thread-triage", "--json", "--process-cap", "1",
+        "--total-thread-cap", "2048", "--no-resolve", "--require-complete",
+    )
+    assert strict_partial.returncode == 1
+    error = json.loads(strict_partial.stdout)
+    assert error["error"]["code"] == "incomplete_result"
+    assert error["error"]["details"]["scope_complete"] is False
+
+
+def test_live_explicit_thread_baseline_and_diff_cleanup_exact_host_state():
+    _require_safe_live_vm()
+
+    from winbox.config import Config
+    from winbox.kdbg.thread_baseline import ThreadBaselineStore
+
+    store = ThreadBaselineStore(Config.load())
+    name = f"integration-thread-{os.getpid()}"
+    store.delete(name)
+    try:
+        baseline = _winbox("kdbg", "thread-baseline", "4", "--name", name, "--json")
+        assert baseline.returncode == 0, baseline.stderr or baseline.stdout
+        saved = json.loads(baseline.stdout)
+        assert saved["process"]["pid"] == 4
+        assert saved["thread_count"] > 0
+        assert saved["snapshot_metadata"]["admission"] == "accepted"
+
+        diff = _winbox("kdbg", "thread-diff", "4", "--name", name, "--limit", "8", "--json")
+        assert diff.returncode == 0, diff.stderr or diff.stdout
+        result = json.loads(diff.stdout)
+        assert result["schema"] == "winbox.kdbg-thread-diff/1"
+        assert result["process"]["pid"] == 4
+        assert result["current"]["thread_count"] > 0
+        assert result["limit"] == 8
+        assert result["snapshot_metadata"]["admission"] == "accepted"
+    finally:
+        store.delete(name)

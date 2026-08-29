@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -238,6 +238,35 @@ class TestKdbgThreads:
         assert payload["threads"][0]["wait_reason"] == {
             "raw": 6, "name": "UserRequest",
         }
+        assert payload["truncation"] == {
+            "stage": "unknown", "link": None, "ethread": None,
+            "returned": 1,
+            "reason": walked.truncated_reason,
+        }
+
+    def test_require_complete_refuses_partial_prefix_with_structured_json(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+
+        target, walked = self._target_and_threads()
+        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg._get_store"), \
+             patch("winbox.cli.kdbg.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.list_threads", return_value=walked):
+            result = runner.invoke(cli, [
+                "kdbg", "threads", "4712", "--json", "--require-complete",
+            ])
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "incomplete_result"
+        assert payload["error"]["retryable"] is True
+        assert payload["error"]["details"]["truncation"] == {
+            "stage": "unknown", "link": None, "ethread": None,
+            "returned": 1,
+            "reason": walked.truncated_reason,
+        }
 
     def test_bounds_rows_and_emits_resolution_and_current_vcpu(self, runner, kdbg_env):
         import json
@@ -292,6 +321,60 @@ class TestKdbgThreads:
         }
         assert payload["current_vcpus"][0]["tid"] == 4816
 
+    def test_wait_objects_are_opt_in_bounded_and_attached_to_waiting_rows(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+
+        target, walked = self._target_and_threads()
+        thread = walked.threads[0]
+        wait = {
+            "scope": {
+                "waiting_threads": 1, "examined": 1, "output_truncated": False,
+                "wait_object_limit": 1, "wait_owner_depth": 2,
+                "external_wait_blocks": "not_chased", "owner_relation": "mutant_only",
+            },
+            "records": {
+                thread.ethread: {
+                    "ethread": "0xffffae0012345000", "complete": False,
+                    "wait_block": "0xffffae0012345140", "object": None,
+                    "owner_chain": [], "reason": "unknown dispatcher object type; owner was not inferred",
+                },
+            },
+        }
+        with patch("winbox.cli.kdbg.ensure_types_loaded") as ensure, \
+             patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg._get_store"), \
+             patch("winbox.cli.kdbg.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.list_threads", return_value=walked), \
+             patch("winbox.cli.kdbg.resolve_thread_wait_objects", return_value=wait) as resolved, \
+             patch("winbox.cli.kdbg.list_current_vcpu_threads", return_value=[]):
+            result = runner.invoke(cli, [
+                "kdbg", "threads", "4712", "--json", "--wait-objects",
+                "--wait-object-limit", "1", "--wait-owner-depth", "2",
+            ])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        ensure.assert_called_once()
+        assert resolved.call_args.kwargs["limit"] == 1
+        assert resolved.call_args.kwargs["owner_depth"] == 2
+        assert payload["wait_objects"]["enabled"] is True
+        assert payload["threads"][0]["wait_object"] == wait["records"][thread.ethread]
+
+    def test_wait_objects_refuse_summary_before_touching_the_vm(self, runner, kdbg_env):
+        from winbox.cli import cli
+
+        with patch("winbox.cli.kdbg.ensure_types_loaded") as ensure, \
+             patch("winbox.cli.kdbg.debug_snapshot") as snapshot:
+            result = runner.invoke(cli, [
+                "kdbg", "threads", "4712", "--detail", "summary", "--wait-objects",
+            ])
+
+        assert result.exit_code == 1
+        assert "requires --detail full" in result.output
+        ensure.assert_not_called()
+        snapshot.assert_not_called()
+
     def test_summary_omits_rows_without_claiming_walk_truncation(self, runner, kdbg_env):
         import json
         from winbox.cli import cli
@@ -310,6 +393,65 @@ class TestKdbgThreads:
         assert payload["detail_rows_omitted"] is True
         assert payload["output_truncated"] is False
         assert payload["walk_complete"] is False
+
+
+class TestKdbgGlobalThreadTriage:
+    # The existing single-process triage tests continue below this insertion
+    # point; retain their compact shared fixture without duplicating it.
+    _target_and_threads = TestKdbgThreads._target_and_threads
+
+    @staticmethod
+    def _result(*, complete: bool) -> dict:
+        return {
+            "schema": "winbox.kdbg-global-thread-triage/1",
+            "scope": {
+                "complete": complete,
+                "reasons": [] if complete else ["total_thread_cap=1 exhausted"],
+            },
+            "totals": {}, "rankings": {"by_thread_count": [], "suspicious_starts": []},
+            "partial_processes": [], "attribution_warnings": [],
+            "kernel_module_attribution_error": None,
+        }
+
+    def test_global_thread_triage_cli_forwards_bounded_options(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+
+        result = self._result(complete=True)
+        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg._get_store"), \
+             patch("winbox.cli.kdbg.triage_all_process_threads", return_value=result) as triage:
+            invoked = runner.invoke(cli, [
+                "kdbg", "thread-triage", "--json", "--process-cap", "7",
+                "--total-thread-cap", "99", "--sample-per-process", "3", "--limit", "5",
+                "--no-resolve",
+            ])
+
+        assert invoked.exit_code == 0, invoked.output
+        payload = json.loads(invoked.output)
+        assert payload["snapshot_metadata"]["admission"] == "unknown"
+        assert triage.call_args.kwargs == {
+            "cache": ANY, "process_cap": 7, "total_thread_cap": 99,
+            "sample_per_process": 3, "result_limit": 5, "resolve": False,
+        }
+
+    def test_global_thread_triage_cli_require_complete_returns_typed_error(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+
+        result = self._result(complete=False)
+        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg._get_store"), \
+             patch("winbox.cli.kdbg.triage_all_process_threads", return_value=result):
+            invoked = runner.invoke(cli, [
+                "kdbg", "thread-triage", "--json", "--require-complete",
+            ])
+
+        assert invoked.exit_code == 1
+        payload = json.loads(invoked.output)
+        assert payload["error"]["code"] == "incomplete_result"
+        assert payload["error"]["details"]["scope_complete"] is False
+        assert payload["error"]["details"]["scope_reasons"] == result["scope"]["reasons"]
 
     def test_missing_pid_never_walks_threads(self, runner, kdbg_env):
         from winbox.cli import cli
@@ -389,7 +531,7 @@ class TestKdbgDoctor:
             "cet": {"safe_for_debug": True, "summary": "safe", "error": None},
             "symbols": {"nt": {"available": True, "identity": "cached_unverified", "live_base": "not_checked", "build": "build"}},
             "debugger": {"state": "stopped", "owner": None},
-            "mcp": {"version": "test", "catalog_revision": "test", "tool_count": 83},
+            "mcp": {"version": "test", "catalog_revision": "test", "tool_count": 85},
             "notes": [],
         }
         with patch("winbox.cli.kdbg.collect_doctor", return_value=report) as doctor:
@@ -397,7 +539,47 @@ class TestKdbgDoctor:
 
         assert result.exit_code == 0, result.output
         assert json.loads(result.output) == report
-        assert doctor.call_args.kwargs["tool_count"] == 83
+        assert doctor.call_args.kwargs["tool_count"] == 92
+
+
+class TestKdbgThreadBaseline:
+    def test_baseline_json_captures_once_and_persists_after_resume(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+
+        baseline = MagicMock()
+        capture = object()
+        baseline.save.return_value = {
+            "name": "case", "captured_at": "2026-08-27T00:00:00Z",
+            "process": {"pid": 4712, "name": "target.exe"}, "thread_count": 1,
+        }
+        with patch("winbox.cli.kdbg.ThreadBaselineStore", return_value=baseline), \
+             patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()) as snapshot, \
+             patch("winbox.cli.kdbg._get_store"), \
+             patch("winbox.cli.kdbg.capture_thread_baseline", return_value=capture):
+            result = runner.invoke(cli, [
+                "kdbg", "thread-baseline", "4712", "--name", "case", "--json",
+            ])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["thread_count"] == 1
+        snapshot.assert_called_once()
+        baseline.validate_name.assert_called_once_with("case")
+        baseline.save.assert_called_once_with("case", capture)
+
+    def test_diff_missing_baseline_does_not_open_a_snapshot(self, runner, kdbg_env):
+        from winbox.kdbg.thread_baseline import BaselineNotFoundError
+        from winbox.cli import cli
+
+        baseline = MagicMock()
+        baseline.load.side_effect = BaselineNotFoundError("baseline 'case' was not found")
+        with patch("winbox.cli.kdbg.ThreadBaselineStore", return_value=baseline), \
+             patch("winbox.cli.kdbg.debug_snapshot") as snapshot:
+            result = runner.invoke(cli, ["kdbg", "thread-diff", "4712", "--name", "case"])
+
+        assert result.exit_code == 1
+        assert "not found" in result.output
+        snapshot.assert_not_called()
 
 
 class TestKdbgTargetStatus:

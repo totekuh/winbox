@@ -17,7 +17,10 @@ def _bounded_value(value: Any, *, depth: int = 0) -> Any:
         return value
     if isinstance(value, str):
         return value[:MAX_DETAIL_STRING]
-    if depth >= 2:
+    # Admission records naturally have ``details -> budget -> scalar``. Keep
+    # that compact three-level shape machine-readable in doctor/busy reports;
+    # key/item/string caps still bound any hostile or accidental payload.
+    if depth >= 3:
         return str(value)[:MAX_DETAIL_STRING]
     if isinstance(value, (list, tuple)):
         return [

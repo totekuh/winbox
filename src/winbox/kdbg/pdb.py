@@ -46,6 +46,11 @@ NT_DEFAULT_TYPES: tuple[str, ...] = (
     "_KPROCESS",
     "_ETHREAD",
     "_KTHREAD",
+    # Opt-in wait-object/owner evidence. These stay PDB-backed rather than
+    # decoding dispatcher objects from stale hard-coded offsets.
+    "_KWAIT_BLOCK",
+    "_DISPATCHER_HEADER",
+    "_KMUTANT",
     # Reverse WoW64 stitching at an arbitrary x86 stop resolves the firing
     # CPU's current thread and its persisted full-width user trap context.
     "_KPRCB",

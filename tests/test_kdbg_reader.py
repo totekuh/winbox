@@ -16,6 +16,7 @@ from winbox.config import Config
 from winbox.kdbg.debugger.install import _CR3_OFFSET_IN_G
 from winbox.kdbg.debugger.reader import (
     ReaderError,
+    SnapshotBudget,
     _LocalRspSnapshot,
     _ReaderBroker,
     _RemoteSnapshot,
@@ -25,6 +26,7 @@ from winbox.kdbg.debugger.reader import (
     reader_info,
 )
 from winbox.kdbg.debugger.rsp import RspError, StopReply
+from winbox.kdbg.admission import active_admission
 
 
 def _regs(*, cr3: int, gs: int = 0, kernel_gs: int = 0) -> bytes:
@@ -234,6 +236,13 @@ def broker(tmp_path):
 def test_real_unix_broker_transaction_reads_and_restores(broker):
     cfg, rsp, _ = broker
     snap = _RemoteSnapshot.connect(cfg)
+    admission = active_admission(cfg.winbox_dir, "kdbg-snapshot")
+    assert admission is not None
+    assert admission["details"]["budget"] == SnapshotBudget().public()
+    metadata = snap.operation_metadata()
+    assert metadata["snapshot_id"]
+    assert metadata["reader_owner"] == "persistent_reader"
+    assert metadata["admission"] == "accepted"
     assert snap.cr3_candidates == (0x111000, 0x222000)
     assert snap.read_virtual(0xABC000, 0x1234, 4) == b"4567"
     assert snap.read_physical(0x2001, 3) == b"\x01\x02\x03"
@@ -243,6 +252,60 @@ def test_real_unix_broker_transaction_reads_and_restores(broker):
     assert rsp.continues == 1
     assert rsp.regs["01"] == rsp.original["01"]
     assert rsp.physical_modes[-1] is False
+
+
+def test_broker_enforces_read_budget_with_typed_metadata_and_resumes(broker):
+    cfg, rsp, _ = broker
+    snap = _RemoteSnapshot.connect(
+        cfg, budget=SnapshotBudget(max_duration_ms=1_000, max_reads=1, max_bytes=16),
+    )
+    assert snap.read_virtual(0xABC000, 0x1234, 4) == b"4567"
+    with pytest.raises(ReaderError) as captured:
+        snap.read_physical(0x2001, 3)
+    assert getattr(captured.value, "code", None) == "snapshot_budget_exceeded"
+    assert captured.value.details["reason"] == "read_count"
+    metadata = snap.operation_metadata()
+    assert metadata["read_count"] == 1
+    assert metadata["bytes_read"] == 4
+    assert metadata["budget_exhausted"] is True
+    snap.close()
+    assert rsp.continues == 1
+
+
+def test_broker_exact_range_cache_reports_logical_and_transport_costs(broker):
+    """A cache hit is visible and cannot consume another RSP-read budget."""
+    cfg, rsp, _ = broker
+    snap = _RemoteSnapshot.connect(
+        cfg, budget=SnapshotBudget(max_duration_ms=1_000, max_reads=1, max_bytes=16),
+    )
+    assert snap.read_virtual(0xABC000, 0x1234, 4) == b"4567"
+    assert snap.read_virtual(0xABC000, 0x1234, 4) == b"4567"
+    metadata = snap.operation_metadata()
+    assert metadata["read_count"] == 1
+    assert metadata["bytes_read"] == 4
+    assert metadata["logical_read_count"] == 2
+    assert metadata["logical_bytes_read"] == 8
+    assert metadata["cache_hits"] == 1
+    snap.close()
+    assert [read[1:3] for read in rsp.reads] == [(0x1234, 4)]
+
+
+def test_broker_idle_duration_budget_resumes_guest_and_is_typed(broker):
+    cfg, rsp, _ = broker
+    snap = _RemoteSnapshot.connect(
+        cfg, budget=SnapshotBudget(max_duration_ms=100, max_reads=8, max_bytes=64),
+    )
+    time.sleep(0.15)
+    with pytest.raises(ReaderError) as captured:
+        snap.read_virtual(0xABC000, 0x1234, 1)
+    assert getattr(captured.value, "code", None) == "snapshot_budget_exceeded"
+    assert captured.value.details["reason"] == "duration"
+    with pytest.raises(ReaderError):
+        snap.close()
+    deadline = time.monotonic() + 1
+    while rsp.continues == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert rsp.continues == 1
 
 
 def test_broker_disconnect_before_end_restores_and_resumes(broker):
@@ -283,32 +346,34 @@ def test_read_failure_restores_and_next_transaction_succeeds(broker):
     assert rsp.continues == 2
 
 
-def test_overlapping_clients_are_strictly_serialized(broker):
+def test_overlapping_clients_fail_busy_before_a_second_guest_stop(broker):
     cfg, rsp, _ = broker
     first = _RemoteSnapshot.connect(cfg)
     started = threading.Event()
-    connected = threading.Event()
-    result: list[bytes] = []
+    finished = threading.Event()
+    errors: list[ReaderError] = []
 
     def second_client():
         started.set()
-        second = _RemoteSnapshot.connect(cfg)
-        connected.set()
-        result.append(second.read_virtual(0xABC000, 0x2000, 2))
-        second.close()
+        try:
+            _RemoteSnapshot.connect(cfg)
+        except ReaderError as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
 
     thread = threading.Thread(target=second_client)
     thread.start()
     assert started.wait(1)
-    assert not connected.wait(0.1), "second transaction overlapped the first"
+    assert finished.wait(1), "second caller must not invisibly queue"
+    assert len(errors) == 1
+    assert getattr(errors[0], "code", None) == "busy"
     first.close()
-    assert connected.wait(2)
     thread.join(2)
 
     assert not thread.is_alive()
-    assert result == [b"\x00\x01"]
-    assert rsp.interrupts == 2
-    assert rsp.continues == 2
+    assert rsp.interrupts == 1
+    assert rsp.continues == 1
 
 
 def test_remote_snapshot_close_is_idempotent(broker):
@@ -394,6 +459,32 @@ def test_debug_snapshot_reconnects_once_after_stale_broker(monkeypatch, tmp_path
     with debug_snapshot(cfg) as snapshot:
         assert snapshot is fake
     assert calls == {"ensure": 2, "connect": 2, "stop": 1}
+
+
+def test_debug_snapshot_busy_does_not_retire_the_active_reader(monkeypatch, tmp_path):
+    cfg = Config(winbox_dir=tmp_path / ".winbox")
+    calls = {"ensure": 0, "stop": 0}
+    busy = ReaderError("snapshot is busy")
+    busy.code = "busy"
+    busy.retryable = True
+
+    monkeypatch.setattr(
+        "winbox.kdbg.debugger.reader.ensure_reader",
+        lambda *_args, **_kwargs: calls.__setitem__("ensure", calls["ensure"] + 1),
+    )
+    monkeypatch.setattr(
+        "winbox.kdbg.debugger.reader._RemoteSnapshot.connect",
+        lambda _cfg: (_ for _ in ()).throw(busy),
+    )
+    monkeypatch.setattr(
+        "winbox.kdbg.debugger.reader.stop_reader",
+        lambda _cfg: calls.__setitem__("stop", calls["stop"] + 1),
+    )
+
+    with pytest.raises(ReaderError, match="busy"):
+        with debug_snapshot(cfg):
+            pytest.fail("busy snapshot must not enter")
+    assert calls == {"ensure": 1, "stop": 0}
 
 
 def test_rsp_errors_during_begin_do_not_claim_a_completed_snapshot(broker):

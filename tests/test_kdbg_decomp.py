@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 import uuid
 from contextlib import contextmanager
@@ -238,6 +239,36 @@ def test_worker_status_bounds_invalid_sidecar(monkeypatch, tmp_path):
     assert result["status_error"]["code"] == "invalid_heartbeat"
 
 
+def test_analysis_readiness_requires_exact_current_profile_project(monkeypatch, tmp_path):
+    from winbox.kdbg.decomp.cache import analysis_readiness
+    from winbox.kdbg.decomp.enrichment import ANALYSIS_PROFILE
+
+    monkeypatch.setenv("WINBOX_DECOMP_BACKEND", "host")
+    projects = tmp_path / "projects"
+    monkeypatch.setenv("WINBOX_GHIDRA_PROJECT_DIR", str(projects))
+    cfg = Config(winbox_dir=tmp_path / "state")
+    digest = "d" * 64
+    metadata = cfg.winbox_dir / "decomp" / "cache" / "metadata"
+    metadata.mkdir(parents=True)
+    (metadata / f"{digest}.json").write_text(
+        json.dumps({
+            "sha256": digest,
+            "project_name": f"v_{digest}",
+            "analysis_profile": ANALYSIS_PROFILE,
+            "ghidra_version": "12.1.3",
+        }), encoding="utf-8",
+    )
+    projects.mkdir()
+    (projects / f"v_{digest}.gpr").write_text("", encoding="utf-8")
+    (projects / f"v_{digest}.rep").mkdir()
+
+    assert analysis_readiness(cfg, digest)["ready"] is True
+    (projects / f"v_{digest}.rep").rmdir()
+    assert analysis_readiness(cfg, digest)["reason"] == "project_missing"
+    (metadata / f"{digest}.json").write_text("x" * (65 * 1024), encoding="utf-8")
+    assert analysis_readiness(cfg, digest)["reason"] == "metadata_oversized"
+
+
 def test_worker_reports_validation_phase_before_typed_failure(tmp_path):
     from winbox.kdbg.decomp.worker import Worker
 
@@ -373,6 +404,10 @@ def test_query_decomp_composes_rva_identity_and_worker(monkeypatch, tmp_path):
         sections=(SectionIdentity(".text", 0x1000, 0x1000, 0, 1),),
     )
     monkeypatch.setattr("winbox.kdbg.decomp.service.parse_static_pe", lambda _: static)
+    monkeypatch.setattr(
+        "winbox.kdbg.decomp.cache.analysis_readiness",
+        lambda *_: {"ready": True, "reason": "ready"},
+    )
     daemon = _FakeDaemon(image)
     worker = _FakeWorker()
     cfg = Config(winbox_dir=tmp_path)
@@ -416,6 +451,53 @@ def test_query_decomp_composes_rva_identity_and_worker(monkeypatch, tmp_path):
     assert snapshot_calls[-1] == {"module": "sample", "rva": "0x1000"}
 
 
+def test_query_decomp_refuses_cold_analysis_unless_explicitly_allowed(monkeypatch, tmp_path):
+    image, key = _live_pe()
+    binary = tmp_path / "sample.exe"
+    binary.write_bytes(b"fixture")
+    static = PeIdentity(
+        0x8664, 0x12345678, 0x5000, 0x140000000, key,
+        sha256="c" * 64, file_size=binary.stat().st_size,
+        sections=(SectionIdentity(".text", 0x1000, 0x1000, 0, 1),),
+    )
+    monkeypatch.setattr("winbox.kdbg.decomp.service.parse_static_pe", lambda _: static)
+    monkeypatch.setattr(
+        "winbox.kdbg.decomp.cache.analysis_readiness",
+        lambda *_: {
+            "schema": "winbox.decomp-analysis-readiness/1",
+            "ready": False,
+            "reason": "metadata_missing",
+        },
+    )
+    daemon = _FakeDaemon(image)
+    worker = _FakeWorker()
+    cfg = Config(winbox_dir=tmp_path)
+
+    with pytest.raises(DecompError) as captured:
+        query_decomp(
+            cfg, binary=str(binary), daemon_client=daemon, decomp_client=worker,
+        )
+    assert captured.value.code == "analysis_required"
+    assert captured.value.retryable is True
+    assert captured.value.details["readiness"]["reason"] == "metadata_missing"
+    assert worker.args is None
+
+    result = query_decomp(
+        cfg, binary=str(binary), allow_cold=True,
+        daemon_client=daemon, decomp_client=worker,
+    )
+    assert worker.args[0] == "decompile"
+    assert result["analysis_admission"] == {
+        "policy": "allow_cold",
+        "cache": {
+            "schema": "winbox.decomp-analysis-readiness/1",
+            "ready": False,
+            "reason": "metadata_missing",
+        },
+        "cold_analysis": True,
+    }
+
+
 def test_query_decomp_cursor_pages_and_is_bound_to_stop_and_binary(
     monkeypatch, tmp_path
 ):
@@ -428,6 +510,10 @@ def test_query_decomp_cursor_pages_and_is_bound_to_stop_and_binary(
         sections=(SectionIdentity(".text", 0x1000, 0x1000, 0, 1),),
     )
     monkeypatch.setattr("winbox.kdbg.decomp.service.parse_static_pe", lambda _: static)
+    monkeypatch.setattr(
+        "winbox.kdbg.decomp.cache.analysis_readiness",
+        lambda *_: {"ready": True, "reason": "ready"},
+    )
     daemon = _FakeDaemon(image)
 
     class PagingWorker(_FakeWorker):
@@ -1043,7 +1129,7 @@ def test_mcp_decomp_serializes_result_and_surfaces_error(monkeypatch, tmp_path):
     monkeypatch.setattr(package, "query_decomp", query)
     reply = mcp_module.kdbg_decomp(
         symbol="sample!focus", cursor="opaque", detail="diagnostic",
-        lines="1-22", assembly="mapped"
+        lines="1-22", assembly="mapped", allow_cold=True,
     )
     assert reply["ok"] is True
     assert reply["result"] == {"ok": 1}
@@ -1054,6 +1140,7 @@ def test_mcp_decomp_serializes_result_and_surfaces_error(monkeypatch, tmp_path):
     assert captured["assembly"] == "mapped"
     assert captured["instruction_bytes"] is False
     assert captured["runtime_vas"] is False
+    assert captured["allow_cold"] is True
 
     def fail(*args, **kwargs):
         raise DecompError("wrong build")
@@ -1101,7 +1188,7 @@ def test_cli_decomp_emits_machine_safe_unwrapped_json(monkeypatch, tmp_path):
     result = CliRunner().invoke(
         cli, [
             "kdbg", "decomp", "--module", "sample.exe", "--rva", "0x1000",
-            "--lines", "1-22", "--assembly", "mapped",
+            "--lines", "1-22", "--assembly", "mapped", "--allow-cold",
         ]
     )
     assert result.exit_code == 0, result.output
@@ -1110,6 +1197,7 @@ def test_cli_decomp_emits_machine_safe_unwrapped_json(monkeypatch, tmp_path):
     assert captured["assembly"] == "mapped"
     assert captured["module"] == "sample.exe"
     assert captured["rva"] == "0x1000"
+    assert captured["allow_cold"] is True
 
 
 @pytest.mark.parametrize(

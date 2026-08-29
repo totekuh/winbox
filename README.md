@@ -39,7 +39,7 @@ PS C:\Windows\system32>
 
 ## Platform capabilities
 
-- **MCP server** — 83 tools form a bounded, AI-native research control plane
+- **MCP server** — 92 tools form a bounded, AI-native research control plane
   for autonomous agents, covering VM lifecycle, execution, memory, symbols,
   debugging, drivers, IPC, defenses, networking, event logs, and evidence
   collection.
@@ -362,7 +362,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (83):**
+**Available tools (92):**
 
 User-mode primitives:
 
@@ -427,7 +427,7 @@ and requires a reboot.
 
 | Tool | Description |
 |------|-------------|
-| `kdbg_doctor(port?)` | Fast non-disruptive readiness report: VM/agent, CET, cached symbol identity, reader/daemon ownership, and MCP catalog revision; labels live-base verification as not checked rather than guessing |
+| `kdbg_doctor(port?)` | Fast non-disruptive readiness report: VM/agent, CET, cached symbol identity, reader/admission ownership, decomp capability, exact runtime/package provenance, and MCP catalog revision; labels live-base verification as not checked rather than guessing |
 | `kdbg_cet_status()` | Report whether the current Windows boot is safe for QEMU GDB stop/resume |
 | `kdbg_prepare(confirm)` | Back up the original mitigation policy and disable CET user shadow stacks; reboot required |
 | `kdbg_restore_cet(confirm)` | Restore the backed-up mitigation policy; reboot required |
@@ -438,9 +438,18 @@ and requires a reboot.
 | `kdbg_user_symbols_load(pid, module, architecture?)` | Pull an x86/x64 module loaded in `pid`, fetch its matching PDB, and persist a separate architecture-correct symbol map |
 | `kdbg_sym(name, search?, limit?, rva?)` | Resolve `mod!sym` to VA or RVA; substring search supported |
 | `kdbg_struct(type_name, field?, module?)` | Dump full struct layout or one field offset |
-| `kdbg_ps()` | Walk `PsActiveProcessHead` (JSON: pid, dtb, eprocess, name) |
-| `kdbg_threads(pid, detail?, state?, wait_reason?, sort?, limit?, resolve?, include_current?)` | Bounded validated ETHREAD walk with scheduler summaries/filters, optional live module+local-symbol start attribution, and exact KPCR→KPRCB current-vCPU identities; never claims arbitrary-thread registers or stacks |
-| `kdbg_triage(pid, thread_limit?)` | One bounded RSP snapshot: process identity, thread summary/top context-switch rows, current vCPUs, capped user modules, and explicitly scoped unmapped-start leads |
+| `kdbg_ps()` | Walk `PsActiveProcessHead` (JSON: pid, dtb, eprocess, name) and return snapshot admission/timing metadata |
+| `kdbg_vad(pid, address?, executable?, limit?, probe_header?, require_complete?)` | Exact-PDB, x64-only user VAD lookup or bounded map. Proves a range/protection/private-or-image fact, exposes explicit tree/output boundaries, and never treats a loader miss as a verdict. |
+| `kdbg_token(pid)` | Decode the target primary token through the exact `_EPROCESS.Token` fast reference: IDs, session, flags, raw privilege masks, and its proven object header. |
+| `kdbg_handles(pid)` | Return the validated process handle-table root and build-specific entry-enumeration support. Public PDBs without the private entry union explicitly refuse slot decoding. |
+| `kdbg_object(body)` | Decode an exact-PDB `_OBJECT_HEADER` only for a caller-proven canonical kernel object-body pointer. |
+| `kdbg_capture(profile?, pid?, name?, require_complete?)` | One bounded RSP stop for an immutable process or system evidence artifact. A named artifact is atomically stored host-side; its snapshot phases/read accounting travel with it. |
+| `kdbg_capture_diff(left, right, limit?, allow_identity_mismatch?)` | Purely offline bounded diff of matching capture identities; no RSP connection or target-memory read. |
+| `kdbg_threads(pid, detail?, state?, wait_reason?, sort?, limit?, resolve?, include_current?, wait_objects?, wait_object_limit?, wait_owner_depth?, require_complete?)` | Bounded validated ETHREAD walk with validated head/link back-links, duplicate-TID rejection, structured partial evidence, optional strict completeness, scheduler summaries/filters, optional live module+local-symbol start attribution, exact KPCR→KPRCB current-vCPU identities, and optional exact-PDB wait-object / mutant-owner evidence. Every stop reports hard duration/read/byte budgets and actual read accounting; never claims arbitrary-thread registers, stacks, or speculative lock owners. |
+| `kdbg_thread_triage(process_cap?, total_thread_cap?, sample_per_process?, result_limit?, resolve?, require_complete?)` | One bounded RSP snapshot ranking process-wide thread/runnable counts, newest and high-context-switch threads, and explicitly scoped suspicious starts. Every process-list, thread-budget, and per-process partial boundary is returned; strict callers can refuse any incomplete scope. |
+| `kdbg_thread_baseline(pid, name?)` | Save one explicit complete host-side ETHREAD baseline, bound to VM boot, target PID/EPROCESS/CreateTime, and active nt symbol-store revision; includes snapshot admission/timing metadata |
+| `kdbg_thread_diff(pid, name?, limit?)` | One explicit bounded comparison against a named baseline: created/exited threads, scheduler transitions, and wrap-aware context-switch deltas; refuses cross-boot/reuse/store comparisons and includes snapshot timing |
+| `kdbg_triage(pid, thread_limit?, require_complete?)` | One bounded RSP snapshot: process identity, thread summary/top context-switch rows, current vCPUs, capped user modules, explicitly scoped unmapped-start leads, structured partial evidence/strict completeness, and stop-duration metadata |
 | `kdbg_lm()` | Walk `PsLoadedModuleList` (JSON: base, size, name) |
 | `kdbg_user_lm(pid)` | Walk native and WoW64 PEB loader views; every module is labelled x64 or x86 |
 | `kdbg_read_va(pid, address, length)` | CR3-switching arbitrary-process read; works against PPL targets (1MB cap, hex bytes) |
@@ -503,8 +512,8 @@ invariant preserves the ordinary x86 trace with `transition_error`.
 | `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |
 | `kdbg_disasm(addr?, count?, instruction_bytes?)` | Symbol-annotated Capstone disassembly; raw bytes are opt-in |
-| `kdbg_decomp(addr?, symbol?, module?, rva?, cursor?, before?, after?, full?, binary?, timeout?, analysis_timeout?, detail="compact", lines?, assembly="nearby", instruction_bytes?, runtime_vas?)` | Resolve current RIP, runtime VA, symbol, or module+RVA, verify PE build identity, snapshot exact host content, and return stop-pinned RVA-linked assembly/pseudocode with bounded pagination; repeated VAs and raw bytes are opt-in |
-| `kdbg_decomp_status()` | Report PyGhidra discovery, isolated worker/JVM state, and durable project-cache status without starting the JVM |
+| `kdbg_decomp(addr?, symbol?, module?, rva?, cursor?, before?, after?, full?, binary?, timeout?, analysis_timeout?, detail="compact", lines?, assembly="nearby", instruction_bytes?, runtime_vas?, allow_cold?)` | Resolve current RIP, runtime VA, symbol, or module+RVA, verify PE build identity, snapshot exact host content, and return stop-pinned RVA-linked assembly/pseudocode with bounded pagination. Cold Ghidra analysis is refused by default so a stopped target is never held while analysis runs; prepare offline first or explicitly opt in with `allow_cold=true`. |
+| `kdbg_decomp_status()` | Report PyGhidra discovery, isolated worker/JVM state, durable project-cache status, and current decomp admission without starting the JVM |
 | `kdbg_decomp_cache()` | List content-keyed binary/project sizes, analysis profiles, and LRU timestamps |
 | `kdbg_decomp_cache_prune(max_bytes?, older_than_days?, sha256?, project?, module?, dry_run?)` | Dry-run-first exact/LRU pruning with reconciled accounting; applying requires the worker to be stopped |
 | `kdbg_decomp_cache_repair(sha256)` | Delete one exact corrupt project cache and attempt one deterministic rebuild from its retained hash-addressed binary |
@@ -525,7 +534,7 @@ The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker pro
 Kali Linux
 ├── winbox control plane
 │   ├── CLI (Python/Click)
-│   └── MCP server (83 bounded agent tools)
+│   └── MCP server (92 bounded agent tools)
 ├── hypervisor research plane
 │   ├── QMP/HMP ────────────> VM + gdbstub lifecycle
 │   ├── persistent RSP ─────> vCPUs, memory, break/watchpoints, stepping

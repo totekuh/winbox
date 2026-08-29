@@ -105,8 +105,8 @@ class DockerManager:
             )
         return result
 
-    def image_info(self) -> dict[str, Any] | None:
-        result = self._docker("image", "inspect", IMAGE, timeout=15, check=False)
+    def image_info(self, *, timeout: float = 15.0) -> dict[str, Any] | None:
+        result = self._docker("image", "inspect", IMAGE, timeout=timeout, check=False)
         if result.returncode:
             detail = (result.stderr or result.stdout).strip()
             if "No such image" in detail or "No such object" in detail:
@@ -132,8 +132,8 @@ class DockerManager:
             "pyghidra_version": labels.get("io.winbox.pyghidra-version"),
         }
 
-    def container_info(self) -> dict[str, Any] | None:
-        result = self._docker("container", "inspect", self.name, timeout=15, check=False)
+    def container_info(self, *, timeout: float = 15.0) -> dict[str, Any] | None:
+        result = self._docker("container", "inspect", self.name, timeout=timeout, check=False)
         if result.returncode:
             detail = (result.stderr or result.stdout).strip()
             if "No such container" in detail or "No such object" in detail:
@@ -174,7 +174,7 @@ class DockerManager:
             },
         }
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, timeout: float = 15.0) -> dict[str, Any]:
         available = shutil.which("docker") is not None
         result: dict[str, Any] = {
             "backend": "docker", "docker_available": available,
@@ -189,8 +189,8 @@ class DockerManager:
             result["error"] = "Docker CLI is not installed or not on PATH"
             return result
         try:
-            image = self.image_info()
-            container = self.container_info()
+            image = self.image_info(timeout=timeout)
+            container = self.container_info(timeout=timeout)
             result["image_installed"] = image is not None
             result["image_info"] = image
             result["container_info"] = container

@@ -29,6 +29,44 @@ from winbox.jobs import Job, JobMode, JobStatus, JobStore
 from winbox.vm.guest import _clixml_to_text
 from winbox.kdbg.errors import bounded_details
 from winbox.kdbg.doctor import collect_doctor as _kdbg_collect_doctor
+from winbox.kdbg.catalog import (
+    MCP_CATALOG_REVISION as _MCP_CATALOG_REVISION,
+    MCP_TOOL_COUNT as _MCP_TOOL_COUNT,
+)
+from winbox.kdbg.presentation import (
+    filetime_utc as _kdbg_filetime_utc,
+    thread_presentation_fields as _kdbg_thread_presentation_fields,
+)
+from winbox.kdbg.thread_baseline import (
+    ThreadBaselineError as _KdbgThreadBaselineError,
+    ThreadBaselineStore as _KdbgThreadBaselineStore,
+    capture_threads as _kdbg_capture_thread_baseline,
+)
+from winbox.kdbg.thread_triage import (
+    GlobalThreadTriageError as _KdbgGlobalThreadTriageError,
+    GlobalThreadTriageIncomplete as _KdbgGlobalThreadTriageIncomplete,
+    triage_all_process_threads as _kdbg_triage_all_process_threads,
+)
+from winbox.kdbg.capture import (
+    CaptureError as _KdbgCaptureError,
+    CaptureStore as _KdbgCaptureStore,
+    capture_live as _kdbg_capture_live,
+    diff_captures as _kdbg_diff_captures,
+)
+from winbox.kdbg.objects import (
+    ObjectEvidenceError as _KdbgObjectEvidenceError,
+    ensure_object_layouts as _kdbg_ensure_object_layouts,
+    handle_table_status as _kdbg_handle_table_status,
+    object_header as _kdbg_object_header,
+    token_evidence as _kdbg_token_evidence,
+)
+from winbox.kdbg.telemetry import summary as _kdbg_operation_summary
+from winbox.kdbg.vad import (
+    VadError as _KdbgVadError,
+    ensure_vad_layouts as _kdbg_ensure_vad_layouts,
+    list_vads as _kdbg_list_vads,
+    lookup_vad as _kdbg_lookup_vad,
+)
 
 mcp = FastMCP(
     "winbox",
@@ -43,10 +81,6 @@ mcp = FastMCP(
 )
 
 _RESEARCH_ENVELOPE = "winbox.mcp/1"
-_MCP_CATALOG_REVISION = "2026-08-27.kdbg-doctor-triage.1"
-_MCP_TOOL_COUNT = 83
-
-
 def _research_ok(result: Any) -> dict[str, Any]:
     """Structured, compact contract for AI-facing research tools."""
     return {
@@ -83,6 +117,9 @@ def _research_error(exc: BaseException | str, *, operation: str) -> dict[str, An
             "identity_mismatch": ["Refresh the target module and symbols, then retry with the verified binary."],
             "worker_not_running": ["Run kdbg_ghidra_run or retry the decompilation request."],
             "stale_heartbeat": ["Inspect kdbg_decomp_status and restart the worker if the heartbeat remains stale."],
+            "analysis_required": ["Detach or continue the halted target, run kdbg_decomp_prepare for the verified module, then retry."],
+            "incomplete_result": ["Retry after the kernel list is stable, or set require_complete=false to inspect the validated prefix."],
+            "snapshot_budget_exceeded": ["Retry with a narrower scope or filter; the guest was already resumed."],
             "cr3_poisoned": ["Detach without resuming and restore a safe VM snapshot or original CR3."],
         }
         recovery = recovery_by_code.get(code, [])
@@ -119,7 +156,8 @@ def _research_error(exc: BaseException | str, *, operation: str) -> dict[str, An
         recovery = ["Inspect the relevant status tool and install or start the missing prerequisite."]
     elif ("must be" in lower or "between" in lower or "at most" in lower
           or "cap is" in lower or "mutually exclusive" in lower
-          or "invalid" in lower or "not a valid" in lower or "too large" in lower
+          or "invalid" in lower or "not a valid" in lower or "requires detail" in lower
+          or "too large" in lower
           or "does not match the current job" in lower):
         code = "invalid_argument"
     error = {
@@ -2971,6 +3009,7 @@ from winbox.kdbg.hmp import HmpError as _KdbgHmpError
 from winbox.kdbg.debugger.reader import (
     debug_snapshot as _kdbg_debug_snapshot,
     reader_info as _kdbg_reader_info,
+    snapshot_metadata as _kdbg_snapshot_metadata,
     stop_reader as _kdbg_stop_reader,
 )
 from winbox.kdbg.cet import (
@@ -2981,12 +3020,15 @@ from winbox.kdbg.cet import (
     restore as _kdbg_restore_cet_policy,
 )
 from winbox.kdbg.pe import PeError as _KdbgPeError
+from winbox.kdbg.walk import ThreadWalkIncomplete as _KdbgThreadWalkIncomplete
 from winbox.kdbg.walk import find_process as _kdbg_find_process
 from winbox.kdbg.walk import list_current_vcpu_threads as _kdbg_list_current_vcpu_threads
 from winbox.kdbg.walk import list_modules as _kdbg_list_modules
 from winbox.kdbg.walk import list_processes as _kdbg_list_processes
 from winbox.kdbg.walk import list_threads as _kdbg_list_threads
+from winbox.kdbg.walk import thread_walk_truncation as _kdbg_thread_walk_truncation
 from winbox.kdbg.walk import list_user_modules as _kdbg_list_user_modules, is_wow64 as _kdbg_is_wow64
+from winbox.kdbg.walk import resolve_thread_wait_objects as _kdbg_resolve_thread_wait_objects
 from winbox.kdbg.walk import resolve_thread_start_addresses as _kdbg_resolve_thread_start_addresses
 from winbox.kdbg.walk import select_threads as _kdbg_select_threads
 
@@ -3191,9 +3233,10 @@ def kdbg_ps() -> dict[str, Any]:
             f"VM is not running (state: {state.value})", operation="kdbg_ps"
         )
     try:
-        with _kdbg_debug_snapshot(cfg):
+        with _kdbg_debug_snapshot(cfg) as snapshot:
             store = _kdbg_get_store()
             procs = _kdbg_list_processes(cfg.vm_name, store)
+            snapshot_metadata = _kdbg_snapshot_metadata(snapshot)
     except (_KdbgStoreError, _KdbgHmpError) as e:
         return _research_error(e, operation="kdbg_ps")
     out = [
@@ -3205,11 +3248,197 @@ def kdbg_ps() -> dict[str, Any]:
         }
         for p in procs
     ]
-    return _research_ok({"processes": out, "count": len(out)})
+    return _research_ok({
+        "processes": out, "count": len(out), "snapshot_metadata": snapshot_metadata,
+    })
+
+
+def _kdbg_target_for_evidence(cfg: Config, store: _KdbgStore, pid: int, cache: _KdbgWalkCache):
+    target = _kdbg_find_process(cfg.vm_name, store, pid=pid, cache=cache)
+    if target is None:
+        raise _KdbgHmpError(f"pid {pid} not found")
+    return target
+
+
+@mcp.tool()
+def kdbg_vad(
+    pid: int, address: str = "", executable: bool = False, limit: int = 128,
+    probe_header: bool = False, require_complete: bool = False,
+) -> dict[str, Any]:
+    """Resolve one user VA or list bounded executable VAD evidence.
+
+    The default address lookup follows only one PDB-validated AVL path.  With
+    no address, returns a bounded in-order executable VAD map.  A loader miss
+    remains a lead unless this walker proves a range; `private` or `image`
+    labels are kernel VAD facts, not a malware verdict.
+
+    Args:
+        pid: Target process ID from kdbg_ps.
+        address: Optional canonical user VA (for one direct lookup).
+        executable: Include only executable mappings in map mode.
+        limit: Map result cap (1..4096).
+        probe_header: Read two bytes at each returned range base for MZ evidence.
+        require_complete: Reject a truncated map instead of returning its prefix.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 4096:
+        return _research_error("limit must be an integer between 1 and 4096", operation="kdbg_vad")
+    if not isinstance(executable, bool) or not isinstance(probe_header, bool) or not isinstance(require_complete, bool):
+        return _research_error("executable, probe_header, and require_complete must be booleans", operation="kdbg_vad")
+    parsed_address: int | None = None
+    if address:
+        try:
+            parsed_address = int(address, 0)
+        except (TypeError, ValueError):
+            return _research_error(f"invalid address: {address!r}", operation="kdbg_vad")
+    cfg, vm, _ = _get_state()
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        return _research_error(f"VM is not running (state: {vm.state().value})", operation="kdbg_vad")
+    try:
+        store = _kdbg_get_store()
+        _kdbg_ensure_vad_layouts(cfg, store)
+        with _kdbg_debug_snapshot(cfg, operation="vad") as snapshot:
+            cache = _KdbgWalkCache()
+            target = _kdbg_target_for_evidence(cfg, store, pid, cache)
+            if parsed_address is not None:
+                record = _kdbg_lookup_vad(
+                    cfg.vm_name, store, target, parsed_address, cache=cache,
+                    probe_header=probe_header,
+                )
+                result = {
+                    "pid": pid, "address": f"0x{parsed_address:016x}",
+                    "found": record is not None,
+                    "vad": record.public() if record is not None else None,
+                    "complete": True,
+                }
+            else:
+                walked = _kdbg_list_vads(
+                    cfg.vm_name, store, target, cache=cache,
+                    executable_only=executable, limit=limit, probe_header=probe_header,
+                )
+                if require_complete and not walked.complete:
+                    error = _KdbgVadError("VAD map is incomplete")
+                    error.code = "incomplete_result"
+                    error.retryable = True
+                    error.details = {"truncation": walked.truncation}
+                    raise error
+                result = {"pid": pid, "executable_only": executable, **walked.public()}
+            result["snapshot_metadata"] = _kdbg_snapshot_metadata(snapshot)
+        return _research_ok(result)
+    except (_KdbgVadError, _KdbgStoreError, _KdbgHmpError) as exc:
+        return _research_error(exc, operation="kdbg_vad")
+
+
+@mcp.tool()
+def kdbg_token(pid: int) -> dict[str, Any]:
+    """Return PDB-backed primary-token identity and raw privilege masks."""
+    cfg, vm, _ = _get_state()
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        return _research_error(f"VM is not running (state: {vm.state().value})", operation="kdbg_token")
+    try:
+        store = _kdbg_get_store()
+        _kdbg_ensure_object_layouts(cfg, store)
+        with _kdbg_debug_snapshot(cfg, operation="token") as snapshot:
+            target = _kdbg_target_for_evidence(cfg, store, pid, _KdbgWalkCache())
+            result = _kdbg_token_evidence(cfg.vm_name, store, target)
+            result["snapshot_metadata"] = _kdbg_snapshot_metadata(snapshot)
+        return _research_ok(result)
+    except (_KdbgObjectEvidenceError, _KdbgStoreError, _KdbgHmpError) as exc:
+        return _research_error(exc, operation="kdbg_token")
+
+
+@mcp.tool()
+def kdbg_handles(pid: int) -> dict[str, Any]:
+    """Return a validated process handle-table root and enumeration support state.
+
+    Public PDBs may omit the private entry union.  In that case this returns
+    the proven root and a refusal rather than guessed 16-byte slot decoding.
+    """
+    cfg, vm, _ = _get_state()
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        return _research_error(f"VM is not running (state: {vm.state().value})", operation="kdbg_handles")
+    try:
+        store = _kdbg_get_store()
+        _kdbg_ensure_object_layouts(cfg, store)
+        with _kdbg_debug_snapshot(cfg, operation="handles") as snapshot:
+            target = _kdbg_target_for_evidence(cfg, store, pid, _KdbgWalkCache())
+            result = _kdbg_handle_table_status(cfg.vm_name, store, target)
+            result["snapshot_metadata"] = _kdbg_snapshot_metadata(snapshot)
+        return _research_ok(result)
+    except (_KdbgObjectEvidenceError, _KdbgStoreError, _KdbgHmpError) as exc:
+        return _research_error(exc, operation="kdbg_handles")
+
+
+@mcp.tool()
+def kdbg_object(body: str) -> dict[str, Any]:
+    """Decode a kernel object header for a caller-proven object body pointer."""
+    try:
+        value = int(body, 0)
+    except (TypeError, ValueError):
+        return _research_error(f"invalid object body: {body!r}", operation="kdbg_object")
+    cfg, vm, _ = _get_state()
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        return _research_error(f"VM is not running (state: {vm.state().value})", operation="kdbg_object")
+    try:
+        store = _kdbg_get_store()
+        _kdbg_ensure_object_layouts(cfg, store)
+        with _kdbg_debug_snapshot(cfg, operation="object") as snapshot:
+            result = _kdbg_object_header(cfg.vm_name, store, value).public()
+            result["snapshot_metadata"] = _kdbg_snapshot_metadata(snapshot)
+        return _research_ok(result)
+    except (_KdbgObjectEvidenceError, _KdbgStoreError, _KdbgHmpError) as exc:
+        return _research_error(exc, operation="kdbg_object")
+
+
+@mcp.tool()
+def kdbg_capture(
+    profile: str = "process", pid: int = 0, name: str = "", require_complete: bool = False,
+) -> dict[str, Any]:
+    """Take one bounded, immutable process or system evidence capture.
+
+    Exact PDB extraction occurs before the single RSP stop.  Optional `name`
+    atomically saves the resulting artifact under the host-owned kdbg capture
+    store; without it the same bounded artifact is returned directly.
+    """
+    cfg, vm, _ = _get_state()
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        return _research_error(f"VM is not running (state: {vm.state().value})", operation="kdbg_capture")
+    try:
+        if not isinstance(require_complete, bool):
+            raise _KdbgCaptureError("require_complete must be a boolean")
+        store = _kdbg_get_store()
+        capture = _kdbg_capture_live(
+            cfg, store, profile=profile, pid=(pid if pid else None),
+            require_complete=require_complete,
+        )
+        if name:
+            saved = _KdbgCaptureStore(cfg).save(name, capture)
+            return _research_ok({"capture": capture, "saved": saved})
+        return _research_ok({"capture": capture, "saved": None})
+    except (_KdbgCaptureError, _KdbgVadError, _KdbgObjectEvidenceError, _KdbgStoreError, _KdbgHmpError) as exc:
+        return _research_error(exc, operation="kdbg_capture")
+
+
+@mcp.tool()
+def kdbg_capture_diff(
+    left: str, right: str, limit: int = 128, allow_identity_mismatch: bool = False,
+) -> dict[str, Any]:
+    """Diff two named captures entirely offline; no VM/RSP access occurs."""
+    cfg, _, _ = _get_state()
+    try:
+        if not isinstance(allow_identity_mismatch, bool):
+            raise _KdbgCaptureError("allow_identity_mismatch must be a boolean")
+        captures = _KdbgCaptureStore(cfg)
+        result = _kdbg_diff_captures(
+            captures.load(left), captures.load(right), limit=limit,
+            allow_identity_mismatch=allow_identity_mismatch,
+        )
+        return _research_ok(result)
+    except _KdbgCaptureError as exc:
+        return _research_error(exc, operation="kdbg_capture_diff")
 
 
 def _kdbg_thread_address(attribution: Any) -> dict[str, Any]:
-    return {
+    result = {
         "address": f"0x{attribution.address:016x}",
         "mapping": attribution.mapping,
         "module": attribution.module,
@@ -3229,6 +3458,9 @@ def _kdbg_thread_address(attribution: Any) -> dict[str, Any]:
             if attribution.symbol_offset is not None else None
         ),
     }
+    if getattr(attribution, "vad", None) is not None:
+        result["vad"] = attribution.vad
+    return result
 
 
 def _kdbg_current_vcpu_record(record: Any) -> dict[str, Any]:
@@ -3247,6 +3479,7 @@ def _kdbg_current_vcpu_record(record: Any) -> dict[str, Any]:
 
 def _kdbg_thread_record(
     thread: Any, *, attribution: Any = None, running_on_vcpus: tuple[int, ...] | list[int] = (),
+    wait_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Serialize ThreadRecord with both stable raw and best-effort enum names."""
     result = {
@@ -3269,6 +3502,7 @@ def _kdbg_thread_record(
         "create_time": thread.create_time,
         "exit_status": thread.exit_status,
     }
+    result.update(_kdbg_thread_presentation_fields(thread))
     if attribution is not None:
         result["start_attribution"] = {
             "start_address": _kdbg_thread_address(attribution.start_address),
@@ -3278,6 +3512,8 @@ def _kdbg_thread_record(
         }
     if running_on_vcpus:
         result["running_on_vcpus"] = list(running_on_vcpus)
+    if wait_evidence is not None:
+        result["wait_object"] = wait_evidence
     return result
 
 
@@ -3291,6 +3527,10 @@ def kdbg_threads(
     limit: int = 256,
     resolve: bool = False,
     include_current: bool = True,
+    wait_objects: bool = False,
+    wait_object_limit: int = 32,
+    wait_owner_depth: int = 2,
+    require_complete: bool = False,
 ) -> dict[str, Any]:
     """Walk one process's kernel thread list without injecting into the guest.
 
@@ -3303,7 +3543,9 @@ def kdbg_threads(
     best-effort current-Windows enum name; wait-reason names are intentionally
     omitted unless the scheduler state is ``Waiting``. A malformed list/read
     or the hard safety cap returns the validated prefix with ``complete=false``
-    and a truthful ``truncated_reason``. ``limit`` only bounds returned detail
+    and a truthful ``truncated_reason`` plus structured ``truncation`` evidence.
+    Set ``require_complete=true`` to reject that prefix with typed
+    ``incomplete_result`` instead. ``limit`` only bounds returned detail
     rows: ``walk_complete`` remains independent, and summary metadata reports
     all walked/matching/filtered rows. ``resolve`` maps returned start VAs to
     live modules and already-local symbols without downloading anything.
@@ -3318,6 +3560,10 @@ def kdbg_threads(
         limit: Maximum returned detailed rows (1..1024; default 256).
         resolve: Attribute returned start addresses against live module lists.
         include_current: Return validated current ETHREAD identity per halted vCPU.
+        wait_objects: Add bounded exact-PDB wait-object and mutant-owner evidence.
+        wait_object_limit: Maximum Waiting detail rows inspected (1..128).
+        wait_owner_depth: Maximum proven mutant-owner hops per row (1..4).
+        require_complete: Refuse an incomplete kernel-list prefix instead of returning it.
     """
     cfg, vm, _ = _get_state()
     vm_state = vm.state()
@@ -3326,7 +3572,37 @@ def kdbg_threads(
             f"VM is not running (state: {vm_state.value})", operation="kdbg_threads"
         )
     try:
-        with _kdbg_debug_snapshot(cfg):
+        if not isinstance(require_complete, bool):
+            raise _KdbgHmpError("require_complete must be a boolean")
+        if not isinstance(wait_objects, bool):
+            raise _KdbgHmpError("wait_objects must be a boolean")
+        if detail not in {"full", "summary"}:
+            raise _KdbgHmpError("detail must be 'full' or 'summary'")
+        if wait_objects and detail != "full":
+            raise _KdbgHmpError("wait_objects requires detail='full'")
+        if (not isinstance(wait_object_limit, int) or isinstance(wait_object_limit, bool)
+                or not 1 <= wait_object_limit <= 128):
+            raise _KdbgHmpError("wait_object_limit must be an integer between 1 and 128")
+        if (not isinstance(wait_owner_depth, int) or isinstance(wait_owner_depth, bool)
+                or not 1 <= wait_owner_depth <= 4):
+            raise _KdbgHmpError("wait_owner_depth must be an integer between 1 and 4")
+        if wait_objects:
+            # Type extraction can parse a large local PDB. Do it before the
+            # RSP stop so optional visibility never lengthens guest downtime.
+            _kdbg_ensure_types_loaded(
+                cfg, _kdbg_get_store(),
+                ["_KWAIT_BLOCK", "_DISPATCHER_HEADER", "_KMUTANT"], module="nt",
+            )
+        if resolve:
+            # Like wait-object layouts, VAD type extraction is host-side work
+            # and must finish before the finite stopped-guest transaction.
+            try:
+                _kdbg_ensure_vad_layouts(cfg, _kdbg_get_store())
+            except (_KdbgVadError, _KdbgStoreError, _KdbgSymbolLoadError):
+                # Optional VAD attribution never invalidates the already
+                # proven ETHREAD/loader result.
+                pass
+        with _kdbg_debug_snapshot(cfg) as snapshot:
             store = _kdbg_get_store()
             cache = _KdbgWalkCache()
             target = _kdbg_find_process(cfg.vm_name, store, pid=pid, cache=cache)
@@ -3335,8 +3611,8 @@ def kdbg_threads(
             walked = _kdbg_list_threads(
                 cfg.vm_name, store, target, cache=cache,
             )
-            if detail not in {"full", "summary"}:
-                raise _KdbgHmpError("detail must be 'full' or 'summary'")
+            if require_complete and not walked.complete:
+                raise _KdbgThreadWalkIncomplete(walked)
             selected = _kdbg_select_threads(
                 walked.threads, state=state or None, wait_reason=wait_reason or None,
                 sort=sort, limit=limit,
@@ -3348,6 +3624,15 @@ def kdbg_threads(
                 attributions, attribution_warnings = _kdbg_resolve_thread_start_addresses(
                     cfg.vm_name, store, target, displayed, cache=cache,
                 )
+            wait_view: dict[str, Any] = {"enabled": False}
+            wait_records: dict[int, dict[str, Any]] = {}
+            if wait_objects:
+                wait_result = _kdbg_resolve_thread_wait_objects(
+                    cfg.vm_name, store, target, displayed, cache=cache,
+                    limit=wait_object_limit, owner_depth=wait_owner_depth,
+                )
+                wait_view = {"enabled": True, **wait_result["scope"]}
+                wait_records = wait_result["records"]
             current_vcpus: list[Any] = []
             current_vcpus_error: str | None = None
             if include_current:
@@ -3357,7 +3642,8 @@ def kdbg_threads(
                     )
                 except (_KdbgStoreError, _KdbgHmpError) as exc:
                     current_vcpus_error = str(exc)
-    except (_KdbgStoreError, _KdbgHmpError) as e:
+            snapshot_metadata = _kdbg_snapshot_metadata(snapshot)
+    except (_KdbgVadError, _KdbgStoreError, _KdbgSymbolLoadError, _KdbgHmpError) as e:
         return _research_error(e, operation="kdbg_threads")
     running_by_ethread: dict[int, list[int]] = {}
     for current in current_vcpus:
@@ -3368,11 +3654,14 @@ def kdbg_threads(
         "name": target.name,
         "eprocess": f"0x{target.eprocess:016x}",
         "process_create_time": target.create_time,
+        "process_create_time_filetime": target.create_time,
+        "process_create_time_utc": _kdbg_filetime_utc(target.create_time),
         "threads": [
             _kdbg_thread_record(
                 thread,
                 attribution=attributions.get(thread.ethread),
                 running_on_vcpus=running_by_ethread.get(thread.ethread, ()),
+                wait_evidence=wait_records.get(thread.ethread),
             )
             for thread in displayed
         ],
@@ -3391,13 +3680,92 @@ def kdbg_threads(
         "complete": walked.complete,
         "walk_complete": walked.complete,
         "truncated_reason": walked.truncated_reason,
+        "truncation": _kdbg_thread_walk_truncation(walked),
         "current_vcpus": [_kdbg_current_vcpu_record(current) for current in current_vcpus],
+        "wait_objects": wait_view,
+        "snapshot_metadata": snapshot_metadata,
     }
     if attribution_warnings:
         response["attribution_warnings"] = list(attribution_warnings)
     if current_vcpus_error is not None:
         response["current_vcpus_error"] = current_vcpus_error
     return _research_ok(response)
+
+
+@mcp.tool()
+def kdbg_thread_baseline(pid: int, name: str = "default") -> dict[str, Any]:
+    """Save one explicit complete host-side ETHREAD baseline for ``pid``.
+
+    This performs one CET-gated RSP snapshot and writes a bounded baseline only
+    when the complete kernel list validates.  The identity binds VM, active nt
+    symbol-store revision, boot/System process, target PID/EPROCESS/CreateTime,
+    and each ETHREAD/CreateTime; a later diff cannot accidentally compare a
+    reboot, PID reuse, or changed symbol store.
+
+    Args:
+        pid: Target process ID.
+        name: Baseline label (default ``default``; letters/digits/dot/dash/underscore).
+    """
+    cfg, vm, _ = _get_state()
+    state = vm.state()
+    if state not in (VMState.RUNNING, VMState.PAUSED):
+        return _research_error(
+            f"VM is not running (state: {state.value})", operation="kdbg_thread_baseline",
+        )
+    baseline = _KdbgThreadBaselineStore(cfg)
+    try:
+        baseline.validate_name(name)
+        with _kdbg_debug_snapshot(cfg) as snapshot:
+            store = _kdbg_get_store()
+            capture = _kdbg_capture_thread_baseline(cfg, store, pid)
+            snapshot_metadata = _kdbg_snapshot_metadata(snapshot)
+        result = baseline.save(name, capture)
+        result["snapshot_metadata"] = snapshot_metadata
+        return _research_ok(result)
+    except (_KdbgThreadBaselineError, _KdbgStoreError, _KdbgHmpError) as exc:
+        return _research_error(exc, operation="kdbg_thread_baseline")
+
+
+@mcp.tool()
+def kdbg_thread_diff(
+    pid: int, name: str = "default", limit: int = 128,
+) -> dict[str, Any]:
+    """Compare one explicit current ETHREAD snapshot to a named baseline.
+
+    Returns bounded created, exited, and changed categories.  A changed thread
+    reports raw scheduler transitions and a 32-bit ContextSwitches delta with
+    explicit counter-wrap status.  It does not poll: every call is one fresh,
+    CET-gated snapshot.  Missing/incompatible baselines produce typed errors
+    rather than a potentially cross-boot comparison.
+
+    Args:
+        pid: Target process ID, which must still match the saved EPROCESS/CreateTime.
+        name: Existing baseline label (default ``default``).
+        limit: Maximum returned rows per created/exited/changed category (1..1024).
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1024:
+        return _research_error(
+            "limit must be an integer between 1 and 1024", operation="kdbg_thread_diff",
+        )
+    cfg, vm, _ = _get_state()
+    state = vm.state()
+    if state not in (VMState.RUNNING, VMState.PAUSED):
+        return _research_error(
+            f"VM is not running (state: {state.value})", operation="kdbg_thread_diff",
+        )
+    baseline = _KdbgThreadBaselineStore(cfg)
+    try:
+        # Check the host prerequisite before opening an RSP transaction.
+        baseline.load(name)
+        with _kdbg_debug_snapshot(cfg) as snapshot:
+            store = _kdbg_get_store()
+            capture = _kdbg_capture_thread_baseline(cfg, store, pid)
+            snapshot_metadata = _kdbg_snapshot_metadata(snapshot)
+        result = baseline.diff(name, capture, limit=limit)
+        result["snapshot_metadata"] = snapshot_metadata
+        return _research_ok(result)
+    except (_KdbgThreadBaselineError, _KdbgStoreError, _KdbgHmpError) as exc:
+        return _research_error(exc, operation="kdbg_thread_diff")
 
 
 def _kdbg_triage_module(module: Any) -> dict[str, Any]:
@@ -3434,7 +3802,9 @@ def _kdbg_triage_unmapped_rows(threads: Any, attributions: dict[int, Any]) -> li
 
 
 @mcp.tool()
-def kdbg_triage(pid: int, thread_limit: int = 16) -> dict[str, Any]:
+def kdbg_triage(
+    pid: int, thread_limit: int = 16, require_complete: bool = False,
+) -> dict[str, Any]:
     """Capture one bounded, coherent process-research snapshot.
 
     One RSP stop collects process identity, the complete ETHREAD walk and its
@@ -3447,6 +3817,7 @@ def kdbg_triage(pid: int, thread_limit: int = 16) -> dict[str, Any]:
     Args:
         pid: Target process ID.
         thread_limit: Top context-switch rows to resolve and return (1..64).
+        require_complete: Refuse an incomplete kernel-list prefix instead of returning it.
     """
     if not 1 <= thread_limit <= 64:
         return _research_error(
@@ -3459,13 +3830,21 @@ def kdbg_triage(pid: int, thread_limit: int = 16) -> dict[str, Any]:
             f"VM is not running (state: {state.value})", operation="kdbg_triage",
         )
     try:
-        with _kdbg_debug_snapshot(cfg):
+        if not isinstance(require_complete, bool):
+            raise _KdbgHmpError("require_complete must be a boolean")
+        try:
+            _kdbg_ensure_vad_layouts(cfg, _kdbg_get_store())
+        except (_KdbgVadError, _KdbgStoreError, _KdbgSymbolLoadError):
+            pass
+        with _kdbg_debug_snapshot(cfg) as snapshot:
             store = _kdbg_get_store()
             cache = _KdbgWalkCache()
             target = _kdbg_find_process(cfg.vm_name, store, pid=pid, cache=cache)
             if target is None:
                 return _research_error(f"pid {pid} not found", operation="kdbg_triage")
             walked = _kdbg_list_threads(cfg.vm_name, store, target, cache=cache)
+            if require_complete and not walked.complete:
+                raise _KdbgThreadWalkIncomplete(walked)
             selected = _kdbg_select_threads(
                 walked.threads, sort="context-switches", limit=thread_limit,
             )
@@ -3493,7 +3872,8 @@ def kdbg_triage(pid: int, thread_limit: int = 16) -> dict[str, Any]:
                 )
             except (_KdbgStoreError, _KdbgHmpError) as exc:
                 current_vcpus_error = str(exc)
-    except (_KdbgStoreError, _KdbgSymbolLoadError, _KdbgHmpError) as exc:
+            snapshot_metadata = _kdbg_snapshot_metadata(snapshot)
+    except (_KdbgVadError, _KdbgStoreError, _KdbgSymbolLoadError, _KdbgHmpError) as exc:
         return _research_error(exc, operation="kdbg_triage")
 
     running_by_ethread: dict[int, list[int]] = {}
@@ -3508,11 +3888,14 @@ def kdbg_triage(pid: int, thread_limit: int = 16) -> dict[str, Any]:
             "eprocess": f"0x{target.eprocess:016x}",
             "dtb": f"0x{target.directory_table_base:012x}",
             "create_time": target.create_time,
+            "create_time_filetime": target.create_time,
+            "create_time_utc": _kdbg_filetime_utc(target.create_time),
         },
         "thread_summary": {
             "total_count": selected.total_count,
             "walk_complete": walked.complete,
             "truncated_reason": walked.truncated_reason,
+            "truncation": _kdbg_thread_walk_truncation(walked),
             "states": selected.state_counts,
             "wait_reasons": selected.wait_reason_counts,
             "top_rows_returned": len(selected.threads),
@@ -3534,6 +3917,7 @@ def kdbg_triage(pid: int, thread_limit: int = 16) -> dict[str, Any]:
         },
         "unmapped_starts": _kdbg_triage_unmapped_rows(selected.threads, attributions),
         "unmapped_starts_scope": "top_rows_only",
+        "snapshot_metadata": snapshot_metadata,
     }
     if module_error:
         result["user_modules"]["error"] = module_error
@@ -3541,6 +3925,64 @@ def kdbg_triage(pid: int, thread_limit: int = 16) -> dict[str, Any]:
         result["attribution_warnings"] = list(attribution_warnings)
     if current_vcpus_error:
         result["current_vcpus_error"] = current_vcpus_error
+    return _research_ok(result)
+
+
+@mcp.tool()
+def kdbg_thread_triage(
+    process_cap: int = 128,
+    total_thread_cap: int = 4096,
+    sample_per_process: int = 8,
+    result_limit: int = 32,
+    resolve: bool = True,
+    require_complete: bool = False,
+) -> dict[str, Any]:
+    """Rank bounded process-wide scheduler evidence from one coherent RSP stop.
+
+    Returns compact rankings by thread/runnable counts, newest threads, high
+    context-switch samples, and module/loader-unmapped starts. Start mapping
+    only examines the top context-switch rows per process. Every process,
+    thread-budget, malformed-list, and attribution boundary is explicit in
+    ``scope``; this never presents a capped subset as the entire kernel.
+
+    Args:
+        process_cap: Active-process records to examine (1..256).
+        total_thread_cap: ETHREAD records examined across that process scope (1..8192).
+        sample_per_process: Top context-switch rows sampled per process (1..32).
+        result_limit: Rows returned in each ranking (1..64).
+        resolve: Resolve only bounded start samples against live module loaders.
+        require_complete: Reject a cap- or corruption-limited scope with typed
+            ``incomplete_result`` rather than returning its validated prefix.
+    """
+    cfg, vm, _ = _get_state()
+    state = vm.state()
+    if state not in (VMState.RUNNING, VMState.PAUSED):
+        return _research_error(
+            f"VM is not running (state: {state.value})", operation="kdbg_thread_triage",
+        )
+    try:
+        if not isinstance(require_complete, bool):
+            raise _KdbgGlobalThreadTriageError("require_complete must be a boolean")
+        if resolve:
+            try:
+                _kdbg_ensure_vad_layouts(cfg, _kdbg_get_store())
+            except (_KdbgVadError, _KdbgStoreError, _KdbgSymbolLoadError):
+                pass
+        with _kdbg_debug_snapshot(cfg) as snapshot:
+            result = _kdbg_triage_all_process_threads(
+                cfg.vm_name, _kdbg_get_store(), cache=_KdbgWalkCache(),
+                process_cap=process_cap, total_thread_cap=total_thread_cap,
+                sample_per_process=sample_per_process, result_limit=result_limit,
+                resolve=resolve,
+            )
+            if require_complete and not result["scope"]["complete"]:
+                raise _KdbgGlobalThreadTriageIncomplete(result)
+            result["snapshot_metadata"] = _kdbg_snapshot_metadata(snapshot)
+    except (
+        _KdbgGlobalThreadTriageError, _KdbgGlobalThreadTriageIncomplete,
+        _KdbgVadError, _KdbgStoreError, _KdbgHmpError,
+    ) as exc:
+        return _research_error(exc, operation="kdbg_thread_triage")
     return _research_ok(result)
 
 
@@ -4429,6 +4871,7 @@ def kdbg_decomp(
     assembly: str = "nearby",
     instruction_bytes: bool = False,
     runtime_vas: bool = False,
+    allow_cold: bool = False,
 ) -> dict[str, Any]:
     """Return focused Ghidra pseudocode for ADDR or the current RIP.
 
@@ -4439,9 +4882,11 @@ def kdbg_decomp(
     only the containing function. A stale or same-named wrong binary is
     refused. The JVM never runs inside the MCP server or kdbg daemon.
 
-    The first query for a binary may take minutes while Ghidra analyzes and
-    caches it; subsequent lookups reuse that project and process. Compact
-    output is the default: it returns the live location, nearby assembly,
+    A cold Ghidra project is refused by default: the target remains halted
+    while its live identity is verified, and background/offline preparation
+    must happen after detach or continue. Set ``allow_cold=true`` only when
+    deliberately accepting cold analysis while the target is stopped. Compact
+    output returns the live location, nearby assembly,
     focused pseudocode, explicit RVA-based assembly-to-pseudocode mapping,
     concise verification, and warnings. Standard or diagnostic evidence is
     available only when explicitly requested.
@@ -4466,6 +4911,7 @@ def kdbg_decomp(
             assembly to every address-bearing selected pseudocode line.
         instruction_bytes: Include raw instruction bytes (off by default).
         runtime_vas: Include repeated static/runtime VAs in addition to RVAs.
+        allow_cold: Explicitly permit a cold import/analysis while the target is halted.
     """
     from winbox.kdbg.decomp import DecompError, query_decomp
 
@@ -4489,6 +4935,7 @@ def kdbg_decomp(
             assembly=assembly,
             instruction_bytes=instruction_bytes,
             runtime_vas=runtime_vas,
+            allow_cold=allow_cold,
         )
     except DecompError as exc:
         return _research_error(exc, operation="kdbg_decomp")
