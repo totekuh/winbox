@@ -522,6 +522,8 @@ def query_decomp(
     assembly: str = "nearby",
     instruction_bytes: bool = False,
     runtime_vas: bool = False,
+    callers: bool = False,
+    callees: bool = False,
     allow_cold: bool = False,
     daemon_client: DaemonClient | None = None,
     decomp_client: DecompClient | None = None,
@@ -556,6 +558,8 @@ def query_decomp(
         page_size = int(cursor_data["page_size"])
         line_range = (start, start + page_size - 1)
     assembly = _assembly_mode(assembly)
+    if not isinstance(callers, bool) or not isinstance(callees, bool):
+        raise DecompError("callers and callees must be booleans", code="invalid_argument")
     if not isinstance(allow_cold, bool):
         raise DecompError("allow_cold must be a boolean", code="invalid_argument")
     daemon = daemon_client or DaemonClient(cfg)
@@ -720,6 +724,28 @@ def query_decomp(
         })
 
     warnings: list[str] = []
+    direct_calls: dict[str, Any] | None = None
+    if callers or callees:
+        from winbox.kdbg.static_search import StaticSearchError, direct_call_xrefs
+
+        try:
+            function_rva = int(str((result.get("function") or {})["rva"]), 0)
+            direct_calls = direct_call_xrefs(
+                binary_path,
+                static_identity,
+                rva=function_rva,
+                callers=callers,
+                callees=callees,
+            )
+        except (StaticSearchError, KeyError, TypeError, ValueError) as exc:
+            direct_calls = {
+                "schema": "winbox.kdbg-direct-call-xrefs/1",
+                "available": False,
+                "callers": [],
+                "callees": [],
+                "reason": str(exc)[:512],
+            }
+            warnings.append("static direct-call xrefs were unavailable for this function")
     if full and (result.get("analysis") or {}).get("code_truncated"):
         warnings.append(
             "full pseudocode was truncated; mapping and selected lines use the complete function"
@@ -798,6 +824,7 @@ def query_decomp(
             "cold_analysis": not readiness["ready"],
         },
         **result,
+        "direct_calls": direct_calls,
         "warnings": warnings,
     }
     return _format_result(
@@ -951,6 +978,8 @@ def _format_result(
     }
     if "code" in result:
         compact["code"] = result["code"]
+    if result.get("direct_calls") is not None:
+        compact["direct_calls"] = result["direct_calls"]
     if "code" in result and (result.get("analysis") or {}).get("code_truncated"):
         compact["code_truncated"] = True
     if detail == "standard":

@@ -1033,6 +1033,107 @@ def test_bp_list_reflects_added_bps():
     assert "target_pretty" in bps[0]
 
 
+def test_bp_accepts_case_insensitive_staged_module_offset_and_lists_it():
+    """Module-relative bps bind to this attach's frozen exact-module list."""
+    from winbox.kdbg.staging import StagedUserModule, UserModuleManifest
+
+    module = StagedUserModule(
+        "MpEngine.dll", r"C:\\ProgramData\\MpEngine.dll", "x64",
+        0x7FF700000000, 0xC00000, "/exact/mpengine.dll", "a" * 64,
+        "mpengine",
+    )
+    session = _make_session(manifest=UserModuleManifest(4584, (module,)))
+    reply = session.handle_op("bp_add", {"target": "MPENGINE+0xB52C40"})
+    assert reply["ok"], reply
+    assert reply["result"]["va"] == "0x7ff700b52c40"
+    assert reply["result"]["target"] == "MpEngine.dll+0xb52c40"
+
+    listed = session.handle_op("bp_list", {})["result"]["bps"][0]
+    assert listed["target"] == "MpEngine.dll+0xb52c40"
+    assert listed["target_pretty"] == "MpEngine.dll+0xb52c40"
+
+
+def test_bp_module_offset_fails_closed_without_one_unambiguous_staged_match():
+    from winbox.kdbg.staging import StagedUserModule, UserModuleManifest
+
+    no_manifest = _make_session()
+    missing = no_manifest.handle_op("bp_add", {"target": "mpengine+0x10"})
+    assert missing["ok"] is False
+    assert "staged user-module manifest" in missing["error"]
+
+    one = StagedUserModule(
+        "mpengine.dll", r"C:\\mpengine.dll", "x64", 0x7FF700000000,
+        0x1000, "/exact/mpengine.dll", "a" * 64, "mpengine",
+    )
+    session = _make_session(manifest=UserModuleManifest(4584, (one,)))
+    out_of_range = session.handle_op("bp_add", {"target": "mpengine+0x1000"})
+    assert out_of_range["ok"] is False
+    assert "outside" in out_of_range["error"]
+    unknown = session.handle_op("bp_add", {"target": "missing+0x10"})
+    assert unknown["ok"] is False
+    assert "not in this session" in unknown["error"]
+
+    duplicate = StagedUserModule(
+        "mpengine.dll", r"C:\\SysWOW64\\mpengine.dll", "x86", 0x400000,
+        0x2000, "/exact/mpengine-x86.dll", "b" * 64, "mpengine_x86",
+    )
+    ambiguous = _make_session(manifest=UserModuleManifest(4584, (one, duplicate)))
+    reply = ambiguous.handle_op("bp_add", {"target": "mpengine+0x10"})
+    assert reply["ok"] is False
+    assert "ambiguous" in reply["error"]
+
+
+def test_explicit_intent_application_installs_matches_and_reports_misses():
+    from winbox.kdbg.debugger.daemon import _apply_breakpoint_intents
+    from winbox.kdbg.staging import StagedUserModule, UserModuleManifest
+
+    module = StagedUserModule(
+        "MpEngine.dll", r"C:\\MpEngine.dll", "x64", 0x7FF700000000,
+        0x2000, "/exact/mpengine.dll", "a" * 64, "mpengine",
+    )
+    session = _make_session(manifest=UserModuleManifest(4584, (module,)))
+    report = _apply_breakpoint_intents(session, [
+        {
+            "id": 7, "target": "mpengine+0x10", "mode": "hw",
+            "condition": None, "wp_type": None, "wp_size": 1,
+            "actions": [],
+        },
+        {
+            "id": 8, "target": "missing+0x10", "mode": "hw",
+            "condition": None, "wp_type": None, "wp_size": 1,
+            "actions": [],
+        },
+    ])
+
+    assert report["installed"] == 1
+    assert report["unresolved"] == 1
+    assert report["failed"] == 0
+    assert report["results"][0]["breakpoint"]["target"] == "MpEngine.dll+0x10"
+    assert report["results"][1]["status"] == "unresolved"
+    session.breakpoint_intents = report
+    assert session.op_status()["breakpoint_intents"] == report
+
+
+def test_parent_validates_intent_snapshot_before_daemon_fork():
+    from winbox.kdbg.debugger.daemon import DaemonError, _validated_breakpoint_intents
+
+    valid = _validated_breakpoint_intents([{
+        "id": 2, "target": "MPENGINE+0x0010", "mode": "soft",
+        "condition": "rax != 0", "wp_type": None, "wp_size": 1,
+        "actions": ["rip"],
+    }])
+    assert valid == [{
+        "id": 2, "target": "mpengine+0x10", "mode": "soft",
+        "condition": "rax != 0", "wp_type": None, "wp_size": 1,
+        "actions": ["rip"],
+    }]
+    with pytest.raises(DaemonError, match="invalid breakpoint intent"):
+        _validated_breakpoint_intents([{
+            "id": 2, "target": "0x7ff700001000", "mode": "hw",
+            "condition": None, "wp_type": None, "wp_size": 1, "actions": [],
+        }])
+
+
 def test_bp_list_includes_demangled_pretty_target():
     """bp_list now exposes a demangled target_pretty alongside the
     raw mangled target string."""

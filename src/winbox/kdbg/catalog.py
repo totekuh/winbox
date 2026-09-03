@@ -8,8 +8,8 @@ or a missed catalog bump visible instead of silently divergent.
 from __future__ import annotations
 
 
-MCP_CATALOG_REVISION = "2026-08-29.capture-vad-object-evidence.1"
-MCP_TOOL_COUNT = 92
+MCP_CATALOG_REVISION = "2026-09-03.breakpoint-intents.1"
+MCP_TOOL_COUNT = 97
 
 
 def catalog_identity() -> dict[str, int | str]:

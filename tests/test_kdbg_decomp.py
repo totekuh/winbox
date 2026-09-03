@@ -498,6 +498,47 @@ def test_query_decomp_refuses_cold_analysis_unless_explicitly_allowed(monkeypatc
     }
 
 
+def test_query_decomp_adds_bounded_static_direct_call_evidence(monkeypatch, tmp_path):
+    image, key = _live_pe()
+    binary = tmp_path / "sample.exe"
+    binary.write_bytes(b"fixture")
+    static = PeIdentity(
+        0x8664, 0x12345678, 0x5000, 0x140000000, key,
+        sha256="d" * 64, file_size=binary.stat().st_size,
+        sections=(SectionIdentity(".text", 0x1000, 0x1000, 0, 1),),
+    )
+    monkeypatch.setattr("winbox.kdbg.decomp.service.parse_static_pe", lambda _: static)
+    monkeypatch.setattr(
+        "winbox.kdbg.decomp.cache.analysis_readiness",
+        lambda *_: {"ready": True, "reason": "ready"},
+    )
+    observed = {}
+
+    def direct(path, identity, **kwargs):
+        observed.update({"path": path, "identity": identity, **kwargs})
+        return {"available": True, "callers": [{"rva": "0x2000"}], "callees": []}
+
+    monkeypatch.setattr("winbox.kdbg.static_search.direct_call_xrefs", direct)
+
+    class XrefWorker(_FakeWorker):
+        def call(self, op, **args):
+            result = super().call(op, **args)
+            result["function"]["rva"] = "0x1000"
+            return result
+
+    result = query_decomp(
+        Config(winbox_dir=tmp_path), binary=str(binary), callers=True, callees=True,
+        daemon_client=_FakeDaemon(image), decomp_client=XrefWorker(),
+    )
+    assert observed["rva"] == 0x1000
+    assert observed["callers"] is True
+    assert observed["callees"] is True
+    assert observed["identity"] == static
+    assert result["direct_calls"] == {
+        "available": True, "callers": [{"rva": "0x2000"}], "callees": [],
+    }
+
+
 def test_query_decomp_cursor_pages_and_is_bound_to_stop_and_binary(
     monkeypatch, tmp_path
 ):
@@ -605,6 +646,8 @@ def test_query_decomp_rejects_bad_detail_before_touching_daemon(tmp_path):
         ({"lines": "1-2-3"}, "must be N or N-M"),
         ({"lines": "1-101"}, "at most 100"),
         ({"assembly": "everything"}, "assembly must be one of"),
+        ({"callers": "true"}, "callers and callees must be booleans"),
+        ({"callees": 1}, "callers and callees must be booleans"),
     ],
 )
 def test_query_decomp_rejects_bad_batch_options_before_daemon(
@@ -1129,7 +1172,8 @@ def test_mcp_decomp_serializes_result_and_surfaces_error(monkeypatch, tmp_path):
     monkeypatch.setattr(package, "query_decomp", query)
     reply = mcp_module.kdbg_decomp(
         symbol="sample!focus", cursor="opaque", detail="diagnostic",
-        lines="1-22", assembly="mapped", allow_cold=True,
+        lines="1-22", assembly="mapped", callers=True, callees=True,
+        allow_cold=True,
     )
     assert reply["ok"] is True
     assert reply["result"] == {"ok": 1}
@@ -1140,6 +1184,8 @@ def test_mcp_decomp_serializes_result_and_surfaces_error(monkeypatch, tmp_path):
     assert captured["assembly"] == "mapped"
     assert captured["instruction_bytes"] is False
     assert captured["runtime_vas"] is False
+    assert captured["callers"] is True
+    assert captured["callees"] is True
     assert captured["allow_cold"] is True
 
     def fail(*args, **kwargs):
@@ -1188,7 +1234,8 @@ def test_cli_decomp_emits_machine_safe_unwrapped_json(monkeypatch, tmp_path):
     result = CliRunner().invoke(
         cli, [
             "kdbg", "decomp", "--module", "sample.exe", "--rva", "0x1000",
-            "--lines", "1-22", "--assembly", "mapped", "--allow-cold",
+            "--lines", "1-22", "--assembly", "mapped", "--callers", "--callees",
+            "--allow-cold",
         ]
     )
     assert result.exit_code == 0, result.output
@@ -1197,6 +1244,8 @@ def test_cli_decomp_emits_machine_safe_unwrapped_json(monkeypatch, tmp_path):
     assert captured["assembly"] == "mapped"
     assert captured["module"] == "sample.exe"
     assert captured["rva"] == "0x1000"
+    assert captured["callers"] is True
+    assert captured["callees"] is True
     assert captured["allow_cold"] is True
 
 

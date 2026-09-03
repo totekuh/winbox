@@ -47,6 +47,76 @@ The investigation-evidence/control-plane pass completed items 105–109 on
 2026-08-29. It adds exact-PDB VAD/token/object evidence, immutable one-stop
 captures, metadata-only operation telemetry, and transport accounting without
 turning a loader miss or public-PDB omission into invented certainty.
+The focused byte-evidence pass completed item 110 on 2026-08-30: a selected
+process VAD can now be proven and extracted during the same bounded stop into
+a mode-0600 immutable host artifact, without leaking raw bytes through CLI or
+MCP.
+The static-research and durable-intent pass completed items 111–112: exact
+cached PEs now expose bounded offline search/direct-call leads, attached
+sessions accept manifest-relative breakpoint targets, and detached symbolic
+intents are applied only through an explicit fresh-manifest attach.
+
+### 111. Completed — static research leads and staged-relative breakpoints
+
+The mpengine reverse-engineering pass exposed a tight loop of repeat ASLR
+math, host-side scripts, and noisy breakpoint handling. `kdbg_bp` now accepts
+case-insensitive `module+0xoffset` only when exactly one module from the
+attach-time staged manifest matches; it bounds-checks the offset, records the
+canonical module name, and `kdbg_bps` shows that target rather than forcing
+manual base subtraction. Missing manifests, absent modules, ambiguous x86/x64
+names, and out-of-range RVAs refuse before touching the target.
+
+`kdbg_search(module, query, limit?, sha256?)` is a deliberately separate
+offline exact-PE discovery surface: it falls back from a symbol-store record to
+named persistent decomp-cache artifacts (including a copied module with failed
+PDB enrichment), and an exact digest resolves intentional same-name ambiguity.
+It returns bounded ASCII/UTF-16 `.rdata` matches, exported-name leads, validated
+MSVC x64 TypeDescriptor→COL→vftable chains, and direct
+RIP-relative string xrefs mapped through `.pdata` function boundaries. It
+checks the cached artifact digest before parsing and never opens an RSP socket.
+`kdbg_decomp(callers?, callees?)` adds bounded direct relative-call evidence
+from the exact immutable decomp input; indirect calls, dynamic dispatch, tail
+jumps, imports, and guessed symbol names remain explicit non-results. Existing
+action breakpoints were documented with their scalar/capture grammar, JSONL
+trace path, resource caps, and automatic continue behavior.
+
+Local unit and exact-PE integration coverage exercise string/RIP xrefs, RTTI,
+direct-call edges, digest tampering, ambiguity, adapter parity, and target
+validation. Live Win11 verification resolved the exact cached `ntdll` export,
+installed and removed its staged-relative breakpoint, then repeated the install
+from a durable intent on a fresh attach. Cleanup left the guest running and
+responsive, the gdbstub stopped, and the intent store empty.
+
+### 112. Completed — detached breakpoint intents, revalidated at attach
+
+`kdbg_bp_intent_add`, `kdbg_bp_intents`, and `kdbg_bp_intent_remove` preserve
+only canonical `module+0xoffset` requests plus their mode, condition,
+watchpoint, and action configuration in an atomic mode-0600 host store. They
+never resolve or touch the VM. A normal attach ignores the store;
+`kdbg_attach(..., apply_intents=true)` / `winbox kdbg attach --apply-intents`
+explicitly snapshots it, stages a fresh loader manifest, and only then asks
+the halted daemon to resolve and install each unique in-range module match.
+Unresolved, ambiguous, out-of-range, and installation failures are retained in
+the attach/session report rather than guessed or made fatal to the session.
+
+### 110. Completed — one-stop VAD byte-evidence extraction
+
+`winbox kdbg vad-extract PID ADDRESS --name CASE` and `kdbg_vad_extract` bind
+an exact-PDB VAD lookup to a bounded process-CR3 byte read in the same snapshot.
+They preserve at most 8 MiB as an append-only mode-0600 blob plus atomic JSON
+manifest: target/boot/PDB identity, VAD evidence, selected range, per-segment
+and whole-blob SHA-256, unreadable/short-read/RSP-partial holes, and snapshot accounting.
+Bytes are never returned in terminal or MCP JSON. A normal partial extraction
+retains its explicit holes; `--require-complete` rejects it before any artifact
+is published. Invalid names, addresses, and bounds fail before the VM stops.
+
+The extractor reuses the VAD preflight, persistent-reader limits, phase timing,
+and host evidence conventions; it does not quietly widen normal process
+captures. Unit coverage exercises range proof, caps, short reads, holes,
+strict non-publication, immutable atomic storage, tampering, CLI/MCP parity,
+and manifest accounting. Live Win11 validation extracted a real executable VAD
+page through both transports, verified the persisted digest/permissions, and
+left the guest running with the gdbstub stopped.
 
 ### Completed sequence — investigation evidence and operator visibility
 
@@ -455,15 +525,6 @@ tests and the live MCP/CLI parity test pass. A fresh installed MCP stdio server
 advertised all seven new inputs and live-validated a complete 174-thread PID 4
 summary, four IdleThread vCPUs, and eight intentionally bounded resolved rows.
 The guest was left running, agent-responsive, and with the gdbstub stopped.
-
-### 92. Planned — optional wait-object and owner-chain evidence
-
-`KWAIT_REASON` says broadly why a thread is waiting, not which dispatcher
-object or owner is blocking it. Add an opt-in, PDB-backed `KWAIT_BLOCK` walk
-that returns a bounded object address/type and owner TID only where the object
-semantics prove one. Cycles, freed objects, unknown object types, and absent
-owners must remain explicit partial evidence; never manufacture a deadlock
-graph from a raw pointer.
 
 ### 93. Completed — strengthen thread-list integrity invariants
 

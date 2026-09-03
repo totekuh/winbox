@@ -67,6 +67,11 @@ from winbox.kdbg.vad import (
     list_vads as _kdbg_list_vads,
     lookup_vad as _kdbg_lookup_vad,
 )
+from winbox.kdbg.vad_extract import (
+    VadExtractError as _KdbgVadExtractError,
+    VadExtractStore as _KdbgVadExtractStore,
+    extract_live as _kdbg_extract_vad_live,
+)
 
 mcp = FastMCP(
     "winbox",
@@ -3329,6 +3334,51 @@ def kdbg_vad(
 
 
 @mcp.tool()
+def kdbg_vad_extract(
+    pid: int, address: str, name: str, length: int = 0,
+    require_complete: bool = False,
+) -> dict[str, Any]:
+    """Extract bytes from one validated process VAD into an immutable artifact.
+
+    The VAD proof and process-CR3 byte reads occur in one bounded stop. Raw
+    bytes are never returned in MCP; the response contains only the manifest
+    and mode-0600 host artifact locations. A partial normal extraction retains
+    its hole map, while `require_complete=true` publishes nothing on a hole.
+
+    Args:
+        pid: Target process ID from kdbg_ps.
+        address: Canonical user-mode address inside the VAD to extract from.
+        name: New immutable artifact name, 1..64 safe filename characters.
+        length: Byte count (1..8 MiB), or 0 for up to 1 MiB within the VAD.
+        require_complete: Refuse an artifact when any selected page is unreadable.
+    """
+    try:
+        parsed_address = int(address, 0)
+    except (TypeError, ValueError):
+        return _research_error(f"invalid address: {address!r}", operation="kdbg_vad_extract")
+    if isinstance(length, bool) or not isinstance(length, int) or not 0 <= length <= 8 * 1024 * 1024:
+        return _research_error("length must be an integer between 0 and 8388608", operation="kdbg_vad_extract")
+    if not isinstance(require_complete, bool):
+        return _research_error("require_complete must be a boolean", operation="kdbg_vad_extract")
+    cfg, vm, _ = _get_state()
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        return _research_error(f"VM is not running (state: {vm.state().value})", operation="kdbg_vad_extract")
+    try:
+        artifacts = _KdbgVadExtractStore(cfg)
+        artifacts.validate_name(name)
+        artifacts.ensure_available(name)
+        store = _kdbg_get_store()
+        extraction = _kdbg_extract_vad_live(
+            cfg, store, pid=pid, address=parsed_address,
+            length=(length or None), require_complete=require_complete,
+        )
+        saved = artifacts.save(name, extraction)
+        return _research_ok({"extraction": extraction.manifest, "saved": saved})
+    except (_KdbgVadExtractError, _KdbgVadError, _KdbgStoreError, _KdbgHmpError) as exc:
+        return _research_error(exc, operation="kdbg_vad_extract")
+
+
+@mcp.tool()
 def kdbg_token(pid: int) -> dict[str, Any]:
     """Return PDB-backed primary-token identity and raw privilege masks."""
     cfg, vm, _ = _get_state()
@@ -4303,6 +4353,7 @@ def _kdbg_cfg_only():
 def kdbg_attach(
     pid: int, port: int = 1234, staging_policy: str = "full",
     preflight: bool = False, prewarm: bool = False,
+    apply_intents: bool = False,
 ) -> dict[str, Any]:
     """Attach a kdbg debugging session to a Windows process via the gdbstub.
 
@@ -4325,11 +4376,17 @@ def kdbg_attach(
             artifacts, taking the gdbstub, or attaching a daemon.
         prewarm: After attach, start background Ghidra preparation for every
             exact symbol-enriched module; the VM is not held for this work.
+        apply_intents: Explicitly snapshot saved module-relative breakpoint
+            intents and install only those resolved by this fresh attach.
 
     Returns:
         The common envelope with daemon PID, target, gdbstub metadata, and
         bounded ``auto_stage`` counts/failures.
     """
+    if not isinstance(apply_intents, bool):
+        return _research_error(
+            "apply_intents must be a boolean", operation="kdbg_attach",
+        )
     cfg, vm, ga = _ensure_vm_ready()
     client = _kdbg_client(cfg)
     if client.session_alive():
@@ -4350,17 +4407,33 @@ def kdbg_attach(
         prepare_user_module_manifest as _kdbg_prepare_manifest,
     )
     try:
+        from winbox.kdbg.breakpoint_intent import (
+            BreakpointIntentError,
+            BreakpointIntentStore,
+        )
+        intent_snapshot = (
+            BreakpointIntentStore(cfg).inventory()["intents"]
+            if apply_intents else None
+        )
         if preflight:
             plan = _kdbg_preflight_staging(
                 cfg, _kdbg_get_store(), pid, policy=staging_policy,
             )
             plan["prewarm_requested"] = bool(prewarm)
+            plan["breakpoint_intents"] = {
+                "apply_requested": bool(apply_intents),
+                "count": len(intent_snapshot or []),
+                "intents": intent_snapshot or [],
+            }
             return _research_ok(plan)
         manifest = _kdbg_prepare_manifest(
             cfg, ga, _kdbg_get_store(), pid,
             enrich_symbols=staging_policy == "full", policy=staging_policy,
         )
-    except (_KdbgStagingError, _KdbgStoreError, _KdbgSymbolLoadError) as e:
+    except (
+        _KdbgStagingError, _KdbgStoreError, _KdbgSymbolLoadError,
+        BreakpointIntentError,
+    ) as e:
         return _research_error(e, operation="kdbg_attach")
 
     # Transfer ownership from the background read broker to the interactive
@@ -4377,6 +4450,7 @@ def kdbg_attach(
     try:
         daemon_pid = _fork_daemon(
             cfg, pid, gdbstub_port=port, module_manifest=manifest,
+            breakpoint_intents=intent_snapshot,
         )
     except _DaemonError as e:
         return _research_error(e, operation="kdbg_attach")
@@ -4391,6 +4465,8 @@ def kdbg_attach(
         "gdbstub_port": info.get("gdbstub_port", port),
         "auto_stage": manifest.summary(),
     }
+    if isinstance(info.get("breakpoint_intents"), dict):
+        result["breakpoint_intents"] = info["breakpoint_intents"]
     if prewarm:
         from winbox.kdbg.decomp import DecompError, start_prepare_background
         modules = sorted({
@@ -4454,6 +4530,67 @@ def kdbg_target_status() -> dict[str, Any]:
 
 
 @mcp.tool()
+def kdbg_bp_intent_add(
+    target: str,
+    mode: str = "hw",
+    condition: str | None = None,
+    wp_type: str | None = None,
+    wp_size: int = 1,
+    actions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Persist a detached module-relative breakpoint intent without touching the VM.
+
+    The target must use ``module+0xoffset``. No virtual address is saved and
+    no breakpoint is installed until a later explicit
+    ``kdbg_attach(..., apply_intents=true)`` resolves it against that attach's
+    fresh staged manifest.
+    """
+    from winbox.kdbg.breakpoint_intent import (
+        BreakpointIntentError,
+        BreakpointIntentStore,
+    )
+
+    try:
+        result = BreakpointIntentStore(_kdbg_cfg_only()).add(
+            target, mode=mode, condition=condition, wp_type=wp_type,
+            wp_size=wp_size, actions=actions,
+        )
+        return _research_ok(result)
+    except BreakpointIntentError as exc:
+        return _research_error(exc, operation="kdbg_bp_intent_add")
+
+
+@mcp.tool()
+def kdbg_bp_intents() -> dict[str, Any]:
+    """List durable breakpoint intents without attaching or touching the VM."""
+    from winbox.kdbg.breakpoint_intent import (
+        BreakpointIntentError,
+        BreakpointIntentStore,
+    )
+
+    try:
+        return _research_ok(BreakpointIntentStore(_kdbg_cfg_only()).inventory())
+    except BreakpointIntentError as exc:
+        return _research_error(exc, operation="kdbg_bp_intents")
+
+
+@mcp.tool()
+def kdbg_bp_intent_remove(intent_id: int) -> dict[str, Any]:
+    """Remove one durable breakpoint intent by its stable non-negative ID."""
+    from winbox.kdbg.breakpoint_intent import (
+        BreakpointIntentError,
+        BreakpointIntentStore,
+    )
+
+    try:
+        return _research_ok(
+            BreakpointIntentStore(_kdbg_cfg_only()).remove(intent_id)
+        )
+    except BreakpointIntentError as exc:
+        return _research_error(exc, operation="kdbg_bp_intent_remove")
+
+
+@mcp.tool()
 def kdbg_bp(
     target: str,
     mode: str = "hw",
@@ -4472,7 +4609,10 @@ def kdbg_bp(
     set). Limit: 4 active per vCPU.
 
     Args:
-        target: Symbol (``module!sym``) or hex VA.
+        target: Symbol (``module!sym``), hex VA, or staged
+            ``module+0xoffset``. The latter is case-insensitive and resolves
+            only against the frozen exact user-module manifest from this
+            attach (for example ``mpengine+0xb52c40``).
         mode: Breakpoint mechanism (ignored when ``wp_type`` is set):
             ``"hw"`` (default) — hardware bp via Z1. PG-safe and
                 anti-debug-invisible. Limit 4 per vCPU.
@@ -4854,6 +4994,41 @@ def kdbg_disasm(
 
 
 @mcp.tool()
+def kdbg_search(
+    module: str, query: str, limit: int = 32, sha256: str = "",
+) -> dict[str, Any]:
+    """Find static research leads in one exact cached/staged PE artifact.
+
+    The search is strictly offline and never opens the debugger socket or
+    alters VM state.  It returns matching ASCII/UTF-16 strings, exported names
+    when present, validated MSVC x64 RTTI vtables, and direct RIP-relative
+    string xrefs mapped through x64 ``.pdata`` boundaries.  Results are leads,
+    not a claim of complete cross-reference recovery.
+
+    Args:
+        module: Cached/staged module name, case-insensitive (for example
+            ``mpengine`` or ``mpengine.dll``). The symbol store is checked
+            first, then named persistent decomp-cache artifacts. Paths are
+            intentionally refused.
+        query: Case-insensitive text to search (2..256 characters).
+        limit: Maximum result leads (1..64). String evidence is separately
+            bounded to keep response size predictable.
+        sha256: Optional full exact cache digest. Use after an ambiguity error
+            to select one decomp-cache binary without trusting its filename.
+    """
+    from winbox.kdbg.static_search import StaticSearchError, search_cached_module
+
+    try:
+        result = search_cached_module(
+            _kdbg_cfg_only(), module=module, query=query, limit=limit,
+            sha256=sha256,
+        )
+    except StaticSearchError as exc:
+        return _research_error(exc, operation="kdbg_search")
+    return _research_ok(result)
+
+
+@mcp.tool()
 def kdbg_decomp(
     addr: str = "",
     symbol: str = "",
@@ -4871,6 +5046,8 @@ def kdbg_decomp(
     assembly: str = "nearby",
     instruction_bytes: bool = False,
     runtime_vas: bool = False,
+    callers: bool = False,
+    callees: bool = False,
     allow_cold: bool = False,
 ) -> dict[str, Any]:
     """Return focused Ghidra pseudocode for ADDR or the current RIP.
@@ -4911,6 +5088,10 @@ def kdbg_decomp(
             assembly to every address-bearing selected pseudocode line.
         instruction_bytes: Include raw instruction bytes (off by default).
         runtime_vas: Include repeated static/runtime VAs in addition to RVAs.
+        callers: Include static direct callers of the selected function from
+            the exact cached PE. Indirect calls are intentionally omitted.
+        callees: Include static direct calls made by the selected function
+            from the exact cached PE. Indirect calls are intentionally omitted.
         allow_cold: Explicitly permit a cold import/analysis while the target is halted.
     """
     from winbox.kdbg.decomp import DecompError, query_decomp
@@ -4935,6 +5116,8 @@ def kdbg_decomp(
             assembly=assembly,
             instruction_bytes=instruction_bytes,
             runtime_vas=runtime_vas,
+            callers=callers,
+            callees=callees,
             allow_cold=allow_cold,
         )
     except DecompError as exc:

@@ -1415,11 +1415,58 @@ class TestKdbg:
             for name in (mcp_name, cli_name):
                 captures.path(name).unlink(missing_ok=True)
 
-    def test_real_mcp_stdio_evidence_surface_is_fresh(self, run):
+    def test_vad_extract_is_one_stop_immutable_byte_evidence(self, run, tool, cfg):
+        """Extract a real executable VAD page through both public transports."""
+        from winbox.kdbg.vad_extract import VadExtractStore
+
+        suffix = f"e2e-vad-extract-{os.getpid()}"
+        mcp_name = f"{suffix}-mcp"
+        cli_name = f"{suffix}-cli"
+        artifacts = VadExtractStore(cfg)
+        for name in (mcp_name, cli_name):
+            artifacts.delete(name)
+
+        run("kdbg", "stop", expect_ok=False)
+        run("kdbg", "start")
+        try:
+            pid = self._target_pid(tool)
+            vad = self._result(tool, "kdbg_vad", pid, executable=True, limit=1)
+            record = vad["records"][0]
+            address = record["start"]
+
+            mcp_extract = self._result(
+                tool, "kdbg_vad_extract", pid, address, mcp_name, length=4096,
+            )
+            assert mcp_extract["extraction"]["complete"] is True, mcp_extract
+            assert mcp_extract["extraction"]["blob"]["size"] == 4096
+            assert mcp_extract["extraction"]["snapshot_metadata"]["admission"] == "accepted"
+            assert {"vad_lookup", "vad_extract"} <= set(
+                mcp_extract["extraction"]["snapshot_metadata"]["phases_ms"],
+            )
+            assert artifacts.load(mcp_name)["blob"] == mcp_extract["extraction"]["blob"]
+            assert artifacts.blob_path(mcp_name).stat().st_mode & 0o077 == 0
+
+            cli_extract = json.loads(run("kdbg", "vad-extract", str(pid), address, "--length", "4096",
+                "--name", cli_name, "--json",
+            ).output)
+            assert cli_extract["extraction"]["complete"] is True
+            assert cli_extract["extraction"]["blob"]["size"] == 4096
+            assert artifacts.load(cli_name)["blob"] == cli_extract["extraction"]["blob"]
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+            for name in (mcp_name, cli_name):
+                artifacts.delete(name)
+
+    def test_real_mcp_stdio_evidence_surface_is_fresh(self, run, cfg):
         """Cross the actual MCP process after registration, not its .fn shim."""
         import anyio
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
+        from winbox.kdbg.vad_extract import VadExtractStore
+
+        artifact_name = f"e2e-stdio-vad-{os.getpid()}"
+        artifacts = VadExtractStore(cfg)
+        artifacts.delete(artifact_name)
 
         async def exercise_server():
             server = StdioServerParameters(
@@ -1437,7 +1484,7 @@ class TestKdbg:
                     names = {item.name for item in (await session.list_tools()).tools}
                     assert {
                         "kdbg_vad", "kdbg_token", "kdbg_handles", "kdbg_object",
-                        "kdbg_capture", "kdbg_capture_diff",
+                        "kdbg_capture", "kdbg_capture_diff", "kdbg_vad_extract",
                     } <= names
                     processes = await session.call_tool("kdbg_ps", {})
                     assert not processes.isError, processes
@@ -1451,12 +1498,42 @@ class TestKdbg:
                     assert result["returned"] == 1
                     assert result["snapshot_metadata"]["admission"] == "accepted"
 
+                    extracted = await session.call_tool("kdbg_vad_extract", {
+                        "pid": pid, "address": result["records"][0]["start"],
+                        "name": artifact_name, "length": 4096,
+                    })
+                    assert not extracted.isError, extracted
+                    extraction = json.loads(extracted.content[0].text)
+                    assert extraction["ok"] is True, extraction
+                    assert extraction["result"]["extraction"]["complete"] is True
+                    assert extraction["result"]["extraction"]["blob"]["size"] == 4096
+                    assert artifacts.load(artifact_name)["blob"] == extraction["result"]["extraction"]["blob"]
+
+                    duplicate = await session.call_tool("kdbg_vad_extract", {
+                        "pid": pid, "address": result["records"][0]["start"],
+                        "name": artifact_name, "length": 4096,
+                    })
+                    assert not duplicate.isError, duplicate
+                    duplicate_result = json.loads(duplicate.content[0].text)
+                    assert duplicate_result["ok"] is False
+                    assert duplicate_result["error"]["code"] == "vad_extract_error"
+
+                    invalid = await session.call_tool("kdbg_vad_extract", {
+                        "pid": pid, "address": "0xffff808d9ec6c080",
+                        "name": f"{artifact_name}-bad", "length": 4096,
+                    })
+                    assert not invalid.isError, invalid
+                    invalid_result = json.loads(invalid.content[0].text)
+                    assert invalid_result["ok"] is False
+                    assert invalid_result["error"]["code"] == "vad_extract_error"
+
         run("kdbg", "stop", expect_ok=False)
         run("kdbg", "start")
         try:
             anyio.run(exercise_server)
         finally:
             run("kdbg", "stop", expect_ok=False)
+            artifacts.delete(artifact_name)
 
     def test_attach_read_and_detach_leaves_the_vm_running(self, tool, cfg, run):
         """A daemon that does not shut down cleanly never resumes the CPU,
@@ -1562,6 +1639,100 @@ class TestKdbg:
             finally:
                 self._result(tool, "kdbg_detach")
         finally:
+            run("kdbg", "stop", expect_ok=False)
+        assert _domstate(cfg.vm_name) == "running"
+
+    def test_staged_relative_breakpoint_and_explicit_detached_intent(
+        self, tool, run, cfg,
+    ):
+        """Resolve now, persist only the RVA, then re-resolve on a fresh attach."""
+        from winbox.kdbg.breakpoint_intent import BreakpointIntentStore
+
+        intent_store = BreakpointIntentStore(cfg)
+        existing = intent_store.inventory()
+        if existing["count"]:
+            pytest.skip("live intent application refuses to touch pre-existing operator intents")
+
+        intent_id = None
+        attached = False
+        run("kdbg", "stop", expect_ok=False)
+        run("kdbg", "start")
+        try:
+            pid = self._target_pid(tool)
+            self._result(tool, "kdbg_user_symbols_load", pid, "ntdll")
+            modules = self._result(tool, "kdbg_user_lm", pid)["modules"]
+            ntdll = next(
+                row for row in modules
+                if row["name"].casefold() == "ntdll.dll"
+                and row.get("architecture", "x64") == "x64"
+            )
+            symbol_va = int(
+                self._result(tool, "kdbg_sym", "ntdll!NtClose")["matches"][0].split()[-1],
+                0,
+            )
+            module_base = int(ntdll["base"], 0)
+            offset = symbol_va - module_base
+            assert 0 <= offset < int(ntdll["size"], 0)
+            target = f"ntdll+0x{offset:x}"
+
+            search = self._result(tool, "kdbg_search", "ntdll", "NtClose", limit=8)
+            assert any(
+                row["context"]["kind"] == "export_name"
+                for row in search["results"]
+            ), search
+
+            self._result(tool, "kdbg_attach", pid)
+            attached = True
+            working_mode = None
+            for mode in ("hw", "soft"):
+                attempted = tool("kdbg_bp")(target, mode)
+                if attempted["ok"]:
+                    working_mode = mode
+                    self._result(tool, "kdbg_rm", attempted["result"]["id"])
+                    break
+            assert working_mode is not None, "no breakpoint mechanism accepted staged module+offset"
+            self._result(tool, "kdbg_detach")
+            attached = False
+
+            cli_added = json.loads(run("kdbg", "bp-intent-add", target,
+                "--mode", working_mode, "--json",
+            ).output)
+            intent_id = cli_added["id"]
+            cli_list = json.loads(run("kdbg", "bp-intents", "--json").output)
+            assert cli_list["intents"] == [cli_added]
+            run("kdbg", "bp-intent-rm", str(intent_id), "--json")
+            intent_id = None
+
+            saved = self._result(
+                tool, "kdbg_bp_intent_add", target, mode=working_mode,
+            )
+            intent_id = saved["id"]
+            assert self._result(tool, "kdbg_bp_intents")["intents"] == [saved]
+
+            attached_result = self._result(
+                tool, "kdbg_attach", pid, apply_intents=True,
+            )
+            attached = True
+            report = attached_result["breakpoint_intents"]
+            assert report["requested"] == 1
+            assert report["installed"] == 1
+            assert report["unresolved"] == 0
+            bps = self._result(tool, "kdbg_bps")["bps"]
+            assert len(bps) == 1
+            assert bps[0]["target"].casefold() == f"ntdll.dll+0x{offset:x}"
+            self._result(tool, "kdbg_rm", bps[0]["id"])
+            self._result(tool, "kdbg_bp_intent_remove", intent_id)
+            intent_id = None
+            self._result(tool, "kdbg_detach")
+            attached = False
+        finally:
+            if attached:
+                tool("kdbg_detach")()
+            if intent_id is not None:
+                try:
+                    intent_store.remove(intent_id)
+                except Exception:
+                    pass
             run("kdbg", "stop", expect_ok=False)
         assert _domstate(cfg.vm_name) == "running"
 

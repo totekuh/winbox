@@ -6,7 +6,7 @@ winbox turns a headless Windows VM (Server Core 2022/2025 or Windows 11) into
 an automation, instrumentation, and analysis environment controlled from
 Kali. Execute tools, drive a PDB-aware hypervisor debugger, inspect protected
 memory, exercise drivers and IPC, change security posture, contain malware,
-and collect evidence through one CLI and a 75-tool MCP surface.
+and collect evidence through one CLI and a 97-tool MCP surface.
 
 Transparent execution is still the shortest path in: type
 `winbox exec SharpHound.exe -c All -d corp.local` and winbox boots the VM,
@@ -39,7 +39,7 @@ PS C:\Windows\system32>
 
 ## Platform capabilities
 
-- **MCP server** — 92 tools form a bounded, AI-native research control plane
+- **MCP server** — 97 tools form a bounded, AI-native research control plane
   for autonomous agents, covering VM lifecycle, execution, memory, symbols,
   debugging, drivers, IPC, defenses, networking, event logs, and evidence
   collection.
@@ -362,7 +362,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (92):**
+**Available tools (97):**
 
 User-mode primitives:
 
@@ -436,10 +436,12 @@ and requires a reboot.
 | `kdbg_status(port?)` | Show stub state + reachability |
 | `kdbg_symbols_load()` | Pull ntoskrnl.exe out, fetch PDB from msdl, persist symbols + struct layouts to `~/.winbox/symbols/` |
 | `kdbg_user_symbols_load(pid, module, architecture?)` | Pull an x86/x64 module loaded in `pid`, fetch its matching PDB, and persist a separate architecture-correct symbol map |
+| `kdbg_search(module, query, limit?, sha256?)` | Offline search over one exact symbol-store or persistent decomp-cache PE: ASCII/UTF-16 strings, exported names, validated MSVC x64 RTTI vtables, and direct RIP-relative string-xref leads. `sha256` disambiguates same-named cached builds. Never opens the debugger socket or changes VM state. |
 | `kdbg_sym(name, search?, limit?, rva?)` | Resolve `mod!sym` to VA or RVA; substring search supported |
 | `kdbg_struct(type_name, field?, module?)` | Dump full struct layout or one field offset |
 | `kdbg_ps()` | Walk `PsActiveProcessHead` (JSON: pid, dtb, eprocess, name) and return snapshot admission/timing metadata |
 | `kdbg_vad(pid, address?, executable?, limit?, probe_header?, require_complete?)` | Exact-PDB, x64-only user VAD lookup or bounded map. Proves a range/protection/private-or-image fact, exposes explicit tree/output boundaries, and never treats a loader miss as a verdict. |
+| `kdbg_vad_extract(pid, address, name, length?, require_complete?)` | In one bounded stop, prove the selected user VAD and preserve up to 8 MiB of its process-CR3 bytes as a mode-0600 immutable host artifact. Returns segment hashes/hole evidence and provenance, never raw bytes over MCP. |
 | `kdbg_token(pid)` | Decode the target primary token through the exact `_EPROCESS.Token` fast reference: IDs, session, flags, raw privilege masks, and its proven object header. |
 | `kdbg_handles(pid)` | Return the validated process handle-table root and build-specific entry-enumeration support. Public PDBs without the private entry union explicitly refuse slot decoding. |
 | `kdbg_object(body)` | Decode an exact-PDB `_OBJECT_HEADER` only for a caller-proven canonical kernel object-body pointer. |
@@ -490,12 +492,15 @@ invariant preserves the ordinary x86 trace with `transition_error`.
 
 | Tool | Description |
 |------|-------------|
-| `kdbg_attach(pid, port?, staging_policy?, preflight?, prewarm?)` | Preflight or attach with `full`, `binaries`, or `cached-only` staging; optional background Ghidra prewarming |
+| `kdbg_attach(pid, port?, staging_policy?, preflight?, prewarm?, apply_intents?)` | Preflight or attach with `full`, `binaries`, or `cached-only` staging; optional Ghidra prewarming and explicit fresh-manifest application of saved breakpoint intents |
 | `kdbg_detach()` | Tear down the session and leave the VM running |
 | `kdbg_session()` | Show current daemon state (target pid, attach time, bp count, halted vs running) |
 | `kdbg_target_status()` | Probe the captured EPROCESS/create-time identity as alive, exiting, gone, or unknown without rebinding PID reuse |
-| `kdbg_bp(target, mode?, condition?, wp_type?, wp_size?, actions?)` | Install an explicit hardware/software breakpoint or hardware watchpoint. Predicates support exact-width `byte`/`word`/`dword`/`qword` reads; actions additionally support bounded `bytes`/`ascii`/`utf16` capture. Action hits append JSONL traces and auto-continue. |
-| `kdbg_bps()` | List installed bps with hit/skip/error counters |
+| `kdbg_bp_intent_add(target, mode?, condition?, wp_type?, wp_size?, actions?)` | Persist a detached `module+0xoffset` intent without resolving or touching the VM |
+| `kdbg_bp_intents()` | List saved symbolic breakpoint intents without touching the VM |
+| `kdbg_bp_intent_remove(intent_id)` | Remove one saved breakpoint intent by stable ID |
+| `kdbg_bp(target, mode?, condition?, wp_type?, wp_size?, actions?)` | Install an explicit hardware/software breakpoint or hardware watchpoint. Targets also accept case-insensitive staged `module+0xoffset`; predicates support exact-width `byte`/`word`/`dword`/`qword` reads; actions additionally support bounded `bytes`/`ascii`/`utf16` capture. Action hits append JSONL traces and auto-continue. |
+| `kdbg_bps()` | List installed bps with hit/skip/error counters and canonical module+offset targets |
 | `kdbg_bp_trace(bp_id, tail?, from_hit?, limit?, expression?, value?, errors_only?, summary?, top?)` | Bounded backward tail or cursor pagination over action traces, with projection/filtering and AI-sized value/error/distribution summaries |
 | `kdbg_rm(bp_id)` | Remove an installed bp |
 | `kdbg_cont(timeout?)` | Resume; block until next stop in target's CR3 set (KPTI-aware: kernel + user PML4) |
@@ -512,7 +517,7 @@ invariant preserves the ordinary x86 trace with `transition_error`.
 | `kdbg_mem(va, length?, decode?)` | Read in target's CR3 (CR3-masquerade); bounded decode modes for hex, UTF-8, UTF-16LE, ASCII, C strings, and qwords |
 | `kdbg_write_mem(va, hex)` | Write into target's CR3 (used for buffer-swap / agent-driven MITM workflows) |
 | `kdbg_disasm(addr?, count?, instruction_bytes?)` | Symbol-annotated Capstone disassembly; raw bytes are opt-in |
-| `kdbg_decomp(addr?, symbol?, module?, rva?, cursor?, before?, after?, full?, binary?, timeout?, analysis_timeout?, detail="compact", lines?, assembly="nearby", instruction_bytes?, runtime_vas?, allow_cold?)` | Resolve current RIP, runtime VA, symbol, or module+RVA, verify PE build identity, snapshot exact host content, and return stop-pinned RVA-linked assembly/pseudocode with bounded pagination. Cold Ghidra analysis is refused by default so a stopped target is never held while analysis runs; prepare offline first or explicitly opt in with `allow_cold=true`. |
+| `kdbg_decomp(addr?, symbol?, module?, rva?, cursor?, before?, after?, full?, binary?, timeout?, analysis_timeout?, detail="compact", lines?, assembly="nearby", instruction_bytes?, runtime_vas?, callers?, callees?, allow_cold?)` | Resolve current RIP, runtime VA, symbol, or module+RVA, verify PE build identity, snapshot exact host content, and return stop-pinned RVA-linked assembly/pseudocode with bounded pagination. `callers`/`callees` add exact-PE direct-call evidence only; indirect flow is never invented. Cold Ghidra analysis is refused by default so a stopped target is never held while analysis runs; prepare offline first or explicitly opt in with `allow_cold=true`. |
 | `kdbg_decomp_status()` | Report PyGhidra discovery, isolated worker/JVM state, durable project-cache status, and current decomp admission without starting the JVM |
 | `kdbg_decomp_cache()` | List content-keyed binary/project sizes, analysis profiles, and LRU timestamps |
 | `kdbg_decomp_cache_prune(max_bytes?, older_than_days?, sha256?, project?, module?, dry_run?)` | Dry-run-first exact/LRU pruning with reconciled accounting; applying requires the worker to be stopped |
@@ -526,6 +531,23 @@ invariant preserves the ordinary x86 trace with `transition_error`.
 
 The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker process per session (spawned as DETACHED_PROCESS | CREATE_NO_WINDOW inside the VM). IPC happens via `cmd.json`/`result.json` files on the VirtIO-FS share, so there's no VM round-trip on the polling path. This matters for protocols where a write on one handle must be answered on the same handle (stateless `send`/`recv` open fresh handles and never see each other's messages).
 
+### Breakpoint action traces
+
+Use a staged relative target when symbols are absent, then attach one or more
+actions to collect a bounded trace without stopping on every hit:
+
+```console
+winbox kdbg bp mpengine+0xb52c40 --action rip --action rcx --action 'ascii(rcx,96)'
+winbox kdbg bp-trace 0 --summary
+```
+
+Scalar actions use the predicate expression grammar (`rax`, `rcx == 4`,
+`qword(rdx+0x10)`, `poi(rcx)`); capture actions are `bytes(addr,n)`,
+`ascii(addr,n)`, or `utf16(addr,n)`. There are at most 16 actions, captures
+are bounded to 256 bytes each/1024 bytes per hit/16 MiB per trace, and every
+action hit is appended as JSONL then auto-continues. Use `kdbg_bps` to see the
+canonical target and counters, and `kdbg_bp_trace` to page/filter the evidence.
+
 **Requires** Python installed in the VM — this is now done automatically as part of `winbox setup`.
 
 ## Architecture
@@ -534,7 +556,7 @@ The `pipe_open` + `pipe_send`/`recv`/`close` family uses a persistent broker pro
 Kali Linux
 ├── winbox control plane
 │   ├── CLI (Python/Click)
-│   └── MCP server (92 bounded agent tools)
+│   └── MCP server (97 bounded agent tools)
 ├── hypervisor research plane
 │   ├── QMP/HMP ────────────> VM + gdbstub lifecycle
 │   ├── persistent RSP ─────> vCPUs, memory, break/watchpoints, stepping

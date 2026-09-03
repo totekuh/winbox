@@ -41,6 +41,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import select
 import secrets
 import signal
@@ -121,6 +122,9 @@ MAX_CAPTURE_BYTES_PER_HIT = 1024
 MAX_CAPTURE_BYTES_PER_TRACE = 16 * 1024 * 1024
 _DAEMON_STARTUP_TIMEOUT = 60.0
 _STARTUP_STATUS_MAX_BYTES = 64 * 1024
+_MODULE_OFFSET_TARGET = re.compile(
+    r"^(?P<module>[A-Za-z0-9_.-]+)\+(?P<offset>0x[0-9a-fA-F]+)$"
+)
 
 
 @dataclass
@@ -311,6 +315,7 @@ class DaemonSession:
         self.target = target
         self.store = store
         self.module_manifest = module_manifest
+        self.breakpoint_intents: dict[str, Any] | None = None
 
         self.bps: dict[int, Breakpoint] = {}
         # va -> bp_id index for O(1) lookup on the cont/predicate hot
@@ -586,6 +591,8 @@ class DaemonSession:
             )
         if self.module_manifest is not None:
             result["auto_stage"] = self.module_manifest.summary()
+        if self.breakpoint_intents is not None:
+            result["breakpoint_intents"] = self.breakpoint_intents
         return result
 
     def op_target_status(self) -> dict[str, Any]:
@@ -672,7 +679,7 @@ class DaemonSession:
                 f"cap is {MAX_CAPTURE_BYTES_PER_HIT}"
             )
 
-        va = self._resolve_target(target)
+        va, target = self._resolve_target(target)
         is_user = (va >> 47) != 0x1FFFF
 
         # Breakpoint ids restart at zero with every daemon session, while the
@@ -726,6 +733,7 @@ class DaemonSession:
             result = {
                 "id": bp_id,
                 "va": f"0x{va:x}",
+                "target": target,
                 "user_mode": is_user,
                 "hw": True,
                 "wp_type": wp_type,
@@ -801,6 +809,7 @@ class DaemonSession:
         result = {
             "id": bp_id,
             "va": f"0x{va:x}",
+            "target": target,
             "user_mode": is_user,
             "hw": installed_hw,
             "condition": condition,
@@ -2803,17 +2812,69 @@ class DaemonSession:
 
     # ── helpers ─────────────────────────────────────────────────────────
 
-    def _resolve_target(self, target: str) -> int:
-        """Turn ``module!sym`` or hex VA into a numeric VA."""
+    def _resolve_target(self, target: str) -> tuple[int, str]:
+        """Resolve a symbol, VA, or staged ``module+offset`` breakpoint.
+
+        Module-relative targets intentionally come from the frozen attach-time
+        manifest, not a host symbols-cache name.  That keeps the address tied
+        to the exact process/module inventory the daemon was attached to.
+        """
+        if not isinstance(target, str):
+            raise RuntimeError("target must be a string")
+        target = target.strip()
+        match = _MODULE_OFFSET_TARGET.fullmatch(target)
+        if match:
+            if self.module_manifest is None:
+                raise RuntimeError(
+                    "module+offset requires an attached session with a staged "
+                    "user-module manifest"
+                )
+            requested = match.group("module").casefold()
+            requested_stem = requested.rsplit(".", 1)[0]
+
+            def forms(name: str) -> set[str]:
+                folded = name.rsplit("\\", 1)[-1].rsplit("/", 1)[-1].casefold()
+                return {folded, folded.rsplit(".", 1)[0]}
+
+            matches = [
+                item for item in self.module_manifest.modules
+                if requested in forms(item.name) or requested_stem in forms(item.name)
+            ]
+            if not matches:
+                raise RuntimeError(
+                    f"module+offset target {target!r} is not in this session's "
+                    "staged module manifest"
+                )
+            if len(matches) != 1:
+                choices = ", ".join(
+                    f"{item.name}@{item.architecture}" for item in matches[:8]
+                )
+                raise RuntimeError(
+                    f"module+offset target {target!r} is ambiguous in the staged "
+                    f"module manifest: {choices}"
+                )
+            item = matches[0]
+            offset = int(match.group("offset"), 16)
+            if offset >= item.size:
+                raise RuntimeError(
+                    f"module+offset target {target!r} lies outside {item.name} "
+                    f"(size 0x{item.size:x})"
+                )
+            va = item.base + offset
+            if not 0 <= va < (1 << 64):
+                raise RuntimeError(f"module+offset target {target!r} overflows uint64")
+            return va, f"{item.name}+0x{offset:x}"
         if "!" in target:
             try:
-                return self.store.resolve(target)
+                return self.store.resolve(target), target
             except SymbolStoreError as e:
                 raise RuntimeError(f"symbol: {e}") from e
         try:
-            return int(target, 0)
+            return int(target, 0), target
         except ValueError as e:
-            raise RuntimeError(f"not a hex VA or module!sym: {target!r}") from e
+            raise RuntimeError(
+                f"not a hex VA, module!symbol, or staged module+0xoffset: {target!r}"
+            ) from e
 
     def _read_rip(self) -> int:
         regs = self.rsp.read_registers()
@@ -3853,12 +3914,99 @@ def _validate_module_bases(
             )
 
 
+def _validated_breakpoint_intents(
+    intents: object,
+) -> list[dict[str, Any]] | None:
+    """Validate a parent-side intent snapshot before QEMU is touched."""
+    if intents is None:
+        return None
+    if not isinstance(intents, (list, tuple)):
+        raise DaemonError("breakpoint intents must be a bounded list")
+    from winbox.kdbg.breakpoint_intent import MAX_INTENTS, normalize_spec
+
+    if len(intents) > MAX_INTENTS:
+        raise DaemonError(f"breakpoint intent snapshot exceeds cap {MAX_INTENTS}")
+    validated: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for raw in intents:
+        if not isinstance(raw, dict):
+            raise DaemonError("breakpoint intent snapshot contains a non-object record")
+        intent_id = raw.get("id")
+        if (
+            isinstance(intent_id, bool)
+            or not isinstance(intent_id, int)
+            or intent_id < 0
+            or intent_id in seen
+        ):
+            raise DaemonError("breakpoint intent snapshot contains an invalid id")
+        seen.add(intent_id)
+        try:
+            spec = normalize_spec(
+                raw.get("target"), mode=raw.get("mode"),
+                condition=raw.get("condition"), wp_type=raw.get("wp_type"),
+                wp_size=raw.get("wp_size"), actions=raw.get("actions"),
+            )
+        except Exception as exc:
+            raise DaemonError(f"invalid breakpoint intent {intent_id}: {exc}") from exc
+        validated.append({"id": intent_id, **spec})
+    return validated
+
+
+def _apply_breakpoint_intents(
+    session: DaemonSession,
+    intents: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Resolve and install one explicit intent snapshot inside a fresh stop."""
+    records: list[dict[str, Any]] = []
+    installed = unresolved = failed = 0
+    for intent in intents:
+        args = {
+            key: intent[key]
+            for key in ("target", "mode", "condition", "wp_type", "wp_size", "actions")
+        }
+        reply = session.handle_op("bp_add", args)
+        record: dict[str, Any] = {
+            "intent_id": intent["id"],
+            "target": intent["target"],
+        }
+        if reply.get("ok") is True:
+            installed += 1
+            record.update({"status": "installed", "breakpoint": reply["result"]})
+        else:
+            message = str(reply.get("error") or "breakpoint installation failed")
+            manifest_miss = any(
+                marker in message
+                for marker in (
+                    "staged user-module manifest", "is not in this session",
+                    "is ambiguous", "lies outside",
+                )
+            )
+            status = "unresolved" if manifest_miss else "install_failed"
+            if manifest_miss:
+                unresolved += 1
+            else:
+                failed += 1
+            record.update({"status": status, "error": message})
+            if reply.get("error_info") is not None:
+                record["error_info"] = reply["error_info"]
+        records.append(record)
+    return {
+        "schema": "winbox.kdbg-breakpoint-intent-application/1",
+        "requested": len(intents),
+        "installed": installed,
+        "unresolved": unresolved,
+        "failed": failed,
+        "results": records,
+    }
+
+
 def fork_daemon(
     cfg: Config,
     target_pid: int,
     *,
     gdbstub_port: int = 1234,
     module_manifest: UserModuleManifest | None = None,
+    breakpoint_intents: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
 ) -> int:
     """Fork off a session daemon. Parent returns the daemon pid; child
     never returns from this function (it enters serve_forever).
@@ -3876,6 +4024,7 @@ def fork_daemon(
             f"module manifest pid {module_manifest.pid} does not match "
             f"target pid {target_pid}"
         )
+    validated_intents = _validated_breakpoint_intents(breakpoint_intents)
 
     # Fail closed before attaching QEMU's gdbstub. Repeated RSP stop/resume is
     # known to corrupt CET shadow-stack state on affected QEMU/KVM builds.
@@ -4014,7 +4163,7 @@ def fork_daemon(
             _validate_module_bases(cfg, rsp, target, store)
 
         listen_sock = _bind_unix_socket(sock_path(cfg))
-        _write_session_file(session_path(cfg), {
+        session_record = {
             "target_pid": target.pid,
             "target_dtb": f"0x{target.dtb:x}",
             "target_name": target.name,
@@ -4028,13 +4177,20 @@ def fork_daemon(
             "auto_stage": (
                 module_manifest.summary() if module_manifest is not None else None
             ),
-        })
+        }
+        _write_session_file(session_path(cfg), session_record)
         session = DaemonSession(
             cfg=cfg, rsp=rsp, target=target, store=store,
             module_manifest=module_manifest,
         )
         session._capture_stop(initial_sr)
         _validate_register_layout(session.stop.raw_regs)
+        if validated_intents is not None:
+            session.breakpoint_intents = _apply_breakpoint_intents(
+                session, validated_intents,
+            )
+            session_record["breakpoint_intents"] = session.breakpoint_intents
+            _write_session_file(session_path(cfg), session_record)
         _install_signal_handlers(session)
 
         os.write(pipe_w, b"OK\n")

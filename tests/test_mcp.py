@@ -28,6 +28,59 @@ def _mcp_error(reply):
     return reply["error"]
 
 
+def test_kdbg_search_mcp_uses_offline_static_service(mock_mcp):
+    from winbox.mcp import kdbg_search
+
+    payload = {"schema": "winbox.kdbg-static-search/1", "results": []}
+    digest = "b" * 64
+    with patch(
+        "winbox.kdbg.static_search.search_cached_module", return_value=payload,
+    ) as search:
+        result = kdbg_search("MpEngine.dll", "Unpacker", limit=5, sha256=digest)
+    assert _mcp_result(result) == payload
+    search.assert_called_once_with(
+        ANY, module="MpEngine.dll", query="Unpacker", limit=5, sha256=digest,
+    )
+
+
+def test_kdbg_search_mcp_preserves_typed_static_error(mock_mcp):
+    from winbox.kdbg.static_search import StaticSearchError
+    from winbox.mcp import kdbg_search
+
+    with patch(
+        "winbox.kdbg.static_search.search_cached_module",
+        side_effect=StaticSearchError("no exact cached PE matches module 'x'"),
+    ):
+        result = kdbg_search("x", "needle")
+    error = _mcp_error(result)
+    assert error["code"] == "static_search_error"
+    assert error["operation"] == "kdbg_search"
+
+
+def test_breakpoint_intent_mcp_round_trip_is_detached_and_explicit(mock_mcp):
+    from winbox.mcp import (
+        kdbg_bp_intent_add,
+        kdbg_bp_intent_remove,
+        kdbg_bp_intents,
+    )
+
+    saved = _mcp_result(kdbg_bp_intent_add(
+        "MPENGINE+0x20", condition="rcx != 0", actions=["rip"],
+    ))
+    assert saved["target"] == "mpengine+0x20"
+    assert _mcp_result(kdbg_bp_intents())["intents"] == [saved]
+    removed = _mcp_result(kdbg_bp_intent_remove(saved["id"]))
+    assert removed["remaining"] == 0
+
+
+def test_breakpoint_intent_mcp_rejects_resolved_va(mock_mcp):
+    from winbox.mcp import kdbg_bp_intent_add
+
+    error = _mcp_error(kdbg_bp_intent_add("0x7ff700001000"))
+    assert error["code"] == "breakpoint_intent_error"
+    assert error["operation"] == "kdbg_bp_intent_add"
+
+
 # ─── Fixtures ───────────────────────────────────────────────────────────────
 
 
@@ -3274,7 +3327,7 @@ class TestKdbgListTools:
             result = _mcp_result(kdbg_doctor())
 
         assert result is report
-        assert doctor.call_args.kwargs["tool_count"] == 92
+        assert doctor.call_args.kwargs["tool_count"] == 97
 
     def test_kdbg_triage_is_single_snapshot_and_bounds_unmapped_leads(self, mock_mcp):
         from contextlib import nullcontext
@@ -3613,6 +3666,67 @@ class TestKdbgEvidenceTools:
             allow_identity_mismatch=False,
         )
 
+    def test_vad_extract_returns_manifest_not_bytes_and_persists_once(self, mock_mcp):
+        from winbox.mcp import kdbg_vad_extract
+
+        _, _, cfg = mock_mcp
+        extraction = SimpleNamespace(manifest={
+            "schema": "winbox.kdbg-vad-extract/1", "complete": True,
+            "blob": {"size": 4096, "sha256": "a" * 64}, "holes": [],
+        })
+        artifacts = MagicMock()
+        artifacts.save.return_value = {
+            "name": "private-rwx", "blob_path": "/evidence/private-rwx.bin",
+            "manifest_path": "/evidence/private-rwx.json",
+        }
+        with patch("winbox.mcp._kdbg_get_store") as symbols, \
+             patch("winbox.mcp._kdbg_extract_vad_live", return_value=extraction) as extract, \
+             patch("winbox.mcp._KdbgVadExtractStore", return_value=artifacts):
+            result = _mcp_result(kdbg_vad_extract(
+                1234, "0x40000000", "private-rwx", length=4096,
+            ))
+
+        assert result["extraction"] == extraction.manifest
+        assert "bytes" not in result["extraction"]
+        assert extract.call_args.args[:2] == (cfg, symbols.return_value)
+        assert extract.call_args.kwargs == {
+            "pid": 1234, "address": 0x40000000,
+            "length": 4096, "require_complete": False,
+        }
+        artifacts.save.assert_called_once_with("private-rwx", extraction)
+
+    def test_vad_extract_rejects_invalid_length_before_touching_vm(self, mock_mcp):
+        from winbox.mcp import kdbg_vad_extract
+
+        with patch("winbox.mcp._kdbg_extract_vad_live") as extract:
+            error = _mcp_error(kdbg_vad_extract(1234, "0x40000000", "case", length=True))
+        assert error["code"] == "invalid_argument"
+        extract.assert_not_called()
+
+    def test_vad_extract_rejects_an_unsafe_name_before_stopping_the_vm(self, mock_mcp):
+        from winbox.mcp import kdbg_vad_extract
+        from winbox.kdbg.vad_extract import VadExtractError
+
+        artifacts = MagicMock()
+        artifacts.validate_name.side_effect = VadExtractError("artifact name must match safe pattern")
+        with patch("winbox.mcp._KdbgVadExtractStore", return_value=artifacts), \
+             patch("winbox.mcp._kdbg_extract_vad_live") as extract:
+            error = _mcp_error(kdbg_vad_extract(1234, "0x40000000", "../../escape"))
+        assert error["code"] == "vad_extract_error"
+        extract.assert_not_called()
+
+    def test_vad_extract_rejects_duplicate_name_before_stopping_the_vm(self, mock_mcp):
+        from winbox.mcp import kdbg_vad_extract
+        from winbox.kdbg.vad_extract import VadExtractError
+
+        artifacts = MagicMock()
+        artifacts.ensure_available.side_effect = VadExtractError("artifact already exists and is immutable")
+        with patch("winbox.mcp._KdbgVadExtractStore", return_value=artifacts), \
+             patch("winbox.mcp._kdbg_extract_vad_live") as extract:
+            error = _mcp_error(kdbg_vad_extract(1234, "0x40000000", "case"))
+        assert error["code"] == "vad_extract_error"
+        extract.assert_not_called()
+
 
 # ─── kdbg session daemon tools (Tool 14) ───────────────────────────────────
 
@@ -3715,6 +3829,28 @@ class TestKdbgDaemonTools:
         assert preflight.call_args.kwargs["policy"] == "cached-only"
         probe.assert_not_called()
         fork.assert_not_called()
+
+    def test_attach_forwards_intents_only_after_explicit_opt_in(self, mock_mcp):
+        from winbox.kdbg.breakpoint_intent import BreakpointIntentStore
+        from winbox.mcp import kdbg_attach
+        import winbox.kdbg.staging as staging_module
+
+        _ga, _vm, cfg = mock_mcp
+        BreakpointIntentStore(cfg).add("mpengine+0x40")
+        client = self._client_with(alive=False)
+        with patch("winbox.mcp._kdbg_client", return_value=client), \
+             patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
+             patch.object(
+                 staging_module, "prepare_user_module_manifest",
+                 wraps=staging_module.prepare_user_module_manifest,
+             ), \
+             patch("winbox.mcp._fork_daemon", return_value=1234) as fork:
+            kdbg_attach(4584)
+            assert fork.call_args.kwargs["breakpoint_intents"] is None
+            kdbg_attach(4584, apply_intents=True)
+            selected = fork.call_args.kwargs["breakpoint_intents"]
+        assert len(selected) == 1
+        assert selected[0]["target"] == "mpengine+0x40"
 
     def test_attach_prewarm_starts_only_exact_symbol_modules(self, mock_mcp):
         from winbox.mcp import kdbg_attach

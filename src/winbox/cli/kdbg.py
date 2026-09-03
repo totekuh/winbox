@@ -95,6 +95,11 @@ from winbox.kdbg.vad import (
     list_vads,
     lookup_vad,
 )
+from winbox.kdbg.vad_extract import (
+    VadExtractError,
+    VadExtractStore,
+    extract_live as extract_vad_live,
+)
 from winbox.kdbg.hmp import (
     HmpError,
     ensure_not_paused,
@@ -626,6 +631,61 @@ def kdbg_vad(
         console.print(f"  {record['start']}..{record['end']}  {record['kind']:11}  {protection}")
     if not payload["complete"]:
         console.print(f"[yellow][!][/] VAD map incomplete: {payload['truncation']}")
+
+
+@kdbg.command("vad-extract")
+@click.argument("pid", type=int)
+@click.argument("address", type=str)
+@click.option(
+    "--length", type=click.IntRange(1, 8 * 1024 * 1024),
+    help="Bytes to extract from ADDRESS (default: up to 1 MiB within the VAD).",
+)
+@click.option("--name", required=True, help="Immutable bounded host-side artifact name.")
+@click.option("--require-complete", is_flag=True, help="Refuse to publish an artifact with unreadable holes.")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON; raw bytes stay host-side.")
+@click.pass_context
+def kdbg_vad_extract(
+    ctx: click.Context, pid: int, address: str, length: int | None, name: str,
+    require_complete: bool, as_json: bool,
+) -> None:
+    """Extract one proven process-VAD range into an immutable host artifact."""
+    import json as _json
+
+    cfg: Config = ctx.obj["cfg"]
+    vm = VM(cfg)
+    if vm.state() not in (VMState.RUNNING, VMState.PAUSED):
+        console.print(f"[red][-][/] VM not running ({vm.state().value})")
+        raise SystemExit(1)
+    try:
+        parsed_address = int(address, 0)
+    except ValueError as exc:
+        raise click.BadParameter(f"invalid address: {address}") from exc
+    try:
+        artifacts = VadExtractStore(cfg)
+        artifacts.validate_name(name)
+        artifacts.ensure_available(name)
+        store = _get_store(cfg)
+        extraction = extract_vad_live(
+            cfg, store, pid=pid, address=parsed_address, length=length,
+            require_complete=require_complete,
+        )
+        saved = artifacts.save(name, extraction)
+        payload = {"extraction": extraction.manifest, "saved": saved}
+    except (VadExtractError, VadError, SymbolStoreError, HmpError, ReaderError) as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(payload, indent=2))
+        return
+    artifact = payload["extraction"]
+    status = "complete" if artifact["complete"] else "partial"
+    console.print(f"[green][+][/] extracted {artifact['blob']['size']} byte(s); {status}")
+    console.print(f"  blob: {saved['blob_path']}")
+    console.print(f"  manifest: {saved['manifest_path']}")
+    if artifact["holes"]:
+        console.print(f"[yellow][!][/] {len(artifact['holes'])} unreadable range(s) retained in manifest")
+    metadata = artifact["snapshot_metadata"]
+    console.print(f"  stop: {metadata.get('stop_duration_ms')} ms, {metadata.get('read_count')} reads")
 
 
 @kdbg.command("token")
@@ -2005,10 +2065,14 @@ def _print_stop(reason: str, info: dict) -> None:
     "--prewarm", is_flag=True,
     help="Start offline Ghidra analysis in the background after attach.",
 )
+@click.option(
+    "--apply-intents", is_flag=True,
+    help="Explicitly resolve and install saved module-relative breakpoint intents.",
+)
 @click.pass_context
 def kdbg_attach(
     ctx: click.Context, pid: int, port: int, staging_policy: str,
-    preflight: bool, prewarm: bool,
+    preflight: bool, prewarm: bool, apply_intents: bool,
 ) -> None:
     """Attach a kdbg debugging session to PID via the gdbstub.
 
@@ -2043,15 +2107,25 @@ def kdbg_attach(
     ga = GuestAgent(cfg)
     try:
         import json as _json
+        from winbox.kdbg.breakpoint_intent import BreakpointIntentStore
         from winbox.kdbg.staging import (
             preflight_user_module_staging, prepare_user_module_manifest,
         )
         store = SymbolStore(cfg.symbols_dir)
+        intent_snapshot = (
+            BreakpointIntentStore(cfg).inventory()["intents"]
+            if apply_intents else None
+        )
         if preflight:
             plan = preflight_user_module_staging(
                 cfg, store, pid, policy=staging_policy,
             )
             plan["prewarm_requested"] = bool(prewarm)
+            plan["breakpoint_intents"] = {
+                "apply_requested": bool(apply_intents),
+                "count": len(intent_snapshot or []),
+                "intents": intent_snapshot or [],
+            }
             click.echo(_json.dumps(plan, indent=2))
             return
 
@@ -2081,6 +2155,7 @@ def kdbg_attach(
     try:
         daemon_pid = fork_daemon(
             cfg, pid, gdbstub_port=port, module_manifest=manifest,
+            breakpoint_intents=intent_snapshot,
         )
     except DaemonError as e:
         console.print(f"[red][-][/] {e}")
@@ -2104,6 +2179,19 @@ def kdbg_attach(
         f"{summary['symbol_warning_count']} symbol warning(s), "
         f"{summary['failed']} failed[/]"
     )
+    intent_report = info.get("breakpoint_intents")
+    if isinstance(intent_report, dict):
+        console.print(
+            f"    [dim]breakpoint intents: {intent_report.get('installed', 0)} installed, "
+            f"{intent_report.get('unresolved', 0)} unresolved, "
+            f"{intent_report.get('failed', 0)} failed[/]"
+        )
+        for record in intent_report.get("results", []):
+            if record.get("status") != "installed":
+                console.print(
+                    f"    [yellow][!][/] intent {record.get('intent_id')}: "
+                    f"{record.get('target')} — {record.get('error', record.get('status'))}"
+                )
     if prewarm:
         from winbox.kdbg.decomp import DecompError, start_prepare_background
         modules = sorted({
@@ -2167,6 +2255,97 @@ def kdbg_target_status(ctx: click.Context) -> None:
     click.echo(_json.dumps(result, indent=2))
 
 
+@kdbg.command("bp-intent-add")
+@click.argument("target")
+@click.option("--mode", type=click.Choice(("hw", "soft")), default="hw", show_default=True)
+@click.option("--condition", default=None, help="Breakpoint predicate expression.")
+@click.option("--watch", "wp_type", type=click.Choice(("write", "read", "access")))
+@click.option("--size", "wp_size", type=click.Choice((1, 2, 4, 8)), default=1, show_default=True)
+@click.option("--action", "actions", multiple=True, help="Persist an action expression; repeatable.")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_bp_intent_add(
+    ctx: click.Context,
+    target: str,
+    mode: str,
+    condition: str | None,
+    wp_type: str | None,
+    wp_size: int,
+    actions: tuple[str, ...],
+    as_json: bool,
+) -> None:
+    """Save a detached module+offset breakpoint intent without touching the VM."""
+    import json as _json
+    from winbox.kdbg.breakpoint_intent import (
+        BreakpointIntentError,
+        BreakpointIntentStore,
+    )
+
+    try:
+        record = BreakpointIntentStore(ctx.obj["cfg"]).add(
+            target, mode=mode, condition=condition, wp_type=wp_type,
+            wp_size=wp_size, actions=actions,
+        )
+    except BreakpointIntentError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(record, indent=2))
+    else:
+        console.print(f"[green][+][/] saved breakpoint intent {record['id']}: {record['target']}")
+        console.print("    [dim]use kdbg attach PID --apply-intents to install it[/]")
+
+
+@kdbg.command("bp-intents")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_bp_intents(ctx: click.Context, as_json: bool) -> None:
+    """List durable breakpoint intents; this never touches the VM."""
+    import json as _json
+    from winbox.kdbg.breakpoint_intent import (
+        BreakpointIntentError,
+        BreakpointIntentStore,
+    )
+
+    try:
+        result = BreakpointIntentStore(ctx.obj["cfg"]).inventory()
+    except BreakpointIntentError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+        return
+    if not result["intents"]:
+        console.print("[dim]No saved breakpoint intents.[/]")
+        return
+    for intent in result["intents"]:
+        kind = f"watch:{intent['wp_type']}" if intent["wp_type"] else intent["mode"]
+        console.print(f"  {intent['id']:3d}  {kind:12s}  {intent['target']}")
+
+
+@kdbg.command("bp-intent-rm")
+@click.argument("intent_id", type=click.IntRange(min=0))
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-safe JSON.")
+@click.pass_context
+def kdbg_bp_intent_rm(ctx: click.Context, intent_id: int, as_json: bool) -> None:
+    """Remove one durable breakpoint intent without touching the VM."""
+    import json as _json
+    from winbox.kdbg.breakpoint_intent import (
+        BreakpointIntentError,
+        BreakpointIntentStore,
+    )
+
+    try:
+        result = BreakpointIntentStore(ctx.obj["cfg"]).remove(intent_id)
+    except BreakpointIntentError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        console.print(f"[green][+][/] removed breakpoint intent {intent_id}")
+
+
 @kdbg.command("bp")
 @click.argument("target", metavar="VA_OR_SYMBOL")
 @click.option(
@@ -2214,12 +2393,15 @@ def kdbg_bp(
     wp_size: int,
     actions: tuple[str, ...],
 ) -> None:
-    """Install a bp at TARGET (hex VA or ``module!symbol``).
+    """Install a bp at TARGET (hex VA, ``module!symbol``, or ``module+0xoffset``).
 
     Default mode is hardware (Z1) — invisible to PatchGuard and
     anti-debug GetThreadContext checks because KVM virtualizes DR
     access. Use ``--mode soft`` for the legacy 0xCC behaviour
     (needed when >4 simultaneous bps required).
+
+    ``module+0xoffset`` is case-insensitive and resolves only against the
+    exact staged modules frozen at attach (for example ``mpengine+0xb52c40``).
 
     ``--watch`` selects a hardware data watchpoint. Repeat ``--action``
     to log expressions/captures and auto-continue instead of halting.
@@ -2282,7 +2464,7 @@ def kdbg_bps(ctx: click.Context) -> None:
             kind = "hw" if b.get("hw") else "soft"
         console.print(
             f"  {b['id']:2d}  {b['va']:18s} {kind:4s}  {b['hits']:5d}  "
-            f"{b['age_s']:6.1f}s  {b['target']}"
+            f"{b['age_s']:6.1f}s  {b.get('target_pretty') or b['target']}"
         )
 
 
@@ -2503,6 +2685,38 @@ def kdbg_regs(ctx: click.Context) -> None:
             console.print(f"  {k.upper():6s}= {result[k]}")
 
 
+@kdbg.command("search")
+@click.argument("module")
+@click.argument("query")
+@click.option("--limit", type=click.IntRange(1, 64), default=32, show_default=True)
+@click.option(
+    "--sha256", "sha256", default="", metavar="DIGEST",
+    help="Exact decomp-cache SHA-256 selector; disambiguates same-named cached binaries.",
+)
+@click.pass_context
+def kdbg_search(
+    ctx: click.Context, module: str, query: str, limit: int, sha256: str,
+) -> None:
+    """Find static string, export, and RTTI leads in one exact cached PE.
+
+    This is offline: it never opens the RSP debugger connection or changes the
+    VM stop state. ``MODULE`` first resolves through the local symbol cache,
+    then through named exact artifacts in the persistent decomp cache. Use
+    ``--sha256`` to select one exact cached build after an ambiguity error.
+    """
+    import json as _json
+    from winbox.kdbg.static_search import StaticSearchError, search_cached_module
+
+    try:
+        result = search_cached_module(
+            ctx.obj["cfg"], module=module, query=query, limit=limit, sha256=sha256,
+        )
+    except StaticSearchError as exc:
+        console.print(f"[red][-][/] {exc}")
+        raise SystemExit(1)
+    click.echo(_json.dumps(result, indent=2))
+
+
 @kdbg.command("decomp")
 @click.argument("address", required=False, default="")
 @click.option("--symbol", default="", help="Loaded module!symbol to decompile.")
@@ -2543,6 +2757,8 @@ def kdbg_regs(ctx: click.Context) -> None:
 )
 @click.option("--instruction-bytes", is_flag=True, help="Include raw instruction bytes.")
 @click.option("--runtime-vas", is_flag=True, help="Include repeated static/runtime VAs.")
+@click.option("--callers", is_flag=True, help="Include static direct callers from the exact cached PE.")
+@click.option("--callees", is_flag=True, help="Include static direct callees from the exact cached PE.")
 @click.option(
     "--allow-cold", is_flag=True,
     help="Permit cold Ghidra analysis while the debugger target remains halted.",
@@ -2566,6 +2782,8 @@ def kdbg_decomp(
     assembly: str,
     instruction_bytes: bool,
     runtime_vas: bool,
+    callers: bool,
+    callees: bool,
     allow_cold: bool,
 ) -> None:
     """Show Ghidra pseudocode at ADDRESS, or at the current RIP.
@@ -2599,6 +2817,8 @@ def kdbg_decomp(
             assembly=assembly,
             instruction_bytes=instruction_bytes,
             runtime_vas=runtime_vas,
+            callers=callers,
+            callees=callees,
             allow_cold=allow_cold,
         )
     except DecompError as exc:

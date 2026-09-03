@@ -175,6 +175,64 @@ class TestKdbgAttachPolicies:
         assert result.exit_code == 2
         assert "Invalid value" in result.output
 
+    def test_preflight_exposes_intents_only_after_explicit_opt_in(
+        self, runner, kdbg_env, cfg,
+    ):
+        import json
+        from winbox.cli import cli
+        from winbox.kdbg.breakpoint_intent import BreakpointIntentStore
+
+        BreakpointIntentStore(cfg).add("mpengine+0x40")
+        daemon = MagicMock()
+        daemon.session_alive.return_value = False
+        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
+             patch(
+                 "winbox.kdbg.staging.preflight_user_module_staging",
+                 return_value={"schema": "preflight", "dry_run": True},
+             ):
+            plain = runner.invoke(cli, ["kdbg", "attach", "4584", "--preflight"])
+            opted = runner.invoke(cli, [
+                "kdbg", "attach", "4584", "--preflight", "--apply-intents",
+            ])
+        assert json.loads(plain.output)["breakpoint_intents"] == {
+            "apply_requested": False, "count": 0, "intents": [],
+        }
+        selected = json.loads(opted.output)["breakpoint_intents"]
+        assert selected["apply_requested"] is True
+        assert selected["count"] == 1
+        assert selected["intents"][0]["target"] == "mpengine+0x40"
+
+
+class TestKdbgBreakpointIntents:
+    def test_add_list_and_remove_work_while_detached(self, runner, kdbg_env, cfg):
+        import json
+        from winbox.cli import cli
+
+        added = runner.invoke(cli, [
+            "kdbg", "bp-intent-add", "MPENGINE+0x20",
+            "--condition", "rcx != 0", "--action", "rip", "--json",
+        ])
+        assert added.exit_code == 0, added.output
+        record = json.loads(added.output)
+        assert record["target"] == "mpengine+0x20"
+
+        listed = runner.invoke(cli, ["kdbg", "bp-intents", "--json"])
+        assert listed.exit_code == 0, listed.output
+        assert json.loads(listed.output)["intents"] == [record]
+
+        removed = runner.invoke(cli, [
+            "kdbg", "bp-intent-rm", str(record["id"]), "--json",
+        ])
+        assert removed.exit_code == 0, removed.output
+        assert json.loads(removed.output)["remaining"] == 0
+
+    def test_add_rejects_a_resolved_va(self, runner, kdbg_env):
+        from winbox.cli import cli
+
+        result = runner.invoke(cli, ["kdbg", "bp-intent-add", "0x7ff700001000"])
+        assert result.exit_code == 1
+        assert "module+0xoffset" in result.output
+
 
 class TestKdbgThreads:
     def _target_and_threads(self):
@@ -539,7 +597,70 @@ class TestKdbgDoctor:
 
         assert result.exit_code == 0, result.output
         assert json.loads(result.output) == report
-        assert doctor.call_args.kwargs["tool_count"] == 92
+        assert doctor.call_args.kwargs["tool_count"] == 97
+
+
+class TestKdbgVadExtract:
+    def test_extract_saves_after_one_snapshot_and_never_prints_raw_bytes(self, runner, kdbg_env):
+        import json
+        from winbox.cli import cli
+
+        extraction = SimpleNamespace(manifest={
+            "schema": "winbox.kdbg-vad-extract/1", "complete": True,
+            "blob": {"size": 4096, "sha256": "a" * 64}, "holes": [],
+            "snapshot_metadata": {"stop_duration_ms": 4.0, "read_count": 2},
+        })
+        artifacts = MagicMock()
+        artifacts.save.return_value = {
+            "name": "private-rwx", "manifest_path": "/evidence/private-rwx.json",
+            "blob_path": "/evidence/private-rwx.bin",
+        }
+        with patch("winbox.cli.kdbg._get_store") as symbols, \
+             patch("winbox.cli.kdbg.extract_vad_live", return_value=extraction) as extract, \
+             patch("winbox.cli.kdbg.VadExtractStore", return_value=artifacts):
+            result = runner.invoke(cli, [
+                "kdbg", "vad-extract", "4712", "0x40000000", "--length", "4096",
+                "--name", "private-rwx", "--json",
+            ])
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["saved"]["blob_path"].endswith(".bin")
+        assert "deadbeef" not in result.output.lower()
+        assert extract.call_args.args[1] is symbols.return_value
+        assert extract.call_args.kwargs == {
+            "pid": 4712, "address": 0x40000000, "length": 4096,
+            "require_complete": False,
+        }
+        artifacts.save.assert_called_once_with("private-rwx", extraction)
+
+    def test_extract_rejects_out_of_budget_length_before_opening_snapshot(self, runner, kdbg_env):
+        from winbox.cli import cli
+
+        with patch("winbox.cli.kdbg.extract_vad_live") as extract:
+            result = runner.invoke(cli, [
+                "kdbg", "vad-extract", "4712", "0x40000000", "--length", str(8 * 1024 * 1024 + 1),
+                "--name", "private-rwx",
+            ])
+
+        assert result.exit_code == 2
+        assert "not in the range" in result.output
+        extract.assert_not_called()
+
+    def test_extract_rejects_duplicate_name_before_opening_a_snapshot(self, runner, kdbg_env):
+        from winbox.cli import cli
+        from winbox.kdbg.vad_extract import VadExtractError
+
+        artifacts = MagicMock()
+        artifacts.ensure_available.side_effect = VadExtractError("artifact 'case' already exists and is immutable")
+        with patch("winbox.cli.kdbg.VadExtractStore", return_value=artifacts), \
+             patch("winbox.cli.kdbg.extract_vad_live") as extract:
+            result = runner.invoke(cli, [
+                "kdbg", "vad-extract", "4712", "0x40000000", "--name", "case",
+            ])
+
+        assert result.exit_code == 1
+        assert "already exists" in result.output
+        extract.assert_not_called()
 
 
 class TestKdbgThreadBaseline:
@@ -914,6 +1035,58 @@ class TestKdbgBreakpointCliParity:
             result = runner.invoke(cli, ["kdbg", "bps"])
         assert result.exit_code == 0, result.output
         assert "write/4" in result.output
+
+    def test_bps_prefers_canonical_pretty_module_offset_target(self, runner, kdbg_env):
+        from winbox.cli import cli
+
+        client = MagicMock()
+        client.call.return_value = {"bps": [{
+            "id": 1, "va": "0x7ff700b52c40", "hw": True,
+            "hits": 0, "age_s": 1.0, "target": "MPENGINE+0xB52C40",
+            "target_pretty": "MpEngine.dll+0xb52c40",
+        }]}
+        with patch("winbox.cli.kdbg._client", return_value=client):
+            result = runner.invoke(cli, ["kdbg", "bps"])
+        assert result.exit_code == 0, result.output
+        assert "MpEngine.dll+0xb52c40" in result.output
+        assert "MPENGINE+0xB52C40" not in result.output
+
+
+class TestKdbgStaticSearch:
+    def test_search_uses_offline_cached_pe_service_and_emits_json(
+        self, runner, kdbg_env,
+    ):
+        import json
+        from winbox.cli import cli
+
+        payload = {"schema": "winbox.kdbg-static-search/1", "results": []}
+        digest = "a" * 64
+        with patch(
+            "winbox.kdbg.static_search.search_cached_module", return_value=payload,
+        ) as search:
+            result = runner.invoke(
+                cli, [
+                    "kdbg", "search", "mpengine", "Unpacker", "--limit", "7",
+                    "--sha256", digest,
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == payload
+        search.assert_called_once_with(
+            ANY, module="mpengine", query="Unpacker", limit=7, sha256=digest,
+        )
+
+    def test_search_surfaces_typed_offline_error(self, runner, kdbg_env):
+        from winbox.cli import cli
+        from winbox.kdbg.static_search import StaticSearchError
+
+        with patch(
+            "winbox.kdbg.static_search.search_cached_module",
+            side_effect=StaticSearchError("staged PE digest does not match"),
+        ):
+            result = runner.invoke(cli, ["kdbg", "search", "mpengine", "Unpacker"])
+        assert result.exit_code == 1
+        assert "digest does not match" in result.output
 
 
 class TestKdbgDetach:
