@@ -171,6 +171,38 @@ Notes for Win10 (client SKU):
   `https://www.microsoft.com/en-us/software-download/windows10ISO` (served to
   non-Windows browsers) and pass `--iso <path>`.
 
+### Choosing the display stack
+
+`winbox setup` builds with plain **VNC** and the default video model, which is
+fine for headless/research use (connect with `winbox vnc`). The guest is then
+locked to a single low resolution — the libvirt-default `bochs` display has no
+Windows mode-setting driver.
+
+For a VM you actually sit in front of (a workstation / report-writing box), pass
+`--display spice`:
+
+```bash
+winbox setup --os win10 --display spice -y   # SPICE + QXL + spice-guest-tools
+```
+
+This builds the VM with SPICE graphics + the QXL video model and installs
+**spice-guest-tools** (QXL WDDM display driver + spice-vdagent) during
+provisioning. You get a resizable resolution picker, window-size auto-resize,
+and host↔guest clipboard in `virt-manager` / `remote-viewer`. The choice is
+build-time (the video hardware is fixed at VM creation) and is recorded as
+`VM_DISPLAY=` in `~/.winbox/config`; the default is `vnc`.
+
+spice-guest-tools is installed **best-effort** — it is not load-bearing for any
+winbox function, so a failed install logs and continues rather than aborting
+setup.
+
+> **⚠ Isolation caveat — do not use `--display spice` for detonation.** The
+> spice vdagent runs over a `spicevmc` *serial* channel (host↔guest), **not** the
+> network. winbox's `winbox-isolate` nwfilter is network-level, so it does **not**
+> block that channel — clipboard (and potentially files) can cross it even while
+> the VM is network-isolated. `--display spice` is for workstation VMs only. For
+> malware analysis / detonation, keep the default `vnc`.
+
 ## Commands
 
 `winbox --help` groups commands into seven sections:
@@ -659,6 +691,7 @@ VIRTIO_ISO_URL=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
 │   ├── virtiofs.exe                    # VirtIO-FS service binary
 │   ├── python-3.13.13-amd64.exe        # Python 3.13 installer for the guest
 │   ├── x64dbg.zip                      # x64dbg snapshot (extracted to C:\Tools\x64dbg)
+│   ├── spice-guest-tools.exe           # QXL driver + vdagent (--display spice only)
 │   └── unattend.img                    # built during setup
 ├── captures/                           # winbox capture — host-side pcaps
 │   ├── capture-<ts>.pcap

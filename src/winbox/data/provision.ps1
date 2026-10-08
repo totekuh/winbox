@@ -317,6 +317,49 @@ try {
     Write-Host "[!] x64dbg install failed: $_"
 }
 
+# --- spice-guest-tools (QXL display driver + vdagent for clipboard/resize) ---
+# Present only when the build was --display spice (payload-presence gate). This
+# is best-effort: spice is not load-bearing (only clipboard + dynamic resize
+# degrade without it), so a failure logs and continues and NEVER sets
+# $script:ProvisionFailed.
+#
+# Install via the hardened wrapper (same as WinFsp/Python above, see the
+# pipeline-stopped note at the Python block): a .bat in a space-free path
+# invoked through a hidden cmd.exe with CREATE_NEW_CONSOLE semantics
+# (-WindowStyle Hidden, NOT -NoNewWindow). The original spice integration
+# (commit d79ca51) used -NoNewWindow and its QXL driver step intermittently
+# killed this pipeline mid-provision ("The pipeline has been stopped"), which
+# is exactly what the detached console avoids.
+$spiceExe = "$provDir\spice-guest-tools.exe"
+if (Test-Path $spiceExe) {
+    Write-Host "[*] Installing spice-guest-tools (QXL + vdagent)..."
+    try {
+        $spiceBat = "C:\winbox-spice-install.bat"
+        $spiceLog = "C:\winbox-spice-install.log"
+        $batLines = @(
+            "@echo off",
+            # NSIS installer: /S = silent.
+            "`"$spiceExe`" /S > `"$spiceLog`" 2>&1"
+        )
+        Set-Content -Path $spiceBat -Value $batLines -Encoding ASCII
+        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $spiceBat `
+            -Wait -PassThru -WindowStyle Hidden
+        Remove-Item $spiceBat -Force -ErrorAction SilentlyContinue
+        if ($proc.ExitCode -eq 0) {
+            Write-Host "[+] spice-guest-tools installed"
+        } else {
+            Write-Host "[!] spice-guest-tools exit code $($proc.ExitCode) - continuing (best-effort)"
+            if (Test-Path $spiceLog) {
+                Write-Host "--- spice-install.log ---"
+                Get-Content $spiceLog | ForEach-Object { Write-Host $_ }
+                Write-Host "--- end spice-install.log ---"
+            }
+        }
+    } catch {
+        Write-Host "[!] spice-guest-tools install error: $_ - continuing (best-effort)"
+    }
+}
+
 # --- Skip Windows Boot Manager menu (boot default immediately) ---
 Write-Host "[*] Disabling boot manager menu..."
 try {

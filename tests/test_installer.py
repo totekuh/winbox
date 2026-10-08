@@ -15,6 +15,9 @@ from winbox.setup.installer import (
     RUNEX_EXE,
     RUNEX_SHA256,
     RUNEX_URL,
+    SPICE_TOOLS_EXE,
+    SPICE_TOOLS_SHA256,
+    SPICE_TOOLS_URL,
     X64DBG_URL,
     X64DBG_ZIP,
     check_prereqs,
@@ -29,10 +32,12 @@ from winbox.setup.installer import (
     download_winfsp,
     download_python,
     download_runex,
+    download_spice_tools,
     download_x64dbg,
     extract_virtiofs,
     build_unattend_image,
     create_disk,
+    run_virt_install,
 )
 
 
@@ -342,6 +347,53 @@ class TestDownloads:
     def test_runex_release_is_pinned(self):
         assert "/releases/download/v2.1/RunEx.exe" in RUNEX_URL
         assert len(RUNEX_SHA256) == 64
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_spice_tools_verifies_and_atomically_installs(self, mock_run, cfg):
+        import hashlib
+
+        payload = b"published-spice"
+        part = cfg.iso_dir / f"{SPICE_TOOLS_EXE}.part"
+        mock_run.side_effect = lambda *a, **kw: part.write_bytes(payload)
+        with patch(
+            "winbox.setup.installer.SPICE_TOOLS_SHA256",
+            hashlib.sha256(payload).hexdigest(),
+        ):
+            result = download_spice_tools(cfg)
+
+        assert result == cfg.iso_dir / SPICE_TOOLS_EXE
+        assert result.read_bytes() == payload
+        assert not part.exists()
+        assert SPICE_TOOLS_URL in mock_run.call_args[0][0]
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_spice_tools_reuses_hash_verified_cache(self, mock_run, cfg):
+        import hashlib
+
+        payload = b"cached-spice"
+        dest = cfg.iso_dir / SPICE_TOOLS_EXE
+        dest.write_bytes(payload)
+        with patch(
+            "winbox.setup.installer.SPICE_TOOLS_SHA256",
+            hashlib.sha256(payload).hexdigest(),
+        ):
+            assert download_spice_tools(cfg) == dest
+        mock_run.assert_not_called()
+
+    @patch("winbox.setup.installer.subprocess.run")
+    def test_download_spice_tools_rejects_bad_checksum(self, mock_run, cfg):
+        part = cfg.iso_dir / f"{SPICE_TOOLS_EXE}.part"
+        mock_run.side_effect = lambda *a, **kw: part.write_bytes(b"wrong")
+
+        with pytest.raises(RuntimeError, match="SHA-256"):
+            download_spice_tools(cfg)
+
+        assert not (cfg.iso_dir / SPICE_TOOLS_EXE).exists()
+        assert not part.exists()
+
+    def test_spice_tools_is_pinned(self):
+        assert SPICE_TOOLS_URL.endswith("spice-guest-tools-latest.exe")
+        assert len(SPICE_TOOLS_SHA256) == 64
 
     def test_copy_setup_files_stages_runex_for_reprovisioning(self, cfg):
         cached = cfg.iso_dir / RUNEX_EXE
@@ -767,6 +819,116 @@ class TestProvisionPayloadPythonCheck:
         self._write_payload(cfg, python_exe=False)
 
         self._provision(cfg)  # must not raise
+
+
+class TestVirtInstallDisplay:
+    """run_virt_install selects the graphics/video stack from cfg.display.
+    qxl video without the qxldod driver = a broken guest display, so the
+    graphics choice here must stay consistent with the payload gate."""
+
+    def _cfg(self, tmp_path, display):
+        from winbox.config import Config
+
+        cfg = Config(winbox_dir=tmp_path / ".winbox")
+        cfg.display = display
+        return cfg
+
+    def _cmd(self, cfg):
+        from winbox.setup import installer
+
+        with (
+            patch.object(installer, "ensure_default_network"),
+            patch.object(installer, "virsh_run"),
+            patch.object(installer.time, "sleep"),
+            patch.object(installer.subprocess, "run") as mock_run,
+        ):
+            run_virt_install(cfg, "/tmp/windows.iso")
+        return mock_run.call_args[0][0]
+
+    def test_vnc_mode_uses_plain_vnc(self, tmp_path):
+        cmd = self._cmd(self._cfg(tmp_path, "vnc"))
+        assert "vnc,listen=127.0.0.1" in cmd
+        assert "qxl" not in cmd
+        assert not any("spicevmc" in str(a) for a in cmd)
+
+    def test_spice_mode_uses_spice_qxl_and_channel(self, tmp_path):
+        cmd = self._cmd(self._cfg(tmp_path, "spice"))
+        assert "spice,listen=127.0.0.1" in cmd
+        assert "qxl" in cmd
+        assert any("spicevmc" in str(a) for a in cmd)
+        assert "vnc,listen=127.0.0.1" not in cmd
+
+
+class TestSpicePayloadGate:
+    """spice-guest-tools is packed into provision.zip only when the build is
+    --display spice (and only best-effort — never required). The guest script
+    self-gates on the file's presence, so the host-side gate is what decides."""
+
+    def _cfg(self, tmp_path, display):
+        from winbox.config import Config
+
+        cfg = Config(winbox_dir=tmp_path / ".winbox")
+        cfg.vm_os = "win10"  # client SKU; ships the embeddable zip
+        cfg.display = display
+        cfg.iso_dir.mkdir(parents=True)
+        cfg.shared_dir.mkdir(parents=True)
+        return cfg
+
+    def _write_payload(self, cfg, *, spice=True):
+        from winbox.setup.installer import (
+            OPENSSH_ZIP, PYTHON_EMBED_ZIP, WINFSP_MSI, RUNEX_EXE,
+            SPICE_TOOLS_EXE, _virtiofs_cache_path,
+        )
+
+        for name in (OPENSSH_ZIP, WINFSP_MSI, RUNEX_EXE, PYTHON_EMBED_ZIP):
+            (cfg.iso_dir / name).write_bytes(b"x")
+        _virtiofs_cache_path(cfg).write_bytes(b"x")
+        if spice:
+            (cfg.iso_dir / SPICE_TOOLS_EXE).write_bytes(b"x")
+
+    def _packed_members(self, cfg):
+        """Provision and return the arcnames written into provision.zip."""
+        import zipfile as _zip
+        from winbox.setup import installer
+
+        captured = {}
+
+        def fake_guestfish(disk_path, env, commands):
+            for cmd in commands:
+                if cmd.startswith("upload ") and cmd.endswith("/provision.zip"):
+                    zip_path = cmd.split(" ", 2)[1]
+                    with _zip.ZipFile(zip_path) as zf:
+                        captured["names"] = zf.namelist()
+
+        with (
+            patch.object(installer, "_guestfish", side_effect=fake_guestfish),
+            patch.object(installer, "_disable_defender_offline"),
+            patch.object(installer.zipfile, "is_zipfile", return_value=True),
+        ):
+            installer.provision_vm_disk(cfg)
+        return captured["names"]
+
+    def test_spice_mode_packs_spice_tools(self, tmp_path):
+        from winbox.setup.installer import SPICE_TOOLS_EXE
+
+        cfg = self._cfg(tmp_path, "spice")
+        self._write_payload(cfg, spice=True)
+        assert SPICE_TOOLS_EXE in self._packed_members(cfg)
+
+    def test_vnc_mode_omits_spice_tools(self, tmp_path):
+        from winbox.setup.installer import SPICE_TOOLS_EXE
+
+        cfg = self._cfg(tmp_path, "vnc")
+        self._write_payload(cfg, spice=True)  # cached but must not be packed
+        assert SPICE_TOOLS_EXE not in self._packed_members(cfg)
+
+    def test_spice_mode_is_best_effort_when_tool_missing(self, tmp_path):
+        """A missing spice-guest-tools must not fail the build (not required)."""
+        from winbox.setup.installer import SPICE_TOOLS_EXE
+
+        cfg = self._cfg(tmp_path, "spice")
+        self._write_payload(cfg, spice=False)
+        assert SPICE_TOOLS_EXE not in self._packed_members(cfg)  # must not raise
 
 
 class TestDiskPartitionsBlock:

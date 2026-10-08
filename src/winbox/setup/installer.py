@@ -246,6 +246,18 @@ X64DBG_URL = (
 )
 X64DBG_ZIP = "x64dbg.zip"
 
+# spice-guest-tools: QXL WDDM display driver + spice-vdagent (dynamic
+# resolution + host<->guest clipboard). Only fetched/installed in the
+# --display spice path. spice-space serves no stable versioned path, so the
+# URL stays "-latest" and the SHA-256 is the real pin: an upstream rebuild
+# fails verification loudly and we re-pin deliberately (same as RunEx).
+SPICE_TOOLS_URL = (
+    "https://www.spice-space.org/download/windows/spice-guest-tools/"
+    "spice-guest-tools-latest.exe"
+)
+SPICE_TOOLS_EXE = "spice-guest-tools.exe"
+SPICE_TOOLS_SHA256 = "b5be0754802bcd7f7fe0ccdb877f8a6224ba13a2af7d84eb087a89b3b0237da2"
+
 PROVISION_SENTINEL = "C:\\winbox-provisioned.ok"
 BOOTSTRAP_LOG = "C:\\winbox-bootstrap.log"
 
@@ -364,6 +376,33 @@ def download_runex(cfg: Config) -> Path:
         part.unlink(missing_ok=True)
         raise
     console.print("[green][+][/] RunEx downloaded and verified")
+    return dest
+
+
+def download_spice_tools(cfg: Config) -> Path:
+    """Ensure the pinned, hash-verified spice-guest-tools installer is cached."""
+    dest = cfg.iso_dir / SPICE_TOOLS_EXE
+    if dest.exists() and _sha256(dest) == SPICE_TOOLS_SHA256:
+        console.print("[green][+][/] spice-guest-tools cached")
+        return dest
+    dest.unlink(missing_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    part.unlink(missing_ok=True)
+    console.print("[blue][*][/] Downloading spice-guest-tools...")
+    try:
+        subprocess.run(
+            ["wget", "-q", "--show-progress", "-O", str(part), SPICE_TOOLS_URL],
+            check=True,
+        )
+        if not part.exists() or _sha256(part) != SPICE_TOOLS_SHA256:
+            raise RuntimeError(
+                "spice-guest-tools download failed SHA-256 verification"
+            )
+        os.replace(part, dest)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+    console.print("[green][+][/] spice-guest-tools downloaded and verified")
     return dest
 
 
@@ -762,10 +801,22 @@ def run_virt_install(cfg: Config, windows_iso: str) -> None:
             f"target.dir=winbox_share"
         ),
         "--os-variant", cfg.profile.os_variant,
-        "--graphics", "vnc,listen=127.0.0.1",
         "--noautoconsole",
         "--boot", "uefi",
     ]
+    if cfg.display == "spice":
+        # SPICE + QXL video + the vdagent serial channel. listen=127.0.0.1
+        # (not none) keeps a local-only TCP port, matching the VNC workflow
+        # (remote-viewer / SSH tunnel). The QXL WDDM driver + vdagent are
+        # installed in-guest from spice-guest-tools (see provision.ps1).
+        cmd += [
+            "--graphics", "spice,listen=127.0.0.1",
+            "--video", "qxl",
+            "--channel",
+            "spicevmc,target.type=virtio,target.name=com.redhat.spice.0",
+        ]
+    else:
+        cmd += ["--graphics", "vnc,listen=127.0.0.1"]
 
     subprocess.run(cmd, check=True)
     console.print("[green][+][/] VM installation started")
@@ -794,6 +845,7 @@ def provision_vm_disk(cfg: Config) -> None:
         python_embed = cfg.iso_dir / PYTHON_EMBED_ZIP
         x64dbg_zip = cfg.iso_dir / X64DBG_ZIP
         runex_exe = cfg.iso_dir / RUNEX_EXE
+        spice_tools_exe = cfg.iso_dir / SPICE_TOOLS_EXE
         # provision.ps1 picks its Python payload by probing the guest's
         # ProductType, so the build has to ship the one that probe will ask
         # for. Shipping the wrong one isn't an error there — it just quietly
@@ -854,6 +906,11 @@ def provision_vm_disk(cfg: Config) -> None:
             if x64dbg_zip.exists():
                 zf.write(x64dbg_zip, X64DBG_ZIP)
             zf.write(runex_exe, RUNEX_EXE)
+            # SPICE display only, and best-effort: provision.ps1 self-gates on
+            # the file's presence. Not in missing_files — spice is not
+            # load-bearing, so a missing/failed install must never fail setup.
+            if cfg.display == "spice" and spice_tools_exe.exists():
+                zf.write(spice_tools_exe, SPICE_TOOLS_EXE)
 
         # Copy bootstrap.ps1 to temp dir
         bootstrap_src = _data.path("bootstrap.ps1")

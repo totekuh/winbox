@@ -12,6 +12,7 @@ class TestConfigDefaults:
         cfg = Config()
         assert cfg.vm_name == "winbox"
         assert cfg.vm_os == "server2022"
+        assert cfg.display == "vnc"
         assert cfg.vm_ram == 4096
         assert cfg.vm_cpus == 4
         assert cfg.vm_disk == 30
@@ -121,6 +122,18 @@ class TestConfigOverrides:
         config_file.write_text("VM_OS=windows95\n")
         cfg = Config._apply_overrides(Config(), config_file)
         assert cfg.vm_os == "server2022"
+
+    def test_override_display(self, tmp_path):
+        config_file = tmp_path / "config"
+        config_file.write_text("VM_DISPLAY=spice\n")
+        cfg = Config._apply_overrides(Config(), config_file)
+        assert cfg.display == "spice"
+
+    def test_override_display_invalid_keeps_default(self, tmp_path):
+        config_file = tmp_path / "config"
+        config_file.write_text("VM_DISPLAY=wayland\n")
+        cfg = Config._apply_overrides(Config(), config_file)
+        assert cfg.display == "vnc"
 
     def test_override_int_fields(self, tmp_path):
         config_file = tmp_path / "config"
@@ -344,3 +357,11 @@ class TestConfigPersist:
         cfg.persist("VM_OS", "win11")
 
         assert Config.load().vm_os == "win11"
+
+    def test_persisted_display_survives_full_load(self, tmp_path, monkeypatch):
+        winbox_dir = tmp_path / ".winbox"
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        cfg = Config(winbox_dir=winbox_dir)
+        cfg.persist("VM_DISPLAY", "spice")
+
+        assert Config.load().display == "spice"

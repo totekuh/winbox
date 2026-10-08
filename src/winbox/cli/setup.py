@@ -11,7 +11,7 @@ import click
 
 from winbox.setup import installer
 from winbox.cli import console, ensure_running, needs_vm
-from winbox.config import Config
+from winbox.config import Config, DISPLAY_MODES
 from winbox.osprofile import OS_PROFILES
 from winbox.vm import GuestAgent, GuestAgentError
 from winbox.setup.iso import download_iso
@@ -36,6 +36,14 @@ from winbox.vm import VM
     help="Server only: install Desktop Experience instead of Server Core "
          "(needed for Office/GUI apps).",
 )
+@click.option(
+    "--display", "display",
+    type=click.Choice(list(DISPLAY_MODES)),
+    default=None,
+    help="VM display stack (default: vnc, or VM_DISPLAY from config). "
+         "'spice' adds QXL + spice-guest-tools for dynamic resolution and "
+         "host<->guest clipboard — workstation VMs only, NOT for detonation.",
+)
 @click.pass_context
 def setup(
     ctx: click.Context,
@@ -43,15 +51,24 @@ def setup(
     yes: bool,
     os_key: str | None,
     desktop: bool,
+    display: str | None,
 ) -> None:
     """Build the Windows VM (one-time setup)."""
     cfg: Config = ctx.obj["cfg"]
     if os_key is not None:
         cfg.vm_os = os_key
+    if display is not None:
+        cfg.display = display
     if desktop and not cfg.profile.supports_core:
         raise click.UsageError(
             f"--desktop is a Windows Server option; {cfg.vm_os} is always a "
             f"full desktop. Drop --desktop."
+        )
+    if cfg.display == "spice":
+        console.print(
+            "[yellow][!][/] SPICE display: the vdagent clipboard channel is "
+            "host<->guest and is NOT blocked by winbox isolation. Use only "
+            "for workstation VMs, never for malware detonation."
         )
     vm = VM(cfg)
 
@@ -157,6 +174,10 @@ def _setup_inner(
     # (status, av, exec, the MCP server) resolves the same profile as the
     # disk that is about to be created.
     cfg.persist("VM_OS", cfg.vm_os)
+    # Persist the display mode too: `winbox provision` re-runs rebuild the
+    # provision payload, which must match the video hardware fixed at
+    # virt-install time (qxl needs spice-guest-tools in the payload).
+    cfg.persist("VM_DISPLAY", cfg.display)
 
     try:
         # Phase 1: ISO install
@@ -169,6 +190,8 @@ def _setup_inner(
         installer.download_python_embed(cfg)
         installer.download_runex(cfg)
         installer.download_x64dbg(cfg)
+        if cfg.display == "spice":
+            installer.download_spice_tools(cfg)
         installer.extract_virtiofs(cfg)
         installer.generate_ssh_keypair(cfg)
         installer.build_unattend_image(cfg, desktop=desktop)

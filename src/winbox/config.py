@@ -11,6 +11,9 @@ from winbox.osprofile import DEFAULT_OS, OS_PROFILES, OSProfile
 
 logger = logging.getLogger(__name__)
 
+# Valid values for Config.display / the setup --display option.
+DISPLAY_MODES = ("vnc", "spice")
+
 
 @dataclass
 class Config:
@@ -18,6 +21,13 @@ class Config:
 
     vm_name: str = "winbox"
     vm_os: str = DEFAULT_OS
+    # VM display stack. "vnc" (default) is plain VNC + the libvirt-default
+    # video model. "spice" switches to SPICE + QXL + spice-guest-tools
+    # (vdagent) for dynamic resolution and host<->guest clipboard. NOTE:
+    # the spice vdagent channel is a host<->guest serial channel, NOT
+    # network, so the winbox-isolate nwfilter does not block it — use
+    # "spice" only for workstation VMs, never for malware detonation.
+    display: str = "vnc"
     vm_user: str = "Administrator"
     vm_password: str = "WinboxP@ss123"
     vm_ram: int = 4096
@@ -169,6 +179,7 @@ class Config:
         mapping = {
             "VM_NAME": "vm_name",
             "VM_OS": "vm_os",
+            "VM_DISPLAY": "display",
             "VM_USER": "vm_user",
             "VM_PASSWORD": "vm_password",
             "VM_RAM": "vm_ram",
@@ -239,6 +250,14 @@ class Config:
                     logger.warning(
                         "%s:%d: %s must be one of %s (got %r) — keeping default",
                         path, lineno, key, ", ".join(sorted(OS_PROFILES)), value,
+                    )
+                    continue
+                setattr(cfg, attr, value)
+            elif attr == "display":
+                if value not in DISPLAY_MODES:
+                    logger.warning(
+                        "%s:%d: %s must be one of %s (got %r) — keeping default",
+                        path, lineno, key, ", ".join(sorted(DISPLAY_MODES)), value,
                     )
                     continue
                 setattr(cfg, attr, value)
