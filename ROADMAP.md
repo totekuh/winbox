@@ -1657,8 +1657,7 @@ MCP catalog exposed 64 tools; CET reported `UserShadowStack=OFF` and
 owned the connected gdbstub; process, kernel-module, and LSASS PE reads were
 correct; four concurrent debugger requests completed through broker
 serialization; and the System log contained zero event ID 1001 bugchecks
-since boot. See `docs/v1.5.20-final-check-handoff.md` for the full checklist
-and stress evidence.
+since boot.
 
 The later item 49 live pass found that the original CET check was incomplete:
 the system default reported OFF while 34 running processes had effective user
