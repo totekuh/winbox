@@ -8,7 +8,7 @@ from winbox.osprofile import DEFAULT_OS, OS_PROFILES, OSProfile, get_profile
 
 
 def test_registry_has_all_targets():
-    assert set(OS_PROFILES) == {"server2022", "server2025", "win11"}
+    assert set(OS_PROFILES) == {"server2022", "server2025", "win11", "win10"}
 
 
 def test_default_os_is_registered():
@@ -34,14 +34,17 @@ def test_get_profile():
 
 
 class TestProfileInvariants:
-    @pytest.mark.parametrize("key", ["server2022", "server2025", "win11"])
+    @pytest.mark.parametrize("key", ["server2022", "server2025", "win11", "win10"])
     def test_shape(self, key):
         p = OS_PROFILES[key]
         assert isinstance(p, OSProfile)
         assert p.os_variant
         assert p.image_name
         assert p.virtio_subdir
-        assert "go.microsoft.com/fwlink" in p.iso_url
+        # A real Microsoft download URL. Server/Win11 use go.microsoft.com
+        # fwlinks; Win10 (EOL, form-gated, no stable fwlink) uses the
+        # evalcenter page so auto-download fails loudly — both are microsoft.com.
+        assert "microsoft.com" in p.iso_url
         assert p.iso_filename.endswith(".iso")
         assert p.iso_min_size > 0
         assert p.min_disk_gb > 0
@@ -98,6 +101,38 @@ class TestProfileInvariants:
         assert p.include_msr is True
         assert p.install_partition_id == 3
 
+    def test_win10_flags(self):
+        p = OS_PROFILES["win10"]
+        assert p.os_variant == "win10"
+        assert p.virtio_subdir == "w10"
+        assert p.supports_core is False
+        assert p.client_sku is True
+        # Win10 predates the Win11 TPM/Secure-Boot gate and the 24H2
+        # network-OOBE block, so those client workarounds stay off.
+        assert p.labconfig_bypass is False
+        assert p.prevent_device_encryption is False
+        # But Win10 Enterprise ships Tamper Protection on, so the offline
+        # Defender-service disable is ON, like Win11/Server 2025.
+        assert p.disable_defender_offline is True
+        assert p.min_disk_gb == 32
+        # Standard UEFI layout: 260 MB ESP + MSR, Windows on partition 3.
+        assert p.esp_size_mb == 260
+        assert p.include_msr is True
+        assert p.install_partition_id == 3
+        # Consumer multi-edition media: Enterprise eval was pulled post-EOL.
+        assert p.image_name == "Windows 10 Pro"
+        # Consumer media needs an edition-selecting key in the answer file.
+        assert p.product_key == "W269N-WFGWX-YVC9B-4J6C9-T83GX"
+        # EnglishInternational media is en-GB; WinPE must request it.
+        assert p.locale == "en-GB"
+        # Distinct local ISO name so it cannot clobber another profile's media.
+        assert p.iso_filename == "Win10_22H2_x64.iso"
+        # Deliberately NOT a go.microsoft.com fwlink: the Win10 ISO is only
+        # served as a per-session signed link, so auto-download must fail
+        # loudly and the user passes --iso instead.
+        assert "go.microsoft.com/fwlink" not in p.iso_url
+        assert "software-download" in p.iso_url
+
 
 class TestClientSku:
     """`client_sku` decides which Python payload the build must ship.
@@ -113,7 +148,7 @@ class TestClientSku:
     def test_win11_is_client(self):
         assert OS_PROFILES["win11"].client_sku is True
 
-    @pytest.mark.parametrize("key", ["server2022", "server2025", "win11"])
+    @pytest.mark.parametrize("key", ["server2022", "server2025", "win11", "win10"])
     def test_client_sku_is_the_inverse_of_server_core_support(self, key):
         """Server Core is a Server-only concept; a client SKU never has it."""
         p = OS_PROFILES[key]
@@ -155,3 +190,28 @@ class TestWin11GatesAreServerNoOps:
     def test_install_partition_follows_msr(self):
         for p in OS_PROFILES.values():
             assert p.install_partition_id == (3 if p.include_msr else 2)
+
+
+class TestProductKey:
+    """Only the consumer multi-edition Win10 media needs an edition-selecting
+    key in the answer file; the single-edition Evaluation media must not carry
+    one (its rendered unattend stays byte-identical)."""
+
+    @pytest.mark.parametrize("key", ["server2022", "server2025", "win11"])
+    def test_eval_media_has_no_product_key(self, key):
+        assert OS_PROFILES[key].product_key == ""
+
+    def test_win10_has_a_product_key(self):
+        assert OS_PROFILES["win10"].product_key
+
+
+class TestLocale:
+    """The unattend locale must match the media. Eval media is en-US; the
+    consumer Win10 EnglishInternational ISO is en-GB."""
+
+    @pytest.mark.parametrize("key", ["server2022", "server2025", "win11"])
+    def test_eval_media_is_en_us(self, key):
+        assert OS_PROFILES[key].locale == "en-US"
+
+    def test_win10_is_en_gb(self):
+        assert OS_PROFILES["win10"].locale == "en-GB"

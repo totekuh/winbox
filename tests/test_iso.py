@@ -40,6 +40,22 @@ class TestOsProfileIsoValues:
         assert w11.iso_url != srv.iso_url
         assert w11.iso_filename != srv.iso_filename
 
+    def test_all_profiles_have_distinct_iso_filenames(self):
+        """A shared local ISO name would clobber another profile's cached
+        media in cfg.iso_dir."""
+        names = [p.iso_filename for p in OS_PROFILES.values()]
+        assert len(names) == len(set(names))
+
+    def test_win10_iso_values(self):
+        """Win10 (EOL) is the one profile without a fwlink: its ISO is only
+        served as a per-session signed link, so auto-download must fail loudly
+        rather than silently fetch the wrong media."""
+        p = OS_PROFILES["win10"]
+        assert "go.microsoft.com/fwlink" not in p.iso_url
+        assert "microsoft.com" in p.iso_url
+        assert p.iso_filename == "Win10_22H2_x64.iso"
+        assert p.iso_min_size >= 4_000_000_000
+
 
 class TestResolveDownloadUrl:
     @pytest.mark.integration

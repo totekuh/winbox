@@ -209,6 +209,7 @@ class TestWindowsPartition:
             ("server2022", "/dev/sda2"),
             ("server2025", "/dev/sda3"),
             ("win11", "/dev/sda3"),
+            ("win10", "/dev/sda3"),
         ],
     )
     def test_follows_the_profile_layout(self, os_key, expected):

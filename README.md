@@ -2,7 +2,8 @@
 
 **An isolated Windows vulnerability-research platform for Kali and AI agents.**
 
-winbox turns a headless Windows VM (Server Core 2022/2025 or Windows 11) into
+winbox turns a headless Windows VM (Server Core 2022/2025, Windows 11, or
+Windows 10) into
 an automation, instrumentation, and analysis environment controlled from
 Kali. Execute tools, drive a PDB-aware hypervisor debugger, inspect protected
 memory, exercise drivers and IPC, change security posture, contain malware,
@@ -56,7 +57,7 @@ PS C:\Windows\system32>
   and a fail-closed detonation preflight. See
   [docs/malware-detonation.md](docs/malware-detonation.md).
 - **Reproducible Windows lab** — build and operate Server 2022, Server 2025,
-  or Windows 11 guests with automatic provisioning, VirtIO-FS staging,
+  Windows 11, or Windows 10 guests with automatic provisioning, VirtIO-FS staging,
   snapshots, VNC, x64dbg, Python, and host-side dependency delivery.
 - **Transparent execution** — run `.exe` files like native Kali commands,
   including background/logged jobs, one-shot uploads, MSI installation,
@@ -71,7 +72,8 @@ Install on Kali (most are pre-installed):
 
 ```bash
 sudo apt install qemu-system-x86 qemu-utils libvirt-daemon-system virtinst \
-    libguestfs-tools virtiofsd p7zip-full genisoimage sshpass wget
+    libguestfs-tools virtiofsd p7zip-full genisoimage sshpass wget \
+    libwin-hivex-perl
 ```
 
 Required:
@@ -81,6 +83,7 @@ Required:
 - `/dev/kvm` (hardware virtualization must be enabled)
 - `mkisofs` or `genisoimage`
 - `wget`
+- `hivexregedit` (libwin-hivex-perl) — offline Defender disable on win10/win11/server2025
 - `default` libvirt network (active)
 
 Optional:
@@ -109,11 +112,13 @@ winbox setup -y              # builds and provisions the VM
 ### Choosing the guest OS
 
 `winbox setup` builds **Windows Server 2022** by default. Pass `--os` to build a
-different target — **Windows Server 2025** or **Windows 11 Enterprise (Evaluation)**:
+different target — **Windows Server 2025**, **Windows 11 Enterprise (Evaluation)**,
+or **Windows 10 (consumer 22H2)**:
 
 ```bash
-winbox setup --os server2025 -y   # Windows Server 2025 (Core, Evaluation)
-winbox setup --os win11 -y        # Windows 11 Enterprise (Evaluation)
+winbox setup --os server2025 -y             # Windows Server 2025 (Core, Evaluation)
+winbox setup --os win11 -y                  # Windows 11 Enterprise (Evaluation)
+winbox setup --os win10 --iso <path> -y     # Windows 10 22H2 — ISO is manual, see note
 ```
 
 The choice is build-time and there is one VM at a time — switching OS means
@@ -145,6 +150,26 @@ Notes for Win11:
   than falsely reporting success if TP is still on.
 - If Microsoft rotates the eval ISO's download link, the auto-download fails loudly;
   grab the ISO manually and pass `--iso <path>`.
+
+Notes for Win10 (client SKU):
+- **No TPM / Secure Boot gate** — unlike Win11, Windows 10 needs no `LabConfig`
+  bypass, so none is injected. `--desktop` is Server-only and rejected for Win10.
+- Same client provisioning as Win11 (Python embeddable payload, standard UEFI
+  layout: larger ESP + MSR, Windows on partition 3, 32 GB system drive).
+- Media is the **consumer 22H2 multi-edition ISO**; the build selects the
+  `Windows 10 Pro` image. It installs unactivated (fine for a throwaway research
+  VM) and is still ProductType 1, so the client provisioning path applies.
+- **Defender:** Win10 ships Tamper Protection on; setup disables the Defender
+  services in the offline registry hive before first boot, same as Win11.
+  `winbox av status` / `winbox av disable` behave identically.
+- **Auto-download is not available.** Windows 10 reached end of life
+  (2025-10-14). The Enterprise eval media was pulled (its evalcenter page
+  redirects to a "move to Win11" blog), and the consumer ISO is served only as a
+  per-session *signed, time-limited* link (not a durable `go.microsoft.com/fwlink`
+  like the other profiles). So `--os win10`'s auto-download deliberately fails
+  loudly — get the Win10 22H2 ISO from
+  `https://www.microsoft.com/en-us/software-download/windows10ISO` (served to
+  non-Windows browsers) and pass `--iso <path>`.
 
 ## Commands
 
@@ -627,6 +652,7 @@ VIRTIO_ISO_URL=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
 │   ├── SERVER_EVAL_x64FRE_en-us.iso    # Windows Server 2022 eval ISO
 │   ├── SERVER2025_EVAL_x64FRE_en-us.iso # Windows Server 2025 eval ISO (--os server2025)
 │   ├── WIN11_ENT_EVAL_x64FRE_en-us.iso # Windows 11 Enterprise eval ISO (--os win11)
+│   ├── Win10_22H2_x64.iso              # Windows 10 22H2 consumer ISO (--os win10, pass --iso)
 │   ├── virtio-win.iso                  # VirtIO drivers
 │   ├── OpenSSH-Win64.zip               # bundled OpenSSH
 │   ├── winfsp.msi                      # WinFsp installer
@@ -660,7 +686,7 @@ VM you are using.
 
 The live suite (`tests/test_e2e_live.py`) exercises every CLI command and every
 MCP tool against whichever image `~/.winbox/config` points at, and is written to
-pass on **all three** profiles (`server2022`, `server2025`, `win11`) — where they
+pass on **all four** profiles (`server2022`, `server2025`, `win11`, `win10`) — where they
 genuinely differ (Tamper Protection, Server Core's smaller service set, the
 Python payload) it asserts the profile-appropriate behavior instead of skipping.
 
@@ -670,12 +696,13 @@ manifest against the real click tree and MCP registry. Adding a command or tool
 fails the build until you say how it gets exercised, which is what keeps "we
 test everything" a claim you can verify rather than one that quietly rots.
 
-To validate a change across both images:
+To validate a change across all images:
 
 ```bash
 winbox setup --os server2022 -y && pytest -m integration
 winbox setup --os server2025 -y && pytest -m integration
 winbox setup --os win11 -y      && pytest -m integration
+winbox setup --os win10 --iso /path/to/win10.iso -y && pytest -m integration
 ```
 
 ## License

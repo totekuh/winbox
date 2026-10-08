@@ -544,6 +544,21 @@ class TestOfflineDisableOnClientSku:
         # The in-guest path cannot work here; it must not even be attempted.
         gp_keys.assert_not_called()
 
+    def test_win10_client_with_tp_on_goes_offline(self, runner, mock_env, cfg):
+        """Win10 is a client SKU with disable_defender_offline on, so a TP-armed
+        disable takes the offline path, same as Win11."""
+        cfg.vm_os = "win10"
+        with (
+            patch("winbox.cli.av.defender.tamper_protection_on", return_value=True),
+            patch("winbox.cli.av._disable_via_offline_hive") as offline,
+            patch("winbox.cli.av.defender.set_disable_regkeys") as gp_keys,
+        ):
+            result = runner.invoke(cli, ["av", "disable"])
+
+        assert result.exit_code == 0
+        offline.assert_called_once()
+        gp_keys.assert_not_called()
+
     def test_client_without_tp_uses_the_fast_in_guest_path(self, runner, mock_env, cfg):
         """Clearing TP during enable is what makes this reachable."""
         cfg.vm_os = "win11"

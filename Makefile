@@ -16,6 +16,8 @@ SHELL := bash
 # --- package sets -----------------------------------------------------------
 
 # Hard requirements: without these `winbox setup` / exec won't work.
+# libwin-hivex-perl provides `hivexregedit`, needed to disable Defender in the
+# offline registry hive on the client/24H2 profiles (win10, win11, server2025).
 APT_REQUIRED := \
 	qemu-system-x86 \
 	qemu-utils \
@@ -26,7 +28,8 @@ APT_REQUIRED := \
 	p7zip-full \
 	genisoimage \
 	sshpass \
-	wget
+	wget \
+	libwin-hivex-perl
 
 # Optional: enable specific features.
 #   virt-manager -> `winbox vnc`

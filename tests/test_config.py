@@ -36,6 +36,12 @@ class TestConfigProfile:
         cfg.vm_os = "win11"
         assert cfg.profile.key == "win11"
 
+    def test_profile_follows_vm_os_win10(self):
+        cfg = Config()
+        cfg.vm_os = "win10"
+        assert cfg.profile.key == "win10"
+        assert cfg.profile.client_sku is True
+
     def test_profile_unknown_falls_back(self):
         cfg = Config()
         cfg.vm_os = "nonsense"
@@ -102,6 +108,13 @@ class TestConfigOverrides:
         cfg = Config._apply_overrides(Config(), config_file)
         assert cfg.vm_os == "win11"
         assert cfg.profile.os_variant == "win11"
+
+    def test_override_vm_os_win10(self, tmp_path):
+        config_file = tmp_path / "config"
+        config_file.write_text("VM_OS=win10\n")
+        cfg = Config._apply_overrides(Config(), config_file)
+        assert cfg.vm_os == "win10"
+        assert cfg.profile.os_variant == "win10"
 
     def test_override_vm_os_invalid_keeps_default(self, tmp_path):
         config_file = tmp_path / "config"

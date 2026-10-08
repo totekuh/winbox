@@ -850,15 +850,17 @@ class TestUnattendBlocks:
         assert "BypassNRO" in xml
         assert "Microsoft-Windows-Deployment" in xml
 
-    def test_rendered_unattend_is_well_formed_for_both_profiles(self):
+    def test_rendered_unattend_is_well_formed_for_all_profiles(self):
         import xml.etree.ElementTree as ET
 
         from winbox import data as _data
+        from winbox.osprofile import OS_PROFILES
         from winbox.setup.installer import (
-            _disk_partitions_block, _labconfig_block, _specialize_deploy_block,
+            _disk_partitions_block, _labconfig_block, _product_key_block,
+            _specialize_deploy_block,
         )
 
-        for os_key in ("server2022", "win11"):
+        for os_key in OS_PROFILES:
             cfg = self._cfg(os_key)
             p = cfg.profile
             rendered = _data.render(
@@ -871,6 +873,8 @@ class TestUnattendBlocks:
                 SPECIALIZE_DEPLOY_BLOCK=(
                     _specialize_deploy_block() if p.prevent_device_encryption else ""
                 ),
+                PRODUCT_KEY_BLOCK=_product_key_block(p.product_key),
+                LOCALE=p.locale,
             )
             ET.fromstring(rendered)  # raises on malformed XML
 
@@ -888,11 +892,15 @@ class TestUnattendBlocks:
             DISK_PARTITIONS=_disk_partitions_block(cfg),
             LABCONFIG_BLOCK="",
             SPECIALIZE_DEPLOY_BLOCK="",
+            PRODUCT_KEY_BLOCK="",
+            LOCALE="en-US",
         )
         assert "LabConfig" not in rendered
         assert "PreventDeviceEncryption" not in rendered
         assert "2k22" in rendered
         assert "w11" not in rendered
+        # Eval media selects its single edition implicitly — no key injected.
+        assert "<ProductKey>" not in rendered
 
     def test_win11_unattend_uses_its_own_virtio_subdir(self):
         from winbox import data as _data
@@ -910,10 +918,41 @@ class TestUnattendBlocks:
             DISK_PARTITIONS=_disk_partitions_block(cfg),
             LABCONFIG_BLOCK=_labconfig_block(),
             SPECIALIZE_DEPLOY_BLOCK=_specialize_deploy_block(),
+            PRODUCT_KEY_BLOCK="",
+            LOCALE="en-US",
         )
         assert r"viofs\w11" in rendered
         assert r"viofs\2k22" not in rendered
         assert "<PartitionID>3</PartitionID>" in rendered
+
+    def test_win10_unattend_injects_product_key(self):
+        """Consumer multi-edition media needs a key to pick the edition; the
+        win10 profile supplies the generic Win10 Pro key."""
+        from winbox import data as _data
+        from winbox.setup.installer import (
+            _disk_partitions_block, _product_key_block,
+        )
+
+        cfg = self._cfg("win10")
+        p = cfg.profile
+        rendered = _data.render(
+            "unattend.xml",
+            IMAGE_NAME=p.image_name,
+            VIRTIO_SUBDIR=p.virtio_subdir,
+            INSTALL_PARTITION_ID=str(p.install_partition_id),
+            DISK_PARTITIONS=_disk_partitions_block(cfg),
+            LABCONFIG_BLOCK="",
+            SPECIALIZE_DEPLOY_BLOCK="",
+            PRODUCT_KEY_BLOCK=_product_key_block(p.product_key),
+            LOCALE=p.locale,
+        )
+        assert "<ProductKey>" in rendered
+        assert "W269N-WFGWX-YVC9B-4J6C9-T83GX" in rendered
+        assert "<WillShowUI>Never</WillShowUI>" in rendered
+        assert "<Value>Windows 10 Pro</Value>" in rendered
+        # en-GB media: WinPE must request en-GB, not en-US, or Setup stalls.
+        assert "<UILanguage>en-GB</UILanguage>" in rendered
+        assert "en-US" not in rendered
 
 
 class TestVirtiofsCacheIsProfileNamespaced:
@@ -938,7 +977,12 @@ class TestVirtiofsCacheIsProfileNamespaced:
 
     @pytest.mark.parametrize(
         "os_key,subdir",
-        [("server2022", "2k22"), ("server2025", "2k25"), ("win11", "w11")],
+        [
+            ("server2022", "2k22"),
+            ("server2025", "2k25"),
+            ("win11", "w11"),
+            ("win10", "w10"),
+        ],
     )
     def test_iso_member_path_follows_the_profile(self, tmp_path, os_key, subdir):
         from winbox.setup.installer import _virtiofs_iso_member
@@ -1155,14 +1199,17 @@ class TestOfflineRegistryPrereq:
 
         assert not any("hivexregedit" in m for m in missing)
 
+    @pytest.mark.parametrize("os_key", ["win11", "server2025", "win10"])
     @patch("winbox.setup.installer.shutil.which")
     @patch("winbox.setup.installer.Path.exists", return_value=True)
-    def test_required_for_the_profile_that_does(self, _exists, mock_which):
+    def test_required_for_the_profile_that_does(self, _exists, mock_which, os_key):
+        """Every profile with disable_defender_offline=True edits the offline
+        hive and so must block on hivexregedit."""
         from winbox.config import Config
 
         mock_which.side_effect = self._which_missing("hivexregedit")
 
-        missing = check_prereqs(Config(vm_os="win11"))
+        missing = check_prereqs(Config(vm_os=os_key))
 
         assert any("hivexregedit" in m for m in missing)
 

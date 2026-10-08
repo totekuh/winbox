@@ -454,6 +454,25 @@ def copy_setup_files(cfg: Config) -> None:
         shutil.copy2(cfg.ssh_pubkey, cfg.tools_dir / ".ssh_pubkey")
 
 
+def _product_key_block(product_key: str) -> str:
+    """Render the ``<ProductKey>`` for the unattend ``<UserData>``.
+
+    Emitted into ``{PRODUCT_KEY_BLOCK}`` right inside ``<UserData>`` (before
+    ``<AcceptEula>``, the order the Setup schema expects). Empty for the
+    Evaluation media, which carries a single edition and picks it implicitly —
+    their rendered XML then stays byte-identical. The consumer multi-edition
+    Win10 ISO needs a key here to choose an edition; ``WillShowUI=Never``
+    suppresses the key prompt during the unattended install."""
+    if not product_key:
+        return ""
+    return (
+        "\n        <ProductKey>"
+        f"\n          <Key>{product_key}</Key>"
+        "\n          <WillShowUI>Never</WillShowUI>"
+        "\n        </ProductKey>"
+    )
+
+
 # LabConfig bypass keys injected in the WinPE pass for Win11 so setup
 # proceeds without TPM 2.0 / Secure Boot / the RAM/storage/CPU gates.
 # Emitted into the {LABCONFIG_BLOCK} placeholder of unattend.xml; empty
@@ -675,6 +694,8 @@ def build_unattend_image(cfg: Config, *, desktop: bool = False) -> None:
             SPECIALIZE_DEPLOY_BLOCK=(
                 _specialize_deploy_block() if profile.prevent_device_encryption else ""
             ),
+            PRODUCT_KEY_BLOCK=_product_key_block(profile.product_key),
+            LOCALE=profile.locale,
         )
         dst.write_text(xml)
 
@@ -931,7 +952,7 @@ def _settle_firstlogon_boot(cfg: "Config", vm: VM, ga: GuestAgent) -> None:
     shut down cleanly. Either way the VM is left shut off, ready for a clean
     provisioning boot.
     """
-    console.print("[blue][*][/] Settling Win11 OOBE FirstLogon boot...")
+    console.print("[blue][*][/] Settling OOBE FirstLogon boot...")
     vm.start()
     deadline = time.monotonic() + 600
     ga_stable = 0

@@ -1,11 +1,11 @@
 """Guest-OS profiles: everything that varies between the Windows targets.
 
 winbox can build Windows Server 2022 (the historical default), Windows Server
-2025, or Windows 11. They differ in a handful of build-time details — the
-evaluation ISO to fetch, the ``install.wim`` image name the unattend
-selects, the VirtIO driver subdirectory (``2k22`` / ``2k25`` / ``w11``), the
-libvirt ``--os-variant``, and whether the Server Core/Desktop toggle and
-the Win11 setup-gate bypass apply.
+2025, Windows 11, or Windows 10. They differ in a handful of build-time
+details — the evaluation ISO to fetch, the ``install.wim`` image name the
+unattend selects, the VirtIO driver subdirectory (``2k22`` / ``2k25`` /
+``w11`` / ``w10``), the libvirt ``--os-variant``, and whether the Server
+Core/Desktop toggle and the Win11 setup-gate bypass apply.
 
 Rather than sprinkling ``if win11`` branches across ``iso.py``,
 ``installer.py``, and the CLI, all of that lives here as a frozen
@@ -93,6 +93,26 @@ class OSProfile:
     pass. Win11 client auto-enables BitLocker Device Encryption (which breaks
     offline access and needs a TPM we don't have) and its OOBE can stall on the
     network screen; Server 2022 does neither."""
+
+    locale: str = "en-US"
+    """UI language / input / system / user locale written into every pass of
+    the unattend (``{LOCALE}``). Must match a language the install media
+    actually carries, or the WinPE pass cannot auto-select it and Setup stops
+    on the interactive "Language to install" page. The Evaluation media winbox
+    normally uses is en-US; the consumer Win10 media is the "EnglishInternational"
+    (en-GB) ISO, so win10 sets ``en-GB``."""
+
+    product_key: str = ""
+    """Edition-selecting product key injected into the unattend ``<UserData>``.
+
+    Empty for the Evaluation media (Server 2022/2025, Win11 Enterprise eval):
+    those ISOs carry a single edition, so Setup picks it implicitly and a key
+    is not needed. The consumer multi-edition Win10 ISO has no default edition,
+    so its Setup *requires* a key in the answer file to choose one — without it
+    the WinPE pass stops on "Windows cannot read the <ProductKey> setting from
+    the unattend answer file". This is the public generic (KMS client setup)
+    key for the target edition: it selects the edition and installs unactivated
+    (fine for a throwaway research VM), it does not activate anything."""
 
     @property
     def install_partition_id(self) -> int:
@@ -213,6 +233,80 @@ OS_PROFILES: dict[str, OSProfile] = {
         # Defender quarantines winbox's tools and breaks provisioning + exec.
         disable_defender_offline=True,
         prevent_device_encryption=True,
+    ),
+    "win10": OSProfile(
+        key="win10",
+        # libvirt osinfo-db id for Windows 10. VERIFY with
+        # `osinfo-query os | grep -i win10` before a build — virt-install
+        # fails if osinfo-db does not know the variant.
+        os_variant="win10",
+        # NOTE: must match the exact image name in the ISO's install.wim.
+        # Verify with `wiminfo` / `dism /Get-WimInfo` before a real build;
+        # a mismatch fails the WinPE image-select step. Microsoft pulled the
+        # Windows 10 Enterprise *Evaluation* media after EOL (its evalcenter
+        # page 301-redirects to a "move to Win11" blog), so the obtainable
+        # media is the consumer multi-edition 22H2 ISO, whose install.wim
+        # carries Home/Pro/Education images — use "Windows 10 Pro". It installs
+        # unactivated, which is fine for a throwaway research VM, and is still
+        # ProductType 1 (client), so the embeddable-Python path applies.
+        image_name="Windows 10 Pro",
+        # virtio-win ships a dedicated w10 driver subdir. VERIFY present on the
+        # pinned virtio-win ISO; if a future ISO drops it, the w11/2k22 drivers
+        # also load on Windows 10.
+        virtio_subdir="w10",
+        # Windows 10 reached end of life 2025-10-14 and auto-download is not
+        # wired. The Enterprise eval media was pulled (its evalcenter page
+        # 301-redirects to a "move to Win11" blog). The consumer 22H2 ISO is
+        # still served, but only to non-Windows browsers and only as a
+        # per-session *signed, time-limited* link minted by the software-
+        # download page (software.download.prss.microsoft.com/...?P1=<expiry>
+        # &P4=<sig>) — not a durable go.microsoft.com/fwlink like the other
+        # profiles, so it cannot be baked in here. iso_url therefore points at
+        # the stable software-download page (which does not HEAD-resolve to an
+        # ISO), so auto-download fails loudly and the user passes `--iso <path>`
+        # with a manually fetched ISO. (Wiring true auto-download would mean
+        # emulating the browser flow: spoof a non-Windows UA, POST a session to
+        # mint a fresh signed link each run — a separate feature.)
+        iso_url="https://www.microsoft.com/en-us/software-download/windows10ISO",
+        iso_filename="Win10_22H2_x64.iso",
+        # Win10 22H2 consumer ISO is ~5.8 GB; keep a conservative floor.
+        iso_min_size=4_500_000_000,
+        # Windows 10 2004+ Setup wants a 32 GB system drive.
+        min_disk_gb=32,
+        # Standard UEFI layout: 260 MB ESP + MSR + Windows (partition 3). This
+        # is the safe default; Win10's older (pre-24H2) Setup engine may also
+        # tolerate the minimal 100 MB ESP / no-MSR layout that Server 2022
+        # uses — if a build confirms that, esp_size_mb/include_msr can drop to
+        # 100/False (Windows would then land on partition 2).
+        esp_size_mb=260,
+        include_msr=True,
+        # Client SKU: no Server Core/Desktop toggle (`--desktop` is rejected).
+        supports_core=False,
+        # ProductType 1 — provision.ps1 installs the Python embeddable zip.
+        client_sku=True,
+        # Windows 10 has no TPM 2.0 / Secure Boot install gate, so the Win11
+        # LabConfig bypass keys are not needed.
+        labconfig_bypass=False,
+        # Windows 10 does not auto-enable BitLocker Device Encryption without a
+        # TPM, and its OOBE does not hard-block on the network screen the way
+        # Win11 24H2 does, so the specialize-pass workaround is not needed.
+        prevent_device_encryption=False,
+        # Win10 Enterprise ships Defender with Tamper Protection on, which
+        # blocks the in-guest registry disable. Like Win11/Server 2025, disable
+        # the Defender services in the offline SYSTEM hive before first boot so
+        # a never-started WinDefend never arms Tamper Protection and does not
+        # quarantine winbox's tools during provisioning. VERIFY on a live build
+        # that first-boot Defender stays quiet. (This also makes the runtime av
+        # offline paths apply — they gate on this flag, not client_sku.)
+        disable_defender_offline=True,
+        # Consumer multi-edition media needs a key in the answer file to pick an
+        # edition. This is Microsoft's public generic/KMS-client setup key for
+        # Windows 10 Pro — it selects Pro and installs unactivated (no
+        # activation), matching image_name above.
+        product_key="W269N-WFGWX-YVC9B-4J6C9-T83GX",
+        # The consumer media is the "EnglishInternational" (en-GB) ISO; the
+        # WinPE pass must request en-GB or Setup stops on the language page.
+        locale="en-GB",
     ),
 }
 
