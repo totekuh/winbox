@@ -79,10 +79,11 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "iso download": (EXCLUDED, "multi-GB download from Microsoft's CDN"),
 
     # Network
-    "net status": (LIVE, ""),
-    "net isolate": (LIVE, "including the re-isolate idempotency case"),
-    "net connect": (LIVE, ""),
-    "net unplug": (LIVE, ""),
+    "net status": (LIVE, "including the VM-off next-boot path"),
+    "net isolate": (LIVE, "including the re-isolate idempotency case and "
+                          "clearing a persistent unplug"),
+    "net connect": (LIVE, "including clearing the next-boot link state"),
+    "net unplug": (LIVE, "including reboot- and power-cycle persistence"),
     "dns view": (LIVE, ""),
     "dns set": (LIVE, ""),
     "dns sync": (LIVE, ""),
@@ -247,7 +248,7 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
                               "`hvci enable` covers the same shared code"),
     "net_isolate": (LIVE, ""),
     "net_connect": (LIVE, ""),
-    "net_unplug": (LIVE, ""),
+    "net_unplug": (LIVE, "including the persistent (next-boot) write"),
 
     # Named-pipe broker
     "pipe_list": (LIVE, ""),

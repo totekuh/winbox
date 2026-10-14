@@ -233,10 +233,39 @@ class TestIpDiscovery:
 
 
 class TestInterfaceAndLink:
+    """Link state must persist, or `net unplug` lies about the air-gap.
+
+    ``domif-setlink`` has no ``--live``/``--persistent`` pair: no flag is
+    live-only, ``--config`` is next-boot-only, so persisting *and* applying
+    takes two calls per NIC. These tests pin the argv and, more importantly,
+    the ORDER: the persistent write goes first, and a failure there must
+    abort before anything live changes, so a failed unplug can never leave
+    the live-down/config-up state that reads as an air-gap and reconnects
+    the guest on the next power cycle.
+    """
+
+    MAC = "52:54:00:aa:bb:cc"
+    MAC2 = "52:54:00:dd:ee:ff"
+
     IFLIST = """\
  Interface   Type      Source    Model    MAC
 -------------------------------------------------------
  vnet0       network   default   virtio   52:54:00:aa:bb:cc
+"""
+
+    # `domiflist --inactive`: no <target dev> in the persistent XML, so the
+    # Interface column is a bare '-'.
+    IFLIST_INACTIVE = """\
+ Interface   Type      Source    Model    MAC
+-------------------------------------------------------
+ -           network   default   virtio   52:54:00:aa:bb:cc
+"""
+
+    IFLIST_TWO = """\
+ Interface   Type      Source    Model    MAC
+-------------------------------------------------------
+ vnet0       network   default   virtio   52:54:00:aa:bb:cc
+ vnet1       network   lab       virtio   52:54:00:dd:ee:ff
 """
 
     def test_interface_parses_the_name(self, vm):
@@ -247,32 +276,209 @@ class TestInterfaceAndLink:
         with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(returncode=1)):
             assert vm.interface() is None
 
-    def test_set_link_requires_an_interface(self, vm):
-        with patch.object(VM, "interface", return_value=None):
-            assert vm.net_set_link("down") is False
+    def test_interface_is_none_for_an_off_domain(self, vm):
+        # The tap only exists while the domain runs; '-' is not a tap name.
+        with patch(
+            "winbox.vm.lifecycle.virsh_run", return_value=_proc(self.IFLIST_INACTIVE)
+        ):
+            assert vm.interface() is None
 
-    def test_set_link_reports_success(self, vm):
+    def test_nics_parses_tap_and_mac(self, vm):
+        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(self.IFLIST)):
+            assert vm.nics() == [("vnet0", self.MAC)]
+
+    def test_nics_parses_the_inactive_listing(self, vm):
+        with patch(
+            "winbox.vm.lifecycle.virsh_run", return_value=_proc(self.IFLIST_INACTIVE)
+        ) as run:
+            assert vm.nics(inactive=True) == [(None, self.MAC)]
+        assert run.call_args[0] == ("domiflist", vm.name, "--inactive")
+
+    def test_nics_parses_multiple_nics_in_order(self, vm):
+        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(self.IFLIST_TWO)):
+            assert vm.nics() == [("vnet0", self.MAC), ("vnet1", self.MAC2)]
+
+    def test_nics_skips_rows_without_a_mac(self, vm):
+        truncated = self.IFLIST + " vnet1       network   lab       virtio\n"
+        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(truncated)):
+            assert vm.nics() == [("vnet0", self.MAC)]
+
+    def test_nics_empty_on_failure(self, vm):
+        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(returncode=1)):
+            assert vm.nics() == []
+            assert vm.nic_macs() == []
+
+    def test_set_link_writes_config_before_live(self, vm):
         with (
-            patch.object(VM, "interface", return_value="vnet0"),
+            patch.object(VM, "nic_macs", return_value=[self.MAC]),
+            patch(
+                "winbox.vm.lifecycle.virsh_run", side_effect=[_proc(), _proc()]
+            ) as run,
+        ):
+            assert vm.net_set_link("down") is None
+        assert run.call_args_list[0][0] == (
+            "domif-setlink", vm.name, self.MAC, "down", "--config",
+        )
+        assert run.call_args_list[1][0] == ("domif-setlink", vm.name, self.MAC, "down")
+
+    def test_set_link_aborts_before_the_live_write_when_persisting_fails(self, vm):
+        with (
+            patch.object(VM, "nic_macs", return_value=[self.MAC]),
+            patch(
+                "winbox.vm.lifecycle.virsh_run",
+                return_value=_proc(returncode=1, stderr="unsupported flag --config"),
+            ) as run,
+        ):
+            with pytest.raises(RuntimeError, match="NOT applied"):
+                vm.net_set_link("down")
+        # The invariant: nothing live changed, so no illusion of an air-gap.
+        assert run.call_count == 1
+        assert run.call_args[0][-1] == "--config"
+
+    def test_set_link_reports_a_live_failure_as_partial(self, vm):
+        with (
+            patch.object(VM, "nic_macs", return_value=[self.MAC]),
+            patch(
+                "winbox.vm.lifecycle.virsh_run",
+                side_effect=[_proc(), _proc(returncode=1, stderr="device not found")],
+            ),
+        ):
+            with pytest.raises(
+                RuntimeError, match="persisted for next boot but NOT applied live"
+            ):
+                vm.net_set_link("down")
+
+    def test_set_link_requires_a_persistent_interface(self, vm):
+        with patch.object(VM, "nic_macs", return_value=[]):
+            with pytest.raises(RuntimeError, match="cannot persist link down"):
+                vm.net_set_link("down")
+
+    def test_set_link_requires_a_live_interface(self, vm):
+        with (
+            patch.object(VM, "nic_macs", return_value=[]),
+            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()),
+        ):
+            with pytest.raises(RuntimeError, match="NOT applied live"):
+                vm.net_set_link("down", config=False)
+
+    def test_set_link_config_only_skips_the_live_call(self, vm):
+        with (
+            patch.object(VM, "nic_macs", return_value=[self.MAC]),
             patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()) as run,
         ):
-            assert vm.net_set_link("down") is True
-        assert run.call_args[0] == ("domif-setlink", vm.name, "vnet0", "down")
+            vm.net_set_link("up", live=False)
+        assert run.call_count == 1
+        assert run.call_args[0] == ("domif-setlink", vm.name, self.MAC, "up", "--config")
 
-    @pytest.mark.parametrize("out,expected", [("vnet0 up", "up"), ("vnet0 down", "down")])
+    def test_set_link_live_only_skips_the_config_call(self, vm):
+        with (
+            patch.object(VM, "nic_macs", return_value=[self.MAC]),
+            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()) as run,
+        ):
+            vm.net_set_link("up", config=False)
+        assert run.call_count == 1
+        assert run.call_args[0] == ("domif-setlink", vm.name, self.MAC, "up")
+
+    def test_set_link_rejects_a_bogus_state(self, vm):
+        with pytest.raises(ValueError):
+            vm.net_set_link("sideways")
+
+    def test_set_link_hits_every_nic_config_first(self, vm):
+        with (
+            patch.object(VM, "nic_macs", return_value=[self.MAC, self.MAC2]),
+            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()) as run,
+        ):
+            vm.net_set_link("down")
+        assert run.call_count == 4
+        scopes = [call[0][-1] for call in run.call_args_list]
+        # Both persistent writes complete before any live write.
+        assert scopes == ["--config", "--config", "down", "down"]
+        macs = [call[0][2] for call in run.call_args_list]
+        assert macs == [self.MAC, self.MAC2, self.MAC, self.MAC2]
+
+    def test_set_link_uses_the_right_nic_list_per_scope(self, vm):
+        # A NIC that exists only in the persistent config must still be set
+        # down (it will exist after a reboot); a live-only hot-plugged NIC
+        # has nothing to persist.
+        def macs(*, inactive=False):
+            return [self.MAC2] if inactive else [self.MAC]
+
+        with (
+            patch.object(VM, "nic_macs", side_effect=macs),
+            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()) as run,
+        ):
+            vm.net_set_link("down")
+        config_call, live_call = run.call_args_list
+        assert config_call[0] == (
+            "domif-setlink", vm.name, self.MAC2, "down", "--config",
+        )
+        assert live_call[0] == ("domif-setlink", vm.name, self.MAC, "down")
+
+    @pytest.mark.parametrize(
+        "out,expected", [(f"{MAC} up", "up"), (f"{MAC} down", "down")]
+    )
     def test_link_state(self, vm, out, expected):
         with (
-            patch.object(VM, "interface", return_value="vnet0"),
+            patch.object(VM, "nic_macs", return_value=[self.MAC]),
             patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(out)),
         ):
             assert vm.net_link_state() == expected
 
-    def test_link_state_none_on_failure(self, vm):
+    def test_link_state_reads_the_config_scope_with_the_flag(self, vm):
         with (
-            patch.object(VM, "interface", return_value="vnet0"),
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(returncode=1)),
+            patch.object(VM, "nic_macs", return_value=[self.MAC]),
+            patch(
+                "winbox.vm.lifecycle.virsh_run", return_value=_proc(f"{self.MAC} down")
+            ) as run,
+        ):
+            assert vm.net_link_state(config=True) == "down"
+        assert run.call_args[0] == ("domif-getlink", vm.name, self.MAC, "--config")
+
+    def test_link_state_is_up_when_any_nic_is_up(self, vm):
+        # One live NIC out of two is not an air-gap.
+        with (
+            patch.object(VM, "nic_macs", return_value=[self.MAC, self.MAC2]),
+            patch(
+                "winbox.vm.lifecycle.virsh_run",
+                side_effect=[_proc(f"{self.MAC} down"), _proc(f"{self.MAC2} up")],
+            ),
+        ):
+            assert vm.net_link_state() == "up"
+
+    def test_link_state_is_down_only_when_every_nic_is_down(self, vm):
+        with (
+            patch.object(VM, "nic_macs", return_value=[self.MAC, self.MAC2]),
+            patch(
+                "winbox.vm.lifecycle.virsh_run",
+                side_effect=[_proc(f"{self.MAC} down"), _proc(f"{self.MAC2} down")],
+            ),
+        ):
+            assert vm.net_link_state() == "down"
+
+    def test_link_state_is_none_when_a_nic_does_not_answer(self, vm):
+        # Silence must not read as "down" — the detonate gate trusts this.
+        with (
+            patch.object(VM, "nic_macs", return_value=[self.MAC, self.MAC2]),
+            patch(
+                "winbox.vm.lifecycle.virsh_run",
+                side_effect=[_proc(f"{self.MAC} down"), _proc(returncode=1)],
+            ),
         ):
             assert vm.net_link_state() is None
+
+    def test_link_state_none_without_an_interface(self, vm):
+        with patch.object(VM, "nic_macs", return_value=[]):
+            assert vm.net_link_state() is None
+
+    def test_link_states_reports_per_nic(self, vm):
+        with (
+            patch.object(VM, "nic_macs", return_value=[self.MAC, self.MAC2]),
+            patch(
+                "winbox.vm.lifecycle.virsh_run",
+                side_effect=[_proc(f"{self.MAC} down"), _proc(returncode=1)],
+            ),
+        ):
+            assert vm.net_link_states() == [(self.MAC, "down"), (self.MAC2, None)]
 
 
 class TestSnapshots:

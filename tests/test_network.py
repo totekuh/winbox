@@ -22,12 +22,24 @@ def mock_nwfilter():
         yield m
 
 
+def _link(live, boot=None):
+    """A ``net_link_state`` stub answering the live and the config scope.
+
+    ``net_link_state(config=True)`` is a separate read, so a plain
+    ``return_value`` would answer both with the same thing and hide exactly
+    the live/next-boot mismatch these commands exist to resolve. A keyword
+    lambda (not a ``side_effect`` list) keeps the test independent of the
+    order the command happens to read the scopes in.
+    """
+    return lambda config=False: (boot if boot is not None else live) if config else live
+
+
 # ─── net isolate ──────────────────────────────────────────────────────────────
 
 
 class TestNetIsolate:
     def test_isolate_attaches_filter(self, runner, mock_env, mock_nwfilter):
-        mock_env._vm.net_link_state.return_value = "up"
+        mock_env._vm.net_link_state.side_effect = _link("up")
         mock_env._vm.name = "winbox"
         result = runner.invoke(cli, ["net", "isolate"])
 
@@ -39,19 +51,47 @@ class TestNetIsolate:
         mock_env.exec_powershell.assert_not_called()
 
     def test_isolate_brings_link_up_when_unplugged(self, runner, mock_env, mock_nwfilter):
-        mock_env._vm.net_link_state.return_value = "down"
+        mock_env._vm.net_link_state.side_effect = _link("down")
         mock_env._vm.name = "winbox"
         result = runner.invoke(cli, ["net", "isolate"])
 
         assert result.exit_code == 0, result.output
         mock_env._vm.net_set_link.assert_called_with("up")
+        assert "next boot" in result.output
         mock_nwfilter.attach_filter.assert_called_once()
+
+    def test_isolate_clears_a_persistent_link_down(
+        self, runner, mock_env, mock_nwfilter,
+    ):
+        """Live up, next boot down: isolate must not leave a NIC-less boot.
+
+        `unplug` then `isolate` used to leave the persistent link down while
+        reporting filtered access — the VM then booted with no NIC at all.
+        """
+        mock_env._vm.net_link_state.side_effect = _link("up", boot="down")
+        mock_env._vm.name = "winbox"
+        result = runner.invoke(cli, ["net", "isolate"])
+
+        assert result.exit_code == 0, result.output
+        mock_env._vm.net_set_link.assert_called_with("up")
+
+    def test_isolate_fails_loudly_when_the_link_cannot_be_brought_up(
+        self, runner, mock_env, mock_nwfilter,
+    ):
+        mock_env._vm.net_link_state.side_effect = _link("down")
+        mock_env._vm.net_set_link.side_effect = RuntimeError("virsh boom")
+        mock_env._vm.name = "winbox"
+        result = runner.invoke(cli, ["net", "isolate"])
+
+        assert result.exit_code != 0
+        assert "virsh boom" in result.output
+        assert "not active" in result.output
 
     def test_isolate_idempotent_when_already_attached(
         self, runner, mock_env, mock_nwfilter,
     ):
         mock_nwfilter.attach_filter.return_value = False
-        mock_env._vm.net_link_state.return_value = "up"
+        mock_env._vm.net_link_state.side_effect = _link("up")
         result = runner.invoke(cli, ["net", "isolate"])
 
         assert result.exit_code == 0
@@ -79,7 +119,7 @@ class TestNetIsolate:
 class TestNetConnect:
     def test_connect_detaches_filter(self, runner, mock_env, mock_nwfilter):
         mock_nwfilter.detach_filter.return_value = True
-        mock_env._vm.net_link_state.return_value = "up"
+        mock_env._vm.net_link_state.side_effect = _link("up")
         mock_env._vm.ip.return_value = "192.168.122.203"
         mock_env._vm.name = "winbox"
         mock_env.exec_powershell.return_value = ExecResult(0, "", "")
@@ -90,7 +130,7 @@ class TestNetConnect:
         mock_nwfilter.detach_filter.assert_called_once_with("winbox")
 
     def test_connect_also_brings_link_up(self, runner, mock_env, mock_nwfilter):
-        mock_env._vm.net_link_state.return_value = "down"
+        mock_env._vm.net_link_state.side_effect = _link("down")
         mock_env._vm.ip.return_value = "192.168.122.203"
         mock_env._vm.name = "winbox"
         mock_env.exec_powershell.return_value = ExecResult(0, "", "")
@@ -101,10 +141,25 @@ class TestNetConnect:
         mock_env._vm.net_set_link.assert_any_call("up")
         mock_nwfilter.detach_filter.assert_called_once()
 
+    def test_connect_clears_a_persistent_link_down(
+        self, runner, mock_env, mock_nwfilter,
+    ):
+        """Live already up, next boot down — connect must still clear it."""
+        mock_env._vm.net_link_state.side_effect = _link("up", boot="down")
+        mock_env._vm.ip.return_value = "192.168.122.203"
+        mock_env._vm.name = "winbox"
+        mock_env.exec.return_value = ExecResult(0, "", "")
+        result = runner.invoke(cli, ["net", "connect"])
+
+        assert result.exit_code == 0, result.output
+        mock_env._vm.net_set_link.assert_any_call("up")
+        # The live link was never down, so don't spend 30s bouncing the adapter.
+        mock_env.exec_powershell.assert_not_called()
+
     def test_connect_tolerates_detach_failure(self, runner, mock_env, mock_nwfilter):
         """Detach failure is a warning, not a hard error — connect should still run."""
         mock_nwfilter.detach_filter.side_effect = RuntimeError("busted")
-        mock_env._vm.net_link_state.return_value = "up"
+        mock_env._vm.net_link_state.side_effect = _link("up")
         mock_env._vm.name = "winbox"
         mock_env.exec.return_value = ExecResult(0, "", "")
         result = runner.invoke(cli, ["net", "connect"])
@@ -119,7 +174,7 @@ class TestNetConnect:
 class TestNetStatus:
     def test_status_connected(self, runner, mock_env, mock_nwfilter):
         mock_nwfilter.has_filter.return_value = False
-        mock_env._vm.net_link_state.return_value = "up"
+        mock_env._vm.net_link_state.side_effect = _link("up")
         mock_env._vm.name = "winbox"
         mock_env.exec_powershell.return_value = ExecResult(0, "1\n", "")
         result = runner.invoke(cli, ["net", "status"])
@@ -131,7 +186,7 @@ class TestNetStatus:
 
     def test_status_isolated_by_filter(self, runner, mock_env, mock_nwfilter):
         mock_nwfilter.has_filter.return_value = True
-        mock_env._vm.net_link_state.return_value = "up"
+        mock_env._vm.net_link_state.side_effect = _link("up")
         mock_env._vm.name = "winbox"
         result = runner.invoke(cli, ["net", "status"])
 
@@ -142,34 +197,118 @@ class TestNetStatus:
         mock_env.exec_powershell.assert_not_called()
 
     def test_status_unplugged(self, runner, mock_env, mock_nwfilter):
-        mock_env._vm.net_link_state.return_value = "down"
+        mock_env._vm.net_link_state.side_effect = _link("down")
         mock_env._vm.name = "winbox"
         result = runner.invoke(cli, ["net", "status"])
 
         assert result.exit_code == 0
         assert "link down" in result.output
+        assert "next boot: down" in result.output
+
+    def test_status_survives_a_guest_probe_timeout(
+        self, runner, mock_env, mock_nwfilter,
+    ):
+        """A GA still settling after boot must not end a status read in a
+        traceback."""
+        from winbox.vm.guest import GuestExecTimeout
+
+        mock_env._vm.net_link_state.side_effect = _link("up")
+        mock_env._vm.name = "winbox"
+        mock_env.exec_powershell.side_effect = GuestExecTimeout("too slow", pid=1)
+        result = runner.invoke(cli, ["net", "status"])
+
+        assert result.exit_code == 0, result.output
+        assert result.exception is None
+        assert "unknown" in result.output
+
+    def test_status_flags_a_live_only_unplug(self, runner, mock_env, mock_nwfilter):
+        """The old bug, made visible: air-gapped now, reconnected by a reboot."""
+        mock_env._vm.net_link_state.side_effect = _link("down", boot="up")
+        mock_env._vm.name = "winbox"
+        result = runner.invoke(cli, ["net", "status"])
+
+        assert result.exit_code == 0
+        assert "next boot: up" in result.output
+        assert "net unplug" in result.output
+
+    def test_status_flags_a_persistent_only_unplug(
+        self, runner, mock_env, mock_nwfilter,
+    ):
+        mock_env._vm.net_link_state.side_effect = _link("up", boot="down")
+        mock_env._vm.name = "winbox"
+        mock_env.exec_powershell.return_value = ExecResult(0, "1\n", "")
+        result = runner.invoke(cli, ["net", "status"])
+
+        assert result.exit_code == 0
+        assert "next boot: down" in result.output
+        assert "net connect" in result.output
+
+    def test_status_reports_next_boot_state_when_the_vm_is_off(
+        self, runner, mock_env, mock_nwfilter,
+    ):
+        mock_env._vm.state.return_value = VMState.SHUTOFF
+        mock_env._vm.net_link_state.side_effect = _link(None, boot="down")
+        mock_env._vm.name = "winbox"
+        result = runner.invoke(cli, ["net", "status"])
+
+        assert result.exit_code == 0, result.output
+        assert "not running" in result.output
+        assert "next boot" in result.output
+        assert "down" in result.output
+        # No guest probing against a VM that isn't there.
+        mock_env.ping.assert_not_called()
+        mock_env.exec_powershell.assert_not_called()
+
+    def test_status_does_not_read_the_live_link_when_off(
+        self, runner, mock_env, mock_nwfilter,
+    ):
+        """A flagless domif-getlink on an off domain answers from the
+        persistent XML, so reading it would print next-boot state as live."""
+        mock_env._vm.state.return_value = VMState.SHUTOFF
+        mock_env._vm.net_link_state.side_effect = _link(None, boot="up")
+        mock_env._vm.name = "winbox"
+        runner.invoke(cli, ["net", "status"])
+
+        calls = mock_env._vm.net_link_state.call_args_list
+        assert [c.kwargs for c in calls] == [{"config": True}]
+
+    def test_status_warns_about_a_saved_state(self, runner, mock_env, mock_nwfilter):
+        mock_env._vm.state.return_value = VMState.SAVED
+        mock_env._vm.net_link_state.side_effect = _link(None, boot="down")
+        mock_env._vm.name = "winbox"
+        result = runner.invoke(cli, ["net", "status"])
+
+        assert result.exit_code == 0
+        assert "saved state" in result.output.lower()
 
 
-# ─── net unplug (sanity — unchanged semantics) ────────────────────────────────
+# ─── net unplug ───────────────────────────────────────────────────────────────
 
 
 class TestNetUnplug:
     def test_unplug_calls_set_link_down(self, runner, mock_env, mock_nwfilter):
-        mock_env._vm.net_set_link.return_value = True
         result = runner.invoke(cli, ["net", "unplug"])
 
         assert result.exit_code == 0
         mock_env._vm.net_set_link.assert_called_with("down")
+        # The claim the command makes must be the one net_set_link delivers:
+        # both scopes, so a power cycle can't undo it.
+        assert "next boot" in result.output
         # unplug leaves filter state alone.
         mock_nwfilter.attach_filter.assert_not_called()
         mock_nwfilter.detach_filter.assert_not_called()
 
     def test_unplug_fails_when_set_link_fails(self, runner, mock_env, mock_nwfilter):
-        mock_env._vm.net_set_link.return_value = False
+        mock_env._vm.net_set_link.side_effect = RuntimeError(
+            "link down NOT applied: persistent write for 52:54:00:aa:bb:cc failed"
+        )
         result = runner.invoke(cli, ["net", "unplug"])
 
         assert result.exit_code != 0
-        assert "Failed" in result.output or "no interface" in result.output
+        assert "NOT air-gapped" in result.output
+        assert "persistent write" in result.output
+        # Never the success wording on a partial write.
+        assert "fully air-gapped" not in result.output
 
 
 # ─── net connect (set-link failure branch) ────────────────────────────────────
@@ -177,13 +316,14 @@ class TestNetUnplug:
 
 class TestNetConnectLinkFailure:
     def test_connect_fails_when_set_link_up_fails(self, runner, mock_env, mock_nwfilter):
-        mock_env._vm.net_link_state.return_value = "down"
-        mock_env._vm.net_set_link.return_value = False
+        mock_env._vm.net_link_state.side_effect = _link("down")
+        mock_env._vm.net_set_link.side_effect = RuntimeError("virsh boom")
         mock_env._vm.name = "winbox"
         result = runner.invoke(cli, ["net", "connect"])
 
         assert result.exit_code != 0
-        assert "Failed" in result.output or "no interface" in result.output
+        assert "Failed to set link up" in result.output
+        assert "virsh boom" in result.output
 
 
 # ─── dns set ──────────────────────────────────────────────────────────────────

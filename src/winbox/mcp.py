@@ -1888,8 +1888,9 @@ def net_isolate() -> str:
     intra-192.168.122.0/24 IPv4, ARP, and DHCPv4 traffic is allowed.
     Enforcement is at the host bridge -- DHCP renewals or in-guest route
     changes cannot defeat it. Kali <-> VM (guest agent, VirtIO-FS, SSH)
-    stays up. For a full NIC disconnect, use net_unplug(). Undo with
-    net_connect().
+    stays up. For a full NIC disconnect, use net_unplug(). Also clears any
+    persistent (next-boot) link-down left by net_unplug(), so the VM does
+    not boot with no NIC at all. Undo with net_connect().
     """
     from winbox import nwfilter
 
@@ -1909,17 +1910,25 @@ def net_isolate() -> str:
     # alone does nothing until traffic can flow. Bring it up so filtered access
     # works — but that WEAKENS a full air-gap to filter-only, so say so instead
     # of silently downgrading, and honor net_set_link's result.
+    # The persistent scope counts too: a next-boot link-down left behind
+    # would boot the VM with no NIC while this tool reported filtered access.
     downgrade_note = ""
-    if vm.net_link_state() == "down":
-        if not vm.net_set_link("up"):
+    live = vm.net_link_state()
+    if "down" in (live, vm.net_link_state(config=True)):
+        try:
+            vm.net_set_link("up")
+        except RuntimeError as e:
             return (
-                "nwfilter attached, but failed to bring the NIC link up "
-                "(no interface found?) — internet-isolation is not yet active."
+                f"nwfilter attached, but failed to bring the NIC link up: {e} — "
+                "internet-isolation is not yet active, and the VM may boot with "
+                "no NIC."
             )
-        downgrade_note = (
-            " (note: the NIC was unplugged/air-gapped; brought the link up for "
-            "filtered access — Kali<->VM is reachable again, internet stays blocked)"
-        )
+        if live == "down":
+            downgrade_note = (
+                " (note: the NIC was unplugged/air-gapped; brought the link up "
+                "(live + next boot) for filtered access — Kali<->VM is reachable "
+                "again, internet stays blocked)"
+            )
 
     if changed:
         return "Internet isolated — nwfilter enforced at host bridge" + downgrade_note
@@ -1931,15 +1940,24 @@ def net_unplug() -> str:
     """Unplug the VM's virtual NIC entirely (full air-gap).
 
     Kills all IP traffic including Kali <-> VM. GA and VirtIO-FS stay
-    up over virtio-serial. For internet-only isolation that keeps
+    up over virtio-serial. The link goes down both live and in the
+    persistent domain config, so the air-gap survives a guest reboot, a
+    BSOD and a VM power cycle. For internet-only isolation that keeps
     Kali <-> VM working, use net_isolate(). Undo with net_connect().
     """
     cfg, vm, ga = _get_state()
     if vm.state() != VMState.RUNNING:
         return f"VM is not running (state: {vm.state().value})"
-    if not vm.net_set_link("down"):
-        return "Failed to set link down (no interface found?)"
-    return "NIC unplugged — VM is fully air-gapped"
+    try:
+        vm.net_set_link("down")
+    except RuntimeError as e:
+        # Never report an air-gap that was only partly applied.
+        return (
+            f"error: NOT air-gapped — the link change failed: {e}. The guest may "
+            "still be on the network. Retry net_unplug(), or use net_isolate() "
+            "if this libvirt lacks `domif-setlink --config`."
+        )
+    return "NIC unplugged — VM is fully air-gapped (live + next boot)"
 
 
 @mcp.tool()
@@ -1947,8 +1965,9 @@ def net_connect() -> str:
     """Restore full network access (undo net_isolate or net_unplug).
 
     Detaches the 'winbox-isolate' nwfilter (idempotent), brings the NIC
-    link up if needed, then runs a full DHCP cycle (release + renew)
-    to re-add the default gateway.
+    link up if needed -- in both the live and the persistent domain config
+    -- then runs a full DHCP cycle (release + renew) to re-add the default
+    gateway.
     """
     import time
     from winbox import nwfilter
@@ -1969,9 +1988,13 @@ def net_connect() -> str:
             f"{e}. Retry, or inspect the domain XML / `virsh nwfilter-list`."
         )
 
-    if vm.net_link_state() == "down":
-        if not vm.net_set_link("up"):
-            return "Failed to set link up (no interface found?)"
+    live = vm.net_link_state()
+    if "down" in (live, vm.net_link_state(config=True)):
+        try:
+            vm.net_set_link("up")
+        except RuntimeError as e:
+            return f"error: failed to bring the NIC link up: {e}"
+    if live == "down":
         # Best-effort: the DHCP poll below is the real readiness signal.
         try:
             ga.exec_powershell(

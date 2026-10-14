@@ -54,9 +54,30 @@ def net_isolate(ctx: click.Context) -> None:
         console.print(f"[red][-][/] {e}")
         raise SystemExit(1)
 
-    # Isolate means "network but blocked" — bring link up if unplugged.
-    if vm.net_link_state() == "down":
-        vm.net_set_link("up")
+    # Isolate means "network but blocked" — bring the link up if unplugged.
+    # The persistent state matters as much as the live one: leaving a
+    # next-boot link-down behind means the VM reboots with no NIC at all
+    # while the filter claims Kali <-> VM still works.
+    live = vm.net_link_state()
+    boot = vm.net_link_state(config=True)
+    if "down" in (live, boot):
+        try:
+            vm.net_set_link("up")
+        except RuntimeError as e:
+            console.print(
+                "[red][-][/] nwfilter attached, but the NIC link could not be "
+                "brought up:"
+            )
+            console.print(f"    {e}", markup=False, highlight=False)
+            console.print(
+                "    Isolation is not active yet, and the VM may boot with no NIC."
+            )
+            raise SystemExit(1)
+        if live == "down":
+            console.print(
+                "[yellow][!][/] NIC was air-gapped — link brought up "
+                "(live + next boot) for filtered access"
+            )
 
     if changed:
         console.print("[green][+][/] Internet isolated — nwfilter enforced at host bridge")
@@ -72,7 +93,9 @@ def net_unplug(ctx: click.Context) -> None:
     """Unplug the VM's virtual NIC entirely (full air-gap).
 
     Kills all IP traffic including Kali <-> VM. Guest agent and VirtIO-FS
-    stay up because they run over virtio-serial, not the NIC. For
+    stay up because they run over virtio-serial, not the NIC. The link is
+    set down both live and in the persistent domain config, so the air-gap
+    survives a guest reboot, a BSOD, and `winbox down` / `winbox up`. For
     internet-only isolation that keeps Kali <-> VM working, use
     `winbox net isolate` instead.
     Undo with: winbox net connect
@@ -84,18 +107,33 @@ def net_unplug(ctx: click.Context) -> None:
         console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
         raise SystemExit(1)
 
-    if not vm.net_set_link("down"):
-        console.print("[red][-][/] Failed to set link down (no interface found?)")
+    try:
+        vm.net_set_link("down")
+    except RuntimeError as e:
+        # Never print the success line on a partial write: claiming an
+        # air-gap that a power cycle undoes is the dangerous direction.
+        console.print("[red][-][/] NOT air-gapped — the link change failed:")
+        console.print(f"    {e}", markup=False, highlight=False)
+        console.print(
+            "    Retry, or use [bold]winbox net isolate[/] (nwfilter) if this "
+            "virsh lacks `domif-setlink --config`."
+        )
         raise SystemExit(1)
 
-    console.print("[green][+][/] NIC unplugged — VM is fully air-gapped")
+    console.print(
+        "[green][+][/] NIC unplugged — VM is fully air-gapped (live + next boot)"
+    )
     console.print("    Undo with: [bold]winbox net connect[/]")
 
 
 @net.command("connect")
 @click.pass_context
 def net_connect(ctx: click.Context) -> None:
-    """Restore full network access (undo isolate or unplug)."""
+    """Restore full network access (undo isolate or unplug).
+
+    Clears the link-down state in both the live domain and the persistent
+    config, so the NIC is back now and after the next boot.
+    """
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
@@ -115,12 +153,20 @@ def net_connect(ctx: click.Context) -> None:
         console.print(f"[yellow][!][/] Could not detach nwfilter: {e}")
 
     # If the NIC was unplugged, plug it back in first. Otherwise skip —
-    # `net isolate` leaves the link up so there's nothing to re-plug.
-    if vm.net_link_state() == "down":
-        console.print("[blue][*][/] Plugging NIC back in...")
-        if not vm.net_set_link("up"):
-            console.print("[red][-][/] Failed to set link up (no interface found?)")
+    # `net isolate` leaves the link up so there's nothing to re-plug. The
+    # persistent scope is checked too: a next-boot link-down would otherwise
+    # survive this "connect" and bite on the next power cycle.
+    live = vm.net_link_state()
+    boot = vm.net_link_state(config=True)
+    if "down" in (live, boot):
+        console.print("[blue][*][/] Plugging NIC back in (live + next boot)...")
+        try:
+            vm.net_set_link("up")
+        except RuntimeError as e:
+            console.print("[red][-][/] Failed to set link up:")
+            console.print(f"    {e}", markup=False, highlight=False)
             raise SystemExit(1)
+    if live == "down":
         # Windows doesn't re-notice the cable by itself; bounce the adapter
         # so the driver re-queries DHCP.
         try:
@@ -165,30 +211,82 @@ def net_connect(ctx: click.Context) -> None:
 @net.command("status")
 @click.pass_context
 def net_status(ctx: click.Context) -> None:
-    """Show VM network state — link and internet reachability."""
+    """Show VM network state — link, filter and internet reachability.
+
+    Reports the link both live and as it will be on the next boot, because
+    `virsh domif-setlink` writes the two scopes separately and a live-only
+    link-down is undone by any power cycle. Works with the VM off, where
+    only the next-boot state exists.
+    """
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
-    if vm.state() != VMState.RUNNING:
-        console.print(f"[yellow][!][/] VM is not running (state: {vm.state().value})")
-        return
+    state = vm.state()
+    running = state == VMState.RUNNING
+    if not running:
+        console.print(
+            f"[yellow][!][/] VM is not running (state: {state.value}) — "
+            "showing next-boot state"
+        )
 
-    link = vm.net_link_state()
-    if link is None:
+    # Read the live scope only when the domain really runs: a flagless
+    # `domif-getlink` against an inactive domain does NOT fail, it answers
+    # from the persistent XML, so an ungated read would print the next-boot
+    # answer as if it were live.
+    live = vm.net_link_state() if running else None
+    boot = vm.net_link_state(config=True)
+
+    def _color(link: str) -> str:
+        return "green" if link == "up" else "red"
+
+    if not running:
+        if boot is None:
+            console.print("Link:     [yellow]unknown[/] (next boot)")
+        else:
+            console.print(f"Link:     [{_color(boot)}]{boot}[/] (next boot)")
+    elif live is None:
         console.print("Link:     [yellow]unknown[/]")
+    elif boot is None:
+        console.print(f"Link:     [{_color(live)}]{live}[/] (next boot: unknown)")
+    elif live == boot:
+        suffix = "" if live == "up" else " (next boot: down)"
+        console.print(f"Link:     [{_color(live)}]{live}[/]{suffix}")
+    elif live == "down":
+        # The old `net unplug` bug: air-gapped now, reconnected by any
+        # power cycle, poweroff or BSOD.
+        console.print(
+            "Link:     [yellow]down (next boot: up — a power cycle restores the "
+            "network; re-run winbox net unplug)[/]"
+        )
     else:
-        link_color = "green" if link == "up" else "red"
-        console.print(f"Link:     [{link_color}]{link}[/]")
+        console.print(
+            "Link:     [yellow]up (next boot: down — a power cycle leaves the VM "
+            "with no NIC; run winbox net connect)[/]"
+        )
 
+    if state == VMState.SAVED:
+        console.print(
+            "    Saved state present — resuming restores the link state captured "
+            "at suspend time, not the next-boot state above."
+        )
+
+    # `has_filter` reads `virsh dumpxml` with no flags, which libvirt answers
+    # from the persistent XML for an inactive domain — so this line is
+    # already the next-boot answer when the VM is off.
+    scope = "" if running else " (next boot)"
     filter_on = nwfilter.has_filter(vm.name)
     if filter_on:
-        console.print(f"Filter:   [red]{nwfilter.FILTER_NAME}[/] (isolated)")
+        console.print(f"Filter:   [red]{nwfilter.FILTER_NAME}[/] (isolated){scope}")
     else:
-        console.print("Filter:   [green]none[/]")
+        console.print(f"Filter:   [green]none[/]{scope}")
+
+    if not running:
+        console.print("Internet: [yellow]unknown[/] (VM not running)")
+        return
 
     # Link down => no packets at all.
-    if link != "up":
+    if live != "up":
         console.print("Internet: [red]blocked[/] (link down)")
         return
 
@@ -205,11 +303,18 @@ def net_status(ctx: click.Context) -> None:
     # @(...) forces a collection so .Count works even when Get-NetRoute
     # returns $null (no match) or a single object (PS unwraps single-element
     # pipelines by default and $null.Count prints as empty string).
-    result = ga.exec_powershell(
-        "@(Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
-        "-ErrorAction SilentlyContinue).Count",
-        timeout=10,
-    )
+    # A GA that pings but is still settling (right after boot) can blow the
+    # 10s budget — report unknown rather than ending a status read in a
+    # traceback.
+    try:
+        result = ga.exec_powershell(
+            "@(Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
+            "-ErrorAction SilentlyContinue).Count",
+            timeout=10,
+        )
+    except GuestAgentError:
+        console.print("Internet: [yellow]unknown[/] (guest probe timed out)")
+        return
     if result.exitcode != 0 or not result.stdout.strip().isdigit():
         console.print("Internet: [yellow]unknown[/]")
         return

@@ -1584,6 +1584,20 @@ class TestAvTools:
 # ─── net_isolate / net_unplug / net_connect tools ───────────────────────────
 
 
+def _link(live, boot=None):
+    """A ``net_link_state`` stub that answers the live and config scopes apart.
+
+    The net tools read ``net_link_state(config=True)`` as a second call, so a
+    single ``return_value`` would hide the live/next-boot mismatch they exist
+    to resolve.
+    """
+    return MagicMock(
+        side_effect=lambda config=False: (
+            (boot if boot is not None else live) if config else live
+        )
+    )
+
+
 class TestNetTools:
     def test_isolate_attaches_nwfilter(self, mock_mcp):
         """net_isolate now uses libvirt nwfilter (guest-proof) instead of
@@ -1591,7 +1605,7 @@ class TestNetTools:
         from winbox.mcp import net_isolate
         ga, vm, cfg = mock_mcp
         vm.name = "winbox"
-        vm.net_link_state = MagicMock(return_value="up")
+        vm.net_link_state = _link("up")
         vm.net_set_link = MagicMock()
 
         with patch("winbox.nwfilter.ensure_filter_defined") as mock_define, \
@@ -1608,7 +1622,7 @@ class TestNetTools:
         from winbox.mcp import net_isolate
         ga, vm, cfg = mock_mcp
         vm.name = "winbox"
-        vm.net_link_state = MagicMock(return_value="up")
+        vm.net_link_state = _link("up")
 
         with patch("winbox.nwfilter.ensure_filter_defined"), \
              patch("winbox.nwfilter.attach_filter", return_value=False):
@@ -1629,6 +1643,35 @@ class TestNetTools:
         assert "failed" in result.lower()
         assert "libvirt refused" in result
 
+    def test_isolate_clears_a_persistent_link_down(self, mock_mcp):
+        """Live up, next boot down — isolate must not leave a NIC-less boot."""
+        from winbox.mcp import net_isolate
+        ga, vm, cfg = mock_mcp
+        vm.name = "winbox"
+        vm.net_link_state = _link("up", boot="down")
+        vm.net_set_link = MagicMock()
+
+        with patch("winbox.nwfilter.ensure_filter_defined"), \
+             patch("winbox.nwfilter.attach_filter", return_value=True):
+            result = net_isolate()
+
+        assert "isolated" in result.lower()
+        vm.net_set_link.assert_called_once_with("up")
+
+    def test_isolate_reports_a_failed_link_up(self, mock_mcp):
+        from winbox.mcp import net_isolate
+        ga, vm, cfg = mock_mcp
+        vm.name = "winbox"
+        vm.net_link_state = _link("down")
+        vm.net_set_link = MagicMock(side_effect=RuntimeError("virsh boom"))
+
+        with patch("winbox.nwfilter.ensure_filter_defined"), \
+             patch("winbox.nwfilter.attach_filter", return_value=True):
+            result = net_isolate()
+
+        assert "not yet active" in result.lower()
+        assert "virsh boom" in result
+
     def test_isolate_vm_not_running(self, mock_mcp):
         from winbox.mcp import net_isolate
         ga, vm, cfg = mock_mcp
@@ -1641,10 +1684,13 @@ class TestNetTools:
     def test_unplug_sets_link_down(self, mock_mcp):
         from winbox.mcp import net_unplug
         ga, vm, cfg = mock_mcp
-        vm.net_set_link = MagicMock(return_value=True)
+        vm.net_set_link = MagicMock()
 
         result = net_unplug()
         assert "unplugged" in result.lower() or "air-gapped" in result.lower()
+        # The air-gap claim must cover the next boot too, or a power cycle
+        # (or a BSOD mid-detonation) silently reconnects the guest.
+        assert "next boot" in result
         vm.net_set_link.assert_called_once_with("down")
 
     def test_unplug_vm_not_running(self, mock_mcp):
@@ -1655,20 +1701,24 @@ class TestNetTools:
         result = net_unplug()
         assert "not running" in result.lower()
 
-    def test_unplug_no_interface(self, mock_mcp):
+    def test_unplug_reports_a_failed_link_change(self, mock_mcp):
         from winbox.mcp import net_unplug
         ga, vm, cfg = mock_mcp
-        vm.net_set_link = MagicMock(return_value=False)
+        vm.net_set_link = MagicMock(
+            side_effect=RuntimeError("cannot persist link down: no network interface")
+        )
 
         result = net_unplug()
-        assert "failed" in result.lower()
+        assert "error" in result.lower()
+        assert "not air-gapped" in result.lower()
+        assert "cannot persist link down" in result
 
     def test_connect_from_isolated_link_up(self, mock_mcp):
         """Undo `net isolate`: link is already up, detach filter, re-DHCP."""
         from winbox.mcp import net_connect
         ga, vm, cfg = mock_mcp
         vm.name = "winbox"
-        vm.net_link_state = MagicMock(return_value="up")
+        vm.net_link_state = _link("up")
         vm.net_set_link = MagicMock()
         vm.ip.return_value = "192.168.122.42"
 
@@ -1689,8 +1739,8 @@ class TestNetTools:
         from winbox.mcp import net_connect
         ga, vm, cfg = mock_mcp
         vm.name = "winbox"
-        vm.net_link_state = MagicMock(return_value="down")
-        vm.net_set_link = MagicMock(return_value=True)
+        vm.net_link_state = _link("down")
+        vm.net_set_link = MagicMock()
         vm.ip.return_value = "192.168.122.42"
 
         with patch("winbox.nwfilter.detach_filter", return_value=False):
@@ -1708,13 +1758,31 @@ class TestNetTools:
         from winbox.mcp import net_connect
         ga, vm, cfg = mock_mcp
         vm.name = "winbox"
-        vm.net_link_state = MagicMock(return_value="down")
-        vm.net_set_link = MagicMock(return_value=False)
+        vm.net_link_state = _link("down")
+        vm.net_set_link = MagicMock(side_effect=RuntimeError("virsh boom"))
 
         with patch("winbox.nwfilter.detach_filter", return_value=False):
             result = net_connect()
-        assert "failed" in result.lower()
+        assert "failed to bring the nic link up" in result.lower()
+        assert "virsh boom" in result
         ga.exec.assert_not_called()
+
+    def test_connect_clears_a_persistent_link_down(self, mock_mcp):
+        """Live already up, next boot down — connect must still clear it."""
+        from winbox.mcp import net_connect
+        ga, vm, cfg = mock_mcp
+        vm.name = "winbox"
+        vm.net_link_state = _link("up", boot="down")
+        vm.net_set_link = MagicMock()
+        vm.ip.return_value = "192.168.122.42"
+
+        with patch("winbox.nwfilter.detach_filter", return_value=False):
+            result = net_connect()
+
+        assert "192.168.122.42" in result
+        vm.net_set_link.assert_called_once_with("up")
+        # Live link was never down — no 30s adapter bounce.
+        ga.exec_powershell.assert_not_called()
 
     def test_connect_vm_not_running(self, mock_mcp):
         from winbox.mcp import net_connect

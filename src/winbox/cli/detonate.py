@@ -100,12 +100,24 @@ def detonate_check(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     safe = True
 
     # ── HARD GATE: guest must not reach the real internet ────────────────
-    link = vm.net_link_state()
+    live_link = vm.net_link_state()
+    boot_link = vm.net_link_state(config=True)
     isolated = nwfilter.has_filter(vm.name)
-    if link == "down":
-        _ok("Internet blocked", "NIC unplugged (full air-gap)")
-    elif isolated:
-        _ok("Internet blocked", "nwfilter attached (net isolate)")
+    # nwfilter first: `attach_filter` writes the live AND persistent config,
+    # so a filtered lab stays filtered across a power cycle and should not
+    # fail the gate over a link-state mismatch that doesn't matter here.
+    if isolated:
+        _ok("Internet blocked", "nwfilter attached (net isolate) — persists across reboot")
+    elif live_link == "down" and boot_link == "down":
+        _ok("Internet blocked", "NIC unplugged (full air-gap, persists across reboot)")
+    elif live_link == "down":
+        _fail(
+            "Air-gap NOT persistent",
+            "the NIC is unplugged live but the persistent domain config has the "
+            "link UP — a power cycle, guest poweroff or BSOD reconnects the guest "
+            "mid-detonation. Re-run `winbox net unplug` (or `winbox net isolate`)",
+        )
+        safe = False
     else:
         _fail(
             "Internet REACHABLE",

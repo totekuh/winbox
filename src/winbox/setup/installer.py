@@ -1011,7 +1011,7 @@ def _settle_firstlogon_boot(cfg: "Config", vm: VM, ga: GuestAgent) -> None:
     """
     console.print("[blue][*][/] Settling OOBE FirstLogon boot...")
     vm.start()
-    deadline = time.monotonic() + 600
+    deadline = time.monotonic() + 1200
     ga_stable = 0
     while time.monotonic() < deadline:
         # is_off(), not state()==SHUTOFF: state() folds "crashed"/"in shutdown"

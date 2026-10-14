@@ -15,6 +15,16 @@ def _defender_result(value: str) -> ExecResult:
     return ExecResult(exitcode=0, stdout=value, stderr="")
 
 
+def _link(live, boot=None):
+    """A ``net_link_state`` stub answering the live and config scopes apart.
+
+    The gate reads the next-boot scope as a second call: a live-only unplug
+    is not an air-gap, because a guest poweroff or BSOD (``on_crash=destroy``)
+    returns the domain to its persistent config with the NIC back up.
+    """
+    return lambda config=False: (boot if boot is not None else live) if config else live
+
+
 class TestDetonateCheck:
     def test_fails_when_internet_reachable(self, runner, mock_env):
         """The hard gate: guest can route out -> FAIL, non-zero exit."""
@@ -66,8 +76,8 @@ class TestDetonateCheck:
         assert "weird" in result.output
 
     def test_passes_gate_when_nic_unplugged(self, runner, mock_env):
-        """Link down (air-gap) also satisfies the gate."""
-        mock_env._vm.net_link_state.return_value = "down"
+        """Link down in BOTH scopes (persistent air-gap) satisfies the gate."""
+        mock_env._vm.net_link_state.side_effect = _link("down")
         mock_env.exec_powershell.side_effect = [
             _dns_result("192.168.122.1"),
             _defender_result("False"),
@@ -78,6 +88,46 @@ class TestDetonateCheck:
             result = runner.invoke(cli, ["detonate", "check"])
         assert result.exit_code == 0
         assert "air-gap" in result.output
+        assert "persists across reboot" in result.output
+
+    def test_fails_when_the_air_gap_is_not_persistent(self, runner, mock_env):
+        """Live-only unplug: a power cycle or BSOD reconnects the guest."""
+        mock_env._vm.net_link_state.side_effect = _link("down", boot="up")
+        with patch("winbox.cli.detonate.nwfilter.has_filter", return_value=False), \
+             patch("winbox.cli.detonate._cap_read_pidfile", return_value=None), \
+             patch("winbox.cli.detonate.sk.is_running", return_value=None):
+            result = runner.invoke(cli, ["detonate", "check"])
+        assert result.exit_code == 1
+        assert "Air-gap NOT persistent" in result.output
+        assert "net unplug" in result.output
+        assert "NOT safe to detonate" in result.output
+
+    def test_nwfilter_satisfies_the_gate_despite_a_link_mismatch(
+        self, runner, mock_env,
+    ):
+        """The filter is written live AND persistent, so it holds across a
+        power cycle regardless of link state — don't fail a safe lab."""
+        mock_env._vm.net_link_state.side_effect = _link("down", boot="up")
+        mock_env.exec_powershell.side_effect = [
+            _dns_result("192.168.122.1"),
+            _defender_result("False"),
+        ]
+        with patch("winbox.cli.detonate.nwfilter.has_filter", return_value=True), \
+             patch("winbox.cli.detonate._cap_read_pidfile", return_value=None), \
+             patch("winbox.cli.detonate.sk.is_running", return_value=None):
+            result = runner.invoke(cli, ["detonate", "check"])
+        assert result.exit_code == 0
+        assert "nwfilter attached" in result.output
+
+    def test_fails_when_the_link_state_is_unreadable(self, runner, mock_env):
+        """Silence is not safety: an unreadable link must not pass the gate."""
+        mock_env._vm.net_link_state.side_effect = _link(None)
+        with patch("winbox.cli.detonate.nwfilter.has_filter", return_value=False), \
+             patch("winbox.cli.detonate._cap_read_pidfile", return_value=None), \
+             patch("winbox.cli.detonate.sk.is_running", return_value=None):
+            result = runner.invoke(cli, ["detonate", "check"])
+        assert result.exit_code == 1
+        assert "Internet REACHABLE" in result.output
 
     def test_warns_but_safe_when_helpers_down(self, runner, mock_env):
         """Gate satisfied but capture/sinkhole/DNS/AV not ready -> warnings, exit 0."""

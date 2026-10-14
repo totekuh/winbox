@@ -305,9 +305,10 @@ winbox eventlogs clear --all -y                             # nuke (read-only / 
 
 ```bash
 # Isolation
-winbox net isolate           # disconnect VM from network (host-VM channels stay up)
-winbox net connect           # reconnect VM to network
-winbox net status            # show link state
+winbox net isolate           # block internet via nwfilter (host-VM channels stay up)
+winbox net unplug            # full air-gap: NIC link down, live + next boot
+winbox net connect           # reconnect VM to network (clears both scopes)
+winbox net status            # link (live and next boot), filter, internet
 
 # DNS
 winbox dns view              # show DNS on Kali and VM
@@ -439,9 +440,9 @@ User-mode primitives:
 | `mem_read(pid, address, length)` | Read memory from a process (enables SeDebugPrivilege, address as hex string, 1MB cap) |
 | `service_start(name)` | Start a Windows service |
 | `service_stop(name)` | Stop a Windows service |
-| `net_isolate()` | Disconnect VM from network (host-VM channels stay up) |
-| `net_connect()` | Reconnect VM to network (restarts adapter, renews DHCP) |
-| `net_unplug()` | Full air-gap (link down via virsh) |
+| `net_isolate()` | Disconnect VM from network (host-VM channels stay up; also clears a persistent unplug) |
+| `net_connect()` | Reconnect VM to network (restarts adapter, renews DHCP, clears the next-boot link state) |
+| `net_unplug()` | Full air-gap (NIC link down live + persistent — survives a reboot, BSOD or power cycle) |
 | `eventlogs(log?, since?, ids?, provider?, level?, max_events?)` | Query Windows event logs via Get-WinEvent (returns JSON array; CLI defaults to CSV) |
 | `eventlogs_clear(log?, all_logs?, confirm)` | Clear event channels via wevtutil cl. `confirm=True` required (destructive). |
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 import xml.etree.ElementTree as ET
@@ -15,6 +16,37 @@ if TYPE_CHECKING:
 # ``state`` attribute on this target and keeps it current as the agent
 # connects and drops — see ``agent_channel_connected``.
 _GUEST_AGENT_CHANNEL = "org.qemu.guest_agent.0"
+
+_MAC_RE = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
+
+
+def _parse_domiflist(stdout: str) -> list[tuple[str | None, str]]:
+    """Parse ``virsh domiflist`` output into ``[(host tap name, MAC)]``.
+
+    The MAC is read from the LAST field rather than a fixed column index:
+    ``--inactive`` prints the Interface column as ``-`` (the persistent XML
+    has no ``<target dev>``) and a non-``network`` interface type can leave
+    Source empty, so a fixed index drifts between the two listings. Rows
+    whose last field is not a MAC are skipped, which also drops the header
+    and rule lines without matching on their text.
+    """
+    nics: list[tuple[str | None, str]] = []
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not _MAC_RE.match(parts[-1]):
+            continue
+        tap = parts[0]
+        nics.append((None if tap == "-" else tap, parts[-1]))
+    return nics
+
+
+def _virsh_err(result: subprocess.CompletedProcess[str]) -> str:
+    """The stderr-or-stdout-or-exit-code detail reported when virsh fails."""
+    return (
+        result.stderr.strip()
+        or result.stdout.strip()
+        or f"virsh exit {result.returncode}"
+    )
 
 
 def agent_channel_connected(vm_name: str) -> bool:
@@ -74,12 +106,7 @@ def virsh_run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str
         check=False,
     )
     if check and result.returncode != 0:
-        msg = (
-            result.stderr.strip()
-            or result.stdout.strip()
-            or f"virsh exit {result.returncode}"
-        )
-        raise RuntimeError(f"virsh {' '.join(args)} failed: {msg}")
+        raise RuntimeError(f"virsh {' '.join(args)} failed: {_virsh_err(result)}")
     return result
 
 
@@ -327,38 +354,143 @@ class VM:
             return first_seen_ip
         return None
 
+    def nics(self, *, inactive: bool = False) -> list[tuple[str | None, str]]:
+        """Every NIC as ``(host tap name, MAC)``, in domain-XML order.
+
+        ``inactive=True`` reads the persistent config instead of the live
+        domain. The two lists can legitimately differ — a NIC hot-plugged
+        with ``attach-device --live`` has no persistent entry, one added with
+        ``--config`` does not exist live yet — which is why link writes
+        iterate the list belonging to their own scope.
+
+        Returns ``[]`` on any virsh failure, never a partial truth.
+        """
+        args = ["domiflist", self.name]
+        if inactive:
+            args.append("--inactive")
+        result = virsh_run(*args, check=False)
+        if result.returncode != 0:
+            return []
+        return _parse_domiflist(result.stdout)
+
+    def nic_macs(self, *, inactive: bool = False) -> list[str]:
+        """Every NIC's MAC address. ``[]`` on failure."""
+        return [mac for _tap, mac in self.nics(inactive=inactive)]
+
     def interface(self) -> str | None:
-        """Get the VM's network interface name (e.g. 'vnet0')."""
-        result = virsh_run("domiflist", self.name, check=False)
-        if result.returncode != 0:
-            return None
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line and not line.startswith("Interface") and not line.startswith("-"):
-                return line.split()[0]
+        """Get the VM's network interface name (e.g. 'vnet0').
+
+        This is the first NIC's host-side tap, which exists only while the
+        domain is running — a shut-off domain gives ``None``, which is what
+        ``ip()``'s "could not determine the target interface" branch already
+        means. Link operations go by MAC instead; see ``net_set_link``.
+        """
+        for tap, _mac in self.nics():
+            if tap:
+                return tap
         return None
 
-    def net_set_link(self, state: str) -> bool:
-        """Set network interface link state ('up' or 'down')."""
-        iface = self.interface()
-        if not iface:
-            return False
-        result = virsh_run("domif-setlink", self.name, iface, state, check=False)
-        return result.returncode == 0
+    def net_set_link(
+        self, state: str, *, live: bool = True, config: bool = True,
+    ) -> None:
+        """Set the link state ('up' or 'down') of every NIC, persistently.
 
-    def net_link_state(self) -> str | None:
-        """Get current network link state ('up' or 'down')."""
-        iface = self.interface()
-        if not iface:
+        ``domif-setlink`` has no ``--live``/``--persistent`` pair like
+        ``update-device`` does: with no flag the change is live-only and dies
+        with the domain, with ``--config`` it only lands in the persistent
+        config. Applying *and* persisting therefore takes two calls per NIC.
+        Both go by MAC, because the persistent XML has no ``<target dev>`` to
+        address (``--config`` on a tap name fails with "Interface (dev:
+        vnetN) not found").
+
+        The persistent scope is written first and the first failure aborts.
+        The one state this must never produce is live-down/config-up: it
+        reads as an air-gap and silently reconnects the guest on the next
+        power cycle. The reachable partial states are therefore
+        config-written/live-unchanged — the guest is visibly online now,
+        which is loud and safe.
+
+        Raises :class:`RuntimeError` naming the scope that failed and the
+        scope that did apply. Returns ``None`` on success; the old bool
+        return is exactly how the live-only write stayed quiet for this long.
+        """
+        if state not in ("up", "down"):
+            raise ValueError(f"link state must be 'up' or 'down', got {state!r}")
+        if not live and not config:
+            raise ValueError("at least one of live/config must be True")
+
+        if config:
+            macs = self.nic_macs(inactive=True)
+            if not macs:
+                raise RuntimeError(
+                    f"cannot persist link {state}: no network interface found in "
+                    f"{self.name}'s persistent config (virsh domiflist --inactive)"
+                )
+            for mac in macs:
+                result = virsh_run(
+                    "domif-setlink", self.name, mac, state, "--config", check=False,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"link {state} NOT applied: persistent write for {mac} "
+                        f"failed: {_virsh_err(result)}"
+                    )
+
+        if live:
+            prefix = (
+                f"link {state} persisted for next boot but" if config
+                else f"link {state}"
+            )
+            macs = self.nic_macs()
+            if not macs:
+                raise RuntimeError(
+                    f"{prefix} NOT applied live: no network interface found"
+                )
+            for mac in macs:
+                result = virsh_run(
+                    "domif-setlink", self.name, mac, state, check=False,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"{prefix} NOT applied live ({mac}): {_virsh_err(result)}"
+                    )
+
+    def net_link_states(
+        self, *, config: bool = False,
+    ) -> list[tuple[str, str | None]]:
+        """Per-NIC ``(MAC, 'up' | 'down' | None)`` for a single scope."""
+        states: list[tuple[str, str | None]] = []
+        for mac in self.nic_macs(inactive=config):
+            args = ["domif-getlink", self.name, mac]
+            if config:
+                args.append("--config")
+            result = virsh_run(*args, check=False)
+            if result.returncode != 0:
+                states.append((mac, None))
+                continue
+            # Output like: "52:54:00:aa:bb:cc up"
+            words = result.stdout.split()
+            state = next((w for w in words if w in ("up", "down")), None)
+            states.append((mac, state))
+        return states
+
+    def net_link_state(self, *, config: bool = False) -> str | None:
+        """Aggregate link state across every NIC: 'up', 'down' or None.
+
+        ``'up'`` if ANY NIC is up — one live NIC out of three is not an
+        air-gap — ``'down'`` only when every NIC is down, and ``None`` when
+        there was nothing to ask or a NIC did not answer, so a caller gating
+        on containment refuses instead of reading silence as safety.
+
+        ``config=True`` reads the next-boot state. NOTE: a *live* read against
+        a shut-off domain does not fail, it answers from the persistent XML —
+        so callers that need a genuinely live answer must check
+        ``state() == VMState.RUNNING`` themselves.
+        """
+        states = self.net_link_states(config=config)
+        if not states or any(s is None for _mac, s in states):
             return None
-        result = virsh_run("domif-getlink", self.name, iface, check=False)
-        if result.returncode != 0:
-            return None
-        # Output like: "vnet0 up" or "vnet0 down"
-        for word in result.stdout.strip().split():
-            if word in ("up", "down"):
-                return word
-        return None
+        return "up" if any(s == "up" for _mac, s in states) else "down"
 
     def snapshot_create(self, name: str) -> None:
         result = virsh_run(
