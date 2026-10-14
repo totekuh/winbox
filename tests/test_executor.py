@@ -265,3 +265,29 @@ class TestCredentialedExecCli:
         assert result.exit_code == 0
         assert run.call_args.kwargs["user"] == "alice"
         assert run.call_args.kwargs["password"] == "secret"
+
+
+class TestCredentialedShellCli:
+    def test_shell_forwards_user_and_password(self, runner, mock_env):
+        from winbox.cli import cli
+
+        with patch("winbox.cli.exec.open_shell") as mock_open:
+            result = runner.invoke(
+                cli,
+                ["shell", "--user", "alice", "--password", "secret"],
+            )
+
+        assert result.exit_code == 0
+        assert mock_open.call_args.kwargs["user"] == "alice"
+        assert mock_open.call_args.kwargs["password"] == "secret"
+
+    @pytest.mark.parametrize(
+        "options", [["--user", "alice"], ["--password", "secret"]],
+    )
+    def test_shell_requires_both_options(self, runner, mock_env, options):
+        from winbox.cli import cli
+
+        result = runner.invoke(cli, ["shell", *options])
+
+        assert result.exit_code != 0
+        assert "must be supplied together" in result.output

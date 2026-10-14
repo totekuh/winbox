@@ -80,10 +80,22 @@ def exec_cmd(
 @click.command()
 @click.option("--port", default=4444, help="Listener port for reverse shell.")
 @click.option("--pipe", is_flag=True, help="Pipe mode (no PTY). Use when tools need real pipe handles (e.g. RunasCs -P).")
+@click.option("--user", help="Run as this local Windows user.")
+@click.option("--password", help="Password for --user.")
 @needs_vm()
-def shell(cfg: Config, vm: VM, ga: GuestAgent, port: int, pipe: bool) -> None:
-    """Open an interactive SYSTEM shell in the VM (ConPTY reverse shell)."""
-    open_shell(cfg, ga, port=port, pipe_mode=pipe)
+def shell(
+    cfg: Config, vm: VM, ga: GuestAgent,
+    port: int, pipe: bool,
+    user: str | None, password: str | None,
+) -> None:
+    """Open an interactive shell in the VM (ConPTY reverse shell).
+
+    Runs as SYSTEM by default. Use --user/--password to spawn the shell
+    as a different local Windows user (via RunEx).
+    """
+    if (user is None) != (password is None):
+        raise click.UsageError("--user and --password must be supplied together")
+    open_shell(cfg, ga, port=port, pipe_mode=pipe, user=user, password=password)
 
 
 @click.command()

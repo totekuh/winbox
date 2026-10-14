@@ -44,8 +44,15 @@ def open_shell(
     *,
     port: int = DEFAULT_PORT,
     pipe_mode: bool = False,
+    user: str | None = None,
+    password: str | None = None,
 ) -> None:
-    """Open an interactive SYSTEM shell via ConPTY reverse connection."""
+    """Open an interactive shell via ConPTY reverse connection.
+
+    Runs as SYSTEM by default.  Pass *user* and *password* to spawn the
+    shell as a different local Windows user (delegated to RunEx by the
+    guest agent layer).
+    """
     if cfg.host_ip == "0.0.0.0":
         # Hard-fail: a typo'd HOST_IP=0.0.0.0 in ~/.winbox/config would
         # otherwise expose a SYSTEM-shell listener to the entire LAN
@@ -93,10 +100,11 @@ def open_shell(
 
     # Fire via guest agent — detached, the shell runs until we disconnect
     mode = "pipe" if pipe_mode else "ConPTY"
-    console.print(f"[blue][*][/] Launching reverse shell as SYSTEM ({mode})...")
+    identity = user or "SYSTEM"
+    console.print(f"[blue][*][/] Launching reverse shell as {identity} ({mode})...")
     shell_pid: int | None = None
     try:
-        shell_pid = ga.exec_detached(cmd)
+        shell_pid = ga.exec_detached(cmd, user=user, password=password)
     except Exception:
         server.close()
         console.print("[red][-][/] Failed to launch reverse shell via guest agent")
@@ -176,7 +184,7 @@ def open_shell(
             f"Rejected connection from {addr[0]} (expected VM at {expected_ip})"
         )
 
-    console.print("[green][+][/] SYSTEM shell ready — type 'exit' to close\n")
+    console.print(f"[green][+][/] {identity} shell ready — type 'exit' to close\n")
 
     # Enter raw terminal mode and relay I/O
     if pipe_mode:

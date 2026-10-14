@@ -236,6 +236,79 @@ class TestOpenShell:
         assert "-ExecutionPolicy Bypass" in cmd
 
 
+    @patch("winbox.exec.shell.VM")
+    @patch("winbox.exec.shell._relay")
+    @patch("winbox.exec.shell._ensure_conpty_on_share")
+    @patch("winbox.exec.shell.os.get_terminal_size")
+    @patch("winbox.exec.shell.socket.socket")
+    def test_user_password_forwarded_to_exec_detached(
+        self, mock_socket_cls, mock_termsize, mock_ensure, mock_relay,
+        mock_vm_cls, cfg,
+    ):
+        """open_shell forwards user/password kwargs to ga.exec_detached."""
+        mock_termsize.return_value = MagicMock(lines=24, columns=80)
+        mock_server = MagicMock()
+        mock_client = MagicMock()
+        mock_server.accept.return_value = (mock_client, ("192.168.122.100", 5555))
+        mock_socket_cls.return_value = mock_server
+        mock_vm_cls.return_value.ip.return_value = "192.168.122.100"
+        ga = MagicMock()
+
+        open_shell(cfg, ga, user="alice", password="secret")
+
+        _, kwargs = ga.exec_detached.call_args
+        assert kwargs["user"] == "alice"
+        assert kwargs["password"] == "secret"
+
+    @patch("winbox.exec.shell.VM")
+    @patch("winbox.exec.shell._relay")
+    @patch("winbox.exec.shell._ensure_conpty_on_share")
+    @patch("winbox.exec.shell.os.get_terminal_size")
+    @patch("winbox.exec.shell.socket.socket")
+    def test_no_user_passes_none(
+        self, mock_socket_cls, mock_termsize, mock_ensure, mock_relay,
+        mock_vm_cls, cfg,
+    ):
+        """Without user/password, exec_detached gets None for both."""
+        mock_termsize.return_value = MagicMock(lines=24, columns=80)
+        mock_server = MagicMock()
+        mock_client = MagicMock()
+        mock_server.accept.return_value = (mock_client, ("192.168.122.100", 5555))
+        mock_socket_cls.return_value = mock_server
+        mock_vm_cls.return_value.ip.return_value = "192.168.122.100"
+        ga = MagicMock()
+
+        open_shell(cfg, ga)
+
+        _, kwargs = ga.exec_detached.call_args
+        assert kwargs["user"] is None
+        assert kwargs["password"] is None
+
+    @patch("winbox.exec.shell.VM")
+    @patch("winbox.exec.shell._relay")
+    @patch("winbox.exec.shell._ensure_conpty_on_share")
+    @patch("winbox.exec.shell.os.get_terminal_size")
+    @patch("winbox.exec.shell.socket.socket")
+    def test_status_shows_username_when_user_set(
+        self, mock_socket_cls, mock_termsize, mock_ensure, mock_relay,
+        mock_vm_cls, cfg, capsys,
+    ):
+        """Status messages show username instead of SYSTEM when user is set."""
+        mock_termsize.return_value = MagicMock(lines=24, columns=80)
+        mock_server = MagicMock()
+        mock_client = MagicMock()
+        mock_server.accept.return_value = (mock_client, ("192.168.122.100", 5555))
+        mock_socket_cls.return_value = mock_server
+        mock_vm_cls.return_value.ip.return_value = "192.168.122.100"
+        ga = MagicMock()
+
+        open_shell(cfg, ga, user="alice", password="secret")
+
+        out = capsys.readouterr().out
+        assert "alice" in out
+        assert "SYSTEM" not in out
+
+
 # ─── _relay TTY guard ────────────────────────────────────────────────────────
 
 

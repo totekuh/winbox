@@ -310,6 +310,12 @@ class TestCredentialedExec:
         )
         assert f"winbox\\{self.USER}" in result.output.lower()
 
+    def test_shell_help_accepts_user_flag(self, run):
+        """Verify --user/--password are recognized by ``winbox shell --help``."""
+        result = run("shell", "--help", expect_ok=True)
+        assert "--user" in result.output
+        assert "--password" in result.output
+
     def test_mcp_exec_python_and_powershell_run_as_local_user(self, tool):
         expected = f"winbox\\{self.USER}".lower()
 
@@ -798,17 +804,69 @@ class TestNetwork:
         assert "up" in run("net", "status").output.lower()
         assert "replugged" in ga.exec("echo replugged", timeout=90).stdout
 
+    def test_unplug_persists_to_the_next_boot(self, run, vm):
+        """`domif-setlink` with no --config is live-only: the NIC used to come
+        back on the next boot while `net unplug` claimed a full air-gap."""
+        run("net", "unplug")
+        try:
+            out = run("net", "status").output.lower()
+            assert "down" in out
+            assert "next boot: up" not in out
+            assert vm.net_link_state() == "down"
+            assert vm.net_link_state(config=True) == "down"
+        finally:
+            run("net", "connect")
+        # connect must clear BOTH scopes, or the VM boots with no NIC.
+        assert vm.net_link_state() == "up"
+        assert vm.net_link_state(config=True) == "up"
+
+    def test_unplug_survives_a_guest_reboot(self, run, vm, ga):
+        run("net", "unplug")
+        try:
+            # The guest reboots itself — the case malware can trigger. The
+            # reboot command never returns cleanly over a dying channel.
+            try:
+                ga.exec("shutdown /r /t 0", timeout=10)
+            except Exception:
+                pass
+            time.sleep(10)
+            ga.wait(timeout=420)
+            assert vm.net_link_state() == "down"
+            assert vm.net_link_state(config=True) == "down"
+        finally:
+            run("net", "connect")
+        assert "replugged" in ga.exec("echo replugged", timeout=90).stdout
+
+    def test_isolate_clears_a_persistent_unplug(self, run, vm):
+        """unplug -> isolate must not leave a next-boot link-down behind:
+        the VM would boot with no NIC while the filter claims Kali <-> VM
+        access works."""
+        run("net", "unplug")
+        try:
+            run("net", "isolate")
+            assert vm.net_link_state() == "up"
+            assert vm.net_link_state(config=True) == "up"
+        finally:
+            run("net", "connect")
+
+    def test_status_reports_both_scopes(self, run, vm):
+        out = run("net", "status").output.lower()
+        assert "link:" in out
+        assert vm.net_link_state(config=True) == "up"
+
     def test_mcp_net_isolate_and_connect(self, tool):
         try:
             assert "isolat" in tool("net_isolate")().lower()
         finally:
             assert "connect" in tool("net_connect")().lower()
 
-    def test_mcp_net_unplug(self, tool, run, ga):
+    def test_mcp_net_unplug(self, tool, run, ga, vm):
         try:
-            tool("net_unplug")()
+            assert "next boot" in tool("net_unplug")()
+            assert vm.net_link_state(config=True) == "down"
         finally:
             tool("net_connect")()
+        assert vm.net_link_state(config=True) == "up"
         assert "up" in run("net", "status").output.lower()
         assert "replugged" in ga.exec("echo replugged", timeout=90).stdout
 
@@ -1987,3 +2045,23 @@ class TestLifecycleTeardown:
         assert vm.agent_connected() is False
         run("up")
         assert "back-up" in ga.exec("echo back-up", timeout=60).stdout
+
+    def test_unplug_survives_a_power_cycle(self, run, vm, ga):
+        """The original bug end to end: a destroy/start cycle (what a guest
+        poweroff or a BSOD does, via on_poweroff/on_crash=destroy) used to
+        drop the air-gap because only the live XML held the link down."""
+        run("net", "unplug")
+        try:
+            run("down")
+            assert vm.state() != VMState.RUNNING
+            # The VM-off status path: next-boot state only, no live read.
+            out = run("net", "status").output.lower()
+            assert "next boot" in out
+            assert "down" in out
+            run("up")
+            ga.wait(timeout=420)
+            assert vm.net_link_state() == "down"
+            assert vm.net_link_state(config=True) == "down"
+        finally:
+            run("net", "connect")
+        assert "cycled-ok" in ga.exec("echo cycled-ok", timeout=90).stdout
