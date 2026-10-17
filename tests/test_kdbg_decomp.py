@@ -1386,7 +1386,7 @@ def test_daemon_module_at_uses_fresh_user_loader_walk(monkeypatch, tmp_path):
     session = _session(tmp_path)
 
     @contextmanager
-    def snapshot(*args):
+    def snapshot(*args, **kwargs):
         yield object()
 
     monkeypatch.setattr("winbox.kdbg.debugger.reader.use_local_rsp", snapshot)
@@ -1407,7 +1407,7 @@ def test_daemon_module_at_uses_kernel_walk_and_smallest_overlap(monkeypatch, tmp
     session = _session(tmp_path)
 
     @contextmanager
-    def snapshot(*args):
+    def snapshot(*args, **kwargs):
         yield object()
 
     monkeypatch.setattr("winbox.kdbg.debugger.reader.use_local_rsp", snapshot)
@@ -1427,7 +1427,7 @@ def test_daemon_module_walk_restore_failure_poisons_session(monkeypatch, tmp_pat
     session = _session(tmp_path)
 
     @contextmanager
-    def broken(*args):
+    def broken(*args, **kwargs):
         yield object()
         raise ReaderError("register restore rejected")
 
@@ -1442,7 +1442,7 @@ def test_daemon_module_at_rejects_unmapped_and_invalid_addresses(monkeypatch, tm
     session = _session(tmp_path)
 
     @contextmanager
-    def snapshot(*args):
+    def snapshot(*args, **kwargs):
         yield object()
 
     monkeypatch.setattr("winbox.kdbg.debugger.reader.use_local_rsp", snapshot)

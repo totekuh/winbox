@@ -506,9 +506,10 @@ class _RemoteSnapshot(DebugSnapshot):
 class _LocalRspSnapshot(DebugSnapshot):
     """Snapshot adapter for code already owning a halted RSP connection."""
 
-    def __init__(self, vm_name: str, rsp: RspClient, stop: StopReply):
+    def __init__(self, vm_name: str, rsp: RspClient, stop: StopReply, *, pagewalk: bool = False):
         self.vm_name = vm_name
         self.rsp = rsp
+        self._pagewalk = pagewalk
         threads = rsp.list_threads()
         if not threads:
             raise ReaderError("gdbstub returned no vCPUs")
@@ -617,16 +618,83 @@ class _LocalRspSnapshot(DebugSnapshot):
         if cached is not None:
             self._cache_hits += 1
             return cached
-        self._set_cr3(cr3)
-        data = self.rsp.read_memory(addr, length)
+        if self._pagewalk:
+            data = self._read_virtual_pagewalk(cr3, addr, length)
+        else:
+            self._set_cr3(cr3)
+            data = self.rsp.read_memory(addr, length)
         self._transport_read_count += 1
         self._transport_bytes_read += len(data)
-        # Exact-range caching is intentionally conservative.  It cannot change
-        # read semantics, only collapse duplicate reads within one halted stop.
         if 0 < len(data) <= 4096 and self._virtual_cache_bytes + len(data) <= _SNAPSHOT_CACHE_MAX_BYTES:
             self._virtual_cache[key] = data
             self._virtual_cache_bytes += len(data)
         return data
+
+    def _read_virtual_pagewalk(self, cr3: int, addr: int, length: int) -> bytes:
+        from winbox.kdbg.memory import (
+            PAGE_SIZE, PAGE_MASK, PHYS_ADDR_MASK,
+            PTE_PRESENT, PTE_LARGE, _pte_index, _is_canonical_x64_4level,
+            PageWalkError,
+        )
+        out = bytearray()
+        remaining = length
+        cursor = addr
+        pte_cache: dict[int, int] = {}
+        while remaining > 0:
+            pa = self._walk_va(
+                cr3, cursor, pte_cache,
+                PAGE_MASK, PHYS_ADDR_MASK, PTE_PRESENT, PTE_LARGE,
+                _pte_index, _is_canonical_x64_4level, PageWalkError,
+            )
+            to_page_end = PAGE_SIZE - (pa & (PAGE_SIZE - 1))
+            take = min(remaining, to_page_end)
+            chunk = self.read_physical(pa, take)
+            out.extend(chunk)
+            cursor += len(chunk)
+            remaining -= len(chunk)
+        return bytes(out)
+
+    def _walk_va(
+        self, cr3: int, va: int, cache: dict[int, int],
+        PAGE_MASK, PHYS_ADDR_MASK, PTE_PRESENT, PTE_LARGE,
+        _pte_index, _is_canonical, PageWalkError,
+    ) -> int:
+        if not _is_canonical(va):
+            raise PageWalkError(f"non-canonical VA 0x{va:x}")
+        def pte_at(table_pa: int, index: int) -> int:
+            entry_pa = table_pa + index * 8
+            cached = cache.get(entry_pa)
+            if cached is not None:
+                return cached
+            raw = self.read_physical(entry_pa, 8)
+            val = int.from_bytes(raw, "little")
+            cache[entry_pa] = val
+            return val
+
+        pml4_pa = cr3 & ~PAGE_MASK & PHYS_ADDR_MASK
+        pml4e = pte_at(pml4_pa, _pte_index(va, 4))
+        if not (pml4e & PTE_PRESENT):
+            raise PageWalkError(f"PML4E not present for VA 0x{va:x}")
+
+        pdpt_pa = pml4e & 0x000FFFFFFFFFF000
+        pdpte = pte_at(pdpt_pa, _pte_index(va, 3))
+        if not (pdpte & PTE_PRESENT):
+            raise PageWalkError(f"PDPTE not present for VA 0x{va:x}")
+        if pdpte & PTE_LARGE:
+            return (pdpte & 0x000FFFFFC0000000) | (va & 0x3FFFFFFF)
+
+        pd_pa = pdpte & 0x000FFFFFFFFFF000
+        pde = pte_at(pd_pa, _pte_index(va, 2))
+        if not (pde & PTE_PRESENT):
+            raise PageWalkError(f"PDE not present for VA 0x{va:x}")
+        if pde & PTE_LARGE:
+            return (pde & 0x000FFFFFFFE00000) | (va & 0x1FFFFF)
+
+        pt_pa = pde & 0x000FFFFFFFFFF000
+        pte = pte_at(pt_pa, _pte_index(va, 1))
+        if not (pte & PTE_PRESENT):
+            raise PageWalkError(f"PTE not present for VA 0x{va:x}")
+        return (pte & 0x000FFFFFFFFFF000) | (va & PAGE_MASK)
 
     def read_physical(self, addr: int, length: int) -> bytes:
         self._set_physical(True)
@@ -715,14 +783,14 @@ def snapshot_phase(name: str) -> Iterator[None]:
 
 @contextmanager
 def use_local_rsp(
-    vm_name: str, rsp: RspClient, stop: StopReply,
+    vm_name: str, rsp: RspClient, stop: StopReply, *, pagewalk: bool = False,
 ) -> Iterator[DebugSnapshot]:
     """Expose an already halted RSP connection to walkers in this process."""
     existing = current_snapshot(vm_name)
     if existing is not None:
         yield existing
         return
-    snapshot = _LocalRspSnapshot(vm_name, rsp, stop)
+    snapshot = _LocalRspSnapshot(vm_name, rsp, stop, pagewalk=pagewalk)
     token = _active_snapshot.set(snapshot)
     try:
         yield snapshot
@@ -744,7 +812,10 @@ class _ReaderBroker:
     def _halt_snapshot(self) -> tuple[StopReply, _LocalRspSnapshot]:
         self.rsp.interrupt()
         stop = self.rsp.wait_for_stop(timeout=10.0)
-        return stop, _LocalRspSnapshot(self.cfg.vm_name, self.rsp, stop)
+        return stop, _LocalRspSnapshot(
+            self.cfg.vm_name, self.rsp, stop,
+            pagewalk=self.cfg.kdbg_pagewalk,
+        )
 
     def serve(self, listener: socket.socket) -> None:
         listener.settimeout(0.5)

@@ -259,10 +259,10 @@ def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
     gives the IDT anchor without issuing HMP ``info registers``.  Candidate
     KPCRs and CR3s are validated by the IDT handler and final MZ header.
     """
-    rva = nt_syms.get("KiDivideErrorFault")
+    rva = nt_syms.get("KiDivideErrorFaultShadow") or nt_syms.get("KiDivideErrorFault")
     if rva is None:
         raise SymbolLoadError(
-            "KiDivideErrorFault missing from PDB publics — "
+            "KiDivideErrorFault[Shadow] missing from PDB publics — "
             "this PDB may not be ntkrnlmp"
         )
 

@@ -4530,12 +4530,12 @@ def kdbg_session() -> dict[str, Any]:
     cfg = _kdbg_cfg_only()
     client = _kdbg_client(cfg)
     if not client.session_alive():
-        return _research_ok({"attached": False})
+        return _research_ok({"attached": False, "pagewalk": cfg.kdbg_pagewalk})
     try:
         result = client.call("status")
     except _ClientError as e:
         return _research_error(e, operation="kdbg_session")
-    return _research_ok({"attached": True, **result})
+    return _research_ok({"attached": True, "pagewalk": cfg.kdbg_pagewalk, **result})
 
 
 @mcp.tool()

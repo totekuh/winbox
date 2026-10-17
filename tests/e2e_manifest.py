@@ -150,6 +150,11 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg start": (LIVE, ""),
     "kdbg stop": (LIVE, ""),
     "kdbg status": (LIVE, ""),
+    "kdbg pagewalk": (
+        EXCLUDED,
+        "config-only toggle (status/on/off) persisted via cfg.persist; the CR3 "
+        "page-walk read path itself is unit-tested (tests/test_kdbg_memory.py)",
+    ),
     "kdbg context": (
         EXCLUDED,
         "same daemon operation is exercised live through kdbg_context; CLI JSON is unit-tested",
@@ -365,6 +370,7 @@ CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "kdbg cont-poll": "tests/test_kdbg_continue_job.py",
     "kdbg cont-cancel": "tests/test_kdbg_continue_job.py",
     "kdbg step": "tests/test_kdbg_daemon.py",
+    "kdbg pagewalk": "tests/test_kdbg_memory.py",
     "kdbg interrupt": "tests/test_kdbg_daemon.py",
     "kdbg context": "tests/test_kdbg_daemon.py",
     "kdbg bp-trace": "tests/test_kdbg.py",

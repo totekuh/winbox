@@ -21,6 +21,7 @@ class Config:
 
     vm_name: str = "winbox"
     vm_os: str = DEFAULT_OS
+    kdbg_pagewalk: bool = False
     # VM display stack. "vnc" (default) is plain VNC + the libvirt-default
     # video model. "spice" switches to SPICE + QXL + spice-guest-tools
     # (vdagent) for dynamic resolution and host<->guest clipboard. NOTE:
@@ -188,8 +189,10 @@ class Config:
             "HOST_IP": "host_ip",
             "WINBOX_DIR": "winbox_dir",
             "VIRTIO_ISO_URL": "virtio_iso_url",
+            "KDBG_PAGEWALK": "kdbg_pagewalk",
         }
         int_fields = {"vm_ram", "vm_cpus", "vm_disk"}
+        bool_fields = {"kdbg_pagewalk"}
         path_fields = {"winbox_dir"}
 
         for lineno, raw in enumerate(path.read_text().splitlines(), start=1):
@@ -243,6 +246,8 @@ class Config:
                     )
                     continue
                 setattr(cfg, attr, parsed)
+            elif attr in bool_fields:
+                setattr(cfg, attr, value.lower() in ("1", "true", "yes", "on"))
             elif attr in path_fields:
                 setattr(cfg, attr, Path(value))
             elif attr == "vm_os":

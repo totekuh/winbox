@@ -233,6 +233,29 @@ def kdbg_stop(ctx: click.Context) -> None:
     console.print("[green][+][/] gdb stub stopped")
 
 
+@kdbg.command("pagewalk")
+@click.argument("state", type=click.Choice(["on", "off", "status"]), default="status")
+@click.pass_context
+def kdbg_pagewalk(ctx: click.Context, state: str) -> None:
+    """Toggle manual page-table walk mode for virtual memory reads.
+
+    When ON, kdbg translates virtual addresses by walking x86-64 page
+    tables through physical memory reads instead of relying on QEMU's
+    gdbstub VA translation. Fixes E14 errors on KVM with Hyper-V
+    enlightenments where the gdbstub cannot translate kernel VAs.
+    """
+    cfg: Config = ctx.obj["cfg"]
+    if state == "status":
+        mode = "ON" if cfg.kdbg_pagewalk else "OFF"
+        console.print(f"pagewalk mode: [bold]{mode}[/bold]")
+        return
+    enabled = state == "on"
+    cfg.persist("KDBG_PAGEWALK", "1" if enabled else "0")
+    mode = "ON" if enabled else "OFF"
+    console.print(f"[green][+][/] pagewalk mode set to [bold]{mode}[/bold]")
+    console.print("Restart kdbg reader for the change to take effect.")
+
+
 @kdbg.command("status")
 @click.option("--port", default=1234, show_default=True, help="Port to probe.")
 @click.pass_context

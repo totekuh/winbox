@@ -147,6 +147,7 @@ class FakeStore:
 class FakeCfg:
     """Minimal Config stand-in. Daemon ops only read .vm_name."""
     vm_name = "winbox"
+    kdbg_pagewalk = False
 
 
 def _make_session(rsp=None, store=None, target=None, manifest=None) -> DaemonSession:

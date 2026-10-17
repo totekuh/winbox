@@ -93,6 +93,7 @@ class FakeStore:
 
 class FakeCfg:
     vm_name = "winbox"
+    kdbg_pagewalk = False
 
 
 @pytest.fixture

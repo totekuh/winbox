@@ -2490,7 +2490,7 @@ class DaemonSession:
         )
         walk_completed = False
         try:
-            with use_local_rsp(self.cfg.vm_name, self.rsp, stop):
+            with use_local_rsp(self.cfg.vm_name, self.rsp, stop, pagewalk=self.cfg.kdbg_pagewalk):
                 cache = WalkCache()
                 if kind == "kernel":
                     modules = list_modules(
@@ -2539,7 +2539,7 @@ class DaemonSession:
         current = None
         errors = []
         try:
-            with use_local_rsp(self.cfg.vm_name, self.rsp, stop):
+            with use_local_rsp(self.cfg.vm_name, self.rsp, stop, pagewalk=self.cfg.kdbg_pagewalk):
                 cache = WalkCache()
                 try:
                     direct = read_process_identity(
@@ -4123,7 +4123,7 @@ def fork_daemon(
         from winbox.kdbg.debugger.reader import use_local_rsp
         from winbox.kdbg.symbols import ensure_nt_base_current
         from winbox.kdbg.walk import find_process
-        with use_local_rsp(cfg.vm_name, rsp, initial_sr):
+        with use_local_rsp(cfg.vm_name, rsp, initial_sr, pagewalk=cfg.kdbg_pagewalk):
             ensure_nt_base_current(cfg, store)
             target_rec = find_process(cfg.vm_name, store, pid=target_pid)
         if target_rec is None:
@@ -4159,7 +4159,7 @@ def fork_daemon(
             create_time=target_rec.create_time,
         )
 
-        with use_local_rsp(cfg.vm_name, rsp, initial_sr):
+        with use_local_rsp(cfg.vm_name, rsp, initial_sr, pagewalk=cfg.kdbg_pagewalk):
             _validate_module_bases(cfg, rsp, target, store)
 
         listen_sock = _bind_unix_socket(sock_path(cfg))
