@@ -236,9 +236,9 @@ PYTHON_EXE = "python-3.13.13-amd64.exe"
 PYTHON_EMBED_URL = "https://www.python.org/ftp/python/3.13.13/python-3.13.13-embed-amd64.zip"
 PYTHON_EMBED_ZIP = "python-3.13.13-embed-amd64.zip"
 
-RUNEX_URL = "https://github.com/totekuh/RunEx/releases/download/v2.1/RunEx.exe"
+RUNEX_URL = "https://github.com/totekuh/RunEx/releases/download/v2.1.1/RunEx.exe"
 RUNEX_EXE = "RunEx.exe"
-RUNEX_SHA256 = "f1603cdbdc7a2fa20aeb94f09f0002d91ee968cb0021534fde3d54bb2bca59a7"
+RUNEX_SHA256 = "74a884a5395c47fc76caea449f3bf7ab0bf20187c3eccfc9bf80af3609cf39bb"
 
 X64DBG_URL = (
     "https://github.com/x64dbg/x64dbg/releases/download/2025.08.19/"

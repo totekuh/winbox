@@ -345,7 +345,7 @@ class TestDownloads:
         assert not part.exists()
 
     def test_runex_release_is_pinned(self):
-        assert "/releases/download/v2.1/RunEx.exe" in RUNEX_URL
+        assert "/releases/download/v2.1.1/RunEx.exe" in RUNEX_URL
         assert len(RUNEX_SHA256) == 64
 
     @patch("winbox.setup.installer.subprocess.run")
