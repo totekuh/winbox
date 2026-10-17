@@ -4064,7 +4064,7 @@ class TestKdbgDaemonTools:
         client = self._client_with(alive=False)
         with patch("winbox.mcp._kdbg_client", return_value=client):
             result = kdbg_session()
-        assert _mcp_result(result) == {"attached": False}
+        assert _mcp_result(result) == {"attached": False, "pagewalk": False}
 
     def test_session_when_attached(self, mock_mcp):
         from winbox.mcp import kdbg_session
@@ -4717,17 +4717,25 @@ class TestReadmeToolCount:
         from winbox.mcp import mcp
 
         tools = {t.name for t in asyncio.run(mcp.list_tools())}
-        readme = self._readme()
+        import pathlib
 
-        m = re.search(r"\*\*Available tools \((\d+)\):\*\*", readme)
-        assert m, "README no longer states the detailed-table tool count in the expected form"
+        doc = pathlib.Path(__file__).resolve().parents[1] / "docs" / "mcp-tools.md"
+        if not doc.exists():
+            import pytest
+
+            pytest.skip("docs/mcp-tools.md not present (installed package)")
+        content = doc.read_text(encoding="utf-8")
+
+        m = re.search(r"^## Available tools \((\d+)\)\s*$", content, re.M)
+        assert m, "docs/mcp-tools.md no longer states the detailed-table tool count in the expected form"
         assert int(m.group(1)) == len(tools), (
-            f"README's detailed table header says {m.group(1)} tools but {len(tools)} are registered"
+            f"docs/mcp-tools.md table header says {m.group(1)} tools but {len(tools)} are registered"
         )
 
-        section = readme.split(f"**Available tools ({m.group(1)}):**", 1)[1]
-        section = section.split("## Architecture", 1)[0]
-        listed = set(re.findall(r"`([a-z_]+)\(", section))
+        # The detailed table runs from that heading to end of file (the
+        # kdbg subsections are ###/#### inside the section).
+        section = content.split(m.group(0), 1)[1]
+        listed = set(re.findall(r"`([a-z_0-9]+)\(", section))
         missing = tools - listed
         assert not missing, f"registered tools missing from the detailed table: {sorted(missing)}"
 
