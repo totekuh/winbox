@@ -6,7 +6,7 @@ winbox turns a headless Windows VM (Server Core 2022/2025 or Windows 11) into
 an automation, instrumentation, and analysis environment controlled from
 Kali. Execute tools, drive a PDB-aware hypervisor debugger, inspect protected
 memory, exercise drivers and IPC, change security posture, contain malware,
-and collect evidence through one CLI and a 97-tool MCP surface.
+and collect evidence through one CLI and a 109-tool MCP surface.
 
 Transparent execution is still the shortest path in: type
 `winbox exec SharpHound.exe -c All -d corp.local` and winbox boots the VM,
@@ -39,7 +39,7 @@ PS C:\Windows\system32>
 
 ## Platform capabilities
 
-- **MCP server** — 97 tools form a bounded, AI-native research control plane
+- **MCP server** — 109 tools form a bounded, AI-native research control plane
   for autonomous agents, covering VM lifecycle, execution, memory, symbols,
   debugging, drivers, IPC, defenses, networking, event logs, and evidence
   collection.
@@ -362,7 +362,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-**Available tools (97):**
+**Available tools (109):**
 
 User-mode primitives:
 
@@ -403,6 +403,23 @@ HVCI / Virtualization Based Security:
 | `hvci_status(timeout?)` | Report HVCI/VBS state (DeviceGuard registry keys + bcdedit hypervisorlaunchtype) |
 | `hvci_disable(confirm)` | Disable HVCI and VBS — sets registry keys + bcdedit then reboots the VM. `confirm=True` required. |
 | `hvci_enable(confirm)` | Re-enable HVCI and VBS. Reboots the VM. `confirm=True` required. |
+
+SMB shares and local users:
+
+| Tool | Description |
+|------|-------------|
+| `share_create(name, path?, full_access?, change_access?, read_access?)` | Create an SMB share (creates backing folder if missing) |
+| `share_delete(name, purge?, confirm?)` | Remove an SMB share; `purge=True` also deletes the backing folder |
+| `share_list()` | List non-special SMB shares (name, path, description) |
+| `share_grant(name, user, permission?)` | Grant Full/Change/Read access to a share |
+| `share_revoke(name, user)` | Revoke an account's access to a share |
+| `share_ls(name, path?)` | List files inside a share's backing folder |
+| `share_mkdir(name, path)` | Create a directory inside a share |
+| `share_write(name, path, content?, source?)` | Write a file inside a share (inline or upload from Kali) |
+| `share_rm(name, path, confirm)` | Delete a file or directory inside a share. `confirm=True` required. |
+| `user_create(username, password, full_name?, no_password_expire?)` | Create a local Windows user |
+| `user_delete(username, confirm)` | Delete a local Windows user. `confirm=True` required. |
+| `user_list()` | List local Windows users (name, enabled, last logon) |
 
 Named pipes:
 
@@ -556,7 +573,7 @@ canonical target and counters, and `kdbg_bp_trace` to page/filter the evidence.
 Kali Linux
 ├── winbox control plane
 │   ├── CLI (Python/Click)
-│   └── MCP server (97 bounded agent tools)
+│   └── MCP server (109 bounded agent tools)
 ├── hypervisor research plane
 │   ├── QMP/HMP ────────────> VM + gdbstub lifecycle
 │   ├── persistent RSP ─────> vCPUs, memory, break/watchpoints, stepping
