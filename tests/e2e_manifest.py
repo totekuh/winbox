@@ -95,6 +95,22 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
                               "controller and credentials"),
     "domain leave": (EXCLUDED, "needs a domain-joined guest; see domain join"),
 
+    # Share / user
+    "share": (GROUP, ""),
+    "user": (GROUP, ""),
+    "share create": (LIVE, ""),
+    "share delete": (LIVE, "including --purge"),
+    "share list": (LIVE, ""),
+    "share grant": (LIVE, ""),
+    "share revoke": (LIVE, ""),
+    "share ls": (LIVE, ""),
+    "share mkdir": (LIVE, ""),
+    "share write": (LIVE, "both --content and --source paths"),
+    "share rm": (LIVE, ""),
+    "user create": (LIVE, ""),
+    "user delete": (LIVE, ""),
+    "user list": (LIVE, ""),
+
     # Target
     "applocker status": (LIVE, ""),
     "applocker enable": (LIVE, ""),
@@ -254,6 +270,20 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "net_isolate": (LIVE, ""),
     "net_connect": (LIVE, ""),
     "net_unplug": (LIVE, "including the persistent (next-boot) write"),
+
+    # Share / user
+    "share_create": (LIVE, ""),
+    "share_delete": (LIVE, "including purge confirmation guard"),
+    "share_list": (LIVE, ""),
+    "share_grant": (LIVE, ""),
+    "share_revoke": (LIVE, ""),
+    "share_ls": (LIVE, ""),
+    "share_mkdir": (LIVE, ""),
+    "share_write": (LIVE, "both inline content and source upload"),
+    "share_rm": (LIVE, "confirmation guard"),
+    "user_create": (LIVE, ""),
+    "user_delete": (LIVE, "confirmation guard"),
+    "user_list": (LIVE, ""),
 
     # Named-pipe broker
     "pipe_list": (LIVE, ""),

@@ -597,7 +597,7 @@ class TestKdbgDoctor:
 
         assert result.exit_code == 0, result.output
         assert json.loads(result.output) == report
-        assert doctor.call_args.kwargs["tool_count"] == 97
+        assert doctor.call_args.kwargs["tool_count"] == 109
 
 
 class TestKdbgVadExtract:

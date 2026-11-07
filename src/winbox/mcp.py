@@ -2052,6 +2052,603 @@ def net_connect() -> str:
     return "Network connected (DHCP pending)"
 
 
+# ─── Tool 9b: share / user management ────────────────────────────────────────
+
+import re as _re
+
+_SHARE_NAME_RE = _re.compile(r"^[A-Za-z0-9_.\-]{1,80}$")
+_USERNAME_RE = _re.compile(r"^[A-Za-z0-9_.\- ]{1,20}$")
+
+
+def _validate_share_name(name: str) -> None:
+    if not _SHARE_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid share name: {name!r} "
+            "(alphanumeric, hyphens, underscores, dots; max 80 chars)"
+        )
+
+
+def _validate_mcp_username(username: str) -> None:
+    if not _USERNAME_RE.match(username):
+        raise ValueError(
+            f"Invalid username: {username!r} "
+            "(alphanumeric, hyphens, underscores, dots, spaces; max 20 chars)"
+        )
+
+
+def _validate_share_relpath(path: str) -> str:
+    if not path:
+        raise ValueError("Path cannot be empty")
+    normalized = path.replace("/", "\\")
+    if _re.match(r"^[A-Za-z]:", normalized) or normalized.startswith("\\"):
+        raise ValueError(f"Path must be relative, not absolute: {path!r}")
+    for part in normalized.split("\\"):
+        if part == "..":
+            raise ValueError(f"Path traversal not allowed: {path!r}")
+    if _re.search(r'[<>"|?*:]', normalized):
+        raise ValueError(f"Invalid characters in path: {path!r}")
+    return normalized
+
+
+def _share_guarded_script(share_name: str, relpath: str, action_lines: str) -> str:
+    from winbox.ps import ps_quote
+    return (
+        f"$base = (Get-SmbShare -Name '{ps_quote(share_name)}' -ErrorAction Stop).Path\n"
+        f"$full = [IO.Path]::GetFullPath((Join-Path $base '{ps_quote(relpath)}'))\n"
+        "if (-not $full.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) {\n"
+        "    Write-Error 'Path escapes share boundary'; exit 1\n"
+        "}\n"
+        f"{action_lines}"
+    )
+
+
+def _build_share_access_params(
+    full_access: list[str] | None,
+    change_access: list[str] | None,
+    read_access: list[str] | None,
+) -> str:
+    from winbox.ps import ps_quote
+    parts: list[str] = []
+    if full_access:
+        quoted = ",".join(f"'{ps_quote(u)}'" for u in full_access)
+        parts.append(f"-FullAccess {quoted}")
+    if change_access:
+        quoted = ",".join(f"'{ps_quote(u)}'" for u in change_access)
+        parts.append(f"-ChangeAccess {quoted}")
+    if read_access:
+        quoted = ",".join(f"'{ps_quote(u)}'" for u in read_access)
+        parts.append(f"-ReadAccess {quoted}")
+    return " ".join(parts)
+
+
+@mcp.tool()
+def share_create(
+    name: str,
+    path: str | None = None,
+    full_access: list[str] | None = None,
+    change_access: list[str] | None = None,
+    read_access: list[str] | None = None,
+    timeout: int = 30,
+) -> str:
+    """Create an SMB share on the Windows VM.
+
+    Creates the backing folder if it does not exist, then registers
+    the SMB share with the specified access controls.
+
+    Args:
+        name: Share name (e.g. 'Data'). Alphanumeric, hyphens, underscores, dots.
+        path: Backing folder path on the VM (default: C:\\Shares\\<name>).
+        full_access: Accounts with FullAccess (default: ['Everyone']).
+        change_access: Accounts with Change access.
+        read_access: Accounts with Read access.
+        timeout: Execution timeout in seconds (default 30).
+    """
+    from winbox.ps import ps_quote, render_ps
+
+    _validate_share_name(name)
+    if path is None:
+        path = f"C:\\Shares\\{name}"
+    if not full_access and not change_access and not read_access:
+        full_access = ["Everyone"]
+
+    access_params = _build_share_access_params(full_access, change_access, read_access)
+
+    cfg, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        result = ga.exec_powershell(
+            render_ps("share_create",
+                      share_name=ps_quote(name),
+                      path=ps_quote(path),
+                      access_params=access_params),
+            timeout=timeout,
+        )
+    if result.exitcode != 0:
+        return _format_exec_result(result)
+
+    import json as _json
+    return _json.dumps({
+        "name": name,
+        "path": path,
+        "full_access": full_access or [],
+        "change_access": change_access or [],
+        "read_access": read_access or [],
+    })
+
+
+@mcp.tool()
+def share_delete(
+    name: str,
+    purge: bool = False,
+    confirm: bool = False,
+    timeout: int = 30,
+) -> str:
+    """Remove an SMB share from the Windows VM.
+
+    With purge=True, also deletes the backing folder and all its contents.
+    Requires confirm=True when purge is set, as a guard against accidental
+    data loss.
+
+    Args:
+        name: Share name to remove.
+        purge: Also delete the backing folder on disk (default False).
+        confirm: Must be True when purge=True (guards data destruction).
+        timeout: Execution timeout in seconds (default 30).
+    """
+    from winbox.ps import ps_quote
+
+    _validate_share_name(name)
+    if purge and not confirm:
+        return (
+            "purge=True requires confirm=True. This will permanently delete "
+            "the share AND its backing folder with all contents."
+        )
+
+    cfg, vm, ga = _ensure_vm_ready()
+
+    # Resolve backing path before removing the share (needed for purge)
+    backing_path = None
+    if purge:
+        with _guest_errors(vm):
+            result = ga.exec_powershell(
+                f"(Get-SmbShare -Name '{ps_quote(name)}' -ErrorAction Stop).Path",
+                timeout=timeout,
+            )
+        backing_path = result.stdout.strip() if result.exitcode == 0 else None
+
+    with _guest_errors(vm):
+        result = ga.exec_powershell(
+            f"Remove-SmbShare -Name '{ps_quote(name)}' -Force -ErrorAction Stop",
+            timeout=timeout,
+        )
+    if result.exitcode != 0:
+        return _format_exec_result(result)
+
+    purged = False
+    purge_error = None
+    if purge and backing_path:
+        with _guest_errors(vm):
+            purge_result = ga.exec_powershell(
+                f"Remove-Item -Path '{ps_quote(backing_path)}' -Recurse -Force -ErrorAction Stop",
+                timeout=timeout,
+            )
+        if purge_result.exitcode == 0:
+            purged = True
+        else:
+            purge_error = purge_result.stderr.strip()
+
+    import json as _json
+    return _json.dumps({
+        "name": name,
+        "removed": True,
+        "purged": purged,
+        "purge_error": purge_error,
+    })
+
+
+@mcp.tool()
+def share_list(timeout: int = 30) -> str:
+    """List SMB shares on the Windows VM.
+
+    Returns a JSON array of non-special shares (excludes C$, IPC$, ADMIN$).
+    Each object has: name, path, description.
+
+    Args:
+        timeout: Execution timeout in seconds (default 30).
+    """
+    script = (
+        "Get-SmbShare | Where-Object { $_.Special -eq $false } | "
+        "Select-Object @{N='name';E={$_.Name}}, @{N='path';E={$_.Path}}, "
+        "@{N='description';E={$_.Description}} | ConvertTo-Json -Compress"
+    )
+    cfg, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        result = ga.exec_powershell(script, timeout=timeout)
+    return _format_exec_result(result)
+
+
+@mcp.tool()
+def share_grant(
+    name: str,
+    user: str,
+    permission: str = "full",
+    timeout: int = 30,
+) -> str:
+    """Grant access to an SMB share.
+
+    Args:
+        name: Share name.
+        user: Account name (e.g. 'bob' or 'Everyone').
+        permission: 'full', 'change', or 'read' (default 'full').
+        timeout: Execution timeout in seconds (default 30).
+    """
+    from winbox.ps import ps_quote, render_ps
+
+    _validate_share_name(name)
+    perm_map = {"full": "Full", "change": "Change", "read": "Read"}
+    ps_perm = perm_map.get(permission.lower())
+    if ps_perm is None:
+        return f"Invalid permission: {permission!r}. Must be 'full', 'change', or 'read'."
+
+    cfg, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        result = ga.exec_powershell(
+            render_ps("share_grant",
+                      share_name=ps_quote(name),
+                      account=ps_quote(user),
+                      permission=ps_perm),
+            timeout=timeout,
+        )
+    if result.exitcode != 0:
+        return _format_exec_result(result)
+
+    import json as _json
+    return _json.dumps({
+        "share": name,
+        "account": user,
+        "permission": ps_perm,
+        "granted": True,
+    })
+
+
+@mcp.tool()
+def share_revoke(name: str, user: str, timeout: int = 30) -> str:
+    """Revoke an account's access to an SMB share.
+
+    Args:
+        name: Share name.
+        user: Account name to revoke.
+        timeout: Execution timeout in seconds (default 30).
+    """
+    from winbox.ps import ps_quote, render_ps
+
+    _validate_share_name(name)
+    cfg, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        result = ga.exec_powershell(
+            render_ps("share_revoke",
+                      share_name=ps_quote(name),
+                      account=ps_quote(user)),
+            timeout=timeout,
+        )
+    if result.exitcode != 0:
+        return _format_exec_result(result)
+
+    import json as _json
+    return _json.dumps({
+        "share": name,
+        "account": user,
+        "revoked": True,
+    })
+
+
+@mcp.tool()
+def share_ls(name: str, path: str = "", timeout: int = 30) -> str:
+    """List files inside an SMB share's backing folder.
+
+    Returns a JSON array. Each object has: name, length (null for dirs),
+    lastWriteTime, isDirectory.
+
+    Args:
+        name: Share name.
+        path: Relative path within the share (default: root).
+        timeout: Execution timeout in seconds (default 30).
+    """
+    from winbox.ps import ps_quote
+
+    _validate_share_name(name)
+    json_select = (
+        "Select-Object @{N='name';E={$_.Name}}, "
+        "@{N='length';E={if($_.PSIsContainer){$null}else{$_.Length}}}, "
+        "@{N='lastWriteTime';E={$_.LastWriteTime.ToString('o')}}, "
+        "@{N='isDirectory';E={$_.PSIsContainer}} | ConvertTo-Json -Compress"
+    )
+    if path:
+        relpath = _validate_share_relpath(path)
+        script = _share_guarded_script(
+            name, relpath,
+            f"Get-ChildItem -Path $full | {json_select}",
+        )
+    else:
+        script = (
+            f"$base = (Get-SmbShare -Name '{ps_quote(name)}' -ErrorAction Stop).Path\n"
+            f"Get-ChildItem -Path $base | {json_select}"
+        )
+
+    cfg, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        result = ga.exec_powershell(script, timeout=timeout)
+    return _format_exec_result(result)
+
+
+@mcp.tool()
+def share_mkdir(name: str, path: str, timeout: int = 30) -> str:
+    """Create a directory inside an SMB share.
+
+    Args:
+        name: Share name.
+        path: Relative path for the new directory.
+        timeout: Execution timeout in seconds (default 30).
+    """
+    _validate_share_name(name)
+    relpath = _validate_share_relpath(path)
+
+    script = _share_guarded_script(
+        name, relpath,
+        "New-Item -ItemType Directory -Path $full -Force | Out-Null\n"
+        "Write-Host $full",
+    )
+
+    cfg, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        result = ga.exec_powershell(script, timeout=timeout)
+    if result.exitcode != 0:
+        return _format_exec_result(result)
+
+    import json as _json
+    return _json.dumps({
+        "share": name,
+        "path": result.stdout.strip(),
+        "created": True,
+    })
+
+
+@mcp.tool()
+def share_write(
+    name: str,
+    path: str,
+    content: str | None = None,
+    source: str | None = None,
+    timeout: int = 60,
+) -> str:
+    """Write a file inside an SMB share.
+
+    Provide either content (inline text) or source (Kali-side file path
+    to upload via VirtIO-FS). Exactly one must be set.
+
+    Args:
+        name: Share name.
+        path: Relative path within the share for the target file.
+        content: Inline text content (mutually exclusive with source).
+        source: Kali-side file path to upload (mutually exclusive with content).
+        timeout: Execution timeout in seconds (default 60).
+    """
+    import base64 as _b64
+    import shutil
+    from winbox.ps import ps_quote
+
+    if content is None and source is None:
+        return "Provide either content or source, not neither."
+    if content is not None and source is not None:
+        return "content and source are mutually exclusive."
+
+    _validate_share_name(name)
+    relpath = _validate_share_relpath(path)
+
+    cfg, vm, ga = _ensure_vm_ready()
+
+    if content is not None:
+        content_b64 = _b64.b64encode(content.encode()).decode()
+        script = _share_guarded_script(
+            name, relpath,
+            "$dir = Split-Path $full -Parent\n"
+            "if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }\n"
+            f"$bytes = [Convert]::FromBase64String('{content_b64}')\n"
+            "[IO.File]::WriteAllBytes($full, $bytes)\n"
+            "Write-Host $full",
+        )
+        with _guest_errors(vm):
+            result = ga.exec_powershell(script, timeout=timeout)
+        if result.exitcode != 0:
+            return _format_exec_result(result)
+
+        import json as _json
+        return _json.dumps({
+            "share": name,
+            "path": result.stdout.strip(),
+            "written": True,
+            "source": "inline",
+        })
+
+    # source path — stage via VirtIO-FS
+    src_path = Path(source)
+    if not src_path.exists():
+        return f"Source not found on Kali: {source}"
+
+    cfg.shared_dir.mkdir(parents=True, exist_ok=True)
+    staged = cfg.shared_dir / src_path.name
+    shutil.copy2(src_path, staged)
+
+    vm_staged = f"Z:\\{src_path.name}"
+    script = _share_guarded_script(
+        name, relpath,
+        "$dir = Split-Path $full -Parent\n"
+        "if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }\n"
+        f"Copy-Item -Path '{ps_quote(vm_staged)}' -Destination $full -Force -ErrorAction Stop\n"
+        "Write-Host $full",
+    )
+    try:
+        with _guest_errors(vm):
+            result = ga.exec_powershell(script, timeout=timeout)
+    finally:
+        staged.unlink(missing_ok=True)
+
+    if result.exitcode != 0:
+        return _format_exec_result(result)
+
+    import json as _json
+    return _json.dumps({
+        "share": name,
+        "path": result.stdout.strip(),
+        "written": True,
+        "source": src_path.name,
+    })
+
+
+@mcp.tool()
+def share_rm(
+    name: str,
+    path: str,
+    confirm: bool = False,
+    timeout: int = 30,
+) -> str:
+    """Delete a file or directory inside an SMB share.
+
+    Args:
+        name: Share name.
+        path: Relative path within the share to delete.
+        confirm: Must be True (guards file deletion).
+        timeout: Execution timeout in seconds (default 30).
+    """
+    if not confirm:
+        return "confirm=True required. This permanently deletes the file or directory."
+
+    _validate_share_name(name)
+    relpath = _validate_share_relpath(path)
+
+    script = _share_guarded_script(
+        name, relpath,
+        "Remove-Item -Path $full -Recurse -Force -ErrorAction Stop\n"
+        "Write-Host $full",
+    )
+
+    cfg, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        result = ga.exec_powershell(script, timeout=timeout)
+    if result.exitcode != 0:
+        return _format_exec_result(result)
+
+    import json as _json
+    return _json.dumps({
+        "share": name,
+        "path": result.stdout.strip(),
+        "removed": True,
+    })
+
+
+@mcp.tool()
+def user_create(
+    username: str,
+    password: str,
+    full_name: str = "",
+    no_password_expire: bool = True,
+    timeout: int = 30,
+) -> str:
+    """Create a local Windows user on the VM.
+
+    Args:
+        username: Username for the new account (max 20 chars).
+        password: Password for the new account.
+        full_name: Optional display name.
+        no_password_expire: Set password to never expire (default True).
+        timeout: Execution timeout in seconds (default 30).
+    """
+    import base64 as _b64
+    from winbox.ps import ps_quote, render_ps
+
+    _validate_mcp_username(username)
+    pass_b64 = _b64.b64encode(password.encode()).decode()
+    no_expire = "$true" if no_password_expire else "$false"
+
+    cfg, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        result = ga.exec_powershell(
+            render_ps("user_create",
+                      username=ps_quote(username),
+                      pass_b64=pass_b64,
+                      full_name=ps_quote(full_name),
+                      no_expire=no_expire),
+            timeout=timeout,
+        )
+    if result.exitcode != 0:
+        return _format_exec_result(result)
+
+    import json as _json
+    return _json.dumps({
+        "username": username,
+        "full_name": full_name,
+        "password_expires": not no_password_expire,
+        "created": True,
+    })
+
+
+@mcp.tool()
+def user_delete(
+    username: str,
+    confirm: bool = False,
+    timeout: int = 30,
+) -> str:
+    """Delete a local Windows user from the VM.
+
+    Args:
+        username: Username to delete.
+        confirm: Must be True (guards account deletion).
+        timeout: Execution timeout in seconds (default 30).
+    """
+    if not confirm:
+        return "confirm=True required. This permanently deletes the user account."
+
+    from winbox.ps import ps_quote
+
+    _validate_mcp_username(username)
+    cfg, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        result = ga.exec_powershell(
+            f"Remove-LocalUser -Name '{ps_quote(username)}' -ErrorAction Stop",
+            timeout=timeout,
+        )
+    if result.exitcode != 0:
+        return _format_exec_result(result)
+
+    import json as _json
+    return _json.dumps({
+        "username": username,
+        "deleted": True,
+    })
+
+
+@mcp.tool()
+def user_list(timeout: int = 30) -> str:
+    """List local Windows users on the VM.
+
+    Returns a JSON array. Each object has: name, enabled, lastLogon
+    (ISO 8601 or null), description.
+
+    Args:
+        timeout: Execution timeout in seconds (default 30).
+    """
+    script = (
+        "Get-LocalUser | Select-Object "
+        "@{N='name';E={$_.Name}}, "
+        "@{N='enabled';E={$_.Enabled}}, "
+        "@{N='lastLogon';E={if($_.LastLogon){$_.LastLogon.ToString('o')}else{$null}}}, "
+        "@{N='description';E={$_.Description}} | ConvertTo-Json -Compress"
+    )
+    cfg, vm, ga = _ensure_vm_ready()
+    with _guest_errors(vm):
+        result = ga.exec_powershell(script, timeout=timeout)
+    return _format_exec_result(result)
+
+
 # ─── Tool 10: pipe_list / pipe_info / pipe_connect ──────────────────────────
 
 @mcp.tool()

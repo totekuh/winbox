@@ -3395,7 +3395,7 @@ class TestKdbgListTools:
             result = _mcp_result(kdbg_doctor())
 
         assert result is report
-        assert doctor.call_args.kwargs["tool_count"] == 97
+        assert doctor.call_args.kwargs["tool_count"] == 109
 
     def test_kdbg_triage_is_single_snapshot_and_bounds_unmapped_leads(self, mock_mcp):
         from contextlib import nullcontext

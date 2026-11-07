@@ -900,6 +900,87 @@ class TestNetwork:
         assert "nothing to remove" in out
 
 
+# ─── share and user management ─────────────────────────────────────────────
+
+
+class TestShareAndUser:
+    def test_user_lifecycle(self, run):
+        run("user", "create", "e2euser", "--password", "E2e-Pass1!")
+        try:
+            assert "e2euser" in run("user", "list").output
+        finally:
+            run("user", "delete", "e2euser")
+
+    def test_share_lifecycle(self, run):
+        run("share", "create", "E2EShare")
+        try:
+            assert "E2EShare" in run("share", "list").output
+            run("share", "mkdir", "E2EShare", "subdir")
+            run("share", "write", "E2EShare", "subdir/test.txt",
+                "--content", "hello from e2e")
+            ls_out = run("share", "ls", "E2EShare", "subdir").output
+            assert "test.txt" in ls_out
+            run("share", "rm", "E2EShare", "subdir/test.txt")
+        finally:
+            run("share", "delete", "E2EShare", "--purge")
+
+    def test_share_grant_and_revoke(self, run):
+        run("share", "create", "E2EGrant")
+        try:
+            run("share", "grant", "E2EGrant", "Everyone", "--permission", "read")
+            run("share", "revoke", "E2EGrant", "Everyone")
+        finally:
+            run("share", "delete", "E2EGrant", "--purge")
+
+    def test_share_write_source(self, run, tmp_path):
+        src = tmp_path / "e2e_upload.txt"
+        src.write_text("uploaded from kali")
+        run("share", "create", "E2EUpload")
+        try:
+            run("share", "write", "E2EUpload", "e2e_upload.txt",
+                "--source", str(src))
+            ls_out = run("share", "ls", "E2EUpload").output
+            assert "e2e_upload" in ls_out
+        finally:
+            run("share", "delete", "E2EUpload", "--purge")
+
+    def test_mcp_share_create_list_delete(self, tool):
+        tool("share_create")(name="MCPShare")
+        try:
+            out = tool("share_list")()
+            assert "MCPShare" in out
+        finally:
+            tool("share_delete")(name="MCPShare", purge=True, confirm=True)
+
+    def test_mcp_share_grant_revoke(self, tool):
+        tool("share_create")(name="MCPGrant")
+        try:
+            tool("share_grant")(name="MCPGrant", user="Everyone", permission="read")
+            tool("share_revoke")(name="MCPGrant", user="Everyone")
+        finally:
+            tool("share_delete")(name="MCPGrant", purge=True, confirm=True)
+
+    def test_mcp_share_file_ops(self, tool):
+        tool("share_create")(name="MCPFiles")
+        try:
+            tool("share_mkdir")(name="MCPFiles", path="testdir")
+            tool("share_write")(name="MCPFiles", path="testdir/f.txt",
+                                content="mcp content")
+            out = tool("share_ls")(name="MCPFiles", path="testdir")
+            assert "f.txt" in out
+            tool("share_rm")(name="MCPFiles", path="testdir/f.txt", confirm=True)
+        finally:
+            tool("share_delete")(name="MCPFiles", purge=True, confirm=True)
+
+    def test_mcp_user_lifecycle(self, tool):
+        tool("user_create")(username="mcpuser", password="Mcp-Pass1!")
+        try:
+            out = tool("user_list")()
+            assert "mcpuser" in out
+        finally:
+            tool("user_delete")(username="mcpuser", confirm=True)
+
+
 # ─── target hardening toggles ───────────────────────────────────────────────
 
 
