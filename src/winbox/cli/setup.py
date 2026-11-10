@@ -148,6 +148,17 @@ def _setup_inner(
         if cached.exists() and cached.stat().st_size >= cfg.profile.iso_min_size:
             console.print(f"[green][+][/] Using cached ISO: {cached}")
             windows_iso = str(cached)
+        elif not cfg.profile.auto_download:
+            console.print(f"[bold]{cfg.profile.key} ISO required.[/]")
+            console.print(
+                f"    Auto-download is not available for {cfg.profile.key}\n"
+                f"    (Microsoft requires a browser session).\n"
+                f"    Download the ISO manually from:\n"
+                f"        {cfg.profile.iso_url}\n"
+                f"    Then re-run: [bold]winbox setup --os {cfg.profile.key} "
+                f"--iso /path/to/{cfg.profile.iso_filename}[/]"
+            )
+            raise SystemExit(1)
         else:
             console.print(f"[bold]{cfg.profile.key} Evaluation ISO required.[/]")
             console.print(

@@ -55,6 +55,14 @@ class TestOsProfileIsoValues:
         assert "microsoft.com" in p.iso_url
         assert p.iso_filename == "Win10_22H2_x64.iso"
         assert p.iso_min_size >= 4_000_000_000
+        assert p.auto_download is False
+
+    def test_auto_download_profiles(self):
+        for key, p in OS_PROFILES.items():
+            if key == "win10":
+                assert p.auto_download is False
+            else:
+                assert p.auto_download is True
 
 
 class TestResolveDownloadUrl:
@@ -134,6 +142,13 @@ class _IsoHarness:
     def write_local(self, nbytes):
         self.cfg.iso_dir.mkdir(parents=True, exist_ok=True)
         self.dest.write_bytes(b"\x00" * nbytes)
+
+
+class TestDownloadIsoAutoDownloadGuard:
+    def test_win10_raises_immediately(self, monkeypatch, tmp_path):
+        h = _IsoHarness(monkeypatch, tmp_path, os_key="win10")
+        with pytest.raises(RuntimeError, match="cannot be downloaded automatically"):
+            h.mod.download_iso(h.cfg)
 
 
 class TestDownloadIsoCacheDecisions:

@@ -94,6 +94,11 @@ class OSProfile:
     offline access and needs a TPM we don't have) and its OOBE can stall on the
     network screen; Server 2022 does neither."""
 
+    auto_download: bool = True
+    """Whether ``download_iso`` can fetch this profile's ISO automatically.
+    False when the CDN requires a browser session flow (e.g. Win10 consumer
+    media) — the user must download manually and pass ``--iso <path>``."""
+
     locale: str = "en-US"
     """UI language / input / system / user locale written into every pass of
     the unattend (``{LOCALE}``). Must match a language the install media
@@ -299,6 +304,7 @@ OS_PROFILES: dict[str, OSProfile] = {
         # that first-boot Defender stays quiet. (This also makes the runtime av
         # offline paths apply — they gate on this flag, not client_sku.)
         disable_defender_offline=True,
+        auto_download=False,
         # Consumer multi-edition media needs a key in the answer file to pick an
         # edition. This is Microsoft's public generic/KMS-client setup key for
         # Windows 10 Pro — it selects Pro and installs unactivated (no

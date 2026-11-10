@@ -80,6 +80,14 @@ def download_iso(
     and truncation floor all come from ``cfg.profile``.
     """
     profile = cfg.profile
+    if not profile.auto_download:
+        raise RuntimeError(
+            f"{profile.key} ISO cannot be downloaded automatically "
+            f"(Microsoft requires a browser session).\n"
+            f"Download the ISO manually from:\n"
+            f"    {profile.iso_url}\n"
+            f"Then run: winbox setup --os {profile.key} --iso /path/to/{profile.iso_filename}"
+        )
     cfg.iso_dir.mkdir(parents=True, exist_ok=True)
     dest = cfg.iso_dir / profile.iso_filename
     url: str | None = None
