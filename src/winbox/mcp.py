@@ -2054,39 +2054,25 @@ def net_connect() -> str:
 
 # ─── Tool 9b: share / user management ────────────────────────────────────────
 
-import re as _re
-
-_SHARE_NAME_RE = _re.compile(r"^[A-Za-z0-9_.\-]{1,80}$")
-_USERNAME_RE = _re.compile(r"^[A-Za-z0-9_.\- ]{1,20}$")
+from winbox.validate import check_share_name, check_username, check_relative_path
 
 
 def _validate_share_name(name: str) -> None:
-    if not _SHARE_NAME_RE.match(name):
-        raise ValueError(
-            f"Invalid share name: {name!r} "
-            "(alphanumeric, hyphens, underscores, dots; max 80 chars)"
-        )
+    err = check_share_name(name)
+    if err:
+        raise ValueError(err)
 
 
 def _validate_mcp_username(username: str) -> None:
-    if not _USERNAME_RE.match(username):
-        raise ValueError(
-            f"Invalid username: {username!r} "
-            "(alphanumeric, hyphens, underscores, dots, spaces; max 20 chars)"
-        )
+    err = check_username(username)
+    if err:
+        raise ValueError(err)
 
 
 def _validate_share_relpath(path: str) -> str:
-    if not path:
-        raise ValueError("Path cannot be empty")
-    normalized = path.replace("/", "\\")
-    if _re.match(r"^[A-Za-z]:", normalized) or normalized.startswith("\\"):
-        raise ValueError(f"Path must be relative, not absolute: {path!r}")
-    for part in normalized.split("\\"):
-        if part == "..":
-            raise ValueError(f"Path traversal not allowed: {path!r}")
-    if _re.search(r'[<>"|?*:]', normalized):
-        raise ValueError(f"Invalid characters in path: {path!r}")
+    err, normalized = check_relative_path(path)
+    if err:
+        raise ValueError(err)
     return normalized
 
 

@@ -4,7 +4,6 @@ ls, mkdir, write, rm), user (create, delete, list)."""
 from __future__ import annotations
 
 import base64
-import re
 import shutil
 from pathlib import Path
 
@@ -13,52 +12,29 @@ import click
 from winbox.cli import console, needs_vm
 from winbox.config import Config
 from winbox.ps import render_ps, ps_quote
+from winbox.validate import check_share_name, check_username, check_relative_path
 from winbox.vm import GuestAgent, VM
 
 
-# ─── Validation ─────────────────────────────────────────────────────────────
-
-_SHARE_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,80}$")
-_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\- ]{1,20}$")
+# ─── Validation (thin wrappers raising click-specific errors) ────────────────
 
 
 def _validate_share_name(name: str) -> None:
-    if not _SHARE_NAME_RE.match(name):
-        raise click.BadParameter(
-            f"Invalid share name: {name!r} "
-            "(alphanumeric, hyphens, underscores, dots; max 80 chars)"
-        )
+    err = check_share_name(name)
+    if err:
+        raise click.BadParameter(err)
 
 
 def _validate_username(username: str) -> None:
-    if not _USERNAME_RE.match(username):
-        raise click.BadParameter(
-            f"Invalid username: {username!r} "
-            "(alphanumeric, hyphens, underscores, dots, spaces; max 20 chars)"
-        )
+    err = check_username(username)
+    if err:
+        raise click.BadParameter(err)
 
 
 def _validate_relative_path(path: str) -> str:
-    """Validate and normalize a relative path within a share.
-
-    Returns the normalized backslash path.
-    """
-    if not path:
-        raise click.BadParameter("Path cannot be empty")
-
-    normalized = path.replace("/", "\\")
-
-    if re.match(r"^[A-Za-z]:", normalized) or normalized.startswith("\\"):
-        raise click.BadParameter(f"Path must be relative, not absolute: {path!r}")
-
-    parts = normalized.split("\\")
-    for part in parts:
-        if part == "..":
-            raise click.BadParameter(f"Path traversal ('..') not allowed: {path!r}")
-
-    if re.search(r'[<>"|?*:]', normalized):
-        raise click.BadParameter(f"Invalid characters in path: {path!r}")
-
+    err, normalized = check_relative_path(path)
+    if err:
+        raise click.BadParameter(err)
     return normalized
 
 
