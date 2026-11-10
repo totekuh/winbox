@@ -348,6 +348,16 @@ class TestDownloads:
         assert "/releases/download/v2.1.1/RunEx.exe" in RUNEX_URL
         assert len(RUNEX_SHA256) == 64
 
+    def test_runex_hash_matches_provision_script(self):
+        import re
+        from pathlib import Path
+
+        ps1 = Path(__file__).resolve().parent.parent / "src" / "winbox" / "data" / "provision.ps1"
+        text = ps1.read_text()
+        match = re.search(r'\$runExSha256\s*=\s*"([0-9a-f]{64})"', text)
+        assert match, "provision.ps1 must contain $runExSha256 = \"<64-hex>\""
+        assert match.group(1) == RUNEX_SHA256
+
     @patch("winbox.setup.installer.subprocess.run")
     def test_download_spice_tools_verifies_and_atomically_installs(self, mock_run, cfg):
         import hashlib
