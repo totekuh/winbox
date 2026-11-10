@@ -102,19 +102,19 @@ See [Guest OS Targets](docs/guest-os.md) for per-OS notes and display options.
 | [Configuration](docs/configuration.md) | Config keys, filesystem layout |
 | [KDBG Decompilation](docs/kdbg-decomp.md) | PyGhidra setup, live decompilation |
 | [Testing](docs/testing.md) | Unit tests, live E2E suite, coverage manifest |
+| [Test Coverage Roadmap](docs/test-coverage-roadmap.md) | Coverage goals and gap analysis |
 
 ## Commands
 
-`winbox --help` groups commands into eight sections:
+`winbox --help` groups commands into seven sections:
 
 ```
 VM Lifecycle       setup  provision  up  down  suspend  destroy  status  snapshot  restore  vnc
 Execute            eventlogs  exec  shell  ssh  jobs  msi
 Files              tools  upload  iso
-Network            net  dns  hosts  domain
-Target             applocker  autologin  av      (bidirectional — flip on to test bypass tools)
-Sharing            share  user                   (SMB shares and local user management)
-Malware Analysis   capture  detonate  sinkhole   (detonation lab — capture C2, sinkhole DNS, preflight)
+Network            net  dns  hosts  domain  share  user
+Target             applocker  autologin  av  hvci  (bidirectional — flip on to test bypass tools)
+Malware Analysis   capture  detonate  sinkhole     (detonation lab — capture C2, sinkhole DNS, preflight)
 Integrations       binfmt  kdbg  mcp  office
 ```
 

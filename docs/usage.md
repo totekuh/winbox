@@ -52,6 +52,7 @@ For files that shouldn't live permanently in the tools dir:
 ```bash
 winbox upload payload.exe                         # stage at Z:\payload.exe
 winbox upload payload.exe C:\Windows\Temp\p.exe   # also copy into the VM path
+winbox upload -r ./implants/                      # recursively upload a directory
 
 winbox msi VMware-tools.msi ADDLOCAL=ALL /norestart   # extra args pass through to msiexec
 ```
@@ -150,6 +151,44 @@ winbox autologin disable
 ```
 
 Unlike the old 3-key approach, this actually survives reboots on Server 2022 (which otherwise silently wipes `DefaultPassword` on first boot without `ForceAutoLogon=1` and the `PasswordLess\Device\DevicePasswordLessBuildVersion=0` gate).
+
+## HVCI / Virtualization Based Security
+
+```bash
+winbox hvci status             # report HVCI/VBS state
+winbox hvci enable -y          # enable HVCI + VBS (reboots VM)
+winbox hvci disable -y         # disable HVCI + VBS (reboots VM)
+```
+
+Use explicit hardware breakpoints when HVCI is on — it blocks software 0xCC breakpoints.
+
+## SMB Shares
+
+```bash
+winbox share create Data                                  # create share at C:\Shares\Data
+winbox share create Loot --path C:\Loot --full Everyone   # custom path + open ACL
+winbox share list                                         # list non-special shares
+winbox share grant Data bob full                          # grant full access
+winbox share revoke Data bob                              # revoke access
+winbox share ls Data                                      # list files in share
+winbox share mkdir Data subdir                            # create directory
+winbox share write Data notes.txt --content "hello"       # write inline text
+winbox share write Data payload.exe --source ./payload    # upload from Kali
+winbox share rm Data notes.txt -y                         # delete file
+winbox share delete Data -y                               # remove share
+winbox share delete Data --purge -y                       # remove share + backing folder
+```
+
+## Local User Management
+
+```bash
+winbox user create bob 'P@ssw0rd!'                 # create local user
+winbox user create alice 'Secret1!' --full-name "Alice Smith"
+winbox user list                                   # list local users
+winbox user delete bob -y                          # delete user
+```
+
+Local users work with `winbox exec --user` and `winbox shell --user` for privilege-separated testing.
 
 ## AppLocker
 

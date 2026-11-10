@@ -4,7 +4,7 @@
 Kali Linux
 ├── winbox control plane
 │   ├── CLI (Python/Click)
-│   └── MCP server (97 bounded agent tools)
+│   └── MCP server (109 bounded agent tools)
 ├── hypervisor research plane
 │   ├── QMP/HMP ────────────> VM + gdbstub lifecycle
 │   ├── persistent RSP ─────> vCPUs, memory, break/watchpoints, stepping
@@ -20,7 +20,7 @@ Kali Linux
 │   ├── bridge packet capture
 │   └── DNS sinkhole + optional INETSim
 │
-└── Windows guest — Server Core 2022/2025 or Win11 (headless QEMU/KVM, plain VNC display)
+└── Windows guest — Server Core 2022/2025, Win11, or Win10 (headless QEMU/KVM, plain VNC display)
     ├── QEMU Guest Agent          ← primary exec channel
     ├── VirtioFsSvc (WinFsp)      ← auto-mounts Z:\ on boot
     ├── OpenSSH Server            ← interactive sessions

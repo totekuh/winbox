@@ -18,7 +18,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-## Available tools (97)
+## Available tools (109)
 
 ### User-mode primitives
 
@@ -43,6 +43,28 @@ claude mcp add winbox -- winbox mcp
 | `net_unplug()` | Full air-gap (NIC link down live + persistent — survives a reboot, BSOD or power cycle) |
 | `eventlogs(log?, since?, ids?, provider?, level?, max_events?)` | Query Windows event logs via Get-WinEvent (returns JSON array; CLI defaults to CSV) |
 | `eventlogs_clear(log?, all_logs?, confirm)` | Clear event channels via wevtutil cl. `confirm=True` required (destructive). |
+
+### SMB shares
+
+| Tool | Description |
+|------|-------------|
+| `share_create(name, path?, full_access?, change_access?, read_access?)` | Create an SMB share on the VM with optional ACLs (creates backing folder if needed) |
+| `share_delete(name, purge?, confirm)` | Remove an SMB share. `purge=True` also deletes the backing folder. `confirm=True` required. |
+| `share_list()` | List non-special SMB shares (excludes C$, IPC$, ADMIN$) as JSON |
+| `share_grant(name, user, permission?)` | Grant access to a share (`full`, `change`, or `read`) |
+| `share_revoke(name, user)` | Revoke an account's access to a share |
+| `share_ls(name, path?)` | List files inside a share's backing folder (JSON: name, length, lastWriteTime) |
+| `share_mkdir(name, path)` | Create a directory inside a share |
+| `share_write(name, path, content?, source?)` | Write a file inside a share (inline text or upload from Kali) |
+| `share_rm(name, path, confirm)` | Delete a file or directory inside a share. `confirm=True` required. |
+
+### Local users
+
+| Tool | Description |
+|------|-------------|
+| `user_create(username, password, full_name?, no_password_expire?)` | Create a local Windows user on the VM |
+| `user_delete(username, confirm)` | Delete a local user. `confirm=True` required. |
+| `user_list()` | List local users as JSON (name, enabled, lastLogon) |
 
 ### Defender
 

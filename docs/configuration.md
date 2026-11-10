@@ -12,6 +12,15 @@ VM_DISK=30           # GB
 # Network
 HOST_IP=192.168.122.1
 
+# Guest OS (server2022, server2025, win11, win10)
+VM_OS=server2022
+
+# Display backend (none, vnc, spice)
+VM_DISPLAY=none
+
+# Kernel debug
+KDBG_PAGEWALK=false      # opt-in CR3 page-walk for VA reads (fixes E14 on Hyper-V enlightened hosts)
+
 # Credentials
 VM_USER=Administrator
 VM_PASSWORD=WinboxP@ss123
