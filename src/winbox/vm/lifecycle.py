@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 import subprocess
 import time
 import xml.etree.ElementTree as ET
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -212,6 +215,22 @@ class VM:
         """
         return agent_channel_connected(self.name)
 
+    @staticmethod
+    def _ensure_libvirt_traversal(winbox_dir: Path) -> None:
+        """Ensure libvirt-qemu (uid 64055) can traverse to winbox_dir.
+
+        libvirt-qemu runs as a different user and needs o+x on every
+        directory from / down to winbox_dir to reach ISOs and disks.
+        Only adds the execute bit — never touches read or write.
+        """
+        for ancestor in [*reversed(winbox_dir.parents), winbox_dir]:
+            try:
+                mode = ancestor.stat().st_mode
+                if not (mode & stat.S_IXOTH):
+                    ancestor.chmod(mode | stat.S_IXOTH)
+            except (PermissionError, OSError):
+                break
+
     def start(self) -> None:
         """Start the domain, tolerating one that is still winding down.
 
@@ -232,6 +251,8 @@ class VM:
         burned 120s in wait_shutdown and returned as if the VM were running
         while the guest stayed asleep and the agent never answered.
         """
+        self._ensure_libvirt_traversal(self.cfg.winbox_dir)
+
         raw = self._domstate_raw()
         if raw is not None and "pmsuspended" in raw:
             result = virsh_run("dompmwakeup", self.name, check=False)

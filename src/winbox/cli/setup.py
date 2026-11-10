@@ -77,8 +77,6 @@ def setup(
     # garbage collection to close the fd worked in CPython but leaked
     # under repeated failures from a long-lived caller (test runners).
     cfg.winbox_dir.mkdir(parents=True, exist_ok=True)
-    # libvirt-qemu needs o+x to traverse into .winbox and reach ISOs/disks
-    cfg.winbox_dir.chmod(0o711)
     lock_path = cfg.winbox_dir / ".setup.lock"
     lock_fh = open(lock_path, "w")
     try:
