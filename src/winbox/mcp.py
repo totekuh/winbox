@@ -1286,58 +1286,81 @@ def eventlogs_clear(
 
 @mcp.tool()
 def upload(src: str, dst: str | None = None, timeout: int = 60) -> str:
-    """Upload a file from Kali to the Windows VM via VirtIO-FS.
+    """Upload a file or directory from Kali to the Windows VM via VirtIO-FS.
 
-    Copies the file to the shared directory on Kali, which is mounted
-    as Z:\\ inside the VM. Optionally moves it to a different location
-    in the VM afterwards.
+    Copies the file (or directory tree) to the shared directory on Kali,
+    which is mounted as Z:\\ inside the VM. Optionally copies it to a
+    different location in the VM afterwards.
 
     Args:
-        src: Linux path on Kali (e.g. '/tmp/payload.dll' or '/opt/tools/mimikatz.exe').
-        dst: Optional Windows destination path inside the VM. If omitted, the file
-             stays at Z:\\<filename>. If provided, the file is copied from Z:\\ to dst.
+        src: Linux path on Kali. May be a file or a directory.
+        dst: Optional Windows destination path inside the VM. If omitted, the
+             file/directory stays at Z:\\<name>. If provided, it is copied from
+             Z:\\ to dst (directories are copied recursively).
         timeout: Execution timeout in seconds for the in-VM copy step (default 60).
     """
     import shutil
 
-    # The host-side staging copy works regardless of VM state, but the
-    # in-VM copy step needs a running VM + GA. _ensure_vm_ready surfaces
-    # a clear "VM not running" error instead of letting a later
-    # ga.exec timeout look like a network problem.
     cfg, vm, ga = _ensure_vm_ready() if dst is not None else _get_state()
     src_path = Path(src)
 
     if not src_path.exists():
         return f"Source not found on Kali: {src}"
 
-    # Copy to shared dir (appears as Z:\ in VM)
     cfg.shared_dir.mkdir(parents=True, exist_ok=True)
     shared_dest = cfg.shared_dir / src_path.name
-    shutil.copy2(src_path, shared_dest)
-    size = shared_dest.stat().st_size
+    is_dir = src_path.is_dir()
+
+    if is_dir:
+        if shared_dest.exists():
+            shutil.rmtree(shared_dest)
+        shutil.copytree(src_path, shared_dest)
+        count = sum(1 for f in shared_dest.rglob("*") if f.is_file())
+        total = sum(f.stat().st_size for f in shared_dest.rglob("*") if f.is_file())
+    else:
+        shutil.copy2(src_path, shared_dest)
+        count = 1
+        total = shared_dest.stat().st_size
 
     if dst is None:
-        return f"Uploaded {src_path.name} to Z:\\{src_path.name} ({size} bytes)"
+        if is_dir:
+            return f"Uploaded {src_path.name}/ to Z:\\{src_path.name}\\ ({count} files, {total} bytes)"
+        return f"Uploaded {src_path.name} to Z:\\{src_path.name} ({total} bytes)"
 
-    # Copy from Z:\ to final destination inside VM
-    script = textwrap.dedent("""\
-        import json
-        import os
-        import shutil
-        import sys
-
-        args = json.load(open(r'Z:\\.mcp\\args.json'))
-        src = args['src']
-        dst = args['dst']
-
-        dst_dir = os.path.dirname(dst)
-        if dst_dir:
-            os.makedirs(dst_dir, exist_ok=True)
-
-        shutil.copy2(src, dst)
-        print(f"ok")
-    """)
     vm_src = f"Z:\\{src_path.name}"
+
+    if is_dir:
+        script = textwrap.dedent("""\
+            import json
+            import os
+            import shutil
+
+            args = json.load(open(r'Z:\\.mcp\\args.json'))
+            src = args['src']
+            dst = args['dst']
+
+            os.makedirs(dst, exist_ok=True)
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+            print("ok")
+        """)
+    else:
+        script = textwrap.dedent("""\
+            import json
+            import os
+            import shutil
+
+            args = json.load(open(r'Z:\\.mcp\\args.json'))
+            src = args['src']
+            dst = args['dst']
+
+            dst_dir = os.path.dirname(dst)
+            if dst_dir:
+                os.makedirs(dst_dir, exist_ok=True)
+
+            shutil.copy2(src, dst)
+            print("ok")
+        """)
+
     result = _exec_python(
         script,
         timeout=timeout,
@@ -1345,9 +1368,13 @@ def upload(src: str, dst: str | None = None, timeout: int = 60) -> str:
     )
     if result["exitcode"] != 0:
         stderr = result["stderr"].strip() if result["stderr"] else "unknown error"
+        if is_dir:
+            return f"Staged at Z:\\{src_path.name}\\ but copy to {dst} failed: {stderr}"
         return f"Uploaded to Z:\\{src_path.name} but copy to {dst} failed: {stderr}"
 
-    return f"Uploaded {src_path.name} -> {dst} ({size} bytes)"
+    if is_dir:
+        return f"Uploaded {src_path.name}/ -> {dst} ({count} files, {total} bytes)"
+    return f"Uploaded {src_path.name} -> {dst} ({total} bytes)"
 
 
 # ─── Tool 7: file_copy ─────────────────────────────────────────────────────
