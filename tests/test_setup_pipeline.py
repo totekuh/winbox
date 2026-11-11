@@ -121,9 +121,9 @@ class TestPrereqCheckIsProfileScoped:
         cfg.vm_os = "server2022"
         assert not cfg.profile.disable_defender_offline
 
-        with patch("winbox.setup.installer.shutil.which", side_effect=
+        with patch("winbox.setup.installer.prereqs.shutil.which", side_effect=
                    lambda n: None if n in PROFILE_GATED_TOOLS else "/usr/bin/" + n), \
-             patch("winbox.setup.installer.Path.exists", return_value=True):
+             patch("winbox.setup.installer.prereqs.Path.exists", return_value=True):
             missing = check_prereqs(cfg)
 
         assert missing == [], (
@@ -138,9 +138,9 @@ class TestPrereqCheckIsProfileScoped:
         cfg.vm_os = "win11"
         assert cfg.profile.disable_defender_offline
 
-        with patch("winbox.setup.installer.shutil.which", side_effect=
+        with patch("winbox.setup.installer.prereqs.shutil.which", side_effect=
                    lambda n: None if n in PROFILE_GATED_TOOLS else "/usr/bin/" + n), \
-             patch("winbox.setup.installer.Path.exists", return_value=True):
+             patch("winbox.setup.installer.prereqs.Path.exists", return_value=True):
             missing = check_prereqs(cfg)
 
         # Entries carry an "(apt install ...)" hint, so match on the tool name.

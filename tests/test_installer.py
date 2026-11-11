@@ -65,9 +65,9 @@ class TestRequiredTools:
         """
         import inspect
 
-        from winbox.setup import installer
+        from winbox.setup.installer import provision as installer_provision
 
-        source = inspect.getsource(installer)
+        source = inspect.getsource(installer_provision)
         assert "virt-customize" not in REQUIRED_TOOLS
         assert 'subprocess.run(\n        ["guestfish"' in source or '"guestfish"' in source
 
@@ -76,15 +76,15 @@ class TestRequiredTools:
 
 
 class TestCheckPrereqs:
-    @patch("winbox.setup.installer.shutil.which")
-    @patch("winbox.setup.installer.Path.exists")
+    @patch("winbox.setup.installer.prereqs.shutil.which")
+    @patch("winbox.setup.installer.prereqs.Path.exists")
     def test_all_present(self, mock_exists, mock_which):
         mock_which.return_value = "/usr/bin/tool"
         mock_exists.return_value = True
         assert check_prereqs() == []
 
-    @patch("winbox.setup.installer.shutil.which")
-    @patch("winbox.setup.installer.Path.exists")
+    @patch("winbox.setup.installer.prereqs.shutil.which")
+    @patch("winbox.setup.installer.prereqs.Path.exists")
     def test_missing_tool(self, mock_exists, mock_which):
         def fake_which(name):
             if name == "wget":
@@ -95,14 +95,14 @@ class TestCheckPrereqs:
         missing = check_prereqs()
         assert "wget" in missing
 
-    @patch("winbox.setup.installer.shutil.which", return_value=None)
-    @patch("winbox.setup.installer.Path.exists", return_value=False)
+    @patch("winbox.setup.installer.prereqs.shutil.which", return_value=None)
+    @patch("winbox.setup.installer.prereqs.Path.exists", return_value=False)
     def test_missing_kvm(self, mock_exists, mock_which):
         missing = check_prereqs()
         assert "/dev/kvm" in missing
 
-    @patch("winbox.setup.installer.shutil.which")
-    @patch("winbox.setup.installer.Path.exists")
+    @patch("winbox.setup.installer.prereqs.shutil.which")
+    @patch("winbox.setup.installer.prereqs.Path.exists")
     def test_virtiofsd_on_path(self, mock_exists, mock_which):
         """virtiofsd found on PATH — not reported missing."""
         def fake_which(name):
@@ -112,8 +112,8 @@ class TestCheckPrereqs:
         missing = check_prereqs()
         assert "virtiofsd" not in missing
 
-    @patch("winbox.setup.installer.shutil.which")
-    @patch("winbox.setup.installer.Path.exists")
+    @patch("winbox.setup.installer.prereqs.shutil.which")
+    @patch("winbox.setup.installer.prereqs.Path.exists")
     def test_virtiofsd_at_libexec(self, mock_exists, mock_which):
         """virtiofsd not on PATH but found at /usr/libexec/virtiofsd."""
         def fake_which(name):
@@ -138,21 +138,21 @@ class TestCheckPrereqs:
 
 
 class TestFindMkisofs:
-    @patch("winbox.setup.installer.shutil.which")
+    @patch("winbox.setup.installer.prereqs.shutil.which")
     def test_finds_mkisofs(self, mock_which):
         mock_which.side_effect = lambda cmd: "/usr/bin/mkisofs" if cmd == "mkisofs" else None
         assert _find_mkisofs() == "mkisofs"
 
-    @patch("winbox.setup.installer.shutil.which")
+    @patch("winbox.setup.installer.prereqs.shutil.which")
     def test_finds_genisoimage(self, mock_which):
         mock_which.side_effect = lambda cmd: "/usr/bin/genisoimage" if cmd == "genisoimage" else None
         assert _find_mkisofs() == "genisoimage"
 
-    @patch("winbox.setup.installer.shutil.which", return_value=None)
+    @patch("winbox.setup.installer.prereqs.shutil.which", return_value=None)
     def test_neither_found(self, mock_which):
         assert _find_mkisofs() is None
 
-    @patch("winbox.setup.installer.shutil.which")
+    @patch("winbox.setup.installer.prereqs.shutil.which")
     def test_prefers_mkisofs(self, mock_which):
         mock_which.return_value = "/usr/bin/tool"
         assert _find_mkisofs() == "mkisofs"
@@ -181,7 +181,7 @@ class TestCreateDirectories:
 
 
 class TestGenerateSshKeypair:
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.prereqs.subprocess.run")
     def test_generates_key(self, mock_run, cfg):
         mock_run.return_value = MagicMock(returncode=0)
         generate_ssh_keypair(cfg)
@@ -190,7 +190,7 @@ class TestGenerateSshKeypair:
         assert "ssh-keygen" in args
         assert str(cfg.ssh_key) in args
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.prereqs.subprocess.run")
     def test_skips_if_exists(self, mock_run, cfg):
         cfg.ssh_key.touch()
         generate_ssh_keypair(cfg)
@@ -201,7 +201,7 @@ class TestGenerateSshKeypair:
 
 
 class TestDownloads:
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_virtio_iso(self, mock_run, cfg):
         def fake_wget(*a, **kw):
             # Create a fake file large enough to pass size check
@@ -212,13 +212,13 @@ class TestDownloads:
         args = mock_run.call_args[0][0]
         assert "wget" in args
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_virtio_iso_cached(self, mock_run, cfg):
         cfg.virtio_iso.write_bytes(b"\x00" * 500_000_001)
         download_virtio_iso(cfg)
         mock_run.assert_not_called()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_openssh(self, mock_run, cfg):
         dest = cfg.iso_dir / "OpenSSH-Win64.zip"
         def fake_wget(*a, **kw):
@@ -228,7 +228,7 @@ class TestDownloads:
         assert result == dest
         mock_run.assert_called_once()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_openssh_cached(self, mock_run, cfg):
         dest = cfg.iso_dir / "OpenSSH-Win64.zip"
         dest.write_bytes(b"\x00" * 5_000_001)
@@ -236,7 +236,7 @@ class TestDownloads:
         assert result == dest
         mock_run.assert_not_called()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_winfsp(self, mock_run, cfg):
         dest = cfg.iso_dir / "winfsp.msi"
         part = cfg.iso_dir / "winfsp.msi.part"
@@ -249,7 +249,7 @@ class TestDownloads:
         assert not part.exists()
         mock_run.assert_called_once()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_winfsp_cached(self, mock_run, cfg):
         dest = cfg.iso_dir / "winfsp.msi"
         dest.write_bytes(b"\x00" * 1_000_001)
@@ -257,7 +257,7 @@ class TestDownloads:
         assert result == dest
         mock_run.assert_not_called()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_python(self, mock_run, cfg):
         dest = cfg.iso_dir / PYTHON_EXE
         part = cfg.iso_dir / (PYTHON_EXE + ".part")
@@ -270,7 +270,7 @@ class TestDownloads:
         assert not part.exists()
         mock_run.assert_called_once()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_python_cached(self, mock_run, cfg):
         dest = cfg.iso_dir / PYTHON_EXE
         dest.write_bytes(b"\x00" * 25_000_000)
@@ -278,7 +278,7 @@ class TestDownloads:
         assert result == dest
         mock_run.assert_not_called()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_python_truncated(self, mock_run, cfg):
         dest = cfg.iso_dir / PYTHON_EXE
         part = cfg.iso_dir / (PYTHON_EXE + ".part")
@@ -297,7 +297,7 @@ class TestDownloads:
         assert PYTHON_URL.endswith("-amd64.exe")
         assert "embed" not in PYTHON_URL
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_runex_verifies_and_atomically_installs(self, mock_run, cfg):
         import hashlib
 
@@ -309,7 +309,7 @@ class TestDownloads:
 
         mock_run.side_effect = fake_wget
         with patch(
-            "winbox.setup.installer.RUNEX_SHA256",
+            "winbox.setup.installer.downloads.RUNEX_SHA256",
             hashlib.sha256(payload).hexdigest(),
         ):
             result = download_runex(cfg)
@@ -319,7 +319,7 @@ class TestDownloads:
         assert not part.exists()
         assert RUNEX_URL in mock_run.call_args[0][0]
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_runex_reuses_hash_verified_cache(self, mock_run, cfg):
         import hashlib
 
@@ -327,13 +327,13 @@ class TestDownloads:
         dest = cfg.iso_dir / RUNEX_EXE
         dest.write_bytes(payload)
         with patch(
-            "winbox.setup.installer.RUNEX_SHA256",
+            "winbox.setup.installer.downloads.RUNEX_SHA256",
             hashlib.sha256(payload).hexdigest(),
         ):
             assert download_runex(cfg) == dest
         mock_run.assert_not_called()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_runex_rejects_bad_checksum(self, mock_run, cfg):
         part = cfg.iso_dir / f"{RUNEX_EXE}.part"
         mock_run.side_effect = lambda *a, **kw: part.write_bytes(b"wrong")
@@ -358,7 +358,7 @@ class TestDownloads:
         assert match, "provision.ps1 must contain $runExSha256 = \"<64-hex>\""
         assert match.group(1) == RUNEX_SHA256
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_spice_tools_verifies_and_atomically_installs(self, mock_run, cfg):
         import hashlib
 
@@ -366,7 +366,7 @@ class TestDownloads:
         part = cfg.iso_dir / f"{SPICE_TOOLS_EXE}.part"
         mock_run.side_effect = lambda *a, **kw: part.write_bytes(payload)
         with patch(
-            "winbox.setup.installer.SPICE_TOOLS_SHA256",
+            "winbox.setup.installer.downloads.SPICE_TOOLS_SHA256",
             hashlib.sha256(payload).hexdigest(),
         ):
             result = download_spice_tools(cfg)
@@ -376,7 +376,7 @@ class TestDownloads:
         assert not part.exists()
         assert SPICE_TOOLS_URL in mock_run.call_args[0][0]
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_spice_tools_reuses_hash_verified_cache(self, mock_run, cfg):
         import hashlib
 
@@ -384,13 +384,13 @@ class TestDownloads:
         dest = cfg.iso_dir / SPICE_TOOLS_EXE
         dest.write_bytes(payload)
         with patch(
-            "winbox.setup.installer.SPICE_TOOLS_SHA256",
+            "winbox.setup.installer.downloads.SPICE_TOOLS_SHA256",
             hashlib.sha256(payload).hexdigest(),
         ):
             assert download_spice_tools(cfg) == dest
         mock_run.assert_not_called()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_spice_tools_rejects_bad_checksum(self, mock_run, cfg):
         part = cfg.iso_dir / f"{SPICE_TOOLS_EXE}.part"
         mock_run.side_effect = lambda *a, **kw: part.write_bytes(b"wrong")
@@ -410,7 +410,7 @@ class TestDownloads:
         cached.write_bytes(b"runex")
 
         with patch(
-            "winbox.setup.installer.download_runex", return_value=cached,
+            "winbox.setup.installer.downloads.download_runex", return_value=cached,
         ) as download:
             copy_setup_files(cfg)
 
@@ -418,7 +418,7 @@ class TestDownloads:
         assert (cfg.tools_dir / RUNEX_EXE).read_bytes() == b"runex"
         assert (cfg.tools_dir / "provision.ps1").exists()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_x64dbg(self, mock_run, cfg):
         dest = cfg.iso_dir / X64DBG_ZIP
         def fake_wget(*a, **kw):
@@ -431,7 +431,7 @@ class TestDownloads:
         assert "wget" in args
         assert X64DBG_URL in args
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_x64dbg_cached(self, mock_run, cfg):
         dest = cfg.iso_dir / X64DBG_ZIP
         dest.write_bytes(b"\x00" * 25_000_000)
@@ -439,7 +439,7 @@ class TestDownloads:
         assert result == dest
         mock_run.assert_not_called()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_download_x64dbg_truncated(self, mock_run, cfg):
         dest = cfg.iso_dir / X64DBG_ZIP
         def fake_wget(*a, **kw):
@@ -452,7 +452,7 @@ class TestDownloads:
         assert X64DBG_URL.startswith("https://github.com/x64dbg/x64dbg/releases/")
         assert X64DBG_URL.endswith(".zip")
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_extract_virtiofs(self, mock_run, cfg):
         cfg.virtio_iso.touch()
 
@@ -468,7 +468,7 @@ class TestDownloads:
         assert result == cfg.iso_dir / "virtiofs-2k22.exe"
         assert result.exists()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_extract_virtiofs_cached(self, mock_run, cfg):
         dest = cfg.iso_dir / "virtiofs-2k22.exe"
         dest.touch()
@@ -476,7 +476,7 @@ class TestDownloads:
         assert result == dest
         mock_run.assert_not_called()
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.downloads.subprocess.run")
     def test_extract_virtiofs_win11_namespaced(self, mock_run, cfg):
         """Win11 extraction uses the w11 ISO member and a w11-namespaced cache."""
         cfg.vm_os = "win11"
@@ -497,14 +497,14 @@ class TestDownloads:
 
 
 class TestCreateCleanSnapshot:
-    @patch("winbox.setup.installer.VM")
+    @patch("winbox.setup.installer.finalize.VM")
     def test_success(self, mock_vm_cls, cfg):
         vm = MagicMock()
         mock_vm_cls.return_value = vm
         create_clean_snapshot(cfg)
         vm.snapshot_create.assert_called_once_with("clean")
 
-    @patch("winbox.setup.installer.VM")
+    @patch("winbox.setup.installer.finalize.VM")
     def test_runtime_error_is_caught(self, mock_vm_cls, cfg):
         """RuntimeError from vm.snapshot_create() must not escape — commit
         aaa81ed made snapshot_create raise RuntimeError but create_clean_snapshot
@@ -521,13 +521,13 @@ class TestCreateCleanSnapshot:
 
 
 class TestBuildUnattendImage:
-    @patch("winbox.setup.installer._find_mkisofs", return_value=None)
+    @patch("winbox.setup.installer.unattend._find_mkisofs", return_value=None)
     def test_raises_without_mkisofs(self, mock_find, cfg):
         with pytest.raises(RuntimeError, match="mkisofs"):
             build_unattend_image(cfg)
 
-    @patch("winbox.setup.installer.subprocess.run")
-    @patch("winbox.setup.installer._find_mkisofs", return_value="genisoimage")
+    @patch("winbox.setup.installer.unattend.subprocess.run")
+    @patch("winbox.setup.installer.unattend._find_mkisofs", return_value="genisoimage")
     def test_calls_mkisofs(self, mock_find, mock_run, cfg):
         mock_run.return_value = MagicMock(returncode=0)
         build_unattend_image(cfg)
@@ -535,8 +535,8 @@ class TestBuildUnattendImage:
         assert args[0] == "genisoimage"
         assert str(cfg.unattend_img) in args
 
-    @patch("winbox.setup.installer.subprocess.run")
-    @patch("winbox.setup.installer._find_mkisofs", return_value="mkisofs")
+    @patch("winbox.setup.installer.unattend.subprocess.run")
+    @patch("winbox.setup.installer.unattend._find_mkisofs", return_value="mkisofs")
     def test_default_is_server_core(self, mock_find, mock_run, cfg):
         """Default (no desktop flag) writes SERVERSTANDARDCORE image name."""
         written = {}
@@ -554,8 +554,8 @@ class TestBuildUnattendImage:
         assert "SERVERSTANDARDCORE" in written["xml"]
         assert "SERVERSTANDARD" in written["xml"]  # CORE contains STANDARD
 
-    @patch("winbox.setup.installer.subprocess.run")
-    @patch("winbox.setup.installer._find_mkisofs", return_value="mkisofs")
+    @patch("winbox.setup.installer.unattend.subprocess.run")
+    @patch("winbox.setup.installer.unattend._find_mkisofs", return_value="mkisofs")
     def test_desktop_replaces_image_name(self, mock_find, mock_run, cfg):
         """--desktop flag replaces SERVERSTANDARDCORE with SERVERSTANDARD."""
         written = {}
@@ -572,8 +572,8 @@ class TestBuildUnattendImage:
         assert "SERVERSTANDARDCORE" not in written["xml"]
         assert "Windows Server 2022 SERVERSTANDARD" in written["xml"]
 
-    @patch("winbox.setup.installer.subprocess.run")
-    @patch("winbox.setup.installer._find_mkisofs", return_value="mkisofs")
+    @patch("winbox.setup.installer.unattend.subprocess.run")
+    @patch("winbox.setup.installer.unattend._find_mkisofs", return_value="mkisofs")
     def test_win11_image_drivers_and_bypass(self, mock_find, mock_run, cfg):
         """Win11 profile writes the Win11 image, w11 driver paths, LabConfig bypass."""
         cfg.vm_os = "win11"
@@ -600,8 +600,8 @@ class TestBuildUnattendImage:
         assert "<Size>260</Size>" in xml
         assert "<PartitionID>3</PartitionID>" in xml
 
-    @patch("winbox.setup.installer.subprocess.run")
-    @patch("winbox.setup.installer._find_mkisofs", return_value="mkisofs")
+    @patch("winbox.setup.installer.unattend.subprocess.run")
+    @patch("winbox.setup.installer.unattend._find_mkisofs", return_value="mkisofs")
     def test_server_disk_layout_unchanged(self, mock_find, mock_run, cfg):
         """Server keeps the minimal ESP+Windows layout on partition 2, no MSR."""
         written = {}
@@ -620,16 +620,16 @@ class TestBuildUnattendImage:
         # InstallTo targets partition 2 for the 2-partition layout.
         assert "<PartitionID>2</PartitionID>" in xml
 
-    @patch("winbox.setup.installer.subprocess.run")
-    @patch("winbox.setup.installer._find_mkisofs", return_value="mkisofs")
+    @patch("winbox.setup.installer.unattend.subprocess.run")
+    @patch("winbox.setup.installer.unattend._find_mkisofs", return_value="mkisofs")
     def test_win11_rejects_desktop(self, mock_find, mock_run, cfg):
         """--desktop is a Server-only concept and is rejected for Win11."""
         cfg.vm_os = "win11"
         with pytest.raises(RuntimeError, match="desktop"):
             build_unattend_image(cfg, desktop=True)
 
-    @patch("winbox.setup.installer.subprocess.run")
-    @patch("winbox.setup.installer._find_mkisofs", return_value="mkisofs")
+    @patch("winbox.setup.installer.unattend.subprocess.run")
+    @patch("winbox.setup.installer.unattend._find_mkisofs", return_value="mkisofs")
     def test_server_has_no_bypass_block(self, mock_find, mock_run, cfg):
         """Server 2022 render carries no LabConfig bypass keys."""
         written = {}
@@ -650,7 +650,7 @@ class TestBuildUnattendImage:
 
 
 class TestCreateDisk:
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.unattend.subprocess.run")
     def test_calls_qemu_img(self, mock_run, cfg):
         mock_run.return_value = MagicMock(returncode=0)
         create_disk(cfg)
@@ -661,7 +661,7 @@ class TestCreateDisk:
         # Server profile floor (30) == default, so the configured size is used.
         assert f"{cfg.vm_disk}G" in args
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.unattend.subprocess.run")
     def test_win11_enforces_64gb_floor(self, mock_run, cfg):
         """Win11 needs ≥64GB; the default 30GB config is bumped up."""
         cfg.vm_os = "win11"
@@ -672,7 +672,7 @@ class TestCreateDisk:
         assert "64G" in args
         assert "30G" not in args
 
-    @patch("winbox.setup.installer.subprocess.run")
+    @patch("winbox.setup.installer.unattend.subprocess.run")
     def test_win11_respects_larger_configured_disk(self, mock_run, cfg):
         """A configured disk above the floor is kept."""
         cfg.vm_os = "win11"
@@ -688,9 +688,9 @@ class TestCreateDisk:
 class TestBootForProvisioningLaunchProbe:
     """B3: if bootstrap.ps1 doesn't start, surface in 30s instead of 600."""
 
-    @patch("winbox.setup.installer.time.sleep")
-    @patch("winbox.setup.installer.GuestAgent")
-    @patch("winbox.setup.installer.VM")
+    @patch("winbox.setup.installer.provision.time.sleep")
+    @patch("winbox.setup.installer.provision.GuestAgent")
+    @patch("winbox.setup.installer.provision.VM")
     def test_bails_when_log_never_appears(
         self, mock_vm_cls, mock_ga_cls, mock_sleep, cfg,
     ):
@@ -714,10 +714,10 @@ class TestBootForProvisioningLaunchProbe:
         # We never reached wait_shutdown — that would be the 600s wait we're avoiding.
         vm.wait_shutdown.assert_not_called()
 
-    @patch("winbox.setup.installer._verify_provisioning")
-    @patch("winbox.setup.installer.time.sleep")
-    @patch("winbox.setup.installer.GuestAgent")
-    @patch("winbox.setup.installer.VM")
+    @patch("winbox.setup.installer.finalize._verify_provisioning")
+    @patch("winbox.setup.installer.provision.time.sleep")
+    @patch("winbox.setup.installer.provision.GuestAgent")
+    @patch("winbox.setup.installer.provision.VM")
     def test_proceeds_when_log_appears(
         self, mock_vm_cls, mock_ga_cls, mock_sleep, mock_verify, cfg,
     ):
@@ -740,10 +740,10 @@ class TestBootForProvisioningLaunchProbe:
         vm.wait_shutdown.assert_called_once()
         mock_verify.assert_called_once()
 
-    @patch("winbox.setup.installer._verify_provisioning")
-    @patch("winbox.setup.installer.time.sleep")
-    @patch("winbox.setup.installer.GuestAgent")
-    @patch("winbox.setup.installer.VM")
+    @patch("winbox.setup.installer.finalize._verify_provisioning")
+    @patch("winbox.setup.installer.provision.time.sleep")
+    @patch("winbox.setup.installer.provision.GuestAgent")
+    @patch("winbox.setup.installer.provision.VM")
     def test_proceeds_when_vm_already_shut_down(
         self, mock_vm_cls, mock_ga_cls, mock_sleep, mock_verify, cfg,
     ):
@@ -793,14 +793,14 @@ class TestProvisionPayloadPythonCheck:
             (cfg.iso_dir / PYTHON_EMBED_ZIP).write_bytes(b"x")
 
     def _provision(self, cfg):
-        from winbox.setup import installer
+        from winbox.setup.installer import provision as installer_provision
 
         with (
-            patch.object(installer, "_guestfish"),
-            patch.object(installer, "_disable_defender_offline"),
-            patch.object(installer.zipfile, "is_zipfile", return_value=True),
+            patch.object(installer_provision, "_guestfish"),
+            patch.object(installer_provision, "_disable_defender_offline"),
+            patch("winbox.setup.installer.provision.zipfile.is_zipfile", return_value=True),
         ):
-            installer.provision_vm_disk(cfg)
+            installer_provision.provision_vm_disk(cfg)
 
     def test_server_build_requires_the_python_installer(self, tmp_path):
         cfg = self._cfg(tmp_path, "server2022")
@@ -844,13 +844,13 @@ class TestVirtInstallDisplay:
         return cfg
 
     def _cmd(self, cfg):
-        from winbox.setup import installer
+        from winbox.setup.installer import unattend as installer_unattend
 
         with (
-            patch.object(installer, "ensure_default_network"),
-            patch.object(installer, "virsh_run"),
-            patch.object(installer.time, "sleep"),
-            patch.object(installer.subprocess, "run") as mock_run,
+            patch.object(installer_unattend, "ensure_default_network"),
+            patch.object(installer_unattend, "virsh_run"),
+            patch("winbox.setup.installer.unattend.time.sleep"),
+            patch("winbox.setup.installer.unattend.subprocess.run") as mock_run,
         ):
             run_virt_install(cfg, "/tmp/windows.iso")
         return mock_run.call_args[0][0]
@@ -910,12 +910,14 @@ class TestSpicePayloadGate:
                     with _zip.ZipFile(zip_path) as zf:
                         captured["names"] = zf.namelist()
 
+        from winbox.setup.installer import provision as installer_provision
+
         with (
-            patch.object(installer, "_guestfish", side_effect=fake_guestfish),
-            patch.object(installer, "_disable_defender_offline"),
-            patch.object(installer.zipfile, "is_zipfile", return_value=True),
+            patch.object(installer_provision, "_guestfish", side_effect=fake_guestfish),
+            patch.object(installer_provision, "_disable_defender_offline"),
+            patch("winbox.setup.installer.provision.zipfile.is_zipfile", return_value=True),
         ):
-            installer.provision_vm_disk(cfg)
+            installer_provision.provision_vm_disk(cfg)
         return captured["names"]
 
     def test_spice_mode_packs_spice_tools(self, tmp_path):
@@ -1199,7 +1201,7 @@ class TestGuestfish:
     def test_prepends_run_and_joins_commands(self):
         from winbox.setup.installer import _guestfish
 
-        with patch("winbox.setup.installer.subprocess.run") as run:
+        with patch("winbox.setup.installer.provision.subprocess.run") as run:
             run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             _guestfish(Path("/disk.qcow2"), {}, ["mount /dev/sda2 /", "upload a b"])
 
@@ -1212,7 +1214,7 @@ class TestGuestfish:
     def test_raises_with_stderr_detail(self):
         from winbox.setup.installer import _guestfish
 
-        with patch("winbox.setup.installer.subprocess.run") as run:
+        with patch("winbox.setup.installer.provision.subprocess.run") as run:
             run.return_value = MagicMock(
                 returncode=1, stdout="", stderr="mount: no such device"
             )
@@ -1335,8 +1337,8 @@ class TestOfflineRegistryPrereq:
 
         assert "hivexregedit" in REQUIRED_TOOLS
 
-    @patch("winbox.setup.installer.shutil.which")
-    @patch("winbox.setup.installer.Path.exists", return_value=True)
+    @patch("winbox.setup.installer.prereqs.shutil.which")
+    @patch("winbox.setup.installer.prereqs.Path.exists", return_value=True)
     def test_missing_hivexregedit_is_reported(self, _exists, mock_which):
         mock_which.side_effect = self._which_missing("hivexregedit")
 
@@ -1344,8 +1346,8 @@ class TestOfflineRegistryPrereq:
 
         assert any("hivexregedit" in m for m in missing)
 
-    @patch("winbox.setup.installer.shutil.which")
-    @patch("winbox.setup.installer.Path.exists", return_value=True)
+    @patch("winbox.setup.installer.prereqs.shutil.which")
+    @patch("winbox.setup.installer.prereqs.Path.exists", return_value=True)
     def test_report_names_the_package_that_actually_provides_it(
         self, _exists, mock_which
     ):
@@ -1356,8 +1358,8 @@ class TestOfflineRegistryPrereq:
 
         assert "libwin-hivex-perl" in report
 
-    @patch("winbox.setup.installer.shutil.which")
-    @patch("winbox.setup.installer.Path.exists", return_value=True)
+    @patch("winbox.setup.installer.prereqs.shutil.which")
+    @patch("winbox.setup.installer.prereqs.Path.exists", return_value=True)
     def test_not_required_for_a_profile_that_never_edits_hives_offline(
         self, _exists, mock_which
     ):
@@ -1372,8 +1374,8 @@ class TestOfflineRegistryPrereq:
         assert not any("hivexregedit" in m for m in missing)
 
     @pytest.mark.parametrize("os_key", ["win11", "server2025", "win10"])
-    @patch("winbox.setup.installer.shutil.which")
-    @patch("winbox.setup.installer.Path.exists", return_value=True)
+    @patch("winbox.setup.installer.prereqs.shutil.which")
+    @patch("winbox.setup.installer.prereqs.Path.exists", return_value=True)
     def test_required_for_the_profile_that_does(self, _exists, mock_which, os_key):
         """Every profile with disable_defender_offline=True edits the offline
         hive and so must block on hivexregedit."""
@@ -1385,8 +1387,8 @@ class TestOfflineRegistryPrereq:
 
         assert any("hivexregedit" in m for m in missing)
 
-    @patch("winbox.setup.installer.shutil.which")
-    @patch("winbox.setup.installer.Path.exists", return_value=True)
+    @patch("winbox.setup.installer.prereqs.shutil.which")
+    @patch("winbox.setup.installer.prereqs.Path.exists", return_value=True)
     def test_nothing_missing_stays_empty_for_both_profiles(self, _exists, mock_which):
         from winbox.config import Config
 

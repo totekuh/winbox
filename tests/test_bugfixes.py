@@ -752,7 +752,7 @@ class TestGrantLibvirtAccessOutsideHome:
         with (
             patch("pathlib.Path.home", return_value=Path("/home/fakeuser")),
             patch("shutil.which", return_value="/usr/bin/setfacl"),
-            patch("winbox.setup.installer.subprocess.run") as mock_run,
+            patch("winbox.setup.installer.prereqs.subprocess.run") as mock_run,
         ):
             # This must complete in finite time (no infinite loop)
             grant_libvirt_access(cfg)
