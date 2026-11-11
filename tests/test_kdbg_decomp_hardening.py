@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,7 +24,16 @@ from winbox.kdbg.decomp.client import (
 from winbox.kdbg.decomp.docker import DockerManager, project_dir
 from winbox.kdbg.decomp.identity import PeIdentity
 from winbox.kdbg.decomp.service import _format_instruction, _resolve_verified_binary, _snapshot_binary
-from winbox.kdbg.decomp.worker import Worker, WorkerError, _read_request, _recover_function
+from winbox.kdbg.decomp.worker import (
+    ANALYSIS_PROFILE,
+    ENRICHMENT_REVISION,
+    MAX_ENRICHMENT_BYTES,
+    MAX_REQUEST,
+    Worker,
+    WorkerError,
+    _read_request,
+    _recover_function,
+)
 from winbox.kdbg.pdb import parse_publics_metadata
 
 
@@ -701,3 +711,361 @@ def test_repair_cli_and_mcp_forward_exact_digest(monkeypatch, tmp_path):
     reply = mcp_module.kdbg_decomp_cache_repair("b" * 64)
     assert reply["ok"] is True
     assert seen == ["a" * 64, "b" * 64]
+
+
+# ── Enrichment validation ──────────────────────────────────────────────
+
+
+def _valid_sidecar(enrichment_dir, digest):
+    payload = {
+        "schema": "winbox.pdb-enrichment/1",
+        "revision": ENRICHMENT_REVISION,
+        "analysis_profile": ANALYSIS_PROFILE,
+        "binary_sha256": digest,
+        "functions": [{"name": "NtClose", "rva": 0x1000}],
+        "globals": [],
+    }
+    path = enrichment_dir / f"{digest}.json"
+    path.write_text(json.dumps(payload))
+    return str(path), payload
+
+
+def _enrichment_worker(tmp_path):
+    cache = tmp_path / "cache"
+    enrichment = cache / "enrichment"
+    enrichment.mkdir(parents=True)
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    worker = Worker(cache, projects, None)
+    return worker, enrichment
+
+
+class TestLoadEnrichment:
+
+    def test_empty_value_returns_none(self, tmp_path):
+        worker, _ = _enrichment_worker(tmp_path)
+        assert worker._load_enrichment("", "abc") is None
+
+    def test_missing_file_raises(self, tmp_path):
+        worker, enrichment = _enrichment_worker(tmp_path)
+        with pytest.raises(WorkerError, match="missing"):
+            worker._load_enrichment(str(enrichment / "gone.json"), "abc")
+
+    def test_symlink_raises(self, tmp_path):
+        worker, enrichment = _enrichment_worker(tmp_path)
+        digest = "a" * 64
+        real_path, _ = _valid_sidecar(enrichment, digest)
+        link = enrichment / "link.json"
+        link.symlink_to(real_path)
+        with pytest.raises(WorkerError, match="unsafe"):
+            worker._load_enrichment(str(link), digest)
+
+    def test_outside_root_raises(self, tmp_path):
+        worker, enrichment = _enrichment_worker(tmp_path)
+        outside = tmp_path / "outside.json"
+        outside.write_text(json.dumps({"schema": "x"}))
+        with pytest.raises(WorkerError, match="unsafe"):
+            worker._load_enrichment(str(outside), "abc")
+
+    def test_exceeds_size_cap(self, monkeypatch, tmp_path):
+        worker, enrichment = _enrichment_worker(tmp_path)
+        digest = "b" * 64
+        _valid_sidecar(enrichment, digest)
+        monkeypatch.setattr(
+            "winbox.kdbg.decomp.worker.MAX_ENRICHMENT_BYTES", 10,
+        )
+        with pytest.raises(WorkerError, match="exceeds"):
+            worker._load_enrichment(str(enrichment / f"{digest}.json"), digest)
+
+    def test_invalid_json_raises(self, tmp_path):
+        worker, enrichment = _enrichment_worker(tmp_path)
+        bad = enrichment / "bad.json"
+        bad.write_bytes(b"not json")
+        with pytest.raises(WorkerError, match="invalid"):
+            worker._load_enrichment(str(bad), "abc")
+
+    def test_schema_mismatch(self, tmp_path):
+        worker, enrichment = _enrichment_worker(tmp_path)
+        digest = "c" * 64
+        path = enrichment / f"{digest}.json"
+        path.write_text(json.dumps({
+            "schema": "wrong/1", "revision": ENRICHMENT_REVISION,
+            "analysis_profile": ANALYSIS_PROFILE, "binary_sha256": digest,
+            "functions": [], "globals": [],
+        }))
+        with pytest.raises(WorkerError, match="identity mismatch"):
+            worker._load_enrichment(str(path), digest)
+
+    def test_digest_mismatch(self, tmp_path):
+        worker, enrichment = _enrichment_worker(tmp_path)
+        digest = "d" * 64
+        path = enrichment / f"{digest}.json"
+        path.write_text(json.dumps({
+            "schema": "winbox.pdb-enrichment/1",
+            "revision": ENRICHMENT_REVISION,
+            "analysis_profile": ANALYSIS_PROFILE,
+            "binary_sha256": "wrong" * 13,
+            "functions": [], "globals": [],
+        }))
+        with pytest.raises(WorkerError, match="identity mismatch"):
+            worker._load_enrichment(str(path), digest)
+
+    def test_invalid_function_record(self, tmp_path):
+        worker, enrichment = _enrichment_worker(tmp_path)
+        digest = "e" * 64
+        path = enrichment / f"{digest}.json"
+        path.write_text(json.dumps({
+            "schema": "winbox.pdb-enrichment/1",
+            "revision": ENRICHMENT_REVISION,
+            "analysis_profile": ANALYSIS_PROFILE,
+            "binary_sha256": digest,
+            "functions": [{"name": "X", "rva": True}],
+            "globals": [],
+        }))
+        with pytest.raises(WorkerError, match="identity"):
+            worker._load_enrichment(str(path), digest)
+
+    def test_valid_sidecar(self, tmp_path):
+        worker, enrichment = _enrichment_worker(tmp_path)
+        digest = "f" * 64
+        path_str, payload = _valid_sidecar(enrichment, digest)
+        result = worker._load_enrichment(path_str, digest)
+        assert result is not None
+        sha, data = result
+        assert len(sha) == 64
+        assert data["binary_sha256"] == digest
+
+
+# ── Decompile input validation ─────────────────────────────────────────
+
+
+class TestDecompileValidation:
+
+    @pytest.fixture()
+    def worker_and_binary(self, tmp_path):
+        cache = tmp_path / "cache"
+        (cache / "binaries").mkdir(parents=True)
+        (cache / "metadata").mkdir()
+        projects = tmp_path / "projects"
+        projects.mkdir()
+        worker = Worker(cache, projects, None)
+        worker.started = True
+        worker.ghidra_version = "12.1.3"
+        binary = tmp_path / "sample.exe"
+        binary.write_bytes(b"test-binary")
+        digest = hashlib.sha256(b"test-binary").hexdigest()
+        return worker, str(binary), digest
+
+    def test_bad_sha_format(self, worker_and_binary):
+        worker, binary, _ = worker_and_binary
+        with pytest.raises(WorkerError, match="64 lowercase hex"):
+            worker.decompile({"binary": binary, "sha256": "ZZZZ", "rva": 0})
+
+    def test_sha_mismatch(self, worker_and_binary):
+        worker, binary, _ = worker_and_binary
+        with pytest.raises(WorkerError, match="binary changed"):
+            worker.decompile({"binary": binary, "sha256": "a" * 64, "rva": 0})
+
+    def test_bad_rva_type(self, worker_and_binary):
+        worker, binary, digest = worker_and_binary
+        with pytest.raises(WorkerError, match="rva must be an integer"):
+            worker.decompile({"binary": binary, "sha256": digest, "rva": "string"})
+
+    def test_rva_out_of_range_negative(self, worker_and_binary):
+        worker, binary, digest = worker_and_binary
+        with pytest.raises(WorkerError, match="outside supported"):
+            worker.decompile({"binary": binary, "sha256": digest, "rva": -1})
+
+    def test_rva_out_of_range_large(self, worker_and_binary):
+        worker, binary, digest = worker_and_binary
+        with pytest.raises(WorkerError, match="outside supported"):
+            worker.decompile({"binary": binary, "sha256": digest, "rva": 2**32})
+
+    def test_bad_assembly_mode(self, worker_and_binary):
+        worker, binary, digest = worker_and_binary
+        with pytest.raises(WorkerError, match="nearby.*mapped"):
+            worker.decompile({
+                "binary": binary, "sha256": digest, "rva": 0x1000,
+                "assembly": "invalid",
+            })
+
+    def test_bad_analysis_timeout_too_low(self, worker_and_binary):
+        worker, binary, digest = worker_and_binary
+        with pytest.raises(WorkerError, match="between 5 and 1800"):
+            worker.decompile({
+                "binary": binary, "sha256": digest, "rva": 0x1000,
+                "analysis_timeout": 2,
+            })
+
+    def test_bad_analysis_timeout_type(self, worker_and_binary):
+        worker, binary, digest = worker_and_binary
+        with pytest.raises(WorkerError, match="analysis_timeout must be an integer"):
+            worker.decompile({
+                "binary": binary, "sha256": digest, "rva": 0x1000,
+                "analysis_timeout": "abc",
+            })
+
+
+# ── _read_request edge cases ───────────────────────────────────────────
+
+
+class TestCheckCancelled:
+
+    def test_no_marker_no_exception(self, tmp_path):
+        worker, _ = _enrichment_worker(tmp_path)
+        worker._check_cancelled("abc123")
+
+    def test_empty_request_id_no_exception(self, tmp_path):
+        worker, _ = _enrichment_worker(tmp_path)
+        worker._check_cancelled("")
+
+    def test_marker_exists_raises_and_unlinks(self, tmp_path):
+        worker, _ = _enrichment_worker(tmp_path)
+        cancel_dir = worker.cache / "cancel"
+        cancel_dir.mkdir(parents=True)
+        marker = cancel_dir / "abc123"
+        marker.write_text("")
+        with pytest.raises(WorkerError, match="cancelled"):
+            worker._check_cancelled("abc123")
+        assert not marker.exists()
+
+
+class TestRunCancellable:
+
+    def _worker(self, tmp_path, monkeypatch):
+        import sys
+        from types import SimpleNamespace, ModuleType
+        fake_ghidra_task = ModuleType("ghidra.util.task")
+        fake_ghidra_task.ConsoleTaskMonitor = lambda: SimpleNamespace(cancel=lambda: None)
+        monkeypatch.setitem(sys.modules, "ghidra.util.task", fake_ghidra_task)
+        worker, _ = _enrichment_worker(tmp_path)
+        return worker
+
+    def test_callback_succeeds(self, tmp_path, monkeypatch):
+        worker = self._worker(tmp_path, monkeypatch)
+        result = worker._run_cancellable(
+            "r1", 10, lambda monitor: "done",
+            timeout_code="timeout", timeout_message="timed out",
+        )
+        assert result == "done"
+
+    def test_callback_timeout(self, tmp_path, monkeypatch):
+        worker = self._worker(tmp_path, monkeypatch)
+        def slow(monitor):
+            time.sleep(0.5)
+            return "late"
+        with pytest.raises(WorkerError, match="timed out"):
+            worker._run_cancellable(
+                "", 0, slow,
+                timeout_code="timeout", timeout_message="timed out",
+            )
+
+    def test_cancel_marker_fires(self, tmp_path, monkeypatch):
+        worker = self._worker(tmp_path, monkeypatch)
+        cancel_dir = worker.cache / "cancel"
+        cancel_dir.mkdir(parents=True)
+        (cancel_dir / "req1").write_text("")
+        def slow(monitor):
+            time.sleep(0.5)
+            return "late"
+        with pytest.raises(WorkerError, match="cancelled"):
+            worker._run_cancellable(
+                "req1", 10, slow,
+                timeout_code="timeout", timeout_message="timed out",
+            )
+
+
+class TestOpenBinaryStagingAndLru:
+
+    def _setup_worker(self, tmp_path, monkeypatch):
+        cache = tmp_path / "cache"
+        (cache / "binaries").mkdir(parents=True)
+        (cache / "metadata").mkdir()
+        projects = tmp_path / "projects"
+        projects.mkdir()
+        worker = Worker(cache, projects, None)
+        worker.started = True
+        worker.ghidra_version = "12.1.3"
+        monkeypatch.setattr(worker, "start_ghidra", lambda: None)
+        fake_opened = SimpleNamespace(
+            context=None, api=None, decompiler=None, program=None,
+            enrichment_key=None, enrichment_summary=None,
+            close=lambda: None,
+        )
+        monkeypatch.setattr(worker, "_enter_project", lambda *a, **kw: fake_opened)
+        monkeypatch.setattr(worker, "_analyze_opened", lambda *a, **kw: True)
+        monkeypatch.setattr(worker, "_apply_enrichment", lambda *a, **kw: None)
+        binary = tmp_path / "sample.exe"
+        binary.write_bytes(b"hello-binary")
+        digest = hashlib.sha256(b"hello-binary").hexdigest()
+        return worker, binary, digest, cache
+
+    def test_binary_staged_to_cache(self, tmp_path, monkeypatch):
+        worker, binary, digest, cache = self._setup_worker(tmp_path, monkeypatch)
+        worker._open(binary, digest, request_id="r1")
+        cached = cache / "binaries" / f"{digest}.exe"
+        assert cached.exists()
+        assert cached.read_bytes() == b"hello-binary"
+
+    def test_lru_eviction(self, tmp_path, monkeypatch):
+        worker, binary, digest, cache = self._setup_worker(tmp_path, monkeypatch)
+        worker.max_open_programs = 1
+        closed = []
+        old_entry = SimpleNamespace(close=lambda: closed.append(True))
+        worker.programs["old_digest"] = old_entry
+        worker._open(binary, digest, request_id="r2")
+        assert closed == [True]
+        assert "old_digest" not in worker.programs
+        assert digest in worker.programs
+
+
+class TestReadRequestEdgeCases:
+
+    def test_oversized_request(self):
+        left, right = socket.socketpair()
+        try:
+            right.sendall(b"x" * (MAX_REQUEST + 1))
+            with pytest.raises(WorkerError, match="exceeds"):
+                _read_request(left)
+        finally:
+            left.close()
+            right.close()
+
+    def test_connection_closed(self):
+        left, right = socket.socketpair()
+        try:
+            right.close()
+            with pytest.raises(WorkerError, match="closed"):
+                _read_request(left)
+        finally:
+            left.close()
+
+    def test_invalid_json(self):
+        left, right = socket.socketpair()
+        try:
+            right.sendall(b"not json\n")
+            with pytest.raises(WorkerError, match="invalid request JSON"):
+                _read_request(left)
+        finally:
+            left.close()
+            right.close()
+
+    def test_missing_op(self):
+        left, right = socket.socketpair()
+        try:
+            right.sendall(b'{"args":{},"request_id":"aa"}\n')
+            with pytest.raises(WorkerError, match="string op"):
+                _read_request(left)
+        finally:
+            left.close()
+            right.close()
+
+    def test_non_dict_args(self):
+        left, right = socket.socketpair()
+        try:
+            right.sendall(b'{"op":"status","args":[1],"request_id":"aa"}\n')
+            with pytest.raises(WorkerError, match="must be an object"):
+                _read_request(left)
+        finally:
+            left.close()
+            right.close()

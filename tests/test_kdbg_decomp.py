@@ -35,11 +35,17 @@ from winbox.kdbg.decomp.service import (
     query_decomp,
 )
 from winbox.kdbg.decomp.worker import (
+    Worker,
     WorkerError,
     _attach_mapped_assembly,
     _bounded_code_payload,
+    _looks_like_project_corruption,
     _map_source,
     _nearby_instructions,
+    _requested_lines,
+    _safe_binary_name,
+    _sha256,
+    _verified_function_name,
 )
 from winbox.kdbg.debugger.daemon import DaemonSession, StopState, TargetInfo
 from winbox.kdbg.debugger.reader import ReaderError
@@ -1451,3 +1457,104 @@ def test_daemon_module_at_rejects_unmapped_and_invalid_addresses(monkeypatch, tm
         session.op_module_at(0x1000)
     with pytest.raises(ValueError, match="uint64"):
         session.op_module_at(-1)
+
+
+# ── Worker pure-function tests ─────────────────────────────────────────
+
+
+class TestWorkerPureFunctions:
+
+    # _safe_binary_name
+
+    def test_safe_binary_name_backslash(self):
+        assert _safe_binary_name("C:\\Users\\x\\a.exe") == "a.exe"
+
+    def test_safe_binary_name_forward_slash(self):
+        assert _safe_binary_name("/cache/binaries/test.bin") == "test.bin"
+
+    def test_safe_binary_name_none(self):
+        assert _safe_binary_name(None) == ""
+
+    def test_safe_binary_name_length_cap(self):
+        assert len(_safe_binary_name("x" * 300)) == 260
+
+    # _looks_like_project_corruption
+
+    def test_corruption_detected(self):
+        assert _looks_like_project_corruption(RuntimeError("corrupt project data")) is True
+
+    def test_corruption_false_for_oom(self):
+        assert _looks_like_project_corruption(RuntimeError("OutOfMemory error")) is False
+
+    def test_corruption_false_for_cancelled(self):
+        assert _looks_like_project_corruption(RuntimeError("operation cancelled")) is False
+
+    def test_corruption_false_for_permission(self):
+        assert _looks_like_project_corruption(OSError("Permission denied")) is False
+
+    def test_corruption_false_for_unrelated(self):
+        assert _looks_like_project_corruption(ValueError("bad value")) is False
+
+    # _requested_lines
+
+    def test_requested_lines_both_none(self):
+        assert _requested_lines({}) == (None, None)
+
+    def test_requested_lines_only_start(self):
+        with pytest.raises(WorkerError, match="supplied together"):
+            _requested_lines({"line_start": 1})
+
+    def test_requested_lines_non_integer(self):
+        with pytest.raises(WorkerError, match="integers"):
+            _requested_lines({"line_start": "x", "line_end": "y"})
+
+    def test_requested_lines_descending(self):
+        with pytest.raises(WorkerError, match="ascending"):
+            _requested_lines({"line_start": 10, "line_end": 5})
+
+    def test_requested_lines_valid(self):
+        assert _requested_lines({"line_start": 1, "line_end": 10}) == (1, 10)
+
+    # _verified_function_name
+
+    def test_verified_function_name_match(self):
+        hint = {"is_function": True, "rva": 0x1000, "name": "NtClose"}
+        assert _verified_function_name(hint, 0x1000) == "NtClose"
+
+    def test_verified_function_name_rva_mismatch(self):
+        hint = {"is_function": True, "rva": 0x2000, "name": "NtClose"}
+        assert _verified_function_name(hint, 0x1000) is None
+
+    def test_verified_function_name_not_function(self):
+        hint = {"is_function": False, "rva": 0x1000, "name": "NtClose"}
+        assert _verified_function_name(hint, 0x1000) is None
+
+    def test_verified_function_name_non_dict(self):
+        assert _verified_function_name("string", 0x1000) is None
+
+    def test_verified_function_name_empty_name(self):
+        hint = {"is_function": True, "rva": 0, "name": "  "}
+        assert _verified_function_name(hint, 0) is None
+
+    # Worker._safe_symbol_name
+
+    def test_safe_symbol_name_normal(self):
+        assert Worker._safe_symbol_name("NtClose", 0x1000) == "NtClose"
+
+    def test_safe_symbol_name_special_chars(self):
+        result = Worker._safe_symbol_name("foo::bar<int>", 0x1000)
+        assert "::" not in result
+        assert "<" not in result
+
+    def test_safe_symbol_name_digit_leading(self):
+        result = Worker._safe_symbol_name("0start", 0x1000)
+        assert result.startswith("winbox_1000_")
+
+    # _sha256
+
+    def test_sha256_computes_correct_digest(self, tmp_path):
+        import hashlib
+        path = tmp_path / "test.bin"
+        path.write_bytes(b"hello")
+        expected = hashlib.sha256(b"hello").hexdigest()
+        assert _sha256(path) == expected
