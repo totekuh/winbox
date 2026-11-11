@@ -12,11 +12,12 @@ import pytest
 from winbox.config import Config
 from winbox.kdbg.capture import (
     CaptureError, CaptureIdentityError, CaptureIncomplete, CaptureStore,
-    SCHEMA, diff_captures,
+    SCHEMA,
     _boot_identity, _boot_identity_for_capture, _module_record,
     _process_record, _thread_record,
     capture_live, capture_process_in_snapshot, capture_system_in_snapshot,
 )
+from winbox.kdbg.capture_diff import diff_captures
 from winbox.kdbg.objects import ObjectEvidenceError
 from winbox.kdbg.vad import VadError
 

@@ -16,6 +16,9 @@ import pytest
 from winbox.config import Config
 from winbox.vm.lifecycle import VM, VMState, virsh_run
 
+_NET = "winbox.vm.net.virsh_run"
+_LC = "winbox.vm.lifecycle.virsh_run"
+
 
 def _proc(stdout="", returncode=0, stderr=""):
     return subprocess.CompletedProcess(
@@ -159,7 +162,7 @@ class TestIpDiscovery:
 
     def test_single_nic(self, vm):
         with (
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(self.SINGLE_NIC)),
+            patch(_NET, return_value=_proc(self.SINGLE_NIC)),
             patch.object(VM, "interface", return_value="vnet0"),
         ):
             assert vm.ip() == "192.168.122.10"
@@ -168,14 +171,14 @@ class TestIpDiscovery:
         """With a second test network attached, the first IPv4 line is no
         longer necessarily the libvirt-default-network address."""
         with (
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(self.MULTI_NIC)),
+            patch(_NET, return_value=_proc(self.MULTI_NIC)),
             patch.object(VM, "interface", return_value="vnet0"),
         ):
             assert vm.ip() == "192.168.122.10"
 
     def test_falls_back_to_first_ip_when_interface_is_unknown(self, vm):
         with (
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(self.MULTI_NIC)),
+            patch(_NET, return_value=_proc(self.MULTI_NIC)),
             patch.object(VM, "interface", return_value=None),
         ):
             assert vm.ip() == "10.9.9.5"
@@ -183,7 +186,7 @@ class TestIpDiscovery:
     def test_no_lease_returns_none(self, vm):
         header = self.SINGLE_NIC.split("\n")[0] + "\n"
         with (
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(header)),
+            patch(_NET, return_value=_proc(header)),
             patch.object(VM, "interface", return_value="vnet0"),
         ):
             assert vm.ip() is None
@@ -197,7 +200,7 @@ class TestIpDiscovery:
             + " vnet1      52:54:00:11:22:33    ipv4         10.9.9.5/24\n"
         )
         with (
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(only_other)),
+            patch(_NET, return_value=_proc(only_other)),
             patch.object(VM, "interface", return_value="vnet0"),
         ):
             assert vm.ip() is None
@@ -228,7 +231,7 @@ class TestIpDiscovery:
                 vm.start()
 
     def test_virsh_failure_returns_none(self, vm):
-        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(returncode=1)):
+        with patch(_NET, return_value=_proc(returncode=1)):
             assert vm.ip() is None
 
 
@@ -269,51 +272,44 @@ class TestInterfaceAndLink:
 """
 
     def test_interface_parses_the_name(self, vm):
-        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(self.IFLIST)):
+        with patch(_NET, return_value=_proc(self.IFLIST)):
             assert vm.interface() == "vnet0"
 
     def test_interface_none_on_failure(self, vm):
-        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(returncode=1)):
+        with patch(_NET, return_value=_proc(returncode=1)):
             assert vm.interface() is None
 
     def test_interface_is_none_for_an_off_domain(self, vm):
-        # The tap only exists while the domain runs; '-' is not a tap name.
-        with patch(
-            "winbox.vm.lifecycle.virsh_run", return_value=_proc(self.IFLIST_INACTIVE)
-        ):
+        with patch(_NET, return_value=_proc(self.IFLIST_INACTIVE)):
             assert vm.interface() is None
 
     def test_nics_parses_tap_and_mac(self, vm):
-        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(self.IFLIST)):
+        with patch(_NET, return_value=_proc(self.IFLIST)):
             assert vm.nics() == [("vnet0", self.MAC)]
 
     def test_nics_parses_the_inactive_listing(self, vm):
-        with patch(
-            "winbox.vm.lifecycle.virsh_run", return_value=_proc(self.IFLIST_INACTIVE)
-        ) as run:
+        with patch(_NET, return_value=_proc(self.IFLIST_INACTIVE)) as run:
             assert vm.nics(inactive=True) == [(None, self.MAC)]
         assert run.call_args[0] == ("domiflist", vm.name, "--inactive")
 
     def test_nics_parses_multiple_nics_in_order(self, vm):
-        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(self.IFLIST_TWO)):
+        with patch(_NET, return_value=_proc(self.IFLIST_TWO)):
             assert vm.nics() == [("vnet0", self.MAC), ("vnet1", self.MAC2)]
 
     def test_nics_skips_rows_without_a_mac(self, vm):
         truncated = self.IFLIST + " vnet1       network   lab       virtio\n"
-        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(truncated)):
+        with patch(_NET, return_value=_proc(truncated)):
             assert vm.nics() == [("vnet0", self.MAC)]
 
     def test_nics_empty_on_failure(self, vm):
-        with patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(returncode=1)):
+        with patch(_NET, return_value=_proc(returncode=1)):
             assert vm.nics() == []
             assert vm.nic_macs() == []
 
     def test_set_link_writes_config_before_live(self, vm):
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC]),
-            patch(
-                "winbox.vm.lifecycle.virsh_run", side_effect=[_proc(), _proc()]
-            ) as run,
+            patch(_NET, side_effect=[_proc(), _proc()]) as run,
         ):
             assert vm.net_set_link("down") is None
         assert run.call_args_list[0][0] == (
@@ -325,13 +321,12 @@ class TestInterfaceAndLink:
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC]),
             patch(
-                "winbox.vm.lifecycle.virsh_run",
+                _NET,
                 return_value=_proc(returncode=1, stderr="unsupported flag --config"),
             ) as run,
         ):
             with pytest.raises(RuntimeError, match="NOT applied"):
                 vm.net_set_link("down")
-        # The invariant: nothing live changed, so no illusion of an air-gap.
         assert run.call_count == 1
         assert run.call_args[0][-1] == "--config"
 
@@ -339,7 +334,7 @@ class TestInterfaceAndLink:
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC]),
             patch(
-                "winbox.vm.lifecycle.virsh_run",
+                _NET,
                 side_effect=[_proc(), _proc(returncode=1, stderr="device not found")],
             ),
         ):
@@ -356,7 +351,7 @@ class TestInterfaceAndLink:
     def test_set_link_requires_a_live_interface(self, vm):
         with (
             patch.object(VM, "nic_macs", return_value=[]),
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()),
+            patch(_NET, return_value=_proc()),
         ):
             with pytest.raises(RuntimeError, match="NOT applied live"):
                 vm.net_set_link("down", config=False)
@@ -364,7 +359,7 @@ class TestInterfaceAndLink:
     def test_set_link_config_only_skips_the_live_call(self, vm):
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC]),
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()) as run,
+            patch(_NET, return_value=_proc()) as run,
         ):
             vm.net_set_link("up", live=False)
         assert run.call_count == 1
@@ -373,7 +368,7 @@ class TestInterfaceAndLink:
     def test_set_link_live_only_skips_the_config_call(self, vm):
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC]),
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()) as run,
+            patch(_NET, return_value=_proc()) as run,
         ):
             vm.net_set_link("up", config=False)
         assert run.call_count == 1
@@ -386,26 +381,22 @@ class TestInterfaceAndLink:
     def test_set_link_hits_every_nic_config_first(self, vm):
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC, self.MAC2]),
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()) as run,
+            patch(_NET, return_value=_proc()) as run,
         ):
             vm.net_set_link("down")
         assert run.call_count == 4
         scopes = [call[0][-1] for call in run.call_args_list]
-        # Both persistent writes complete before any live write.
         assert scopes == ["--config", "--config", "down", "down"]
         macs = [call[0][2] for call in run.call_args_list]
         assert macs == [self.MAC, self.MAC2, self.MAC, self.MAC2]
 
     def test_set_link_uses_the_right_nic_list_per_scope(self, vm):
-        # A NIC that exists only in the persistent config must still be set
-        # down (it will exist after a reboot); a live-only hot-plugged NIC
-        # has nothing to persist.
         def macs(*, inactive=False):
             return [self.MAC2] if inactive else [self.MAC]
 
         with (
             patch.object(VM, "nic_macs", side_effect=macs),
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc()) as run,
+            patch(_NET, return_value=_proc()) as run,
         ):
             vm.net_set_link("down")
         config_call, live_call = run.call_args_list
@@ -420,26 +411,23 @@ class TestInterfaceAndLink:
     def test_link_state(self, vm, out, expected):
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC]),
-            patch("winbox.vm.lifecycle.virsh_run", return_value=_proc(out)),
+            patch(_NET, return_value=_proc(out)),
         ):
             assert vm.net_link_state() == expected
 
     def test_link_state_reads_the_config_scope_with_the_flag(self, vm):
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC]),
-            patch(
-                "winbox.vm.lifecycle.virsh_run", return_value=_proc(f"{self.MAC} down")
-            ) as run,
+            patch(_NET, return_value=_proc(f"{self.MAC} down")) as run,
         ):
             assert vm.net_link_state(config=True) == "down"
         assert run.call_args[0] == ("domif-getlink", vm.name, self.MAC, "--config")
 
     def test_link_state_is_up_when_any_nic_is_up(self, vm):
-        # One live NIC out of two is not an air-gap.
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC, self.MAC2]),
             patch(
-                "winbox.vm.lifecycle.virsh_run",
+                _NET,
                 side_effect=[_proc(f"{self.MAC} down"), _proc(f"{self.MAC2} up")],
             ),
         ):
@@ -449,18 +437,17 @@ class TestInterfaceAndLink:
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC, self.MAC2]),
             patch(
-                "winbox.vm.lifecycle.virsh_run",
+                _NET,
                 side_effect=[_proc(f"{self.MAC} down"), _proc(f"{self.MAC2} down")],
             ),
         ):
             assert vm.net_link_state() == "down"
 
     def test_link_state_is_none_when_a_nic_does_not_answer(self, vm):
-        # Silence must not read as "down" — the detonate gate trusts this.
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC, self.MAC2]),
             patch(
-                "winbox.vm.lifecycle.virsh_run",
+                _NET,
                 side_effect=[_proc(f"{self.MAC} down"), _proc(returncode=1)],
             ),
         ):
@@ -474,7 +461,7 @@ class TestInterfaceAndLink:
         with (
             patch.object(VM, "nic_macs", return_value=[self.MAC, self.MAC2]),
             patch(
-                "winbox.vm.lifecycle.virsh_run",
+                _NET,
                 side_effect=[_proc(f"{self.MAC} down"), _proc(returncode=1)],
             ),
         ):
@@ -785,7 +772,7 @@ class TestAgentChannelConnected:
     def _call(self, proc):
         from winbox.vm.lifecycle import agent_channel_connected
 
-        with patch("winbox.vm.lifecycle.virsh_run", return_value=proc):
+        with patch("winbox.vm.virsh.virsh_run", return_value=proc):
             return agent_channel_connected("winbox")
 
     def test_connected(self):

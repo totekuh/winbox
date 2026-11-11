@@ -1,6 +1,7 @@
 """VM infrastructure — lifecycle, guest agent."""
 
-from winbox.vm.lifecycle import VM, VMState, virsh_run
+from winbox.vm.lifecycle import VM
+from winbox.vm.virsh import VMState, virsh_run
 from winbox.vm.guest import (
     ExecResult,
     GuestAgent,

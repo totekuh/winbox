@@ -6,7 +6,8 @@ an isolated, persistent PyGhidra worker for focused pseudocode.
 """
 
 from winbox.kdbg.decomp.client import DecompClient, DecompError
-from winbox.kdbg.decomp.cache import cache_inventory, prune_cache, repair_cache
+from winbox.kdbg.decomp.cache import cache_inventory
+from winbox.kdbg.decomp.cache_prune import prune_cache, repair_cache
 from winbox.kdbg.decomp.service import (
     cancel_decomp,
     cancel_prepare_job,

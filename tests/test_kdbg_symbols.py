@@ -20,6 +20,8 @@ from types import SimpleNamespace
 import pytest
 
 from winbox.kdbg import symbols
+from winbox.kdbg import symbols_copy
+from winbox.kdbg import symbols_lazy
 from winbox.kdbg.store import SymbolStore
 from winbox.kdbg.symbols import (
     SymbolLoadError,
@@ -154,7 +156,7 @@ def test_ensure_types_loaded_noop_when_all_present(tmp_path, monkeypatch):
         called["n"] += 1
         return {}
 
-    monkeypatch.setattr(symbols, "load_types", fake_load_types)
+    monkeypatch.setattr(symbols_lazy, "load_types", fake_load_types)
     ensure_types_loaded(_FakeCfg(tmp_path), store, ["_PEB"])
     assert called["n"] == 0
 
@@ -175,7 +177,7 @@ def test_ensure_types_loaded_extracts_missing_and_persists(tmp_path, monkeypatch
         captured["wanted"] = list(wanted)
         return {"_PEB": FakeLayout()}
 
-    monkeypatch.setattr(symbols, "load_types", fake_load_types)
+    monkeypatch.setattr(symbols_lazy, "load_types", fake_load_types)
     ensure_types_loaded(_FakeCfg(tmp_path), store, ["_PEB", "_PEB_LDR_DATA"])
 
     # Only the missing types were requested.
@@ -203,7 +205,7 @@ def test_ensure_types_loaded_partial_extraction_keeps_others(tmp_path, monkeypat
     def fake_load_types(pdb_path, wanted):
         return {"_PEB": FakeLayout()}  # _PEB_LDR_DATA not returned
 
-    monkeypatch.setattr(symbols, "load_types", fake_load_types)
+    monkeypatch.setattr(symbols_lazy, "load_types", fake_load_types)
     ensure_types_loaded(_FakeCfg(tmp_path), store, ["_PEB", "_PEB_LDR_DATA"])
 
     data = store.load("nt")
@@ -218,7 +220,7 @@ def test_ensure_types_loaded_empty_pdb_response_is_silent(tmp_path, monkeypatch)
     _save_nt(store, build="DEAD", types={})
     (tmp_path / "ntkrnlmp_DEAD.pdb").write_bytes(b"fake pdb")
 
-    monkeypatch.setattr(symbols, "load_types", lambda pdb_path, wanted: {})
+    monkeypatch.setattr(symbols_lazy, "load_types", lambda pdb_path, wanted: {})
     ensure_types_loaded(_FakeCfg(tmp_path), store, ["_NEVER_HEARD_OF_IT"])
 
     # Store untouched.
@@ -343,10 +345,10 @@ def test_copy_via_share_cleans_staging_and_partial_on_publish_failure(
 ):
     cfg = _CopyCfg(tmp_path)
     ga = _ShareGA(cfg)
-    monkeypatch.setattr(symbols.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("full")))
+    monkeypatch.setattr(symbols_copy.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("full")))
 
     with pytest.raises(OSError, match="full"):
-        symbols._copy_via_share(cfg, ga, r"C:\safe.dll", "safe.dll")
+        symbols_copy._copy_via_share(cfg, ga, r"C:\safe.dll", "safe.dll")
 
     assert not list(cfg.shared_dir.iterdir())
     assert not list(cfg.symbols_dir.glob("*.part"))
@@ -401,8 +403,8 @@ def test_copy_user_module_redirects_system32_for_x86_and_validates_identity(
         return copied
 
     parsed = _FakePe(0x014C, 0x1A0000)
-    monkeypatch.setattr(symbols, "_copy_via_share", fake_copy)
-    monkeypatch.setattr(symbols.pefile, "PE", lambda *_a, **_k: parsed)
+    monkeypatch.setattr(symbols_copy, "_copy_via_share", fake_copy)
+    monkeypatch.setattr(symbols_copy.pefile, "PE", lambda *_a, **_k: parsed)
 
     result = symbols.copy_user_module(
         cfg, object(), r"C:\Windows\System32\ntdll.dll", "ntdll.dll",
@@ -421,10 +423,10 @@ def test_copy_user_module_rejects_wrong_machine_and_live_size(
     copied = tmp_path / "module.dll"
     copied.write_bytes(b"MZ")
     monkeypatch.setattr(
-        symbols, "_copy_via_share", lambda *_args, **_kwargs: copied,
+        symbols_copy, "_copy_via_share", lambda *_args, **_kwargs: copied,
     )
     monkeypatch.setattr(
-        symbols.pefile, "PE", lambda *_a, **_k: _FakePe(0x8664, 0x2000),
+        symbols_copy.pefile, "PE", lambda *_a, **_k: _FakePe(0x8664, 0x2000),
     )
 
     with pytest.raises(SymbolLoadError, match="expected x86"):
@@ -434,7 +436,7 @@ def test_copy_user_module_rejects_wrong_machine_and_live_size(
         )
 
     monkeypatch.setattr(
-        symbols.pefile, "PE", lambda *_a, **_k: _FakePe(0x014C, 0x3000),
+        symbols_copy.pefile, "PE", lambda *_a, **_k: _FakePe(0x014C, 0x3000),
     )
     with pytest.raises(SymbolLoadError, match="live loader reports"):
         symbols.copy_user_module(

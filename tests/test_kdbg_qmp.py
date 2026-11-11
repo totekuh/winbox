@@ -16,13 +16,14 @@ import pytest
 from winbox.kdbg.hmp import HmpError, _QmpConnection, hmp
 
 hmp_module = importlib.import_module("winbox.kdbg.hmp")
+hmp_qmp_module = importlib.import_module("winbox.kdbg.hmp_qmp")
 
 
 @pytest.fixture(autouse=True)
 def clean_qmp_cache():
-    hmp_module._close_qmp_connections()
+    hmp_qmp_module._close_qmp_connections()
     yield
-    hmp_module._close_qmp_connections()
+    hmp_qmp_module._close_qmp_connections()
 
 
 def test_qmp_connection_handles_fragmented_messages_and_events():
@@ -205,7 +206,7 @@ def test_real_unix_qmp_socket_reuses_connection_and_serializes_calls(tmp_path):
     server.start()
     try:
         with (
-            patch.object(hmp_module, "_qmp_socket_paths", return_value=[str(path)]),
+            patch.object(hmp_qmp_module, "_qmp_socket_paths", return_value=[str(path)]),
             patch.object(hmp_module, "_virsh_hmp") as virsh,
         ):
             commands = [f"info test-{number}" for number in range(8)]
@@ -217,7 +218,7 @@ def test_real_unix_qmp_socket_reuses_connection_and_serializes_calls(tmp_path):
         assert server.connections == 1
         virsh.assert_not_called()
     finally:
-        hmp_module._close_qmp_connections()
+        hmp_qmp_module._close_qmp_connections()
         server.stop()
 
 
@@ -227,7 +228,7 @@ def test_gdbserver_bootstrap_runs_over_real_unix_qmp_socket(tmp_path):
     server.start()
     try:
         with (
-            patch.object(hmp_module, "_qmp_socket_paths", return_value=[str(path)]),
+            patch.object(hmp_qmp_module, "_qmp_socket_paths", return_value=[str(path)]),
             patch.object(hmp_module, "_virsh_hmp") as virsh,
         ):
             assert hmp("vm", "gdbserver tcp:127.0.0.1:1234") == (
@@ -240,5 +241,5 @@ def test_gdbserver_bootstrap_runs_over_real_unix_qmp_socket(tmp_path):
         assert server.connections == 1
         virsh.assert_not_called()
     finally:
-        hmp_module._close_qmp_connections()
+        hmp_qmp_module._close_qmp_connections()
         server.stop()

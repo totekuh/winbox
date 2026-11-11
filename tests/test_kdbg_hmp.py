@@ -11,17 +11,19 @@ import pytest
 from winbox.kdbg.hmp import HmpError, hmp
 
 hmp_module = importlib.import_module("winbox.kdbg.hmp")
+hmp_qmp_module = importlib.import_module("winbox.kdbg.hmp_qmp")
+hmp_probe_module = importlib.import_module("winbox.kdbg.hmp_probe")
 
 
 @pytest.fixture(autouse=True)
 def force_virsh_transport():
     """These legacy tests specifically exercise subprocess semantics."""
     with (
-        patch.object(hmp_module, "_qmp_socket_paths", return_value=[]),
+        patch.object(hmp_qmp_module, "_qmp_socket_paths", return_value=[]),
         patch.object(
-            hmp_module,
+            hmp_qmp_module,
             "_libvirt_hmp",
-            side_effect=hmp_module._QmpUnavailable("disabled for test"),
+            side_effect=hmp_qmp_module._QmpUnavailable("disabled for test"),
         ),
     ):
         yield
@@ -92,29 +94,29 @@ def test_gdbstub_has_client_no_match():
 
 
 def test_tcp6_decoder_preserves_address_family_and_word_order():
-    assert hmp_module._hex_to_ipv6(
+    assert hmp_probe_module._hex_to_ipv6(
         "00000000000000000000000001000000"
     ) == "::1"
-    assert hmp_module._hex_to_ipv6("not-hex") is None
+    assert hmp_probe_module._hex_to_ipv6("not-hex") is None
 
 
 def test_ipv6_listener_never_matches_ipv4_probe(monkeypatch):
     monkeypatch.setattr(
-        hmp_module, "_listening_sockets", lambda: {("::", 1234), ("::1", 1235)},
+        hmp_probe_module, "_listening_sockets", lambda: {("::", 1234), ("::1", 1235)},
     )
-    assert hmp_module.probe_port("127.0.0.1", 1234) is False
-    assert hmp_module.probe_port("::1", 1234) is True
-    assert hmp_module.probe_port("::1", 1235) is True
+    assert hmp_probe_module.probe_port("127.0.0.1", 1234) is False
+    assert hmp_probe_module.probe_port("::1", 1234) is True
+    assert hmp_probe_module.probe_port("::1", 1235) is True
 
 
 def test_ipv4_listener_never_matches_ipv6_probe(monkeypatch):
     monkeypatch.setattr(
-        hmp_module, "_listening_sockets",
+        hmp_probe_module, "_listening_sockets",
         lambda: {("0.0.0.0", 1234), ("127.0.0.1", 1235)},
     )
-    assert hmp_module.probe_port("::1", 1234) is False
-    assert hmp_module.probe_port("127.0.0.1", 1234) is True
-    assert hmp_module.probe_port("127.0.0.1", 1235) is True
+    assert hmp_probe_module.probe_port("::1", 1234) is False
+    assert hmp_probe_module.probe_port("127.0.0.1", 1234) is True
+    assert hmp_probe_module.probe_port("127.0.0.1", 1235) is True
 
 
 def test_unparseable_listener_row_is_not_a_wildcard_match(monkeypatch):
@@ -130,8 +132,8 @@ def test_unparseable_listener_row_is_not_a_wildcard_match(monkeypatch):
         return io.StringIO(tcp6 if str(path).endswith("tcp6") else tcp)
 
     monkeypatch.setattr("builtins.open", opened)
-    assert hmp_module._listening_sockets() == set()
-    assert hmp_module.probe_port("127.0.0.1", 1234) is False
+    assert hmp_probe_module._listening_sockets() == set()
+    assert hmp_probe_module.probe_port("127.0.0.1", 1234) is False
 
 
 # ── QMP connection protocol tests ──────────────────────────────────────

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import stat
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ import pytest
 
 from winbox.config import Config
 from winbox.kdbg import cet
+from winbox.kdbg import cet_domain
 from winbox.kdbg.cet import CetSafetyError
 
 
@@ -50,6 +52,7 @@ def fake_libvirt(monkeypatch):
         raise AssertionError(f"unexpected virsh call: {args}")
 
     monkeypatch.setattr(cet, "virsh_run", run)
+    monkeypatch.setattr(cet_domain, "virsh_run", run)
     return calls
 
 
@@ -219,13 +222,11 @@ def test_stage_cpu_disable_is_idempotent_when_feature_already_hidden(
         "<feature policy='disable' name='cet-ss'/>"
         "</cpu><clock/></domain>"
     )
-    monkeypatch.setattr(
-        cet,
-        "virsh_run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout=domain, stderr="",
-        ),
+    _fake = lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout=domain, stderr="",
     )
+    monkeypatch.setattr(cet, "virsh_run", _fake)
+    monkeypatch.setattr(cet_domain, "virsh_run", _fake)
     original, updated = cet._stage_cet_ss_disable(Config(winbox_dir=tmp_path))
     assert "cet-ss" in original
     assert updated is None
@@ -233,16 +234,14 @@ def test_stage_cpu_disable_is_idempotent_when_feature_already_hidden(
 
 def test_stage_cpu_disable_creates_cpu_before_clock(monkeypatch, tmp_path):
     domain = "<domain><name>box</name><clock/><devices/></domain>"
-    monkeypatch.setattr(
-        cet,
-        "virsh_run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout=domain, stderr="",
-        ),
+    _fake = lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout=domain, stderr="",
     )
+    monkeypatch.setattr(cet, "virsh_run", _fake)
+    monkeypatch.setattr(cet_domain, "virsh_run", _fake)
     original, updated = cet._stage_cet_ss_disable(Config(winbox_dir=tmp_path))
     assert original is None
-    root = cet.ET.fromstring(updated)
+    root = ET.fromstring(updated)
     assert [child.tag for child in root][:3] == ["name", "cpu", "clock"]
     assert root.find("cpu/feature[@name='cet-ss']").get("policy") == "disable"
 
@@ -256,6 +255,7 @@ def test_prepare_define_failure_preserves_recovery_backup(monkeypatch, tmp_path)
         return SimpleNamespace(returncode=1, stdout="", stderr="define denied")
 
     monkeypatch.setattr(cet, "virsh_run", run)
+    monkeypatch.setattr(cet_domain, "virsh_run", run)
     cfg = Config(winbox_dir=tmp_path)
     ga = FakeGa(
         _status("ON"),
@@ -328,6 +328,7 @@ def test_restore_domain_failure_preserves_backup_and_guest_policy(
         return SimpleNamespace(returncode=1, stdout="", stderr="define denied")
 
     monkeypatch.setattr(cet, "virsh_run", run)
+    monkeypatch.setattr(cet_domain, "virsh_run", run)
     cfg = Config(winbox_dir=tmp_path, vm_name="box")
     path = cet.backup_path(cfg)
     path.write_text(json.dumps({

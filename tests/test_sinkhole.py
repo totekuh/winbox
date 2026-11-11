@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from winbox import sinkhole as sk
+from winbox import sinkhole_proc
 from winbox.cli.sinkhole import sinkhole
 from winbox.config import Config
 
@@ -194,29 +195,29 @@ class TestProcessMgmt:
     def test_is_running_cleans_stale_pidfile(self, cfg):
         # A PID that's almost certainly dead.
         sk.write_pidfile(cfg, 999999)
-        with patch.object(sk, "pid_alive", return_value=False):
+        with patch.object(sinkhole_proc, "pid_alive", return_value=False):
             assert sk.is_running(cfg) is None
         assert not sk.pidfile_path(cfg).exists()
 
     def test_is_running_reports_live_pid(self, cfg):
         sk.write_pidfile(cfg, os.getpid())
         # is_running now also confirms the PID is actually the sinkhole process.
-        with patch.object(sk, "_is_sinkhole_proc", return_value=True):
+        with patch.object(sinkhole_proc, "_is_sinkhole_proc", return_value=True):
             assert sk.is_running(cfg) == os.getpid()
 
     def test_is_running_ignores_recycled_non_sinkhole_pid(self, cfg):
         """The F8 fix: a live PID that isn't our sinkhole (recycled) must read
         as not-running and clean up the stale pidfile — never be signalled."""
         sk.write_pidfile(cfg, os.getpid())
-        with patch.object(sk, "_is_sinkhole_proc", return_value=False):
+        with patch.object(sinkhole_proc, "_is_sinkhole_proc", return_value=False):
             assert sk.is_running(cfg) is None
         assert not sk.pidfile_path(cfg).exists()
 
     def test_stop_signals_and_clears_pidfile(self, cfg):
         sk.write_pidfile(cfg, 5555)
-        with patch.object(sk, "pid_alive", side_effect=[True, False]), \
-             patch.object(sk, "_is_sinkhole_proc", return_value=True), \
-             patch.object(sk.os, "kill") as mock_kill:
+        with patch.object(sinkhole_proc, "pid_alive", side_effect=[True, False]), \
+             patch.object(sinkhole_proc, "_is_sinkhole_proc", return_value=True), \
+             patch.object(sinkhole_proc.os, "kill") as mock_kill:
             assert sk.stop(cfg) is True
             mock_kill.assert_called_once()
         assert not sk.pidfile_path(cfg).exists()
@@ -224,9 +225,9 @@ class TestProcessMgmt:
     def test_stop_refuses_to_signal_a_recycled_pid(self, cfg):
         """A recycled PID (not our sinkhole) must not get SIGTERM/SIGKILL."""
         sk.write_pidfile(cfg, 5555)
-        with patch.object(sk, "pid_alive", return_value=True), \
-             patch.object(sk, "_is_sinkhole_proc", return_value=False), \
-             patch.object(sk.os, "kill") as mock_kill:
+        with patch.object(sinkhole_proc, "pid_alive", return_value=True), \
+             patch.object(sinkhole_proc, "_is_sinkhole_proc", return_value=False), \
+             patch.object(sinkhole_proc.os, "kill") as mock_kill:
             assert sk.stop(cfg) is False
             mock_kill.assert_not_called()
         assert not sk.pidfile_path(cfg).exists()

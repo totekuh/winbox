@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from winbox.kdbg.debugger import trace as trace_mod
+from winbox.kdbg.debugger import trace_summary as trace_summary_mod
 from winbox.kdbg.debugger.trace import query_trace
 
 
@@ -145,7 +146,7 @@ def test_summary_counts_top_values_range_errors_and_representative_hits(tmp_path
 def test_summary_distinct_tracking_is_bounded_but_total_is_exact(
     tmp_path, monkeypatch,
 ):
-    monkeypatch.setattr(trace_mod, "MAX_TRACKED_VALUES", 2)
+    monkeypatch.setattr(trace_summary_mod, "MAX_TRACKED_VALUES", 2)
     path = tmp_path / "trace.jsonl"
     _write_trace(path, [_entry(hit, code=f"0x{hit:x}") for hit in range(5)])
 

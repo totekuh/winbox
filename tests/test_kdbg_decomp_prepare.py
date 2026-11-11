@@ -15,9 +15,9 @@ import pytest
 
 from winbox.config import Config
 from winbox.kdbg.decomp.client import DecompClient, DecompError, WORKER_API
+from winbox.kdbg.decomp.bounded import _bounded_command
 from winbox.kdbg.decomp.enrichment import (
     ANALYSIS_PROFILE,
-    _bounded_command,
     build_enrichment,
     parse_rendered_signature,
     parse_symbol_enrichment,

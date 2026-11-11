@@ -51,8 +51,8 @@ from winbox.kdbg.capture import (
     CaptureError as _KdbgCaptureError,
     CaptureStore as _KdbgCaptureStore,
     capture_live as _kdbg_capture_live,
-    diff_captures as _kdbg_diff_captures,
 )
+from winbox.kdbg.capture_diff import diff_captures as _kdbg_diff_captures
 from winbox.kdbg.objects import (
     ObjectEvidenceError as _KdbgObjectEvidenceError,
     ensure_object_layouts as _kdbg_ensure_object_layouts,

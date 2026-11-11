@@ -5,22 +5,11 @@ the running guest via VirtIO-FS, fetch its CodeView-referenced PDB from
 msdl, parse with llvm-pdbutil, and persist into ``SymbolStore``. The
 ``load_nt`` wrapper layers on the kernel-specific base resolution (via
 the live IDT[0] handler).
-
-For per-process user-mode loads, ``copy_user_module`` extracts a binary
-out of an arbitrary process's address space — the binary on disk is
-authoritative for symbol lookup, the in-VM module base is recorded
-separately by the caller (``walk_user_modules``).
 """
 
 from __future__ import annotations
 
-import base64
 import logging
-import os
-import secrets
-import shutil
-import hashlib
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
@@ -38,21 +27,18 @@ from winbox.kdbg.pdb import (
     load_fpo,
     load_publics_metadata,
     load_section_headers,
-    load_types,
 )
-from winbox.kdbg.pe import fetch_pdb, pdb_cache_path, read_pdb_ref
+from winbox.kdbg.pe import fetch_pdb, read_pdb_ref
 from winbox.kdbg.store import SymbolStore, SymbolStoreError
+from winbox.kdbg.symbols_copy import (  # noqa: F401 — re-exported
+    SymbolLoadError, _copy_via_share, _sha256, copy_ntoskrnl, copy_user_module,
+)
 
 if TYPE_CHECKING:
     from winbox.config import Config
     from winbox.vm import GuestAgent
 
-
-
 logger = logging.getLogger(__name__)
-
-class SymbolLoadError(RuntimeError):
-    pass
 
 
 @dataclass
@@ -67,198 +53,8 @@ class LoadedModule:
     type_count: int
 
 
-# ── Binary copy helpers ─────────────────────────────────────────────────
-
-
-def _copy_via_share(
-    cfg: Config,
-    ga: GuestAgent,
-    src_in_vm: str,
-    cached_name: str,
-    *,
-    max_file_size: int | None = None,
-) -> Path:
-    """Copy a file out of the VM via the VirtIO-FS share.
-
-    Stages at ``Z:\\<basename>``, copies into ``cfg.symbols_dir``, removes
-    the staging copy. Raises ``SymbolLoadError`` if the in-VM Copy-Item
-    fails or the staged file never appears.
-    """
-    if not src_in_vm or "\0" in src_in_vm:
-        raise SymbolLoadError("invalid source module path")
-    cfg.symbols_dir.mkdir(parents=True, exist_ok=True)
-    # Both values originate in a target-controlled PEB. BaseDllName must be a
-    # single filename: rejecting both host and Windows separators keeps it from
-    # becoming either a host traversal or a guest-side Z:\ subpath.
-    if (
-        not cached_name
-        or cached_name in {".", ".."}
-        or any(character in cached_name for character in ("/", "\\", "\0"))
-    ):
-        raise SymbolLoadError(f"invalid module filename: {cached_name!r}")
-    cached = cfg.symbols_dir / cached_name
-    # cached_name can originate from a PEB BaseDllName read out of a live
-    # process on the analyzed VM — a hostile sample can spoof that to a
-    # traversal payload, so we must not let it walk either copy outside
-    # its intended directory.
-    if not cached.resolve().is_relative_to(cfg.symbols_dir.resolve()):
-        raise SymbolLoadError(f"invalid module filename: {cached_name!r}")
-
-    cfg.shared_dir.mkdir(parents=True, exist_ok=True)
-    # Never interpolate target-controlled loader strings into PowerShell
-    # source. UTF-16LE base64 is both lossless for Windows paths and restricted
-    # to an inert alphabet; the generated destination name is host-owned.
-    token = secrets.token_hex(16)
-    suffix = Path(cached_name).suffix
-    if len(suffix) > 16 or any(not (c.isalnum() or c == ".") for c in suffix):
-        suffix = ".bin"
-    staging_name = f"winbox-kdbg-{token}{suffix}"
-    staging = cfg.shared_dir / staging_name
-    src_basename = src_in_vm.rsplit("\\", 1)[-1]
-    staging_in_vm = f"Z:\\{staging_name}"
-
-    def encoded_path(value: str) -> str:
-        return base64.b64encode(value.encode("utf-16-le")).decode("ascii")
-
-    src_encoded = encoded_path(src_in_vm)
-    dst_encoded = encoded_path(staging_in_vm)
-    script = (
-        "$src=[Text.Encoding]::Unicode.GetString("
-        f"[Convert]::FromBase64String('{src_encoded}'))\n"
-        "$dst=[Text.Encoding]::Unicode.GetString("
-        f"[Convert]::FromBase64String('{dst_encoded}'))\n"
-        "Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop"
-    )
-    temporary = cfg.symbols_dir / f".{cached_name}.{token}.part"
-
-    try:
-        result = ga.exec_powershell(script, timeout=60)
-        if result.exitcode != 0:
-            raise SymbolLoadError(
-                f"Copy-Item {src_basename} failed: {result.stderr or result.stdout}"
-            )
-        if not staging.exists():
-            raise SymbolLoadError(
-                f"{src_basename} did not appear on the share after Copy-Item"
-            )
-        staged_size = staging.stat().st_size
-        if max_file_size is not None and staged_size > max_file_size:
-            raise SymbolLoadError(
-                f"{src_basename} is {staged_size} bytes; attach staging cap is "
-                f"{max_file_size} bytes"
-            )
-        shutil.copyfile(staging, temporary)
-        os.chmod(temporary, 0o600)
-        content_sha = _sha256(temporary)
-        try:
-            build = read_pdb_ref(temporary).build_key
-            published_key = f"{build}_{content_sha}"
-        except Exception:
-            # Stripped/third-party PEs can lack CodeView. They may not support
-            # PDB loading, but still deserve immutable, collision-free storage.
-            published_key = content_sha
-        module_dir = cfg.symbols_dir / "pe" / cached_name.lower()
-        module_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(module_dir, 0o700)
-        cached = module_dir / f"{published_key}{suffix.lower()}"
-        os.replace(temporary, cached)
-    finally:
-        staging.unlink(missing_ok=True)
-        temporary.unlink(missing_ok=True)
-
-    return cached
-
-
-def copy_ntoskrnl(cfg: Config, ga: GuestAgent) -> Path:
-    """Copy ``C:\\Windows\\System32\\ntoskrnl.exe`` into the symbol cache."""
-    return _copy_via_share(cfg, ga, r"C:\Windows\System32\ntoskrnl.exe", "ntoskrnl.exe")
-
-
-def copy_user_module(
-    cfg: Config,
-    ga: GuestAgent,
-    vm_path: str,
-    cached_name: str,
-    *,
-    architecture: str = "auto",
-    expected_size: int | None = None,
-    max_file_size: int | None = None,
-) -> Path:
-    """Copy any user-mode binary out of the VM into the symbol cache.
-
-    ``vm_path`` is the absolute Windows path (e.g.
-    ``C:\\Windows\\System32\\notepad.exe``). ``cached_name`` is the
-    filename to store under (e.g. ``notepad.exe``).
-    """
-    if architecture not in {"auto", "x86", "x64"}:
-        raise SymbolLoadError(f"unsupported module architecture: {architecture!r}")
-
-    candidates = [vm_path]
-    if architecture == "x86":
-        # A 32-bit process sees System32 through WOW64 file-system
-        # redirection, but qemu-ga launches 64-bit PowerShell and therefore
-        # resolves the exact same loader string to the native x64 file.
-        # Translate only Windows' redirected system directory; arbitrary
-        # application paths remain byte-for-byte loader controlled.
-        redirected = re.sub(
-            r"(?i)(\\windows\\)system32(?=\\)",
-            r"\1SysWOW64",
-            vm_path,
-            count=1,
-        )
-        if redirected != vm_path:
-            candidates.insert(0, redirected)
-
-    expected_machine = {"x86": 0x014C, "x64": 0x8664}.get(architecture)
-    failures: list[str] = []
-    for candidate in candidates:
-        try:
-            copy_kwargs = (
-                {"max_file_size": max_file_size}
-                if max_file_size is not None else {}
-            )
-            copied = _copy_via_share(
-                cfg, ga, candidate, cached_name, **copy_kwargs,
-            )
-            pe = None
-            try:
-                pe = pefile.PE(str(copied), fast_load=True)
-                machine = int(pe.FILE_HEADER.Machine)
-                image_size = int(pe.OPTIONAL_HEADER.SizeOfImage)
-            except (OSError, pefile.PEFormatError, AttributeError) as exc:
-                raise SymbolLoadError(
-                    f"copied module is not a valid PE: {exc}"
-                ) from exc
-            finally:
-                if pe is not None:
-                    pe.close()
-            if expected_machine is not None and machine != expected_machine:
-                raise SymbolLoadError(
-                    f"copied {candidate} has PE machine 0x{machine:04x}; "
-                    f"expected {architecture} (0x{expected_machine:04x})"
-                )
-            if expected_size is not None and image_size != expected_size:
-                raise SymbolLoadError(
-                    f"copied {candidate} has SizeOfImage 0x{image_size:x}; "
-                    f"live loader reports 0x{expected_size:x}"
-                )
-            return copied
-        except SymbolLoadError as exc:
-            failures.append(str(exc))
-    raise SymbolLoadError("; ".join(failures))
-
-
-# ── nt-specific base resolver ───────────────────────────────────────────
-
-
 def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
-    """Derive ntoskrnl's load base using RSP registers and memory only.
-
-    QEMU's gdb register block exposes GS_BASE/KERNEL_GS_BASE but not IDTR.
-    One of those bases is Windows' KPCR on each halted vCPU; ``_KPCR.IdtBase``
-    gives the IDT anchor without issuing HMP ``info registers``.  Candidate
-    KPCRs and CR3s are validated by the IDT handler and final MZ header.
-    """
+    """Derive ntoskrnl's load base using RSP registers and memory only."""
     rva = nt_syms.get("KiDivideErrorFaultShadow") or nt_syms.get("KiDivideErrorFault")
     if rva is None:
         raise SymbolLoadError(
@@ -319,9 +115,6 @@ def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
     raise SymbolLoadError(f"could not resolve nt base through KPCR/IDT: {detail}")
 
 
-# ── Generic module loader ───────────────────────────────────────────────
-
-
 def load_module(
     cfg: Config,
     store: SymbolStore,
@@ -331,18 +124,7 @@ def load_module(
     base: int | None = None,
     wanted_types: Iterable[str] = (),
 ) -> LoadedModule:
-    """PE → PDB ref → fetch → parse → persist for an arbitrary binary.
-
-    Caller is responsible for getting the PE file onto disk (use
-    ``copy_ntoskrnl`` / ``copy_user_module`` for live VM extraction). The
-    base, when known, is recorded so ``store.resolve(name)`` can return
-    absolute VAs; pass None if the caller will fill it in later via
-    ``store.set_base``.
-
-    ``wanted_types`` is the subset of structs to extract. Empty means
-    "no types" — useful for user-mode binaries where only symbols matter.
-    For the kernel pass ``NT_DEFAULT_TYPES``.
-    """
+    """PE -> PDB ref -> fetch -> parse -> persist for an arbitrary binary."""
     ref = read_pdb_ref(pe_path)
     pdb_path = fetch_pdb(ref, cfg.symbols_dir)
 
@@ -397,13 +179,7 @@ def load_nt(
     *,
     reuse_cached_pe: bool = False,
 ) -> LoadedModule:
-    """Copy ntoskrnl out of the VM, fetch PDB, extract, compute base, save.
-
-    ``reuse_cached_pe=True`` skips the in-VM Copy-Item if the cached PE
-    still exists — fast, but UNSAFE if the kernel changed (e.g., after a
-    Windows Update). Default is False; the extra ~1s Copy-Item is the
-    right trade-off vs surprising the user with bad symbols.
-    """
+    """Copy ntoskrnl out of the VM, fetch PDB, extract, compute base, save."""
     cached_pe = None
     try:
         stored = store.load("nt").get("pe_path")
@@ -417,9 +193,6 @@ def load_nt(
     else:
         pe_path = copy_ntoskrnl(cfg, ga)
 
-    # Load symbols + nt's default type set first, then resolve base.
-    # We do it in two passes because base resolution needs the symbol
-    # table to look up KiDivideErrorFault.
     info = load_module(
         cfg, store,
         pe_path=pe_path,
@@ -440,12 +213,6 @@ def load_nt(
             type_count=info.type_count,
         )
     except (HmpError, SymbolLoadError) as e:
-        # VM may not be in kernel context at the time of the load call,
-        # or some other transient HMP issue — leave base unset and let
-        # the caller re-resolve later via `kdbg symbols base`. Logged
-        # so an operator can tell the symbol load partially succeeded
-        # (symbols cached, base unresolved) rather than seeing a silent
-        # ``base=null`` and wondering why every later resolve fails.
         _log.warning(
             "load_nt: symbols cached but nt base unresolved (%s: %s); "
             "re-run `winbox kdbg base` once the VM is in kernel context",
@@ -455,138 +222,8 @@ def load_nt(
     return info
 
 
-# ── Lazy type extraction ────────────────────────────────────────────────
+# ── Re-exports from extracted modules ──────────────────────────────────
 
-
-def cached_pdb_path(cfg: Config, store: SymbolStore, module: str) -> Path:
-    """Return the on-disk PDB path for a loaded module, or raise.
-
-    Mirrors ``pe.pdb_cache_path`` using the metadata persisted in the
-    store. Useful for re-extraction on demand without the round-trip to
-    the VM.
-    """
-    data = store.load(module)
-    image = data.get("image", "")
-    build = data.get("build", "")
-    if not image or not build:
-        raise SymbolLoadError(
-            f"module {module!r} has no image/build metadata — "
-            f"re-run `winbox kdbg symbols`"
-        )
-    path = cfg.symbols_dir / f"{Path(image).stem}_{build}.pdb"
-    if not path.exists():
-        raise SymbolLoadError(
-            f"cached PDB missing for {module!r} at {path} — "
-            f"re-run `winbox kdbg symbols`"
-        )
-    return path
-
-
-def ensure_types_loaded(
-    cfg: Config,
-    store: SymbolStore,
-    type_names: Iterable[str],
-    *,
-    module: str = "nt",
-) -> None:
-    """Make sure ``type_names`` are present in the store; extract if missing.
-
-    Reads the cached PDB once and parses the requested types; persists
-    the result back to the store so subsequent calls hit the JSON path.
-
-    No-op if every type is already present. Cheap enough to call from
-    walkers as a precondition without worrying about cost — the JSON
-    check is in-memory.
-    """
-    data = store.load(module)
-    have = data.get("types", {})
-    missing = [t for t in type_names if t not in have]
-    if not missing:
-        return
-
-    pdb_path = cached_pdb_path(cfg, store, module)
-    layouts = load_types(pdb_path, wanted=missing)
-    if not layouts:
-        # Nothing to add — every requested type was either already present
-        # or absent from the PDB. The walker that needed them will surface
-        # a more specific "field not found" message downstream.
-        return
-
-    have.update({name: layout.to_json() for name, layout in layouts.items()})
-    # Re-save preserves base, image, symbols, size, etc.
-    store.save(
-        module=data["module"],
-        build=data["build"],
-        image=data["image"],
-        symbols=data["symbols"],
-        types=have,
-        base=data.get("base"),
-        size_of_image=data.get("size_of_image"),
-        architecture=data.get("architecture"),
-        function_symbols=data.get("function_symbols"),
-        frame_data=data.get("frame_data"),
-        pe_path=data.get("pe_path"),
-        pe_sha256=data.get("pe_sha256"),
-    )
-
-
-def _sha256(path: Path) -> str:
-    value = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            value.update(chunk)
-    return value.hexdigest()
-
-
-def ensure_nt_base_current(cfg: Config, store: SymbolStore) -> bool:
-    """Re-point the store's nt base at the running kernel if ASLR moved it.
-
-    The symbol store outlives the boot that produced it, but ASLR
-    re-randomizes the kernel base on every restart. Every RVA in the store is
-    still correct — only the number they are added to changed — so this is
-    the entire repair, and it is cheap enough to do before a walk rather than
-    making the user run ``kdbg base`` by hand after every reboot.
-
-    Must run *before* anything resolves a kernel symbol: a walk against a
-    stale base fails deep inside the page-table walk as
-    ``PageWalkError: PDPTE not present``, which says nothing about the actual
-    cause.
-
-    Returns True if the base was changed. Never raises — a probe that cannot
-    run leaves the store alone, and the walk fails as it did before.
-    """
-    try:
-        data = store.load("nt")
-    except Exception:
-        return False  # nt not loaded yet; nothing to correct
-
-    cached = data.get("base")
-    syms = data.get("symbols") or {}
-    if not cached or not syms:
-        # resolve_nt_base works backwards from the IDT using
-        # KiDivideErrorFault's RVA, so with no symbols there is nothing to
-        # compare against.
-        return False
-
-    # Stores created before the RSP-only resolver did not extract KPCR.
-    # Upgrade them lazily from the already-cached PDB. Failure here is not
-    # itself fatal: resolve_nt_base below reports the precise missing-field
-    # error, and test/custom stores may provide their own resolver.
-    try:
-        ensure_types_loaded(cfg, store, ["_KPCR"], module="nt")
-    except Exception:
-        pass
-    try:
-        live = resolve_nt_base(cfg, syms)
-    except Exception:
-        return False
-
-    if not live or live == cached:
-        return False
-
-    store.set_base("nt", live)
-    logger.info(
-        "nt base moved 0x%x -> 0x%x (ASLR, typically a VM reboot); refreshed",
-        cached, live,
-    )
-    return True
+from winbox.kdbg.symbols_lazy import (  # noqa: E402, F401
+    cached_pdb_path, ensure_nt_base_current, ensure_types_loaded,
+)

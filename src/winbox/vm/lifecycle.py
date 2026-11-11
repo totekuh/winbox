@@ -1,121 +1,23 @@
-"""VM lifecycle management via libvirt/virsh."""
+"""VM lifecycle management — state queries, power control, snapshots."""
 
 from __future__ import annotations
 
 import os
-import re
 import stat
-import subprocess
 import time
-import xml.etree.ElementTree as ET
-from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from winbox.vm.net import VMNetMixin
+from winbox.vm.virsh import (  # noqa: F401 — re-exported
+    VMState, agent_channel_connected, virsh_run,
+)
 
 if TYPE_CHECKING:
     from winbox.config import Config
 
-# The virtio-serial channel qemu-ga speaks over. libvirt stamps a live
-# ``state`` attribute on this target and keeps it current as the agent
-# connects and drops — see ``agent_channel_connected``.
-_GUEST_AGENT_CHANNEL = "org.qemu.guest_agent.0"
 
-_MAC_RE = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
-
-
-def _parse_domiflist(stdout: str) -> list[tuple[str | None, str]]:
-    """Parse ``virsh domiflist`` output into ``[(host tap name, MAC)]``.
-
-    The MAC is read from the LAST field rather than a fixed column index:
-    ``--inactive`` prints the Interface column as ``-`` (the persistent XML
-    has no ``<target dev>``) and a non-``network`` interface type can leave
-    Source empty, so a fixed index drifts between the two listings. Rows
-    whose last field is not a MAC are skipped, which also drops the header
-    and rule lines without matching on their text.
-    """
-    nics: list[tuple[str | None, str]] = []
-    for line in stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 2 or not _MAC_RE.match(parts[-1]):
-            continue
-        tap = parts[0]
-        nics.append((None if tap == "-" else tap, parts[-1]))
-    return nics
-
-
-def _virsh_err(result: subprocess.CompletedProcess[str]) -> str:
-    """The stderr-or-stdout-or-exit-code detail reported when virsh fails."""
-    return (
-        result.stderr.strip()
-        or result.stdout.strip()
-        or f"virsh exit {result.returncode}"
-    )
-
-
-def agent_channel_connected(vm_name: str) -> bool:
-    """Whether libvirt currently sees the guest-agent channel as connected.
-
-    This is the authoritative readiness signal, and the cause of the
-    post-reboot flake it guards against: the agent comes up, answers once, and
-    the channel drops again for a few seconds before it settles. A
-    ``guest-ping`` only sees that indirectly; libvirt tracks the channel state
-    directly and exposes it in ``virsh dumpxml`` as::
-
-        <target type='virtio' name='org.qemu.guest_agent.0' state='connected'/>
-
-    Reads that attribute and nothing else. Returns ``False`` — never raises —
-    when the domain is off, absent, unqueryable, or the channel/attribute is
-    missing, matching how :meth:`VM.state` degrades an unusable domain: a
-    "not connected" answer has to be a value callers can gate on, not an
-    exception.
-    """
-    result = virsh_run("dumpxml", vm_name, check=False)
-    if result.returncode != 0:
-        return False
-    try:
-        domain = ET.fromstring(result.stdout)
-    except ET.ParseError:
-        return False
-    target = domain.find(
-        f"devices/channel/target[@name='{_GUEST_AGENT_CHANNEL}']"
-    )
-    # `state` is only present on a live domain; absent on a shut-off one.
-    return target is not None and target.get("state") == "connected"
-
-
-class VMState(Enum):
-    RUNNING = "running"
-    SHUTOFF = "shut off"
-    PAUSED = "paused"
-    SAVED = "saved"
-    NOT_FOUND = "not found"
-    UNKNOWN = "unknown"
-
-
-def virsh_run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    """Run ``virsh -c qemu:///system <args>`` and return the result.
-
-    Always returns a :class:`subprocess.CompletedProcess`. With
-    ``check=True``, raises :class:`RuntimeError` (with stderr) on a
-    non-zero exit instead of the stdlib's :class:`CalledProcessError` —
-    the rest of the codebase already raises ``RuntimeError`` for virsh
-    failures (e.g. ``snapshot_create``), so a single error type avoids
-    callers having to ``except (RuntimeError, CalledProcessError)``.
-    """
-    result = subprocess.run(
-        ["virsh", "-c", "qemu:///system", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if check and result.returncode != 0:
-        raise RuntimeError(f"virsh {' '.join(args)} failed: {_virsh_err(result)}")
-    return result
-
-
-
-
-class VM:
+class VM(VMNetMixin):
     """Manages the winbox VM lifecycle via virsh."""
 
     def __init__(self, cfg: Config) -> None:
@@ -123,20 +25,7 @@ class VM:
         self.name = cfg.vm_name
 
     def _domstate_raw(self) -> str | None:
-        """Raw, lowercased ``virsh domstate --reason`` text — or None if
-        unqueryable.
-
-        ``--reason`` is what makes a managed-saved domain read as
-        ``"shut off (saved)"`` instead of a bare ``"shut off"`` indistinguishable
-        from any other shutoff cause; without it ``state()`` can never see
-        SAVED and ``is_off()`` can never exclude it.
-
-        Kept separate from :meth:`state` because two callers want two
-        different questions answered from the same output: "roughly, what is
-        this domain doing" (``state``, which folds transient states onto the
-        nearest stable one) and "has QEMU actually let go of the disk"
-        (``is_off``, which must not fold anything).
-        """
+        """Raw, lowercased ``virsh domstate --reason`` text — or None."""
         result = virsh_run("domstate", self.name, "--reason", check=False)
         if result.returncode != 0:
             return None
@@ -146,25 +35,12 @@ class VM:
         raw = self._domstate_raw()
         if raw is None:
             return VMState.NOT_FOUND
-        # virsh emits 8 well-known states; map the transient ones to the
-        # nearest stable one rather than collapsing them all to UNKNOWN
-        # (which callers like _ensure_vm_ready treat as fatal). "saved"
-        # comes from managedsave indicator on running VMs.
         if "saved" in raw:
             return VMState.SAVED
-        # --reason appends " (<reason>)" to the state; strip it before
-        # matching against the bare canonical values below.
         canonical = raw.partition(" (")[0]
-        # Direct match against canonical values first.
         for s in VMState:
             if s.value == canonical:
                 return s
-        # Transient / nearby states virsh can emit:
-        #   "in shutdown" — heading to SHUTOFF, not interesting to most callers
-        #   "dying"       — heading to SHUTOFF
-        #   "crashed"     — VM died; treat as off so callers offer winbox up
-        #   "pmsuspended" — ACPI-suspended, equivalent to a saved state
-        #   "idle"        — defined-but-not-running on some libvirt builds
         if canonical in ("in shutdown", "dying", "crashed", "idle"):
             return VMState.SHUTOFF
         if canonical == "pmsuspended":
@@ -172,28 +48,7 @@ class VM:
         return VMState.UNKNOWN
 
     def is_off(self) -> bool:
-        """True only when libvirt reports the domain as genuinely "shut off".
-
-        Deliberately *not* ``state() == VMState.SHUTOFF``. ``state()`` folds
-        "in shutdown", "dying", "crashed" and "idle" onto SHUTOFF so callers
-        like ``ensure_running`` don't treat them as a fatal UNKNOWN — but in
-        every one of those states the domain is still active and the QEMU
-        process still holds the qcow2 open read-write. "crashed" is the worst
-        of them: it is not transient, it persists until someone destroys the
-        domain.
-
-        This is the predicate for "QEMU has released the disk, so guestfish
-        may open it read-write" (offline provisioning, the offline Defender
-        hive edits). A false "yes" costs a corrupted disk image; a false "no"
-        costs a caller some waiting. So anything we cannot positively confirm
-        as off — including a domain we failed to query at all, since a dead
-        libvirtd is not evidence that QEMU exited — answers False.
-
-        "shut off (saved)" is excluded on purpose too: the disk is free, but
-        the next ``start`` restores RAM captured before whatever edit we are
-        about to make, and a hive edited underneath a saved memory image is
-        its own kind of corruption.
-        """
+        """True only when libvirt reports the domain as genuinely "shut off"."""
         raw = self._domstate_raw()
         if raw is None:
             return False
@@ -207,22 +62,12 @@ class VM:
         return self.state() == VMState.RUNNING
 
     def agent_connected(self) -> bool:
-        """Whether libvirt sees the guest-agent channel as connected.
-
-        The authoritative readiness signal — see
-        :func:`agent_channel_connected`. A method here so callers read it the
-        conventional ``vm.*`` way and tests can mock it like ``state``.
-        """
+        """Whether libvirt sees the guest-agent channel as connected."""
         return agent_channel_connected(self.name)
 
     @staticmethod
     def _ensure_libvirt_traversal(winbox_dir: Path) -> None:
-        """Ensure libvirt-qemu (uid 64055) can traverse to winbox_dir.
-
-        libvirt-qemu runs as a different user and needs o+x on every
-        directory from / down to winbox_dir to reach ISOs and disks.
-        Only adds the execute bit — never touches read or write.
-        """
+        """Ensure libvirt-qemu can traverse to winbox_dir."""
         for ancestor in [*reversed(winbox_dir.parents), winbox_dir]:
             try:
                 mode = ancestor.stat().st_mode
@@ -232,25 +77,7 @@ class VM:
                 break
 
     def start(self) -> None:
-        """Start the domain, tolerating one that is still winding down.
-
-        ``state()`` folds "in shutdown" into SHUTOFF — right for callers
-        asking "is it usable", wrong for callers asking "can I start it".
-        A `winbox down` immediately followed by `winbox up` therefore hit
-        ``virsh start`` while the domain was still active, and libvirt
-        refused with "Domain is already active".
-
-        Rather than leak that distinction into every caller, settle it here:
-        wait for the shutdown to finish and start once more. If it never
-        settles, the domain is genuinely running and the goal is already met.
-
-        A pmsuspended (ACPI-S3) domain is a different animal: state() folds it
-        onto SAVED, whose callers route here, but `virsh start` cannot wake it
-        ("already active") — the correct verb is `dompmwakeup`. Detect it up
-        front and issue that instead, otherwise the "already active" path below
-        burned 120s in wait_shutdown and returned as if the VM were running
-        while the guest stayed asleep and the agent never answered.
-        """
+        """Start the domain, tolerating one that is still winding down."""
         self._ensure_libvirt_traversal(self.cfg.winbox_dir)
 
         raw = self._domstate_raw()
@@ -273,8 +100,6 @@ class VM:
         if self.wait_shutdown(timeout=120, poll=2):
             virsh_run("start", self.name)
             return
-        # Still up after two minutes: it was not shutting down at all, it was
-        # simply running. Nothing to do.
 
     def shutdown(self) -> None:
         virsh_run("shutdown", self.name, check=False)
@@ -291,17 +116,9 @@ class VM:
 
     def destroy(self) -> None:
         """Completely remove the VM, snapshots, NVRAM, and disk (but not ISOs)."""
-        # Force-stop anything that isn't *genuinely* off. state() folds
-        # "crashed" onto SHUTOFF and "pmsuspended" onto SAVED, but in both the
-        # QEMU process is still alive with the qcow2 open — so a `state() in
-        # (RUNNING, PAUSED)` check skipped force_stop and then undefine +
-        # unlink'd the disk out from under a live QEMU. is_off() is the precise
-        # "QEMU has released the disk" predicate (False for crashed/pmsuspended/
-        # saved and for a domain we couldn't query), so stop unless it says off.
         if self.exists() and not self.is_off():
             self.force_stop()
 
-        # Undefine without --remove-all-storage (that deletes attached ISOs too)
         undefine_ok = False
         for flags in [
             ["--managed-save", "--snapshots-metadata", "--nvram"],
@@ -319,7 +136,6 @@ class VM:
                 f"Manual cleanup: virsh undefine {self.name} && rm {self.cfg.disk_path}"
             )
 
-        # Clean up disk only
         if self.cfg.disk_path.exists():
             try:
                 self.cfg.disk_path.unlink()
@@ -328,190 +144,6 @@ class VM:
                     f"VM undefined but disk deletion failed: {e}\n"
                     f"    Manual cleanup: rm {self.cfg.disk_path}"
                 ) from e
-
-    def ip(self) -> str | None:
-        """Return the VM's IPv4 address on the libvirt default network.
-
-        ``virsh domifaddr`` can list multiple NICs / leases; if the user has
-        added a second network for testing, the first IPv4 line is no longer
-        guaranteed to be the libvirt-default-network address. Filter to
-        leases on the interface returned by ``self.interface()`` so the
-        ConPTY listener doesn't reject "the wrong" IP later.
-        """
-        result = virsh_run("domifaddr", self.name, check=False)
-        if result.returncode != 0:
-            return None
-        target_iface = self.interface()
-        # `domifaddr` output (Linux/libvirt) looks like:
-        #   Name       MAC address       Protocol   Address
-        #   ----------------------------------------------------
-        #   vnet0      52:54:00:aa:bb    ipv4       192.168.122.10/24
-        # The Name field is set on the row that introduces an interface
-        # and blank on subsequent rows belonging to the same iface.
-        current_iface: str | None = None
-        first_seen_ip: str | None = None
-        for line in result.stdout.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("Name") or stripped.startswith("-"):
-                continue
-            parts = stripped.split()
-            # 4-column row: NEW interface; 3-column row: continuation.
-            if len(parts) >= 4 and not parts[0].startswith("0x") and "ipv4" in parts:
-                current_iface = parts[0]
-            if "ipv4" in parts:
-                for part in parts:
-                    if "/" in part and "." in part:
-                        ip_addr = part.split("/")[0]
-                        if first_seen_ip is None:
-                            first_seen_ip = ip_addr
-                        if target_iface and current_iface == target_iface:
-                            return ip_addr
-        # Fall back to the first IPv4 only when we couldn't determine the target
-        # interface at all (single-NIC case, or domiflist failed). If we DO know
-        # the target interface but it has no lease yet, returning another NIC's
-        # address is exactly the wrong-address bug the filtering exists to
-        # prevent — return None so the caller waits/retries for the real lease.
-        if target_iface is None:
-            return first_seen_ip
-        return None
-
-    def nics(self, *, inactive: bool = False) -> list[tuple[str | None, str]]:
-        """Every NIC as ``(host tap name, MAC)``, in domain-XML order.
-
-        ``inactive=True`` reads the persistent config instead of the live
-        domain. The two lists can legitimately differ — a NIC hot-plugged
-        with ``attach-device --live`` has no persistent entry, one added with
-        ``--config`` does not exist live yet — which is why link writes
-        iterate the list belonging to their own scope.
-
-        Returns ``[]`` on any virsh failure, never a partial truth.
-        """
-        args = ["domiflist", self.name]
-        if inactive:
-            args.append("--inactive")
-        result = virsh_run(*args, check=False)
-        if result.returncode != 0:
-            return []
-        return _parse_domiflist(result.stdout)
-
-    def nic_macs(self, *, inactive: bool = False) -> list[str]:
-        """Every NIC's MAC address. ``[]`` on failure."""
-        return [mac for _tap, mac in self.nics(inactive=inactive)]
-
-    def interface(self) -> str | None:
-        """Get the VM's network interface name (e.g. 'vnet0').
-
-        This is the first NIC's host-side tap, which exists only while the
-        domain is running — a shut-off domain gives ``None``, which is what
-        ``ip()``'s "could not determine the target interface" branch already
-        means. Link operations go by MAC instead; see ``net_set_link``.
-        """
-        for tap, _mac in self.nics():
-            if tap:
-                return tap
-        return None
-
-    def net_set_link(
-        self, state: str, *, live: bool = True, config: bool = True,
-    ) -> None:
-        """Set the link state ('up' or 'down') of every NIC, persistently.
-
-        ``domif-setlink`` has no ``--live``/``--persistent`` pair like
-        ``update-device`` does: with no flag the change is live-only and dies
-        with the domain, with ``--config`` it only lands in the persistent
-        config. Applying *and* persisting therefore takes two calls per NIC.
-        Both go by MAC, because the persistent XML has no ``<target dev>`` to
-        address (``--config`` on a tap name fails with "Interface (dev:
-        vnetN) not found").
-
-        The persistent scope is written first and the first failure aborts.
-        The one state this must never produce is live-down/config-up: it
-        reads as an air-gap and silently reconnects the guest on the next
-        power cycle. The reachable partial states are therefore
-        config-written/live-unchanged — the guest is visibly online now,
-        which is loud and safe.
-
-        Raises :class:`RuntimeError` naming the scope that failed and the
-        scope that did apply. Returns ``None`` on success; the old bool
-        return is exactly how the live-only write stayed quiet for this long.
-        """
-        if state not in ("up", "down"):
-            raise ValueError(f"link state must be 'up' or 'down', got {state!r}")
-        if not live and not config:
-            raise ValueError("at least one of live/config must be True")
-
-        if config:
-            macs = self.nic_macs(inactive=True)
-            if not macs:
-                raise RuntimeError(
-                    f"cannot persist link {state}: no network interface found in "
-                    f"{self.name}'s persistent config (virsh domiflist --inactive)"
-                )
-            for mac in macs:
-                result = virsh_run(
-                    "domif-setlink", self.name, mac, state, "--config", check=False,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"link {state} NOT applied: persistent write for {mac} "
-                        f"failed: {_virsh_err(result)}"
-                    )
-
-        if live:
-            prefix = (
-                f"link {state} persisted for next boot but" if config
-                else f"link {state}"
-            )
-            macs = self.nic_macs()
-            if not macs:
-                raise RuntimeError(
-                    f"{prefix} NOT applied live: no network interface found"
-                )
-            for mac in macs:
-                result = virsh_run(
-                    "domif-setlink", self.name, mac, state, check=False,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"{prefix} NOT applied live ({mac}): {_virsh_err(result)}"
-                    )
-
-    def net_link_states(
-        self, *, config: bool = False,
-    ) -> list[tuple[str, str | None]]:
-        """Per-NIC ``(MAC, 'up' | 'down' | None)`` for a single scope."""
-        states: list[tuple[str, str | None]] = []
-        for mac in self.nic_macs(inactive=config):
-            args = ["domif-getlink", self.name, mac]
-            if config:
-                args.append("--config")
-            result = virsh_run(*args, check=False)
-            if result.returncode != 0:
-                states.append((mac, None))
-                continue
-            # Output like: "52:54:00:aa:bb:cc up"
-            words = result.stdout.split()
-            state = next((w for w in words if w in ("up", "down")), None)
-            states.append((mac, state))
-        return states
-
-    def net_link_state(self, *, config: bool = False) -> str | None:
-        """Aggregate link state across every NIC: 'up', 'down' or None.
-
-        ``'up'`` if ANY NIC is up — one live NIC out of three is not an
-        air-gap — ``'down'`` only when every NIC is down, and ``None`` when
-        there was nothing to ask or a NIC did not answer, so a caller gating
-        on containment refuses instead of reading silence as safety.
-
-        ``config=True`` reads the next-boot state. NOTE: a *live* read against
-        a shut-off domain does not fail, it answers from the persistent XML —
-        so callers that need a genuinely live answer must check
-        ``state() == VMState.RUNNING`` themselves.
-        """
-        states = self.net_link_states(config=config)
-        if not states or any(s is None for _mac, s in states):
-            return None
-        return "up" if any(s == "up" for _mac, s in states) else "down"
 
     def snapshot_create(self, name: str) -> None:
         result = virsh_run(
@@ -533,15 +165,7 @@ class VM:
         return [s.strip() for s in result.stdout.splitlines() if s.strip()]
 
     def wait_shutdown(self, timeout: int = 600, poll: int = 5) -> bool:
-        """Wait for the VM to be genuinely shut off. False on timeout.
-
-        Gated on :meth:`is_off`, not on ``state()``: every caller of this
-        method uses a True return as permission to open the qcow2 read-write
-        from the host (``winbox setup`` phase 2, ``winbox av enable/disable``).
-        Under ``state()``'s lenient mapping a domain that had crashed — QEMU
-        still running, image still open — reported SHUTOFF on the very first
-        poll, and provisioning went on to write to a live disk.
-        """
+        """Wait for the VM to be genuinely shut off. False on timeout."""
         deadline = time.monotonic() + timeout
         while not self.is_off():
             if time.monotonic() >= deadline:

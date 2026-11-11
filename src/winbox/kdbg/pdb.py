@@ -23,8 +23,6 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
-import sys
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,116 +34,8 @@ class PdbError(RuntimeError):
     pass
 
 
-# Types we extract from nt's PDB by default. The Cortex-engagement agent
-# needs EPROCESS for CR3 switching, KPROCESS for DirectoryTableBase,
-# KTHREAD for "who was running when the BP fired", LDR_DATA_TABLE_ENTRY
-# for kdbg_lm, etc. Keep this list small: each extra type blows up the
-# JSON store with little benefit.
-NT_DEFAULT_TYPES: tuple[str, ...] = (
-    "_EPROCESS",
-    "_KPROCESS",
-    "_ETHREAD",
-    "_KTHREAD",
-    # Opt-in wait-object/owner evidence. These stay PDB-backed rather than
-    # decoding dispatcher objects from stale hard-coded offsets.
-    "_KWAIT_BLOCK",
-    "_DISPATCHER_HEADER",
-    "_KMUTANT",
-    # Reverse WoW64 stitching at an arbitrary x86 stop resolves the firing
-    # CPU's current thread and its persisted full-width user trap context.
-    "_KPRCB",
-    "_KTRAP_FRAME",
-    # RSP does not expose IDTR directly. KPCR is reachable from GS/KERNEL_GS
-    # and its IdtBase field gives the same safe kernel-base anchor without HMP.
-    "_KPCR",
-    "_LIST_ENTRY",
-    "_UNICODE_STRING",
-    "_LDR_DATA_TABLE_ENTRY",
-    "_KLDR_DATA_TABLE_ENTRY",
-    # Needed by walk_user_modules — PEB→Ldr→InLoadOrderModuleList walk.
-    "_PEB",
-    "_PEB_LDR_DATA",
-    "_EWOW64PROCESS",
-)
-
-
-@dataclass
-class StructField:
-    offset: int
-    type_hint: str  # Raw type description from llvm-pdbutil (best-effort)
-
-
-@dataclass
-class StructLayout:
-    size: int
-    fields: dict[str, StructField]
-
-    def to_json(self) -> dict:
-        return {
-            "size": self.size,
-            "fields": {
-                name: {"off": f.offset, "type": f.type_hint}
-                for name, f in self.fields.items()
-            },
-        }
-
-
-@dataclass
-class PublicSymbols:
-    symbols: dict[str, int]
-    functions: set[str]
-
-
-@dataclass(frozen=True)
-class FpoRecord:
-    """One old-FPO or modern frame-data record, normalized for JSON."""
-
-    rva: int
-    code_size: int
-    locals_size: int
-    params_size: int
-    prolog_size: int
-    saved_regs_size: int
-    source: str
-    recipe: str
-    use_bp: bool = False
-    has_seh: bool = False
-    stack_size: int = 0
-    has_cpp_eh: bool = False
-    function_start: bool = True
-    frame_type: str = "FPO"
-    program: str = ""
-    alignment: int = 0
-
-    def to_json(self) -> dict[str, object]:
-        return {
-            "rva": self.rva,
-            "code_size": self.code_size,
-            "locals_size": self.locals_size,
-            "params_size": self.params_size,
-            "prolog_size": self.prolog_size,
-            "saved_regs_size": self.saved_regs_size,
-            "source": self.source,
-            "recipe": self.recipe,
-            "use_bp": self.use_bp,
-            "has_seh": self.has_seh,
-            "stack_size": self.stack_size,
-            "has_cpp_eh": self.has_cpp_eh,
-            "function_start": self.function_start,
-            "frame_type": self.frame_type,
-            "program": self.program,
-            "alignment": self.alignment,
-        }
-
-
 def _run_dump(pdb_path: Path, *args: str, timeout: int = 300) -> str:
-    """Invoke ``llvm-pdbutil dump`` and return stdout as text.
-
-    We decode as latin-1: publics can contain raw bytes from mangled C++
-    literal names that are not valid UTF-8, and the parser operates on
-    ASCII markers so lossless byte-to-char mapping is safer than strict
-    UTF-8 with ``errors='replace'``.
-    """
+    """Invoke ``llvm-pdbutil dump`` and return stdout as text."""
     try:
         result = subprocess.run(
             ["llvm-pdbutil", "dump", *args, str(pdb_path)],
@@ -199,20 +89,14 @@ _PUB_RE = re.compile(r"S_PUB32 \[size = \d+\] `([^`]+)`")
 _ADDR_RE = re.compile(r"addr\s*=\s*(\d+):(\d+)")
 
 
+@dataclass
+class PublicSymbols:
+    symbols: dict[str, int]
+    functions: set[str]
+
+
 def parse_publics_metadata(text: str, sections: dict[int, int]) -> PublicSymbols:
-    """Turn ``--publics`` dump text into ``{name: rva}``.
-
-    llvm-pdbutil prints each symbol on two lines::
-
-            0 | S_PUB32 [size = 32] `ZwCreateTimer2`
-                flags = function, addr = 0008:2180304
-
-    We walk pairwise: whenever we see a name, the next line that has an
-    ``addr =`` binds to it. If a second ``S_PUB32`` name appears before
-    the addr line (shouldn't happen with current llvm-pdbutil output,
-    but let's be defensive), the newer name displaces the orphan so we
-    don't misalign the rest of the stream.
-    """
+    """Turn ``--publics`` dump text into ``{name: rva}``."""
     out: dict[str, int] = {}
     functions: set[str] = set()
     pending_name: str | None = None
@@ -230,35 +114,19 @@ def parse_publics_metadata(text: str, sections: dict[int, int]) -> PublicSymbols
             sec_off = int(addr_match.group(2))
             sec_va = sections.get(sec_idx)
             if sec_va is not None:
-                # Publics with spurious C++ literal names crowd the table; we
-                # keep them since filtering would hide legitimate entries.
                 out[pending_name] = sec_va + sec_off
                 if re.search(r"\bfunction\b", line, re.IGNORECASE):
                     functions.add(pending_name)
             else:
-                # Section index not in the headers map. Common causes:
-                # truncated llvm-pdbutil output (timeout mid-stream),
-                # forward-declared sections in fragments, or genuinely
-                # corrupt PDB. Count + warn at end so the caller doesn't
-                # silently get a partial symbol table.
                 dropped += 1
             pending_name = None
     if dropped:
-        # If we got nothing usable, the PDB parse is catastrophically
-        # broken — caller MUST not cache this as a successful symbol
-        # load. Raise instead of returning an empty dict that looks
-        # like "this PDB just has no publics."
         if not out:
             raise PdbError(
                 f"parse_publics: all {dropped} symbol(s) dropped due to "
                 f"unknown section index — llvm-pdbutil output appears "
                 f"truncated or PDB is corrupt"
             )
-        # Partial drops with usable symbols: warn loudly via the proper
-        # logger so the daemon's stderr/log file captures it. Previous
-        # ``print(file=sys.stderr)`` was easy to miss, made test capture
-        # awkward, and didn't include a count of accepted symbols for
-        # context. Operators tail the daemon log to see this.
         _log.warning(
             "parse_publics dropped %d/%d symbol(s) with unknown section "
             "index — llvm-pdbutil output may be truncated; symbol table "
@@ -280,277 +148,6 @@ def load_publics_metadata(pdb_path: Path, sections: dict[int, int]) -> PublicSym
     return parse_publics_metadata(_run_dump(pdb_path, "--publics"), sections)
 
 
-# ── x86 FPO / frame data ───────────────────────────────────────────────
-
-_FPO_MAX_RECORDS = 1_000_000
-_FPO_MAX_PROGRAM = 4096
-_FPO_ROW_RE = re.compile(r"^\s*([0-9A-Fa-f]{8})\s*\|")
-
-
-def _fpo_bool(value: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized not in {"true", "false"}:
-        raise ValueError(f"invalid boolean {value!r}")
-    return normalized == "true"
-
-
-def _frame_recipe(program: str) -> tuple[str, int]:
-    """Classify the finite frame-program shapes LLVM emits for MS PDBs.
-
-    The original program remains persisted for provenance.  Classification
-    lets the live unwinder support known-safe recipes without implementing an
-    open-ended postfix VM over untrusted PDB text.
-    """
-    normalized = " ".join(program.split())
-    if ".raSearchStart" in normalized:
-        return "ra-search-start", 0
-    if ".raSearch" in normalized:
-        match = re.search(r"\b(\d+)\s+@\s+=", normalized)
-        if "@" not in normalized:
-            return "ra-search", 0
-        if match is None:
-            return "unsupported", 0
-        alignment = int(match.group(1))
-        if alignment > 4096 or alignment < 2 or alignment & (alignment - 1):
-            return "unsupported", 0
-        return "ra-search", alignment
-    if "$T1 $ebx =" in normalized and "$eip $T1 4 + ^ =" in normalized:
-        return "ebx-frame", 0
-    if "$T0 $ebp =" in normalized and "$eip $T0 4 + ^ =" in normalized:
-        return "ebp-frame", 0
-    return "unsupported", 0
-
-
-def parse_fpo(text: str) -> list[FpoRecord]:
-    """Parse ``llvm-pdbutil dump --fpo`` old and new frame tables."""
-    section: str | None = None
-    records: list[FpoRecord] = []
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
-        if "Old FPO Data" in line:
-            section = "old"
-            continue
-        if "New FPO Data" in line:
-            section = "new"
-            continue
-        if section is None or not _FPO_ROW_RE.match(line):
-            continue
-        if len(records) >= _FPO_MAX_RECORDS:
-            raise PdbError(f"FPO record count exceeds {_FPO_MAX_RECORDS}")
-        fields = [part.strip() for part in line.split("|")]
-        try:
-            if section == "old":
-                if len(fields) != 9:
-                    raise ValueError(f"expected 9 columns, got {len(fields)}")
-                rva, code, locals_, params, prolog, saved = (
-                    int(fields[0], 16), *(int(value, 10) for value in fields[1:6])
-                )
-                use_bp = _fpo_bool(fields[6])
-                frame_type = fields[8]
-                if frame_type.upper() in {"TRAP", "TSS"}:
-                    recipe = "unsupported"
-                else:
-                    recipe = "ebp-frame" if use_bp else "fpo-stack"
-                records.append(FpoRecord(
-                    rva=rva, code_size=code,
-                    # IMAGE_DEBUG_TYPE_FPO stores these two as DWORD counts.
-                    locals_size=locals_ * 4, params_size=params * 4,
-                    prolog_size=prolog, saved_regs_size=saved * 4,
-                    source="pdb-old-fpo",
-                    recipe=recipe,
-                    use_bp=use_bp, has_seh=_fpo_bool(fields[7]),
-                    frame_type=frame_type,
-                ))
-            else:
-                if len(fields) != 11:
-                    raise ValueError(f"expected 11 columns, got {len(fields)}")
-                program = fields[10]
-                if len(program) > _FPO_MAX_PROGRAM:
-                    raise ValueError("frame program exceeds 4096 characters")
-                recipe, alignment = _frame_recipe(program)
-                records.append(FpoRecord(
-                    rva=int(fields[0], 16), code_size=int(fields[1], 10),
-                    locals_size=int(fields[2], 10),
-                    params_size=int(fields[3], 10),
-                    stack_size=int(fields[4], 10),
-                    prolog_size=int(fields[5], 10),
-                    saved_regs_size=int(fields[6], 10),
-                    source="pdb-frame-data", recipe=recipe,
-                    has_seh=_fpo_bool(fields[7]),
-                    has_cpp_eh=_fpo_bool(fields[8]),
-                    function_start=_fpo_bool(fields[9]),
-                    program=program, alignment=alignment,
-                ))
-        except ValueError as exc:
-            raise PdbError(f"malformed {section} FPO row: {line[:160]} ({exc})") from exc
-    records.sort(key=lambda item: (item.rva, item.source != "pdb-frame-data"))
-    return records
-
-
-def load_fpo(pdb_path: Path) -> list[FpoRecord]:
-    return parse_fpo(_run_dump(pdb_path, "--fpo"))
-
-
-# ── Types (structures) ──────────────────────────────────────────────────
-
-_TPI_RECORD_RE = re.compile(r"^\s*0x([0-9A-Fa-f]+)\s*\|\s*(LF_\w+)\b")
-_STRUCT_NAME_RE = re.compile(r"LF_STRUCTURE \[size = \d+\] `([^`]+)`")
-_FIELDLIST_REF_RE = re.compile(r"field list:\s*0x([0-9A-Fa-f]+)")
-_SIZEOF_RE = re.compile(r"sizeof\s+(\d+)")
-_MEMBER_RE = re.compile(
-    r"LF_MEMBER \[name = `([^`]+)`,\s*Type = 0x[0-9A-Fa-f]+"
-    r"(?:\s*\(([^)]+)\))?,\s*offset = (\d+)"
-)
-
-
-def parse_types(text: str, wanted: Iterable[str]) -> dict[str, StructLayout]:
-    """Extract named struct layouts from ``--types`` dump text.
-
-    Handles the two-record pattern MSVC emits: a forward-ref
-    ``LF_STRUCTURE`` (``sizeof 0``, ``field list: <no type>``) followed by
-    the full record with an actual field list id and non-zero sizeof. We
-    pick the latter when available.
-
-    The parser is line-oriented and streams, so it stays flat on memory
-    even on a 40k-type ntkrnlmp.pdb dump.
-    """
-    wanted_set = set(wanted)
-    # Two-phase: (1) collect LF_FIELDLIST contents keyed by type id;
-    # (2) collect full LF_STRUCTURE records and resolve their field list.
-    field_lists: dict[int, dict[str, StructField]] = {}
-    # Each entry: (name, fieldlist_id_or_None, sizeof)
-    struct_decls: list[tuple[str, int | None, int]] = []
-
-    current_record: str | None = None
-    current_record_id: int | None = None
-    current_struct_name: str | None = None
-    current_struct_flist: int | None = None
-    current_struct_size: int | None = None
-    current_fieldlist: dict[str, StructField] | None = None
-
-    def finalize_struct() -> None:
-        nonlocal current_struct_name, current_struct_flist, current_struct_size
-        if current_struct_name and current_struct_name in wanted_set:
-            struct_decls.append((
-                current_struct_name,
-                current_struct_flist,
-                current_struct_size or 0,
-            ))
-        current_struct_name = None
-        current_struct_flist = None
-        current_struct_size = None
-
-    def finalize_fieldlist() -> None:
-        nonlocal current_record_id, current_fieldlist
-        if current_record_id is not None and current_fieldlist is not None:
-            field_lists[current_record_id] = current_fieldlist
-        current_record_id = None
-        current_fieldlist = None
-
-    for line in text.splitlines():
-        rec_match = _TPI_RECORD_RE.match(line)
-        if rec_match:
-            # A new top-level TPI record starts — close any in-progress one.
-            if current_record == "LF_STRUCTURE":
-                finalize_struct()
-            elif current_record == "LF_FIELDLIST":
-                finalize_fieldlist()
-
-            current_record = rec_match.group(2)
-            rec_id = int(rec_match.group(1), 16)
-            if current_record == "LF_FIELDLIST":
-                current_record_id = rec_id
-                current_fieldlist = {}
-            elif current_record == "LF_STRUCTURE":
-                struct_match = _STRUCT_NAME_RE.search(line)
-                if struct_match:
-                    current_struct_name = struct_match.group(1)
-                # flist / sizeof come on following lines
-            continue
-
-        # Continuation lines for the active record
-        if current_record == "LF_STRUCTURE" and current_struct_name:
-            flist_match = _FIELDLIST_REF_RE.search(line)
-            if flist_match:
-                current_struct_flist = int(flist_match.group(1), 16)
-            size_match = _SIZEOF_RE.search(line)
-            if size_match:
-                current_struct_size = int(size_match.group(1))
-        elif current_record == "LF_FIELDLIST" and current_fieldlist is not None:
-            mem_match = _MEMBER_RE.search(line)
-            if mem_match:
-                name = mem_match.group(1)
-                type_hint = (mem_match.group(2) or "").strip()
-                offset = int(mem_match.group(3))
-                # llvm-pdbutil occasionally emits duplicate members inside
-                # union substructures; first wins.
-                current_fieldlist.setdefault(
-                    name, StructField(offset=offset, type_hint=type_hint)
-                )
-
-    # Close any record that was still open at EOF.
-    if current_record == "LF_STRUCTURE":
-        finalize_struct()
-    elif current_record == "LF_FIELDLIST":
-        finalize_fieldlist()
-
-    # Resolve: for each wanted struct, prefer the decl with a real field
-    # list and non-zero sizeof. Forward refs have flist=None and size=0.
-    layouts: dict[str, StructLayout] = {}
-    for name, flist_id, sizeof in struct_decls:
-        if flist_id is None or sizeof == 0:
-            continue
-        fields = field_lists.get(flist_id)
-        if fields is None:
-            continue
-        # Some types appear multiple times (inner anon). Keep the first
-        # populated one; if a later decl has more fields, prefer that one
-        # as it's more likely to be the "real" ntoskrnl layout.
-        existing = layouts.get(name)
-        if existing is None or len(fields) > len(existing.fields):
-            layouts[name] = StructLayout(size=sizeof, fields=fields)
-
-    missing = wanted_set - layouts.keys()
-    if missing:
-        _log.warning(
-            "parse_types: %d/%d wanted type(s) not found (%s) — struct map is "
-            "incomplete; llvm-pdbutil output may be truncated",
-            len(missing), len(wanted_set), ", ".join(sorted(missing)),
-        )
-
-    empty = [name for name, layout in layouts.items() if not layout.fields]
-    if empty:
-        raise ValueError(
-            f"parse_types: {len(empty)} type(s) have zero fields after "
-            f"parsing ({', '.join(sorted(empty))}). This usually means "
-            f"llvm-pdbutil output format drifted and the field-line regex "
-            f"no longer matches. Check _MEMBER_RE against current "
-            f"llvm-pdbutil --types output."
-        )
-
-    sparse = [
-        f"{name} (sizeof={layout.size}, {len(layout.fields)} fields)"
-        for name, layout in layouts.items()
-        if layout.size >= 64 and len(layout.fields) < 3
-    ]
-    if sparse:
-        _log.warning(
-            "parse_types: %d type(s) have suspiciously few fields for their "
-            "size (%s) — field-line regex may have partially failed; check "
-            "_MEMBER_RE against current llvm-pdbutil output",
-            len(sparse), "; ".join(sparse),
-        )
-
-    return layouts
-
-
-def load_types(
-    pdb_path: Path,
-    wanted: Iterable[str] = NT_DEFAULT_TYPES,
-) -> dict[str, StructLayout]:
-    return parse_types(_run_dump(pdb_path, "--types"), wanted)
-
-
 # ── Convenience ─────────────────────────────────────────────────────────
 
 
@@ -560,10 +157,12 @@ def build_symbol_map(pdb_path: Path) -> dict[str, int]:
     return load_publics(pdb_path, sections)
 
 
-def build_type_map(
-    pdb_path: Path,
-    wanted: Iterable[str] = NT_DEFAULT_TYPES,
-) -> dict[str, dict]:
-    """One-shot: wanted types, return JSON-ready ``{name: {size, fields}}``."""
-    layouts = load_types(pdb_path, wanted)
-    return {name: layout.to_json() for name, layout in layouts.items()}
+# ── Re-exports from extracted modules ──────────────────────────────────
+
+from winbox.kdbg.pdb_types import (  # noqa: E402, F401
+    NT_DEFAULT_TYPES, StructField, StructLayout,
+    build_type_map, load_types, parse_types,
+)
+from winbox.kdbg.pdb_fpo import (  # noqa: E402, F401
+    FpoRecord, load_fpo, parse_fpo,
+)

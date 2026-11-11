@@ -26,9 +26,9 @@ def kdbg_env(cfg):
 
     with patch("winbox.cli.kdbg.VM", return_value=vm), \
          patch("winbox.cli.Config.load", return_value=cfg), \
-         patch("winbox.kdbg.hmp._qmp_socket_paths", return_value=[]), \
+         patch("winbox.kdbg.hmp_qmp._qmp_socket_paths", return_value=[]), \
          patch(
-             "winbox.kdbg.hmp._libvirt_hmp",
+             "winbox.kdbg.hmp_qmp._libvirt_hmp",
              side_effect=hmp_module._QmpUnavailable("disabled for subprocess tests"),
          ), \
          patch("winbox.kdbg.hmp.subprocess.run") as mock_run, \

@@ -15,6 +15,8 @@ from unittest.mock import patch
 
 from winbox.kdbg.hmp import ensure_not_paused
 
+hmp_probe = importlib.import_module("winbox.kdbg.hmp_probe")
+
 
 def _proc(stdout="", returncode=0):
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
@@ -109,20 +111,16 @@ class TestProbePortIsPassive:
     def test_probe_does_not_open_a_connection(self, monkeypatch):
         import socket as socket_mod
 
-        hmp = importlib.import_module("winbox.kdbg.hmp")
-
         def forbidden(*a, **kw):
             raise AssertionError("probe_port must not connect to the gdbstub")
 
         monkeypatch.setattr(socket_mod, "create_connection", forbidden)
-        monkeypatch.setattr(hmp, "_listening_sockets", lambda: {("127.0.0.1", 1234)})
+        monkeypatch.setattr(hmp_probe, "_listening_sockets", lambda: {("127.0.0.1", 1234)})
 
-        assert hmp.probe_port("127.0.0.1", 1234) is True
-        assert hmp.probe_port("127.0.0.1", 4321) is False
+        assert hmp_probe.probe_port("127.0.0.1", 1234) is True
+        assert hmp_probe.probe_port("127.0.0.1", 4321) is False
 
     def test_reads_listen_sockets_from_proc(self, monkeypatch, tmp_path):
-        hmp = importlib.import_module("winbox.kdbg.hmp")
-
         # state 0A is TCP_LISTEN; 01 is ESTABLISHED and must be ignored.
         proc_tcp = tmp_path / "tcp"
         proc_tcp.write_text(
@@ -139,16 +137,14 @@ class TestProbePortIsPassive:
 
         monkeypatch.setattr("builtins.open", fake_open)
 
-        socks = hmp._listening_sockets()
+        socks = hmp_probe._listening_sockets()
         assert ("127.0.0.1", 0x04D2) in socks   # 1234, listening
         assert not any(p == 0x1F90 for _, p in socks)  # established, not LISTEN
 
     def test_falls_back_to_connect_when_proc_is_unavailable(self, monkeypatch):
         import socket as socket_mod
 
-        hmp = importlib.import_module("winbox.kdbg.hmp")
-
-        monkeypatch.setattr(hmp, "_listening_sockets", lambda: None)
+        monkeypatch.setattr(hmp_probe, "_listening_sockets", lambda: None)
 
         class FakeConn:
             def __enter__(self): return self
@@ -157,13 +153,13 @@ class TestProbePortIsPassive:
         monkeypatch.setattr(
             socket_mod, "create_connection", lambda *a, **kw: FakeConn()
         )
-        assert hmp.probe_port("127.0.0.1", 1234) is True
+        assert hmp_probe.probe_port("127.0.0.1", 1234) is True
 
         def refuse(*a, **kw):
             raise OSError("refused")
 
         monkeypatch.setattr(socket_mod, "create_connection", refuse)
-        assert hmp.probe_port("127.0.0.1", 1234) is False
+        assert hmp_probe.probe_port("127.0.0.1", 1234) is False
 
 
 class TestProbePortAddressMatching:
@@ -171,9 +167,8 @@ class TestProbePortAddressMatching:
     read as "the gdbstub is up", which makes `kdbg start` refuse to run."""
 
     def _probe(self, monkeypatch, sockets, host="127.0.0.1", port=1234):
-        hmp = importlib.import_module("winbox.kdbg.hmp")
-        monkeypatch.setattr(hmp, "_listening_sockets", lambda: sockets)
-        return hmp.probe_port(host, port)
+        monkeypatch.setattr(hmp_probe, "_listening_sockets", lambda: sockets)
+        return hmp_probe.probe_port(host, port)
 
     def test_exact_host_matches(self, monkeypatch):
         assert self._probe(monkeypatch, {("127.0.0.1", 1234)}) is True
@@ -206,21 +201,17 @@ class TestHexToIpv4:
     """/proc stores IPv4 little-endian, so a naive decode reverses the octets."""
 
     def test_loopback(self):
-        hmp = importlib.import_module("winbox.kdbg.hmp")
-        assert hmp._hex_to_ipv4("0100007F") == "127.0.0.1"
+        assert hmp_probe._hex_to_ipv4("0100007F") == "127.0.0.1"
 
     def test_wildcard(self):
-        hmp = importlib.import_module("winbox.kdbg.hmp")
-        assert hmp._hex_to_ipv4("00000000") == "0.0.0.0"
+        assert hmp_probe._hex_to_ipv4("00000000") == "0.0.0.0"
 
     def test_libvirt_bridge(self):
-        hmp = importlib.import_module("winbox.kdbg.hmp")
-        assert hmp._hex_to_ipv4("017AA8C0") == "192.168.122.1"
+        assert hmp_probe._hex_to_ipv4("017AA8C0") == "192.168.122.1"
 
     def test_rejects_malformed_input(self):
-        hmp = importlib.import_module("winbox.kdbg.hmp")
-        assert hmp._hex_to_ipv4("00FF") is None
-        assert hmp._hex_to_ipv4("ZZZZZZZZ") is None
+        assert hmp_probe._hex_to_ipv4("00FF") is None
+        assert hmp_probe._hex_to_ipv4("ZZZZZZZZ") is None
 
 
 class TestResumeIsSafeOnARunningVm:

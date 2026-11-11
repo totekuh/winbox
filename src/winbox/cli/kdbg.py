@@ -80,8 +80,8 @@ from winbox.kdbg.capture import (
     CaptureError,
     CaptureStore,
     capture_live,
-    diff_captures,
 )
+from winbox.kdbg.capture_diff import diff_captures
 from winbox.kdbg.objects import (
     ObjectEvidenceError,
     ensure_object_layouts,

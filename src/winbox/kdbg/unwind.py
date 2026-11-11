@@ -9,35 +9,10 @@ from __future__ import annotations
 
 import bisect
 import struct
-from dataclasses import dataclass
 from typing import Callable
 
-
-class UnwindError(RuntimeError):
-    """Malformed metadata, unsupported architecture, or unreadable stack."""
-
-
-@dataclass(frozen=True)
-class RuntimeFunction:
-    begin: int
-    end: int
-    unwind: int
-
-
-@dataclass(frozen=True)
-class UnwindStep:
-    rip: int
-    rsp: int
-    registers: dict[str, int]
-    operations: tuple[str, ...]
-    leaf: bool = False
-
-
-# UNWIND_CODE register numbering is the architectural order, not QEMU's
-# g-packet order.
-_REGISTERS = (
-    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
-    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+from winbox.kdbg.unwind_types import (  # noqa: F401 — re-exported
+    RuntimeFunction, UnwindError, UnwindStep, _REGISTERS,
 )
 
 
