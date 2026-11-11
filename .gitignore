@@ -25,6 +25,22 @@ htmlcov/
 # Type checkers / linters
 .mypy_cache/
 .ruff_cache/
+.tox/
+.nox/
+
+# Runtime artifacts
+*.log
+*.pid
+*.sock
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor swap files
+*.swp
+*.swo
+*~
 
 # Safety nets — prevent accidental commits of large/sensitive files
 *.qcow2
