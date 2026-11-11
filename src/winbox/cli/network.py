@@ -218,43 +218,36 @@ def net_status(ctx: click.Context) -> None:
     link-down is undone by any power cycle. Works with the VM off, where
     only the next-boot state exists.
     """
+    from winbox.netstatus import net_status as _net_status
+
     cfg: Config = ctx.obj["cfg"]
     vm = VM(cfg)
     ga = GuestAgent(cfg)
 
-    state = vm.state()
-    running = state == VMState.RUNNING
-    if not running:
+    ns = _net_status(vm, ga)
+
+    if not ns.vm_running:
         console.print(
-            f"[yellow][!][/] VM is not running (state: {state.value}) — "
+            f"[yellow][!][/] VM is not running (state: {ns.vm_state}) — "
             "showing next-boot state"
         )
-
-    # Read the live scope only when the domain really runs: a flagless
-    # `domif-getlink` against an inactive domain does NOT fail, it answers
-    # from the persistent XML, so an ungated read would print the next-boot
-    # answer as if it were live.
-    live = vm.net_link_state() if running else None
-    boot = vm.net_link_state(config=True)
 
     def _color(link: str) -> str:
         return "green" if link == "up" else "red"
 
-    if not running:
-        if boot is None:
+    if not ns.vm_running:
+        if ns.link_boot is None:
             console.print("Link:     [yellow]unknown[/] (next boot)")
         else:
-            console.print(f"Link:     [{_color(boot)}]{boot}[/] (next boot)")
-    elif live is None:
+            console.print(f"Link:     [{_color(ns.link_boot)}]{ns.link_boot}[/] (next boot)")
+    elif ns.link_live is None:
         console.print("Link:     [yellow]unknown[/]")
-    elif boot is None:
-        console.print(f"Link:     [{_color(live)}]{live}[/] (next boot: unknown)")
-    elif live == boot:
-        suffix = "" if live == "up" else " (next boot: down)"
-        console.print(f"Link:     [{_color(live)}]{live}[/]{suffix}")
-    elif live == "down":
-        # The old `net unplug` bug: air-gapped now, reconnected by any
-        # power cycle, poweroff or BSOD.
+    elif ns.link_boot is None:
+        console.print(f"Link:     [{_color(ns.link_live)}]{ns.link_live}[/] (next boot: unknown)")
+    elif ns.link_live == ns.link_boot:
+        suffix = "" if ns.link_live == "up" else " (next boot: down)"
+        console.print(f"Link:     [{_color(ns.link_live)}]{ns.link_live}[/]{suffix}")
+    elif ns.link_live == "down":
         console.print(
             "Link:     [yellow]down (next boot: up — a power cycle restores the "
             "network; re-run winbox net unplug)[/]"
@@ -265,64 +258,22 @@ def net_status(ctx: click.Context) -> None:
             "with no NIC; run winbox net connect)[/]"
         )
 
-    if state == VMState.SAVED:
+    if ns.vm_state == VMState.SAVED.value:
         console.print(
             "    Saved state present — resuming restores the link state captured "
             "at suspend time, not the next-boot state above."
         )
 
-    # `has_filter` reads `virsh dumpxml` with no flags, which libvirt answers
-    # from the persistent XML for an inactive domain — so this line is
-    # already the next-boot answer when the VM is off.
-    scope = "" if running else " (next boot)"
-    filter_on = nwfilter.has_filter(vm.name)
-    if filter_on:
+    scope = "" if ns.vm_running else " (next boot)"
+    if ns.filter_active:
         console.print(f"Filter:   [red]{nwfilter.FILTER_NAME}[/] (isolated){scope}")
     else:
         console.print(f"Filter:   [green]none[/]{scope}")
 
-    if not running:
-        console.print("Internet: [yellow]unknown[/] (VM not running)")
-        return
-
-    # Link down => no packets at all.
-    if live != "up":
-        console.print("Internet: [red]blocked[/] (link down)")
-        return
-
-    # Filter attached => the default route inside the VM may still exist,
-    # but packets die at the bridge. Trust the filter, skip the GA probe.
-    if filter_on:
-        console.print("Internet: [red]isolated[/] (nwfilter active)")
-        return
-
-    if not ga.ping():
-        console.print("Internet: [yellow]unknown[/] (GA unreachable)")
-        return
-
-    # @(...) forces a collection so .Count works even when Get-NetRoute
-    # returns $null (no match) or a single object (PS unwraps single-element
-    # pipelines by default and $null.Count prints as empty string).
-    # A GA that pings but is still settling (right after boot) can blow the
-    # 10s budget — report unknown rather than ending a status read in a
-    # traceback.
-    try:
-        result = ga.exec_powershell(
-            "@(Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
-            "-ErrorAction SilentlyContinue).Count",
-            timeout=10,
-        )
-    except GuestAgentError:
-        console.print("Internet: [yellow]unknown[/] (guest probe timed out)")
-        return
-    if result.exitcode != 0 or not result.stdout.strip().isdigit():
-        console.print("Internet: [yellow]unknown[/]")
-        return
-
-    if int(result.stdout.strip()) > 0:
-        console.print("Internet: [green]reachable[/]")
-    else:
-        console.print("Internet: [red]isolated[/] (no default route)")
+    _INET_COLORS = {"reachable": "green", "isolated": "red", "blocked": "red", "unknown": "yellow"}
+    color = _INET_COLORS.get(ns.internet, "yellow")
+    detail = f" ({ns.internet_detail})" if ns.internet_detail else ""
+    console.print(f"Internet: [{color}]{ns.internet}[/]{detail}")
 
 
 # ─── dns ─────────────────────────────────────────────────────────────────────

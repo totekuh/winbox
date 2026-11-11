@@ -2,80 +2,23 @@
 
 from __future__ import annotations
 
-import time
-from pathlib import Path
-
 import click
 
-from winbox import data as _data
-from winbox.cli import console, ensure_running, needs_vm, reboot_and_wait, _ensure_z_drive
+from winbox import applocker
+from winbox.applocker import AppLockerError
+from winbox.cli import console, needs_vm, reboot_and_wait
 from winbox.config import Config
-from winbox.ps import render_ps
-from winbox.vm import GuestAgent, GuestAgentError
+from winbox.vm import GuestAgent
 from winbox.vm import VM
 
 
-def _default_policy_xml() -> str:
-    return _data.read("applocker", "default-policy.xml")
-
-
-def _clear_policy_xml() -> str:
-    return _data.read("applocker", "clear-policy.xml")
-
-# Enable/disable scripts read the policy XML from Z:\ (VirtIO-FS share)
-# to avoid command-line length limits with -EncodedCommand.
-_POLICY_PATH = r"Z:\.applocker-policy.xml"
-
-_SET_POLICY_SCRIPT = render_ps("applocker_apply", path=_POLICY_PATH)
-_DISABLE_APPLY_SCRIPT = render_ps("applocker_clear", path=_POLICY_PATH)
-
-_STATUS_SCRIPT = r"""
-$svc = Get-Service AppIDSvc -ErrorAction SilentlyContinue
-if (-not $svc) {
-    Write-Host "AppLocker: not available"
-    exit 0
-}
-
-$svcStatus = $svc.Status
-if ($svcStatus -ne 'Running') {
-    Write-Host "AppLocker: off (AppIDSvc $svcStatus)"
-    exit 0
-}
-
-$policy = Get-AppLockerPolicy -Effective
-$collections = $policy.RuleCollections
-$enforced = @($collections | Where-Object { $_.EnforcementMode -eq 'Enabled' })
-$audit = @($collections | Where-Object { $_.EnforcementMode -eq 'AuditOnly' })
-
-if ($enforced.Count -eq 0 -and $audit.Count -eq 0) {
-    Write-Host "AppLocker: off (no rules configured)"
-    exit 0
-}
-
-if ($enforced.Count -gt 0) {
-    Write-Host "AppLocker: ENFORCED"
-} else {
-    Write-Host "AppLocker: audit only"
-}
-
-foreach ($c in $collections) {
-    $mode = $c.EnforcementMode
-    $type = $c.RuleCollectionType
-    $count = $c.Count
-    if ($mode -ne 'NotConfigured') {
-        Write-Host "  ${type}: $mode ($count rules)"
-    }
-}
-"""
-
-
 @click.group()
-def applocker() -> None:
+def applocker_group() -> None:
     """Toggle AppLocker on the VM (default rules, no DLLs)."""
     pass
 
 
-@applocker.command("enable")
+@applocker_group.command("enable")
 @needs_vm()
 def applocker_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Enable AppLocker with default rules (Exe, Script, MSI, Appx).
@@ -84,43 +27,12 @@ def applocker_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     for Everyone, Administrators can run anything. No DLL rules.
     Undo with: winbox applocker disable
     """
-    # Write policy XML to VirtIO-FS share (avoids command-line length limits)
-    policy_file = Path(cfg.shared_dir) / ".applocker-policy.xml"
     console.print("[blue][*][/] Applying default AppLocker policy...")
-    policy_file.write_text(_default_policy_xml(), encoding="utf-8")
     try:
-        result = ga.exec_powershell(_SET_POLICY_SCRIPT, timeout=30)
-    finally:
-        policy_file.unlink(missing_ok=True)
-
-    if result.exitcode != 0:
-        console.print("[red][-][/] Failed to set AppLocker policy:")
-        console.print(f"    {result.stderr.strip()}", markup=False, highlight=False)
+        applocker.enable(ga, cfg.shared_dir)
+    except AppLockerError as exc:
+        console.print(f"[red][-][/] {exc}")
         raise SystemExit(1)
-
-    # Each step must be a separate GA call — running inside a single
-    # exec_powershell doesn't give the converter the right context.
-    console.print("[blue][*][/] Starting AppLocker stack...")
-    result = ga.exec("appidtel.exe start", timeout=60)
-    if result.exitcode != 0:
-        console.print("[red][-][/] Failed to start AppLocker stack (appidtel.exe):")
-        console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
-        raise SystemExit(1)
-    time.sleep(5)
-
-    console.print("[blue][*][/] Compiling rules...")
-    result = ga.exec(r"C:\Windows\System32\AppIdPolicyConverter.exe", timeout=60)
-    if result.exitcode != 0:
-        console.print("[yellow][!][/] Rule compilation warning (AppIdPolicyConverter):")
-        console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
-    time.sleep(5)
-    # gpupdate /force can block for minutes when the guest has no domain
-    # controller to reach and the NIC is still settling — a tight budget
-    # here kills it mid-apply and leaves the policy half-applied.
-    result = ga.exec("gpupdate /force", timeout=180)
-    if result.exitcode != 0:
-        console.print("[yellow][!][/] gpupdate warning:")
-        console.print(f"    {result.stdout.strip()}", markup=False, highlight=False)
 
     console.print("[green][+][/] AppLocker enforced (Exe, Script, MSI, Appx)")
     console.print("    Allowed: %WINDIR%\\*, %PROGRAMFILES%\\*, Admins everywhere")
@@ -128,7 +40,7 @@ def applocker_enable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     console.print("    Undo with: [bold]winbox applocker disable[/]")
 
 
-@applocker.command("disable")
+@applocker_group.command("disable")
 @needs_vm()
 def applocker_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Disable AppLocker — clear policy, stop stack, reboot.
@@ -136,25 +48,11 @@ def applocker_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     Reboot is required because appid.sys caches rules in kernel memory
     and continues enforcing even after AppIDSvc is stopped.
     """
-    policy_file = Path(cfg.shared_dir) / ".applocker-policy.xml"
     console.print("[blue][*][/] Clearing AppLocker policies...")
-    policy_file.write_text(_clear_policy_xml(), encoding="utf-8")
     try:
-        result = ga.exec_powershell(_DISABLE_APPLY_SCRIPT, timeout=30)
-    finally:
-        policy_file.unlink(missing_ok=True)
-
-    # The reboot only flushes appid.sys's cached rules — it does NOT clear a
-    # policy that is still in the registry. So if Set-AppLockerPolicy failed
-    # (commonly: Z: not mounted yet, so the script's Test-Path bails with
-    # exit 1 having cleared nothing) rebooting and claiming success leaves
-    # the guest still enforcing while the user is told it is off. Match
-    # applocker_enable and refuse to continue.
-    if result.exitcode != 0:
-        console.print("[red][-][/] Failed to clear AppLocker policy:")
-        detail = result.stderr.strip() or result.stdout.strip()
-        if detail:
-            console.print(f"    {detail}", markup=False, highlight=False)
+        applocker.disable_apply(ga, cfg.shared_dir)
+    except AppLockerError as exc:
+        console.print(f"[red][-][/] {exc}")
         raise SystemExit(1)
 
     reboot_and_wait(
@@ -162,37 +60,34 @@ def applocker_disable(cfg: Config, vm: VM, ga: GuestAgent) -> None:
         msg="Rebooting VM (kernel caches enforcement)...",
     )
 
-    # Trust the guest, not the exit code: appid.sys can survive the clear
-    # (compiled rule cache, service restart racing the reboot). Re-query
-    # rather than assert an outcome we never checked.
-    status = ga.exec_powershell(_STATUS_SCRIPT, timeout=90)
-    reported = status.stdout.strip()
-    if status.exitcode != 0:
-        console.print("[yellow][!][/] Policy cleared, but could not verify state:")
-        console.print(f"    {status.stderr.strip()}", markup=False, highlight=False)
+    try:
+        result = applocker.status(ga)
+    except AppLockerError as exc:
+        console.print(f"[yellow][!][/] Policy cleared, but could not verify state:")
+        console.print(f"    {exc}", markup=False, highlight=False)
         return
-    if "AppLocker: off" in reported or "not available" in reported:
+
+    if not result.active:
         console.print("[green][+][/] AppLocker disabled")
         return
 
     console.print("[red][-][/] AppLocker still active after disable:")
-    console.print(reported, markup=False, highlight=False)
+    console.print(result.raw_stdout, markup=False, highlight=False)
     raise SystemExit(1)
 
 
-@applocker.command("status")
+@applocker_group.command("status")
 @needs_vm()
 def applocker_status(cfg: Config, vm: VM, ga: GuestAgent) -> None:
     """Show current AppLocker enforcement status."""
-    # Normally ~2s, but a read-only status query should ride out a
-    # transient guest stall rather than time out and get taskkill'd.
-    result = ga.exec_powershell(_STATUS_SCRIPT, timeout=90)
-    if result.exitcode != 0:
+    try:
+        result = applocker.status(ga)
+    except AppLockerError as exc:
         console.print("[red][-][/] Failed to query status:")
-        console.print(f"    {result.stderr.strip()}", markup=False, highlight=False)
+        console.print(f"    {exc}", markup=False, highlight=False)
         raise SystemExit(1)
 
-    console.print(result.stdout.strip(), markup=False, highlight=False)
+    console.print(result.raw_stdout, markup=False, highlight=False)
 
 
-REGISTER = ("Target", [applocker])
+REGISTER = ("Target", [applocker_group])

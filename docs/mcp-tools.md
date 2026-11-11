@@ -18,7 +18,15 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-## Available tools (109)
+## Available tools (116)
+
+### VM lifecycle
+
+| Tool | Description |
+|------|-------------|
+| `vm_up()` | Start the VM (boot from SHUTOFF/SAVED, resume from PAUSED) and wait for guest agent |
+| `vm_down(force?)` | Shut down the VM. Graceful by default (ACPI, 60s wait); `force=True` for hard power-off |
+| `vm_status()` | JSON: vm name, OS, state, IP, agent health, disk MB, tools/loot counts, snapshots |
 
 ### User-mode primitives
 
@@ -81,6 +89,20 @@ claude mcp add winbox -- winbox mcp
 | `hvci_status(timeout?)` | Report HVCI/VBS state (DeviceGuard registry keys + bcdedit hypervisorlaunchtype) |
 | `hvci_disable(confirm)` | Disable HVCI and VBS — sets registry keys + bcdedit then reboots the VM. `confirm=True` required. |
 | `hvci_enable(confirm)` | Re-enable HVCI and VBS. Reboots the VM. `confirm=True` required. |
+
+### AppLocker
+
+| Tool | Description |
+|------|-------------|
+| `applocker_status(timeout?)` | Report AppLocker enforcement state per rule collection (Exe, Script, MSI, Appx) |
+| `applocker_enable()` | Enable AppLocker with default rules. Undo with `applocker_disable` |
+| `applocker_disable(confirm)` | Disable AppLocker — clears policy and reboots. `confirm=True` required. |
+
+### Network status
+
+| Tool | Description |
+|------|-------------|
+| `net_status()` | JSON: link state (live + next-boot), nwfilter status, internet reachability |
 
 ### Named pipes
 

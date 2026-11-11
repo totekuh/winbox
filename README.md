@@ -7,7 +7,7 @@ Windows 10) into
 an automation, instrumentation, and analysis environment controlled from
 Kali. Execute tools, drive a PDB-aware hypervisor debugger, inspect protected
 memory, exercise drivers and IPC, change security posture, contain malware,
-and collect evidence through one CLI and a 109-tool MCP surface.
+and collect evidence through one CLI and a 116-tool MCP surface.
 
 ## Quick Demo
 
@@ -35,7 +35,7 @@ PS C:\Windows\system32>
 
 ## Platform capabilities
 
-- **MCP server** — 109 tools form a bounded, AI-native research control plane
+- **MCP server** — 116 tools form a bounded, AI-native research control plane
   for autonomous agents, covering VM lifecycle, execution, memory, symbols,
   debugging, drivers, IPC, defenses, networking, event logs, and evidence
   collection.
@@ -95,7 +95,7 @@ See [Guest OS Targets](docs/guest-os.md) for per-OS notes and display options.
 | Guide | Description |
 |-------|-------------|
 | [Usage](docs/usage.md) | CLI commands, shells, tools, network, snapshots, event logs |
-| [MCP Tools](docs/mcp-tools.md) | 109-tool AI agent surface — full reference |
+| [MCP Tools](docs/mcp-tools.md) | 116-tool AI agent surface — full reference |
 | [Guest OS Targets](docs/guest-os.md) | Server 2022/2025, Win11, Win10 notes; display stack |
 | [Malware Detonation](docs/malware-detonation.md) | Containment, preflight, capture, sinkhole |
 | [Architecture](docs/architecture.md) | Platform layers, control planes |

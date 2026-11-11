@@ -432,6 +432,138 @@ def _launch_bg_job(cfg: Config, launch, label: str) -> str:
     return _json.dumps({"background": True, "job_id": job.id, "pid": job.pid})
 
 
+# ─── Tool 0: vm_up / vm_down / vm_status ─────────────────────────────────────
+
+@mcp.tool()
+def vm_up() -> str:
+    """Start the VM (or confirm it is already running).
+
+    Boots the VM from SHUTOFF/SAVED or resumes from PAUSED state, then
+    waits for the guest agent to respond.  Returns the VM IP on success.
+    """
+    cfg, vm, ga = _get_state()
+    state = vm.state()
+
+    if state == VMState.RUNNING:
+        ip = vm.ip()
+        return f"VM is already running{f' — IP: {ip}' if ip else ''}"
+    if state == VMState.NOT_FOUND:
+        raise RuntimeError("VM not found. Run 'winbox setup' first.")
+    if state == VMState.PAUSED:
+        vm.resume()
+    else:
+        vm.start()
+
+    try:
+        ga.wait(timeout=120)
+    except GuestAgentError:
+        return (
+            "VM started but guest agent did not respond within 120s. "
+            f"Check with: virsh console {cfg.vm_name}"
+        )
+
+    ip = vm.ip()
+    return f"VM started{f' — IP: {ip}' if ip else ''}"
+
+
+@mcp.tool()
+def vm_down(force: bool = False) -> str:
+    """Shut down the VM.
+
+    Graceful shutdown by default (ACPI signal, waits up to 60s).  Pass
+    ``force=True`` for an immediate power-off (virsh destroy).
+
+    Args:
+        force: Hard power-off instead of graceful shutdown.
+    """
+    cfg, vm, ga = _get_state()
+    state = vm.state()
+
+    if state in (VMState.SHUTOFF, VMState.NOT_FOUND):
+        return f"VM is not running (state: {state.value})"
+
+    if force:
+        vm.force_stop()
+        return "VM powered off (forced)"
+
+    if state == VMState.PAUSED:
+        return "VM is paused — use force=True to power off, or resume first"
+
+    if ga.ping():
+        try:
+            ga.exec("shutdown /s /t 0", timeout=10)
+        except GuestAgentError:
+            pass
+    else:
+        vm.shutdown()
+
+    import time as _time
+    for _ in range(60):
+        if vm.state() in (VMState.SHUTOFF, VMState.NOT_FOUND):
+            return "VM shut down"
+        _time.sleep(1)
+
+    vm.force_stop()
+    return "Graceful shutdown timed out — forced power-off"
+
+
+@mcp.tool()
+def vm_status() -> str:
+    """Report VM state, IP, agent health, disk, tools, and snapshots.
+
+    Returns a JSON object with the current status.  Works whether the VM
+    is running or off.
+    """
+    cfg, vm, ga = _get_state()
+    state = vm.state()
+    running = state == VMState.RUNNING
+
+    ip = None
+    agent_ok = False
+    if running:
+        ip = vm.ip()
+        agent_ok = ga.ping()
+
+    disk_mb = None
+    try:
+        disk_mb = round(vm.disk_usage() / (1024 * 1024))
+    except (OSError, AttributeError):
+        pass
+
+    tools_count = 0
+    loot_count = 0
+    try:
+        tools_dir = cfg.shared_dir / "tools"
+        if tools_dir.is_dir():
+            tools_count = sum(1 for _ in tools_dir.iterdir())
+    except OSError:
+        pass
+    try:
+        loot_dir = cfg.shared_dir / "loot"
+        if loot_dir.is_dir():
+            loot_count = sum(1 for _ in loot_dir.iterdir())
+    except OSError:
+        pass
+
+    snaps = []
+    try:
+        snaps = vm.snapshot_list()
+    except Exception:
+        pass
+
+    return _json.dumps({
+        "vm_name": cfg.vm_name,
+        "os": cfg.vm_os,
+        "state": state.value,
+        "ip": ip,
+        "agent": agent_ok,
+        "disk_mb": disk_mb,
+        "tools": tools_count,
+        "loot": loot_count,
+        "snapshots": snaps,
+    })
+
+
 # ─── Tool 1: python ────────────────────────────────────────────────────────
 
 def _execution_json(result) -> str:
@@ -1905,6 +2037,93 @@ def hvci_enable(confirm: bool = False) -> str:
     )
 
 
+# ─── Tool 8d: applocker_enable / applocker_disable / applocker_status ────────
+
+@mcp.tool()
+def applocker_status(timeout: int = 90) -> str:
+    """Report current AppLocker enforcement state.
+
+    Returns the enforcement mode for each rule collection (Exe, Script,
+    MSI, Appx) or reports that AppLocker is off / not available.
+
+    Args:
+        timeout: Guest agent timeout in seconds.
+    """
+    from winbox import applocker
+
+    cfg, vm, ga = _ensure_vm_ready()
+    try:
+        result = applocker.status(ga, timeout=timeout)
+    except applocker.AppLockerError as exc:
+        return f"error: {exc}"
+    return result.raw_stdout
+
+
+@mcp.tool()
+def applocker_enable() -> str:
+    """Enable AppLocker with default rules (Exe, Script, MSI, Appx).
+
+    Standard corporate config: allow C:\\Windows\\* and C:\\Program Files\\*
+    for Everyone, Administrators can run anything.  No DLL rules.
+    Undo with applocker_disable.
+    """
+    from winbox import applocker
+
+    cfg, vm, ga = _ensure_vm_ready()
+    try:
+        applocker.enable(ga, cfg.shared_dir)
+    except applocker.AppLockerError as exc:
+        return f"error: {exc}"
+    return "AppLocker enforced (Exe, Script, MSI, Appx). Undo with applocker_disable."
+
+
+@mcp.tool()
+def applocker_disable(confirm: bool = False) -> str:
+    """Disable AppLocker — clear policy, reboot (kernel caches rules).
+
+    The reboot is required because appid.sys caches enforcement rules
+    in kernel memory.  Pass ``confirm=True`` to proceed.
+
+    Args:
+        confirm: Must be True to actually run (guards the reboot).
+    """
+    from winbox import applocker
+
+    if not confirm:
+        return "pass confirm=true to disable AppLocker (will reboot the VM)"
+
+    cfg, vm, ga = _ensure_vm_ready()
+    try:
+        applocker.disable_apply(ga, cfg.shared_dir)
+    except applocker.AppLockerError as exc:
+        return f"error: {exc}"
+
+    try:
+        ga.exec("shutdown /r /t 0", timeout=10)
+    except GuestAgentError:
+        pass
+
+    import time as _time
+    _time.sleep(10)
+    try:
+        ga.wait(timeout=120)
+    except GuestAgentError:
+        return (
+            "AppLocker policy cleared and reboot issued, but the guest agent "
+            "did not come back within 120s. Check with: virsh console "
+            + cfg.vm_name
+        )
+
+    try:
+        result = applocker.status(ga)
+    except applocker.AppLockerError:
+        return "AppLocker policy cleared, but post-reboot status check failed"
+
+    if not result.active:
+        return "AppLocker disabled"
+    return f"AppLocker still active after disable:\n{result.raw_stdout}"
+
+
 # ─── Tool 9: net_isolate / net_unplug / net_connect ─────────────────────────
 
 @mcp.tool()
@@ -2050,6 +2269,30 @@ def net_connect() -> str:
             return f"Network connected — IP: {ip}"
         time.sleep(1)
     return "Network connected (DHCP pending)"
+
+
+@mcp.tool()
+def net_status() -> str:
+    """Report VM network state — link, filter, and internet reachability.
+
+    Returns a JSON object with link state (live and next-boot), nwfilter
+    status, and internet reachability.  Works whether the VM is running
+    or off.
+    """
+    from winbox.netstatus import net_status as _net_status
+
+    cfg, vm, ga = _get_state()
+    ns = _net_status(vm, ga)
+
+    return _json.dumps({
+        "vm_running": ns.vm_running,
+        "link_live": ns.link_live,
+        "link_boot": ns.link_boot,
+        "filter_active": ns.filter_active,
+        "internet": ns.internet,
+        "internet_detail": ns.internet_detail,
+        "vm_state": ns.vm_state,
+    })
 
 
 # ─── Tool 9b: share / user management ────────────────────────────────────────

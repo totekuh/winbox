@@ -3,7 +3,7 @@
 from unittest.mock import patch
 
 from winbox.cli import cli
-from winbox.cli.applocker import (
+from winbox.applocker import (
     _clear_policy_xml,
     _default_policy_xml,
     _STATUS_SCRIPT,
@@ -27,7 +27,7 @@ class TestAppLockerEnable:
             exitcode=0, stdout="", stderr=""
         )
 
-        with patch("winbox.cli.applocker.time.sleep"):
+        with patch("winbox.applocker.time.sleep"):
             result = runner.invoke(cli, ["applocker", "enable"])
 
         assert result.exit_code == 0
@@ -71,8 +71,8 @@ def _run_disable(runner, mock_env, *powershell_results):
     """
     mock_env.exec_powershell.side_effect = list(powershell_results)
     mock_env.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
-    with patch("winbox.cli.applocker.time.sleep"), \
-         patch("winbox.cli.applocker._ensure_z_drive"):
+    with patch("winbox.applocker.time.sleep"), \
+         patch("winbox.cli._ensure_z_drive"):
         return runner.invoke(cli, ["applocker", "disable"])
 
 
@@ -276,14 +276,14 @@ class TestClearScriptExitCodeIsMeaningful:
     decided by the post-reboot status check, not by this exit code."""
 
     def test_script_ends_with_an_explicit_success_exit(self):
-        from winbox.cli.applocker import _DISABLE_APPLY_SCRIPT
+        from winbox.applocker import _DISABLE_APPLY_SCRIPT
 
         assert _DISABLE_APPLY_SCRIPT.rstrip().endswith("exit 0"), (
             "clear script must not leak appidtel.exe's exit code to the caller"
         )
 
     def test_appidtel_stop_is_not_the_last_statement(self):
-        from winbox.cli.applocker import _DISABLE_APPLY_SCRIPT
+        from winbox.applocker import _DISABLE_APPLY_SCRIPT
 
         body = _DISABLE_APPLY_SCRIPT.rstrip()
         assert not body.endswith("appidtel.exe stop")

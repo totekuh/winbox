@@ -267,9 +267,16 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
                                "`hvci disable` covers the same shared code"),
     "hvci_enable": (EXCLUDED, "reboots the guest mid-suite; the CLI path "
                               "`hvci enable` covers the same shared code"),
+    "vm_up": (LIVE, ""),
+    "vm_down": (LIVE, ""),
+    "vm_status": (LIVE, ""),
+    "applocker_status": (LIVE, ""),
+    "applocker_enable": (LIVE, ""),
+    "applocker_disable": (LIVE, "paired with enable; reboot is part of the test"),
     "net_isolate": (LIVE, ""),
     "net_connect": (LIVE, ""),
     "net_unplug": (LIVE, "including the persistent (next-boot) write"),
+    "net_status": (LIVE, ""),
 
     # Share / user
     "share_create": (LIVE, ""),

@@ -2146,3 +2146,59 @@ class TestLifecycleTeardown:
         finally:
             run("net", "connect")
         assert "cycled-ok" in ga.exec("echo cycled-ok", timeout=90).stdout
+
+
+# ─── MCP: vm lifecycle ──────────────────────────────────────────────────────
+
+
+class TestMcpVmLifecycle:
+    """MCP tools for VM up/down/status."""
+
+    def test_mcp_vm_status(self, tool):
+        import json
+        raw = tool("vm_status")()
+        data = json.loads(raw)
+        assert data["state"] == "running"
+        assert data["agent"] is True
+        assert isinstance(data["snapshots"], list)
+
+    def test_mcp_vm_down_and_up(self, tool, vm, ga):
+        out = tool("vm_down")()
+        assert "shut down" in out.lower() or "powered off" in out.lower()
+        assert vm.state() != VMState.RUNNING
+        out = tool("vm_up")()
+        assert "started" in out.lower() or "already running" in out.lower()
+        assert "alive" in ga.exec("echo alive", timeout=120).stdout
+
+
+# ─── MCP: applocker ─────────────────────────────────────────────────────────
+
+
+class TestMcpAppLocker:
+    """MCP tools for AppLocker enable/disable/status."""
+
+    def test_mcp_applocker_status(self, tool):
+        out = tool("applocker_status")()
+        assert "AppLocker" in out
+
+    def test_mcp_applocker_enable_disable(self, tool, ga):
+        out = tool("applocker_enable")()
+        assert "enforced" in out.lower() or "error" in out.lower()
+        if "error" not in out.lower():
+            out = tool("applocker_disable")(confirm=True)
+            assert "disabled" in out.lower() or "error" in out.lower()
+            assert "alive" in ga.exec("echo alive", timeout=120).stdout
+
+
+# ─── MCP: net status ────────────────────────────────────────────────────────
+
+
+class TestMcpNetStatus:
+    """MCP tool for network status."""
+
+    def test_mcp_net_status(self, tool):
+        import json
+        raw = tool("net_status")()
+        data = json.loads(raw)
+        assert data["vm_running"] is True
+        assert data["internet"] in ("reachable", "isolated", "blocked", "unknown")

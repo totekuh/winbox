@@ -12,8 +12,9 @@ from winbox.vm.guest import ExecResult
 
 @pytest.fixture
 def mock_nwfilter():
-    """Patch winbox.cli.network.nwfilter with sensible defaults."""
-    with patch("winbox.cli.network.nwfilter") as m:
+    """Patch nwfilter in both cli.network and netstatus with sensible defaults."""
+    with patch("winbox.cli.network.nwfilter") as m, \
+         patch("winbox.netstatus.nwfilter", m):
         m.FILTER_NAME = "winbox-isolate"
         m.ensure_filter_defined.return_value = None
         m.attach_filter.return_value = True
