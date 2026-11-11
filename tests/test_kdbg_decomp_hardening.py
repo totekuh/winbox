@@ -100,13 +100,13 @@ def test_same_name_candidates_select_live_build(monkeypatch, tmp_path):
     wrong.write_bytes(b"wrong")
     right.write_bytes(b"right")
     monkeypatch.setattr(
-        "winbox.kdbg.decomp.service._binary_candidates", lambda *_: [wrong, right],
+        "winbox.kdbg.decomp.service.resolve._binary_candidates", lambda *_: [wrong, right],
     )
     def parse(path):
         timestamp = 2 if path.read_bytes() == b"right" else 1
         return PeIdentity(0x8664, timestamp, 0x3000, 0x140000000, None,
                           sha256=hashlib.sha256(path.read_bytes()).hexdigest())
-    monkeypatch.setattr("winbox.kdbg.decomp.service.parse_static_pe", parse)
+    monkeypatch.setattr("winbox.kdbg.decomp.service.resolve.parse_static_pe", parse)
     live = PeIdentity(0x8664, 2, 0x3000, 0x140000000, None)
     selected, _, confidence = _resolve_verified_binary(
         cfg, "same.exe", "", live, 0x3000,

@@ -32,6 +32,10 @@ from winbox.kdbg.walk import (
 @pytest.fixture(autouse=True)
 def _no_live_snapshot(monkeypatch):
     import winbox.kdbg.debugger.reader as reader
+    import winbox.kdbg.debugger.reader.lifecycle as reader_lifecycle
+    monkeypatch.setattr(
+        reader_lifecycle, "debug_snapshot_for_vm", lambda _vm: nullcontext(),
+    )
     monkeypatch.setattr(
         reader, "debug_snapshot_for_vm", lambda _vm: nullcontext(),
     )

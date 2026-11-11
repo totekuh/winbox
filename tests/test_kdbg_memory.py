@@ -121,10 +121,10 @@ class FakeMemory:
 @pytest.fixture
 def fake_mem(monkeypatch):
     mem = FakeMemory()
-    import winbox.kdbg.debugger.reader as reader
+    import winbox.kdbg.debugger.reader.lifecycle as reader_lifecycle
     monkeypatch.setattr(memory, "current_snapshot", lambda _vm=None: mem)
     monkeypatch.setattr(
-        reader, "debug_snapshot_for_vm", lambda _vm: nullcontext(mem),
+        reader_lifecycle, "debug_snapshot_for_vm", lambda _vm: nullcontext(mem),
     )
     return mem
 

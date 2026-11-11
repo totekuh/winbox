@@ -409,7 +409,7 @@ def test_query_decomp_composes_rva_identity_and_worker(monkeypatch, tmp_path):
         sha256="a" * 64, file_size=binary.stat().st_size,
         sections=(SectionIdentity(".text", 0x1000, 0x1000, 0, 1),),
     )
-    monkeypatch.setattr("winbox.kdbg.decomp.service.parse_static_pe", lambda _: static)
+    monkeypatch.setattr("winbox.kdbg.decomp.service.resolve.parse_static_pe", lambda _: static)
     monkeypatch.setattr(
         "winbox.kdbg.decomp.cache.analysis_readiness",
         lambda *_: {"ready": True, "reason": "ready"},
@@ -466,7 +466,7 @@ def test_query_decomp_refuses_cold_analysis_unless_explicitly_allowed(monkeypatc
         sha256="c" * 64, file_size=binary.stat().st_size,
         sections=(SectionIdentity(".text", 0x1000, 0x1000, 0, 1),),
     )
-    monkeypatch.setattr("winbox.kdbg.decomp.service.parse_static_pe", lambda _: static)
+    monkeypatch.setattr("winbox.kdbg.decomp.service.resolve.parse_static_pe", lambda _: static)
     monkeypatch.setattr(
         "winbox.kdbg.decomp.cache.analysis_readiness",
         lambda *_: {
@@ -513,7 +513,7 @@ def test_query_decomp_adds_bounded_static_direct_call_evidence(monkeypatch, tmp_
         sha256="d" * 64, file_size=binary.stat().st_size,
         sections=(SectionIdentity(".text", 0x1000, 0x1000, 0, 1),),
     )
-    monkeypatch.setattr("winbox.kdbg.decomp.service.parse_static_pe", lambda _: static)
+    monkeypatch.setattr("winbox.kdbg.decomp.service.resolve.parse_static_pe", lambda _: static)
     monkeypatch.setattr(
         "winbox.kdbg.decomp.cache.analysis_readiness",
         lambda *_: {"ready": True, "reason": "ready"},
@@ -556,7 +556,7 @@ def test_query_decomp_cursor_pages_and_is_bound_to_stop_and_binary(
         sha256="b" * 64, file_size=binary.stat().st_size,
         sections=(SectionIdentity(".text", 0x1000, 0x1000, 0, 1),),
     )
-    monkeypatch.setattr("winbox.kdbg.decomp.service.parse_static_pe", lambda _: static)
+    monkeypatch.setattr("winbox.kdbg.decomp.service.resolve.parse_static_pe", lambda _: static)
     monkeypatch.setattr(
         "winbox.kdbg.decomp.cache.analysis_readiness",
         lambda *_: {"ready": True, "reason": "ready"},

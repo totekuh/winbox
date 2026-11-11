@@ -7,6 +7,7 @@ import importlib
 
 from winbox.kdbg import hmp as exported_hmp_function
 import winbox.kdbg.debugger.reader as reader
+import winbox.kdbg.debugger.reader.lifecycle as reader_lifecycle
 
 hmp_mod = importlib.import_module("winbox.kdbg.hmp")
 
@@ -23,6 +24,7 @@ def test_paused_snapshot_delegates_to_rsp_reader(monkeypatch):
         finally:
             events.append(("exit", vm_name))
 
+    monkeypatch.setattr(reader_lifecycle, "debug_snapshot_for_vm", snapshot)
     monkeypatch.setattr(reader, "debug_snapshot_for_vm", snapshot)
     monkeypatch.setattr(
         hmp_mod, "hmp", lambda *a, **k: (_ for _ in ()).throw(
@@ -45,6 +47,7 @@ def test_hmp_snapshot_operation_delegates_to_rsp_decorator(monkeypatch):
         finally:
             events.append(f"exit:{vm_name}")
 
+    monkeypatch.setattr(reader_lifecycle, "debug_snapshot_for_vm", snapshot)
     monkeypatch.setattr(reader, "debug_snapshot_for_vm", snapshot)
 
     @hmp_mod.snapshot_operation

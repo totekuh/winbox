@@ -322,7 +322,7 @@ def test_background_prepare_validates_budget_and_forwards_force(
 ):
     cfg = Config(winbox_dir=tmp_path)
     monkeypatch.setattr(
-        "winbox.kdbg.decomp.service._prepare_modules", lambda *_a, **_k: ["sample"],
+        "winbox.kdbg.decomp.service.prepare_bg._prepare_modules", lambda *_a, **_k: ["sample"],
     )
     with pytest.raises(DecompError) as captured:
         start_prepare_background(cfg, modules=["sample"], analysis_timeout=True)
@@ -335,7 +335,7 @@ def test_background_prepare_validates_budget_and_forwards_force(
         captured_command["value"] = command
         return process
 
-    monkeypatch.setattr("winbox.kdbg.decomp.service.subprocess.Popen", popen)
+    monkeypatch.setattr("winbox.kdbg.decomp.service.prepare_bg.subprocess.Popen", popen)
     result = start_prepare_background(
         cfg, modules=["sample"], analysis_timeout=30, force_enrichment=True,
     )
@@ -395,12 +395,12 @@ def test_prepare_job_cancel_is_nonce_bound_and_terminal_safe(tmp_path):
 
 
 def test_prepare_job_retention_removes_only_old_terminal_pairs(monkeypatch, tmp_path):
-    import winbox.kdbg.decomp.service as service
+    import winbox.kdbg.decomp.service.prepare_bg as prepare_bg
 
     cfg = Config(winbox_dir=tmp_path)
     root = tmp_path / "decomp" / "prepare-jobs"
     root.mkdir(parents=True)
-    monkeypatch.setattr(service, "PREPARE_JOB_MAX_RETAINED", 2)
+    monkeypatch.setattr(prepare_bg, "PREPARE_JOB_MAX_RETAINED", 2)
     tokens = [f"{index:032x}" for index in range(4)]
     for index, token in enumerate(tokens):
         path = root / f"{token}.json"
@@ -506,7 +506,7 @@ def test_prepare_batch_builds_sidecar_and_calls_worker(monkeypatch, tmp_path):
     sidecar = tmp_path / "sidecar.json"
     sidecar.write_text("{}")
     monkeypatch.setattr(
-        "winbox.kdbg.decomp.service._prepare_modules", lambda *_a, **_k: ["sample"],
+        "winbox.kdbg.decomp.service.prepare._prepare_modules", lambda *_a, **_k: ["sample"],
     )
 
     class Store:
@@ -514,7 +514,7 @@ def test_prepare_batch_builds_sidecar_and_calls_worker(monkeypatch, tmp_path):
         def load(self, _name):
             return {"pe_path": str(binary), "pe_sha256": digest}
 
-    monkeypatch.setattr("winbox.kdbg.decomp.service.SymbolStore", Store)
+    monkeypatch.setattr("winbox.kdbg.decomp.service.prepare.SymbolStore", Store)
     monkeypatch.setattr(
         "winbox.kdbg.decomp.enrichment.build_enrichment",
         lambda *_a, **_k: (sidecar, {"pdb_build": "BUILD"}),
@@ -527,7 +527,7 @@ def test_prepare_batch_builds_sidecar_and_calls_worker(monkeypatch, tmp_path):
             calls.append((op, kwargs))
             return {"prepared": True}
 
-    monkeypatch.setattr("winbox.kdbg.decomp.service.DecompClient", Client)
+    monkeypatch.setattr("winbox.kdbg.decomp.service.prepare.DecompClient", Client)
     result = prepare_decomp(cfg, module="sample", analysis_timeout=25)
     assert result["prepared"] == 1
     assert result["failed"] == 0

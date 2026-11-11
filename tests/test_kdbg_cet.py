@@ -364,28 +364,30 @@ def test_restore_failure_preserves_recovery_backup(tmp_path):
 
 
 def test_reader_gate_runs_before_fork(monkeypatch, tmp_path):
-    import winbox.kdbg.debugger.reader as reader
+    import winbox.kdbg.debugger.reader.lifecycle as reader_lifecycle
+    from winbox.kdbg.debugger.reader import ensure_reader
 
     cfg = Config(winbox_dir=tmp_path)
-    monkeypatch.setattr(reader, "_reader_alive", lambda cfg: False)
+    monkeypatch.setattr(reader_lifecycle, "_reader_alive", lambda cfg: False)
     monkeypatch.setattr(
         "winbox.kdbg.debugger.client.DaemonClient.session_alive", lambda self: False,
     )
     events = []
     monkeypatch.setattr(cet, "require_safe", lambda cfg: events.append("gate"))
-    monkeypatch.setattr(reader, "_fork_reader", lambda cfg, port: events.append("fork") or 1)
-    monkeypatch.setattr(reader, "sock_path", lambda cfg: tmp_path / "ready.sock")
+    monkeypatch.setattr(reader_lifecycle, "_fork_reader", lambda cfg, port: events.append("fork") or 1)
+    monkeypatch.setattr(reader_lifecycle, "sock_path", lambda cfg: tmp_path / "ready.sock")
     # Make the post-fork readiness check succeed.
     (tmp_path / "ready.sock").touch()
-    reader.ensure_reader(cfg)
+    ensure_reader(cfg)
     assert events == ["gate", "fork"]
 
 
 def test_reader_gate_failure_prevents_fork(monkeypatch, tmp_path):
-    import winbox.kdbg.debugger.reader as reader
+    import winbox.kdbg.debugger.reader.lifecycle as reader_lifecycle
+    from winbox.kdbg.debugger.reader import ReaderError
 
     cfg = Config(winbox_dir=tmp_path)
-    monkeypatch.setattr(reader, "_reader_alive", lambda cfg: False)
+    monkeypatch.setattr(reader_lifecycle, "_reader_alive", lambda cfg: False)
     monkeypatch.setattr(
         "winbox.kdbg.debugger.client.DaemonClient.session_alive", lambda self: False,
     )
@@ -394,10 +396,10 @@ def test_reader_gate_failure_prevents_fork(monkeypatch, tmp_path):
     )
     fork = SimpleNamespace(called=False)
     monkeypatch.setattr(
-        reader, "_fork_reader", lambda cfg, port: setattr(fork, "called", True),
+        reader_lifecycle, "_fork_reader", lambda cfg, port: setattr(fork, "called", True),
     )
-    with pytest.raises(reader.ReaderError, match="unsafe"):
-        reader.ensure_reader(cfg)
+    with pytest.raises(ReaderError, match="unsafe"):
+        reader_lifecycle.ensure_reader(cfg)
     assert fork.called is False
 
 
@@ -416,34 +418,36 @@ def test_daemon_gate_failure_is_actionable_and_prevents_fork(monkeypatch, tmp_pa
 
 
 def test_verified_running_reader_does_not_repeat_guest_query(monkeypatch, tmp_path):
-    import winbox.kdbg.debugger.reader as reader
+    import winbox.kdbg.debugger.reader.lifecycle as reader_lifecycle
+    from winbox.kdbg.debugger.reader import session_path
 
     cfg = Config(winbox_dir=tmp_path)
-    reader.session_path(cfg).write_text(json.dumps({"cet_safe": True}))
-    monkeypatch.setattr(reader, "_reader_alive", lambda cfg: True)
+    session_path(cfg).write_text(json.dumps({"cet_safe": True}))
+    monkeypatch.setattr(reader_lifecycle, "_reader_alive", lambda cfg: True)
     monkeypatch.setattr(
         cet, "require_safe",
         lambda cfg: pytest.fail("verified reader must not re-query the guest"),
     )
-    reader.ensure_reader(cfg)
+    reader_lifecycle.ensure_reader(cfg)
 
 
 def test_unverified_running_reader_is_replaced_and_gated(monkeypatch, tmp_path):
-    import winbox.kdbg.debugger.reader as reader
+    import winbox.kdbg.debugger.reader.lifecycle as reader_lifecycle
+    from winbox.kdbg.debugger.reader import session_path
 
     cfg = Config(winbox_dir=tmp_path)
-    reader.session_path(cfg).write_text(json.dumps({"pid": 123}))
+    session_path(cfg).write_text(json.dumps({"pid": 123}))
     alive = iter((True, False))
-    monkeypatch.setattr(reader, "_reader_alive", lambda cfg: next(alive))
+    monkeypatch.setattr(reader_lifecycle, "_reader_alive", lambda cfg: next(alive))
     monkeypatch.setattr(
         "winbox.kdbg.debugger.client.DaemonClient.session_alive", lambda self: False,
     )
     events = []
-    monkeypatch.setattr(reader, "stop_reader", lambda cfg: events.append("stop"))
+    monkeypatch.setattr(reader_lifecycle, "stop_reader", lambda cfg: events.append("stop"))
     monkeypatch.setattr(cet, "require_safe", lambda cfg: events.append("gate"))
-    monkeypatch.setattr(reader, "_fork_reader", lambda cfg, port: events.append("fork"))
-    monkeypatch.setattr(reader, "sock_path", lambda cfg: tmp_path / "ready.sock")
+    monkeypatch.setattr(reader_lifecycle, "_fork_reader", lambda cfg, port: events.append("fork"))
+    monkeypatch.setattr(reader_lifecycle, "sock_path", lambda cfg: tmp_path / "ready.sock")
     (tmp_path / "ready.sock").touch()
 
-    reader.ensure_reader(cfg)
+    reader_lifecycle.ensure_reader(cfg)
     assert events == ["stop", "gate", "fork"]

@@ -125,17 +125,18 @@ def test_local_snapshot_collects_all_cr3_and_kernel_gs_candidates():
 def test_reader_handshake_failure_best_effort_resumes_before_raw_close(
     monkeypatch, tmp_path,
 ):
-    import winbox.kdbg.debugger.reader as reader
+    import winbox.kdbg.debugger.reader.lifecycle as reader_lifecycle
+    from winbox.kdbg.debugger.rsp import RspClient
 
     cfg = Config(winbox_dir=tmp_path)
     rsp = MagicMock()
     rsp.handshake.side_effect = RspError("handshake failed")
-    monkeypatch.setattr(reader, "gdbstub_has_client", lambda port: False)
-    monkeypatch.setattr(reader, "probe_port", lambda host, port: True)
-    monkeypatch.setattr(reader.RspClient, "connect", lambda *args, **kwargs: rsp)
+    monkeypatch.setattr(reader_lifecycle, "gdbstub_has_client", lambda port: False)
+    monkeypatch.setattr(reader_lifecycle, "probe_port", lambda host, port: True)
+    monkeypatch.setattr(RspClient, "connect", lambda *args, **kwargs: rsp)
 
     with pytest.raises(RspError, match="handshake failed"):
-        reader._open_rsp(cfg, 1234)
+        reader_lifecycle._open_rsp(cfg, 1234)
 
     rsp.cont.assert_called_once()
     rsp._sock.close.assert_called_once()
@@ -418,14 +419,14 @@ def test_debug_snapshot_nesting_reuses_one_remote_transaction(monkeypatch, tmp_p
     calls = {"connect": 0, "close": 0}
 
     monkeypatch.setattr(
-        "winbox.kdbg.debugger.reader.ensure_reader", lambda cfg, port=1234: None,
+        "winbox.kdbg.debugger.reader.lifecycle.ensure_reader", lambda cfg, port=1234: None,
     )
     def connect(_cfg):
         calls["connect"] += 1
         fake.close = lambda: calls.__setitem__("close", calls["close"] + 1)
         return fake
     monkeypatch.setattr(
-        "winbox.kdbg.debugger.reader._RemoteSnapshot.connect", connect,
+        "winbox.kdbg.debugger.reader.snapshot._RemoteSnapshot.connect", connect,
     )
 
     with debug_snapshot(cfg) as outer:
@@ -449,10 +450,10 @@ def test_debug_snapshot_reconnects_once_after_stale_broker(monkeypatch, tmp_path
             raise ReaderError("peer rebooted")
         return fake
 
-    monkeypatch.setattr("winbox.kdbg.debugger.reader.ensure_reader", ensure)
-    monkeypatch.setattr("winbox.kdbg.debugger.reader._RemoteSnapshot.connect", connect)
+    monkeypatch.setattr("winbox.kdbg.debugger.reader.lifecycle.ensure_reader", ensure)
+    monkeypatch.setattr("winbox.kdbg.debugger.reader.snapshot._RemoteSnapshot.connect", connect)
     monkeypatch.setattr(
-        "winbox.kdbg.debugger.reader.stop_reader",
+        "winbox.kdbg.debugger.reader.lifecycle.stop_reader",
         lambda _cfg: calls.__setitem__("stop", calls["stop"] + 1),
     )
 
@@ -469,15 +470,15 @@ def test_debug_snapshot_busy_does_not_retire_the_active_reader(monkeypatch, tmp_
     busy.retryable = True
 
     monkeypatch.setattr(
-        "winbox.kdbg.debugger.reader.ensure_reader",
+        "winbox.kdbg.debugger.reader.lifecycle.ensure_reader",
         lambda *_args, **_kwargs: calls.__setitem__("ensure", calls["ensure"] + 1),
     )
     monkeypatch.setattr(
-        "winbox.kdbg.debugger.reader._RemoteSnapshot.connect",
+        "winbox.kdbg.debugger.reader.snapshot._RemoteSnapshot.connect",
         lambda _cfg: (_ for _ in ()).throw(busy),
     )
     monkeypatch.setattr(
-        "winbox.kdbg.debugger.reader.stop_reader",
+        "winbox.kdbg.debugger.reader.lifecycle.stop_reader",
         lambda _cfg: calls.__setitem__("stop", calls["stop"] + 1),
     )
 
@@ -498,15 +499,17 @@ def test_rsp_errors_during_begin_do_not_claim_a_completed_snapshot(broker):
 
 def test_reader_info_ignores_stale_session_file(monkeypatch, tmp_path):
     cfg = Config(winbox_dir=tmp_path / ".winbox")
-    from winbox.kdbg.debugger import reader
-    reader.session_path(cfg).write_text('{"pid":123,"port":1234}')
-    monkeypatch.setattr(reader, "_reader_alive", lambda cfg: False)
+    import winbox.kdbg.debugger.reader.broker as reader_broker
+    from winbox.kdbg.debugger.reader import session_path
+    session_path(cfg).write_text('{"pid":123,"port":1234}')
+    monkeypatch.setattr(reader_broker, "_reader_alive", lambda cfg: False)
     assert reader_info(cfg) is None
 
 
 def test_reader_info_returns_live_metadata(monkeypatch, tmp_path):
     cfg = Config(winbox_dir=tmp_path / ".winbox")
-    from winbox.kdbg.debugger import reader
-    reader.session_path(cfg).write_text('{"pid":123,"port":4321}')
-    monkeypatch.setattr(reader, "_reader_alive", lambda cfg: True)
+    import winbox.kdbg.debugger.reader.broker as reader_broker
+    from winbox.kdbg.debugger.reader import session_path
+    session_path(cfg).write_text('{"pid":123,"port":4321}')
+    monkeypatch.setattr(reader_broker, "_reader_alive", lambda cfg: True)
     assert reader_info(cfg) == {"active": True, "pid": 123, "port": 4321}
