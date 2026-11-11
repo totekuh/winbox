@@ -16,11 +16,18 @@ import pytest
 
 from winbox.kdbg.debugger.daemon import (
     Breakpoint,
+    DaemonError,
     DaemonSession,
     StopState,
     TargetInfo,
+    _acquire_lock_or_die,
+    _bind_unix_socket,
     _decode_regs,
     _looks_like_code_va,
+    _read_target_bytes,
+    _validate_register_layout,
+    _validated_breakpoint_intents,
+    _write_session_file,
 )
 from winbox.kdbg.debugger.protocol import OPS
 
@@ -4761,3 +4768,218 @@ class TestBpActions:
         bp = list(session.bps.values())[0]
         assert bp.actions == []
         assert bp._action_asts == []
+
+
+# ── Bootstrap helper tests ─────────────────────────────────────────────
+
+
+class TestDaemonBootstrapHelpers:
+
+    # ── T1: _validate_register_layout ──────────────────────────────────
+
+    def test_valid_blob_passes(self):
+        _validate_register_layout(_blob())
+
+    def test_blob_too_short(self):
+        with pytest.raises(DaemonError, match="too short"):
+            _validate_register_layout(b"\x00" * 100)
+
+    def test_non_canonical_rip(self):
+        with pytest.raises(DaemonError, match="not canonical"):
+            _validate_register_layout(_blob(rip=0x0001ffffffffffff))
+
+    def test_bad_cs_selector(self):
+        with pytest.raises(DaemonError, match="not a recognized"):
+            _validate_register_layout(_blob(cs=0xFF))
+
+    def test_cr3_zero(self):
+        with pytest.raises(DaemonError, match="implausible"):
+            _validate_register_layout(_blob(cr3=0))
+
+    def test_cr3_too_large(self):
+        with pytest.raises(DaemonError, match="implausible"):
+            _validate_register_layout(_blob(cr3=1 << 52))
+
+    @pytest.mark.parametrize("cs", [0x10, 0x33, 0x08, 0x23, 0x2b, 0x1b])
+    def test_valid_cs_selectors_accepted(self, cs):
+        _validate_register_layout(_blob(cs=cs))
+
+    # ── T2: _read_target_bytes ─────────────────────────────────────────
+
+    def test_read_target_bytes_happy_path(self):
+        rsp = FakeRsp()
+        original_cr3 = struct.unpack_from("<Q", rsp.regs_blob, _CR3_OFFSET)[0]
+        result = _read_target_bytes(rsp, 0xDEAD000, 0xfffff80600000000, 16)
+        assert result == b"\x90" * 16
+        restored_cr3 = struct.unpack_from("<Q", rsp.regs_blob, _CR3_OFFSET)[0]
+        assert restored_cr3 == original_cr3
+
+    def test_read_target_bytes_no_threads(self):
+        rsp = FakeRsp(threads=())
+        with pytest.raises(DaemonError, match="no threads"):
+            _read_target_bytes(rsp, 0xDEAD000, 0x1000, 4)
+
+    def test_read_target_bytes_swap_rejected(self):
+        rsp = FakeRsp()
+        call_count = [0]
+        def exchange(body, **kw):
+            if body.startswith(b"G"):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    return b"E01"
+                rsp.regs_blob = bytes.fromhex(body[1:].decode("ascii"))
+                return b"OK"
+            return b"OK"
+        rsp._exchange = exchange
+        with pytest.raises(DaemonError, match="G-packet rejected"):
+            _read_target_bytes(rsp, 0xDEAD000, 0x1000, 4)
+
+    def test_read_target_bytes_restore_exception(self):
+        rsp = FakeRsp()
+        call_count = [0]
+        def exchange(body, **kw):
+            if body.startswith(b"G"):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    rsp.regs_blob = bytes.fromhex(body[1:].decode("ascii"))
+                    return b"OK"
+                raise OSError("socket died")
+            return b"OK"
+        rsp._exchange = exchange
+        with pytest.raises(DaemonError, match="CR3 restore failed.*poisoned"):
+            _read_target_bytes(rsp, 0xDEAD000, 0x1000, 4)
+
+    def test_read_target_bytes_restore_rejected(self):
+        rsp = FakeRsp()
+        call_count = [0]
+        def exchange(body, **kw):
+            if body.startswith(b"G"):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    rsp.regs_blob = bytes.fromhex(body[1:].decode("ascii"))
+                    return b"OK"
+                return b"E01"
+            return b"OK"
+        rsp._exchange = exchange
+        with pytest.raises(DaemonError, match="CR3 restore failed"):
+            _read_target_bytes(rsp, 0xDEAD000, 0x1000, 4)
+
+    def test_read_target_bytes_memory_error_still_restores_cr3(self):
+        rsp = FakeRsp()
+        original_cr3 = struct.unpack_from("<Q", rsp.regs_blob, _CR3_OFFSET)[0]
+        rsp.read_memory = lambda va, length: (_ for _ in ()).throw(
+            RuntimeError("read failed")
+        )
+        with pytest.raises(RuntimeError, match="read failed"):
+            _read_target_bytes(rsp, 0xDEAD000, 0x1000, 4)
+        restored_cr3 = struct.unpack_from("<Q", rsp.regs_blob, _CR3_OFFSET)[0]
+        assert restored_cr3 == original_cr3
+
+    # ── T3: _acquire_lock_or_die ───────────────────────────────────────
+
+    def test_lock_acquired_with_pid(self, tmp_path):
+        import os
+        lock_file = tmp_path / "kdbg.lock"
+        fd = _acquire_lock_or_die(lock_file)
+        try:
+            content = lock_file.read_text()
+            assert str(os.getpid()) in content
+        finally:
+            os.close(fd)
+
+    def test_lock_contention(self, tmp_path):
+        import fcntl, os
+        lock_file = tmp_path / "kdbg.lock"
+        fd = _acquire_lock_or_die(lock_file)
+        try:
+            with pytest.raises(DaemonError, match="another kdbg session"):
+                _acquire_lock_or_die(lock_file)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def test_lock_released_after_close(self, tmp_path):
+        import os
+        lock_file = tmp_path / "kdbg.lock"
+        fd = _acquire_lock_or_die(lock_file)
+        os.close(fd)
+        fd2 = _acquire_lock_or_die(lock_file)
+        os.close(fd2)
+
+    # ── T4: _bind_unix_socket ──────────────────────────────────────────
+
+    def test_bind_fresh_socket(self, tmp_path):
+        import socket as sock_mod
+        sock_file = tmp_path / "daemon.sock"
+        s = _bind_unix_socket(sock_file)
+        try:
+            assert sock_file.exists()
+            assert oct(sock_file.stat().st_mode & 0o777) == oct(0o600)
+            client = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+            client.connect(str(sock_file))
+            client.close()
+        finally:
+            s.close()
+
+    def test_bind_cleans_stale_socket(self, tmp_path):
+        sock_file = tmp_path / "daemon.sock"
+        sock_file.write_text("stale")
+        s = _bind_unix_socket(sock_file)
+        try:
+            assert sock_file.exists()
+        finally:
+            s.close()
+
+    # ── T5: _write_session_file ────────────────────────────────────────
+
+    def test_write_session_file_roundtrip(self, tmp_path):
+        import json
+        path = tmp_path / "session.json"
+        info = {"target_pid": 1234, "daemon_pid": 5678}
+        _write_session_file(path, info)
+        assert json.loads(path.read_text()) == info
+
+    # ── T6: _validated_breakpoint_intents ──────────────────────────────
+
+    def test_intents_none_passes_through(self):
+        assert _validated_breakpoint_intents(None) is None
+
+    def test_intents_empty_list(self):
+        assert _validated_breakpoint_intents([]) == []
+
+    def test_intents_non_list_rejected(self):
+        with pytest.raises(DaemonError, match="bounded list"):
+            _validated_breakpoint_intents("bad")
+
+    def test_intents_exceeds_cap(self):
+        from winbox.kdbg.breakpoint_intent import MAX_INTENTS
+        intents = [{"id": i, "target": "nt+0x1000"} for i in range(MAX_INTENTS + 1)]
+        with pytest.raises(DaemonError, match="exceeds cap"):
+            _validated_breakpoint_intents(intents)
+
+    def test_intents_non_dict_record(self):
+        with pytest.raises(DaemonError, match="non-object"):
+            _validated_breakpoint_intents([42])
+
+    def test_intents_bool_id_rejected(self):
+        with pytest.raises(DaemonError, match="invalid id"):
+            _validated_breakpoint_intents([{"id": True, "target": "nt+0x1000"}])
+
+    def test_intents_negative_id_rejected(self):
+        with pytest.raises(DaemonError, match="invalid id"):
+            _validated_breakpoint_intents([{"id": -1, "target": "nt+0x1000"}])
+
+    def test_intents_duplicate_id_rejected(self):
+        with pytest.raises(DaemonError, match="invalid id"):
+            _validated_breakpoint_intents([
+                {"id": 0, "target": "nt+0x1000", "mode": "hw", "wp_size": 1},
+                {"id": 0, "target": "nt+0x2000", "mode": "hw", "wp_size": 1},
+            ])
+
+    def test_intents_valid_normalized(self):
+        result = _validated_breakpoint_intents([
+            {"id": 0, "target": "nt+0x1000", "mode": "hw", "wp_size": 1},
+        ])
+        assert len(result) == 1
+        assert result[0]["id"] == 0
+        assert result[0]["target"] == "nt+0x1000"
