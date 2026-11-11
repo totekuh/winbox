@@ -251,44 +251,44 @@ class TestNetworkInputValidation:
     """Bug #4: hostname/ip/domain interpolated unsanitized into PowerShell."""
 
     def test_valid_ip_passes(self):
-        from winbox.cli.network import _validate_ip
+        from winbox.cli.network_dns_hosts import _validate_ip
         _validate_ip("192.168.122.1")
         _validate_ip("10.0.0.1")
         _validate_ip("::1")
 
     def test_invalid_ip_rejected(self):
-        from winbox.cli.network import _validate_ip
+        from winbox.cli.network_dns_hosts import _validate_ip
         with pytest.raises(click.BadParameter):
             _validate_ip("192.168.1.1; malicious")
 
     def test_ip_with_semicolon_rejected(self):
-        from winbox.cli.network import _validate_ip
+        from winbox.cli.network_dns_hosts import _validate_ip
         with pytest.raises(click.BadParameter):
             _validate_ip("10.0.0.1;Invoke-Expression")
 
     def test_valid_hostname_passes(self):
-        from winbox.cli.network import _validate_hostname
+        from winbox.cli.network_dns_hosts import _validate_hostname
         _validate_hostname("dc01.corp.local")
         _validate_hostname("server-01")
         _validate_hostname("HOST_NAME")
 
     def test_invalid_hostname_rejected(self):
-        from winbox.cli.network import _validate_hostname
+        from winbox.cli.network_dns_hosts import _validate_hostname
         with pytest.raises(click.BadParameter):
             _validate_hostname("host; rm -rf /")
 
     def test_hostname_with_quotes_rejected(self):
-        from winbox.cli.network import _validate_hostname
+        from winbox.cli.network_dns_hosts import _validate_hostname
         with pytest.raises(click.BadParameter):
             _validate_hostname("host'$(malicious)")
 
     def test_valid_domain_passes(self):
-        from winbox.cli.network import _validate_domain
+        from winbox.cli.network_dns_hosts import _validate_domain
         _validate_domain("corp.local")
         _validate_domain("ad.example.com")
 
     def test_invalid_domain_rejected(self):
-        from winbox.cli.network import _validate_domain
+        from winbox.cli.network_dns_hosts import _validate_domain
         with pytest.raises(click.BadParameter):
             _validate_domain("corp.local; Invoke-Expression 'bad'")
 
@@ -458,9 +458,13 @@ def mock_env(cfg):
         patch("winbox.cli.vm.ensure_running"),
         patch("winbox.cli.vm.GuestAgent", return_value=ga),
         patch("winbox.cli.vm.VM", return_value=vm),
-        patch("winbox.cli.network.GuestAgent", return_value=ga),
-        patch("winbox.cli.network.VM", return_value=vm),
-        patch("winbox.cli.network.VMState", VMState),
+        patch("winbox.cli.network_net.GuestAgent", return_value=ga),
+        patch("winbox.cli.network_net.VM", return_value=vm),
+        patch("winbox.cli.network_net.VMState", VMState),
+        patch("winbox.cli.network_dns_hosts.GuestAgent", return_value=ga),
+        patch("winbox.cli.network_dns_hosts.VM", return_value=vm),
+        patch("winbox.cli.network_domain.GuestAgent", return_value=ga),
+        patch("winbox.cli.network_domain.VM", return_value=vm),
         patch("winbox.cli.exec.GuestAgent", return_value=ga),
         patch("winbox.cli.exec.VM", return_value=vm),
         patch("winbox.cli.setup.VM", return_value=vm),
@@ -543,23 +547,23 @@ class TestDomainJoinUserValidation:
     into PowerShell scripts, allowing command injection."""
 
     def test_valid_user_passes_validation(self):
-        from winbox.cli.network import _validate_hostname
+        from winbox.cli.network_dns_hosts import _validate_hostname
         _validate_hostname("Administrator")
         _validate_hostname("domain_admin")
         _validate_hostname("svc-account")
 
     def test_malicious_user_semicolon_rejected(self):
-        from winbox.cli.network import _validate_hostname
+        from winbox.cli.network_dns_hosts import _validate_hostname
         with pytest.raises(click.BadParameter):
             _validate_hostname("admin; Invoke-Expression 'evil'")
 
     def test_malicious_user_backtick_rejected(self):
-        from winbox.cli.network import _validate_hostname
+        from winbox.cli.network_dns_hosts import _validate_hostname
         with pytest.raises(click.BadParameter):
             _validate_hostname("admin`$(whoami)")
 
     def test_malicious_user_quotes_rejected(self):
-        from winbox.cli.network import _validate_hostname
+        from winbox.cli.network_dns_hosts import _validate_hostname
         with pytest.raises(click.BadParameter):
             _validate_hostname("admin'$(whoami)")
 
@@ -567,7 +571,7 @@ class TestDomainJoinUserValidation:
         """Verify that domain_join invokes _validate_user for the user param."""
         from winbox.cli import cli
 
-        with patch("winbox.cli.network._validate_user") as mock_vu:
+        with patch("winbox.cli.network_domain._validate_user") as mock_vu:
             mock_vu.side_effect = click.BadParameter("Invalid username: bad;user")
             result = runner.invoke(
                 cli,

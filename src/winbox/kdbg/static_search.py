@@ -9,571 +9,48 @@ RIP-relative data references and direct relative calls only.
 
 from __future__ import annotations
 
-import bisect
 import hashlib
-import json
-import os
-import stat
 import struct
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
-import capstone
-from capstone import x86
 import pefile
 
 from winbox.config import Config
-from winbox.kdbg.decomp.client import cache_dir
-from winbox.kdbg.decomp.identity import PeIdentity, parse_static_pe
-from winbox.kdbg.store import SymbolStore, SymbolStoreError
-
-
-SCHEMA = "winbox.kdbg-static-search/1"
-XREF_SCHEMA = "winbox.kdbg-direct-call-xrefs/1"
-MAX_QUERY_CHARS = 256
-MAX_RESULTS = 64
-MAX_STRING_MATCHES = 64
-MAX_VFUNCS = 16
-MAX_FILE_BYTES = 128 * 1024 * 1024
-MAX_INSTRUCTIONS = 2_000_000
-MAX_PDATA_ENTRIES = 262_144
-MAX_CACHE_METADATA_BYTES = 64 * 1024
-MAX_CACHE_METADATA_RECORDS = 10_000
-
-
-class StaticSearchError(RuntimeError):
-    code = "static_search_error"
-
-
-@dataclass(frozen=True)
-class _RuntimeFunction:
-    begin: int
-    end: int
-
-
-class _FunctionIndex:
-    def __init__(self, entries: Iterable[_RuntimeFunction]) -> None:
-        self.entries = tuple(sorted(entries, key=lambda item: item.begin))
-        self.begins = tuple(item.begin for item in self.entries)
-
-    def find(self, rva: int) -> _RuntimeFunction | None:
-        index = bisect.bisect_right(self.begins, rva) - 1
-        if index < 0:
-            return None
-        entry = self.entries[index]
-        return entry if entry.begin <= rva < entry.end else None
-
-
-def _hex(value: int) -> str:
-    return f"0x{value:x}"
-
-
-def _bounded_text(value: str, limit: int = 260) -> str:
-    return value if len(value) <= limit else value[:limit - 3] + "..."
-
-
-def _validate_module(module: object, *, required: bool = True) -> str:
-    if not isinstance(module, str):
-        raise StaticSearchError("module must be a string")
-    value = module.strip()
-    if not value and not required:
-        return ""
-    if not value or len(value) > 260 or "/" in value or "\\" in value:
-        raise StaticSearchError("module must be a safe cached module name")
-    return value
-
-
-def _validate_sha256(value: object) -> str:
-    if value is None or value == "":
-        return ""
-    if not isinstance(value, str):
-        raise StaticSearchError("sha256 must be a lowercase 64-character hexadecimal digest")
-    digest = value.strip().lower()
-    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-        raise StaticSearchError("sha256 must be a lowercase 64-character hexadecimal digest")
-    return digest
-
-
-def _validate_query(query: object) -> str:
-    if not isinstance(query, str):
-        raise StaticSearchError("query must be a string")
-    value = query.strip()
-    if not 2 <= len(value) <= MAX_QUERY_CHARS:
-        raise StaticSearchError(
-            f"query must contain between 2 and {MAX_QUERY_CHARS} characters",
-        )
-    return value
-
-
-def _validate_limit(limit: object) -> int:
-    if isinstance(limit, bool) or not isinstance(limit, int):
-        raise StaticSearchError("limit must be an integer")
-    if not 1 <= limit <= MAX_RESULTS:
-        raise StaticSearchError(f"limit must be between 1 and {MAX_RESULTS}")
-    return limit
-
-
-def _aliases(store_name: str, record: dict[str, Any]) -> set[str]:
-    values = {store_name}
-    for key in ("module", "image"):
-        value = record.get(key)
-        if isinstance(value, str) and value:
-            values.add(value.rsplit("\\", 1)[-1].rsplit("/", 1)[-1])
-    aliases: set[str] = set()
-    for value in values:
-        folded = value.strip().lower()
-        if folded:
-            aliases.add(folded)
-            aliases.add(Path(folded).stem)
-    return aliases
-
-
-def _select_module(store: SymbolStore, requested: str) -> tuple[str, dict[str, Any]] | None:
-    needle = requested.lower()
-    stem = Path(needle).stem
-    matches: list[tuple[str, dict[str, Any]]] = []
-    for store_name in store.list_modules():
-        try:
-            record = store.load(store_name)
-        except (SymbolStoreError, OSError, TypeError, ValueError):
-            continue
-        aliases = _aliases(store_name, record)
-        if needle in aliases or stem in aliases:
-            matches.append((store_name, record))
-    if not matches:
-        return None
-    if len(matches) > 1:
-        names = ", ".join(name for name, _ in matches[:8])
-        raise StaticSearchError(
-            f"module {requested!r} is ambiguous across cached artifacts: {names}",
-        )
-    return matches[0]
-
-
-def _safe_cache_binary_name(value: object) -> str:
-    if not isinstance(value, str):
-        return ""
-    name = value.strip()
-    if (
-        not name or len(name) > 260 or name != Path(name).name
-        or "/" in name or "\\" in name or "\0" in name
-    ):
-        return ""
-    return name
-
-
-def _cache_binary_for_digest(root: Path, digest: str) -> Path | None:
-    """Find one immutable cache copy without accepting lock/partial files."""
-    for directory in (root / "verified-binaries", root / "binaries"):
-        try:
-            candidates = [directory / digest, *sorted(directory.glob(f"{digest}.*"))]
-        except OSError:
-            continue
-        for path in candidates:
-            if (
-                path.name.endswith((".lock", ".part"))
-                or path.is_symlink() or not path.is_file()
-            ):
-                continue
-            return path
-    return None
-
-
-def _cache_metadata_records(cfg: Config) -> list[tuple[str, dict[str, Any]]]:
-    """Read bounded decomp metadata to recover names for symbol-less PEs."""
-    root = cache_dir(cfg)
-    metadata = root / "metadata"
-    try:
-        paths = sorted(metadata.glob("*.json"))[:MAX_CACHE_METADATA_RECORDS]
-    except OSError:
-        return []
-    records: list[tuple[str, dict[str, Any]]] = []
-    for path in paths:
-        try:
-            if path.is_symlink() or not path.is_file():
-                continue
-            if path.stat().st_size > MAX_CACHE_METADATA_BYTES:
-                continue
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, TypeError, ValueError):
-            continue
-        if not isinstance(value, dict):
-            continue
-        try:
-            digest = _validate_sha256(value.get("sha256"))
-        except StaticSearchError:
-            continue
-        name = _safe_cache_binary_name(value.get("binary_name"))
-        binary = _cache_binary_for_digest(root, digest) if digest else None
-        if not digest or not name or binary is None:
-            continue
-        records.append((digest, {
-            "module": Path(name).stem,
-            "image": name,
-            "pe_path": str(binary),
-            "pe_sha256": digest,
-            "artifact_source": "decomp-cache",
-        }))
-    return records
-
-
-def _select_cache_module(
-    cfg: Config, requested: str, *, sha256: str,
-) -> tuple[str, dict[str, Any]]:
-    root = cache_dir(cfg)
-    if sha256:
-        binary = _cache_binary_for_digest(root, sha256)
-        if binary is None:
-            raise StaticSearchError(
-                f"no exact decomp-cache binary matches sha256 {sha256}",
-            )
-        record = next(
-            (value for digest, value in _cache_metadata_records(cfg) if digest == sha256),
-            None,
-        )
-        if record is None:
-            record = {
-                "module": Path(binary.name).stem,
-                "image": binary.name,
-                "pe_path": str(binary),
-                "pe_sha256": sha256,
-                "artifact_source": "decomp-cache",
-            }
-        return Path(str(record["image"])).stem, record
-
-    needle = requested.lower()
-    stem = Path(needle).stem
-    matches: list[tuple[str, dict[str, Any]]] = []
-    for digest, record in _cache_metadata_records(cfg):
-        aliases = _aliases(str(record["module"]), record)
-        if needle in aliases or stem in aliases:
-            matches.append((digest, record))
-    if not matches:
-        raise StaticSearchError(
-            f"no exact cached PE matches module {requested!r}; no symbol-store "
-            "record or named decomp-cache artifact is available",
-        )
-    unique = {digest: record for digest, record in matches}
-    if len(unique) != 1:
-        choices = ", ".join(
-            f"{record['image']}@{digest[:12]}" for digest, record in list(unique.items())[:8]
-        )
-        raise StaticSearchError(
-            f"module {requested!r} is ambiguous across decomp-cache artifacts: "
-            f"{choices}; repeat with sha256=<full digest>",
-        )
-    _digest, record = next(iter(unique.items()))
-    return str(record["module"]), record
-
-
-def _read_bounded_regular_file(path: Path, *, label: str) -> bytes:
-    """Read one non-symlink regular artifact without trusting a prior stat.
-
-    The local symbol cache is normally operator-owned, but these records can
-    originate from a target-controlled loader name.  Holding the descriptor
-    while checking type/size avoids the easy path-swap and unbounded-read
-    failures that would otherwise turn a supposedly offline lookup into a host
-    memory pressure primitive.
-    """
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise StaticSearchError(f"{label} is missing or unsafe: {exc}") from exc
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise StaticSearchError(f"{label} is not a regular file")
-        if info.st_size > MAX_FILE_BYTES:
-            raise StaticSearchError(
-                f"{label} exceeds the {MAX_FILE_BYTES // (1024 * 1024)} MiB search cap"
-            )
-        with os.fdopen(descriptor, "rb", closefd=True) as handle:
-            descriptor = -1
-            data = handle.read(MAX_FILE_BYTES + 1)
-        if len(data) > MAX_FILE_BYTES:
-            raise StaticSearchError(
-                f"{label} grew beyond the {MAX_FILE_BYTES // (1024 * 1024)} MiB search cap"
-            )
-        return data
-    except StaticSearchError:
-        raise
-    except OSError as exc:
-        raise StaticSearchError(f"could not read {label}: {exc}") from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _load_exact_artifact(
-    cfg: Config, store: SymbolStore, module: str, *, sha256: str,
-) -> tuple[str, dict[str, Any], Path, PeIdentity, bytes]:
-    if sha256:
-        store_name, record = _select_cache_module(cfg, module, sha256=sha256)
-    else:
-        selected = _select_module(store, module)
-        if selected is None:
-            store_name, record = _select_cache_module(cfg, module, sha256="")
-        else:
-            store_name, record = selected
-    raw_path = record.get("pe_path")
-    expected = str(record.get("pe_sha256") or "").lower()
-    if not isinstance(raw_path, str) or not raw_path:
-        raise StaticSearchError(f"{store_name!r} has no staged PE artifact")
-    if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
-        raise StaticSearchError(f"{store_name!r} has no valid staged PE digest")
-    path = Path(raw_path).expanduser()
-    try:
-        data = _read_bounded_regular_file(path, label=f"{store_name!r} staged PE")
-        actual = hashlib.sha256(data).hexdigest()
-        if actual != expected:
-            raise StaticSearchError(f"{store_name!r} staged PE digest does not match its record")
-    except StaticSearchError:
-        raise
-    except OSError as exc:
-        raise StaticSearchError(f"could not read staged PE for {store_name!r}: {exc}") from exc
-    try:
-        identity = parse_static_pe(path)
-    except Exception as exc:
-        raise StaticSearchError(f"could not parse staged PE for {store_name!r}: {exc}") from exc
-    if identity.sha256 != expected:
-        raise StaticSearchError(f"{store_name!r} staged PE changed while being searched")
-    return store_name, record, path, identity, data
-
-
-def _section_data(data: bytes, identity: PeIdentity, section) -> bytes:
-    start = section.raw_offset
-    end = start + section.raw_size
-    if start < 0 or end < start or end > len(data):
-        return b""
-    return data[start:end]
-
-
-def _bytes_at_rva(
-    data: bytes, identity: PeIdentity, rva: int, length: int,
-) -> bytes | None:
-    if rva < 0 or length < 0:
-        return None
-    for section in identity.sections:
-        delta = rva - section.virtual_address
-        if delta < 0 or delta + length > section.raw_size:
-            continue
-        start = section.raw_offset + delta
-        end = start + length
-        if 0 <= start <= end <= len(data):
-            return data[start:end]
-    return None
-
-
-def _rva_to_offset(identity: PeIdentity, rva: int) -> int | None:
-    for section in identity.sections:
-        delta = rva - section.virtual_address
-        if 0 <= delta < section.raw_size:
-            return section.raw_offset + delta
-    return None
-
-
-def _data_sections(identity: PeIdentity) -> tuple[Any, ...]:
-    return tuple(
-        section for section in identity.sections
-        if not section.name.lower().startswith(".text")
-    )
-
-
-def _code_sections(identity: PeIdentity) -> tuple[Any, ...]:
-    return tuple(
-        section for section in identity.sections
-        if section.name.lower().startswith(".text")
-    )
-
-
-def _ascii_string(raw: bytes, offset: int) -> tuple[int, str] | None:
-    start = raw.rfind(b"\0", 0, offset) + 1
-    end = raw.find(b"\0", offset)
-    if end < 0:
-        end = min(len(raw), start + 512)
-    if end <= start:
-        return None
-    value = raw[start:end].decode("utf-8", errors="replace")
-    return start, _bounded_text(value, 260)
-
-
-def _utf16_string(raw: bytes, offset: int) -> tuple[int, str] | None:
-    offset -= offset % 2
-    start = offset
-    while start >= 2 and raw[start - 2:start] != b"\0\0":
-        start -= 2
-    end = offset
-    limit = min(len(raw) - (len(raw) % 2), start + 512)
-    while end + 2 <= limit and raw[end:end + 2] != b"\0\0":
-        end += 2
-    if end <= start:
-        return None
-    value = raw[start:end].decode("utf-16le", errors="replace")
-    return start, _bounded_text(value, 260)
-
-
-def _find_strings(data: bytes, identity: PeIdentity, query: str) -> list[dict[str, Any]]:
-    needle_ascii = query.encode("utf-8", errors="strict").lower()
-    needle_utf16 = query.encode("utf-16le", errors="strict").lower()
-    matches: list[dict[str, Any]] = []
-    seen: set[tuple[int, str]] = set()
-    for section in _data_sections(identity):
-        raw = _section_data(data, identity, section)
-        lowered = raw.lower()
-        for needle, encoding, reader in (
-            (needle_ascii, "ascii", _ascii_string),
-            (needle_utf16, "utf16", _utf16_string),
-        ):
-            offset = 0
-            while len(matches) < MAX_STRING_MATCHES:
-                found = lowered.find(needle, offset)
-                if found < 0:
-                    break
-                offset = found + max(1, len(needle))
-                rendered = reader(raw, found)
-                if rendered is None:
-                    continue
-                start, value = rendered
-                rva = section.virtual_address + start
-                key = (rva, encoding)
-                if key in seen:
-                    continue
-                seen.add(key)
-                matches.append({
-                    "rva": _hex(rva), "encoding": encoding, "value": value,
-                })
-    return matches
-
-
-def _runtime_functions(path: Path, identity: PeIdentity, data: bytes) -> _FunctionIndex:
-    try:
-        pe = pefile.PE(str(path), fast_load=True)
-        directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
-        rva = int(directory.VirtualAddress)
-        size = int(directory.Size)
-    except (AttributeError, IndexError, TypeError, ValueError, pefile.PEFormatError) as exc:
-        raise StaticSearchError(f"PE exception directory is malformed: {exc}") from exc
-    finally:
-        try:
-            pe.close()
-        except (AttributeError, UnboundLocalError):
-            pass
-    if not rva or not size:
-        return _FunctionIndex(())
-    if size % 12 or size // 12 > MAX_PDATA_ENTRIES:
-        raise StaticSearchError("PE exception directory is outside the static-search cap")
-    raw = _bytes_at_rva(data, identity, rva, size)
-    if raw is None:
-        raise StaticSearchError("PE exception directory is not fully present in the staged file")
-    entries: list[_RuntimeFunction] = []
-    previous = -1
-    for offset in range(0, len(raw), 12):
-        begin, end, _unwind = struct.unpack_from("<III", raw, offset)
-        if not (begin < end <= identity.image_size) or begin < previous:
-            raise StaticSearchError("PE exception directory has invalid function boundaries")
-        entries.append(_RuntimeFunction(begin, end))
-        previous = begin
-    return _FunctionIndex(entries)
-
-
-def _decoder(identity: PeIdentity) -> capstone.Cs:
-    if identity.machine == 0x8664:
-        mode = capstone.CS_MODE_64
-    elif identity.machine == 0x14C:
-        mode = capstone.CS_MODE_32
-    else:
-        raise StaticSearchError(f"PE machine 0x{identity.machine:04x} is not x86/x64")
-    decoder = capstone.Cs(capstone.CS_ARCH_X86, mode)
-    decoder.detail = True
-    return decoder
-
-
-def _instruction_iter(data: bytes, identity: PeIdentity):
-    decoder = _decoder(identity)
-    seen = 0
-    for section in _code_sections(identity):
-        raw = _section_data(data, identity, section)
-        for instruction in decoder.disasm(raw, identity.preferred_base + section.virtual_address):
-            seen += 1
-            if seen > MAX_INSTRUCTIONS:
-                return
-            yield instruction
-
-
-def _instruction_rva(identity: PeIdentity, instruction) -> int:
-    return int(instruction.address) - identity.preferred_base
-
-
-def _rip_target(identity: PeIdentity, instruction) -> int | None:
-    if identity.machine != 0x8664:
-        return None
-    for operand in instruction.operands:
-        if operand.type != x86.X86_OP_MEM or operand.mem.base != x86.X86_REG_RIP:
-            continue
-        target = int(instruction.address) + int(instruction.size) + int(operand.mem.disp)
-        rva = target - identity.preferred_base
-        if 0 <= rva < identity.image_size:
-            return rva
-    return None
-
-
-def _direct_call_target(identity: PeIdentity, instruction) -> int | None:
-    if capstone.CS_GRP_CALL not in instruction.groups:
-        return None
-    for operand in instruction.operands:
-        if operand.type == x86.X86_OP_IMM:
-            rva = int(operand.imm) - identity.preferred_base
-            if 0 <= rva < identity.image_size:
-                return rva
-    return None
-
-
-def _function_public(entry: _RuntimeFunction | None) -> dict[str, str] | None:
-    if entry is None:
-        return None
-    return {"rva": _hex(entry.begin), "end": _hex(entry.end)}
-
-
-def _scan_string_xrefs(
-    data: bytes,
-    identity: PeIdentity,
-    functions: _FunctionIndex,
-    strings: list[dict[str, Any]],
-    *,
-    limit: int,
-) -> tuple[list[dict[str, Any]], bool]:
-    by_rva = {int(str(item["rva"]), 0): item for item in strings}
-    results: list[dict[str, Any]] = []
-    seen: set[tuple[int, int]] = set()
-    for instruction in _instruction_iter(data, identity):
-        target = _rip_target(identity, instruction)
-        if target not in by_rva:
-            continue
-        instruction_rva = _instruction_rva(identity, instruction)
-        function = functions.find(instruction_rva)
-        if function is None:
-            continue
-        key = (function.begin, target)
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append({
-            "rva": _hex(function.begin),
-            "context": {
-                "kind": "direct_string_xref",
-                "function_end": _hex(function.end),
-                "xref_rva": _hex(instruction_rva),
-                "instruction": _bounded_text(
-                    f"{instruction.mnemonic} {instruction.op_str}".strip(), 260,
-                ),
-                "string": by_rva[target],
-            },
-        })
-        if len(results) >= limit:
-            return results, True
-    return results, False
+from winbox.kdbg.decomp.identity import PeIdentity
+from winbox.kdbg.store import SymbolStore
+
+from winbox.kdbg.static_search_types import (  # noqa: F401 — re-exported
+    SCHEMA,
+    XREF_SCHEMA,
+    MAX_RESULTS,
+    MAX_VFUNCS,
+    StaticSearchError,
+    _FunctionIndex,
+    _hex,
+    _validate_limit,
+    _validate_module,
+    _validate_query,
+    _validate_sha256,
+)
+from winbox.kdbg.static_search_resolve import (
+    _load_exact_artifact,
+    _read_bounded_regular_file,
+)
+from winbox.kdbg.static_search_disasm import (
+    _bytes_at_rva,
+    _code_sections,
+    _data_sections,
+    _direct_call_target,
+    _find_strings,
+    _function_public,
+    _instruction_iter,
+    _instruction_rva,
+    _runtime_functions,
+    _scan_string_xrefs,
+    _section_data,
+    _bounded_text,
+)
 
 
 def _exports(path: Path, query: str, functions: _FunctionIndex) -> list[dict[str, Any]]:
@@ -631,7 +108,7 @@ def _rtti_results(
     ]
     if not wanted:
         return []
-    data_sections = _data_sections(identity)
+    data_sects = _data_sections(identity)
     results: list[dict[str, Any]] = []
     seen_vtables: set[int] = set()
     for string in wanted:
@@ -640,7 +117,7 @@ def _rtti_results(
         if type_rva < 0:
             continue
         locators: set[int] = set()
-        for section in data_sections:
+        for section in data_sects:
             raw = _section_data(data, identity, section)
             needle = struct.pack("<I", type_rva)
             offset = 0
@@ -665,7 +142,7 @@ def _rtti_results(
                 locators.add(col_rva)
         for col_rva in sorted(locators):
             pointer = struct.pack("<Q", identity.preferred_base + col_rva)
-            for section in data_sections:
+            for section in data_sects:
                 raw = _section_data(data, identity, section)
                 offset = 0
                 while True:
@@ -800,8 +277,8 @@ def direct_call_xrefs(
         target = _direct_call_target(identity, instruction)
         if target is None:
             continue
-        instruction_rva = _instruction_rva(identity, instruction)
-        source = functions.find(instruction_rva)
+        instruction_rva_val = _instruction_rva(identity, instruction)
+        source = functions.find(instruction_rva_val)
         rendered = _bounded_text(f"{instruction.mnemonic} {instruction.op_str}".strip(), 260)
         if callers and target == rva and source is not None and source.begin not in caller_seen:
             caller_seen.add(source.begin)
@@ -809,19 +286,19 @@ def direct_call_xrefs(
                 "rva": _hex(source.begin),
                 "context": {
                     "kind": "direct_caller", "function_end": _hex(source.end),
-                    "call_rva": _hex(instruction_rva), "instruction": rendered,
+                    "call_rva": _hex(instruction_rva_val), "instruction": rendered,
                     "target_rva": _hex(rva),
                 },
             })
             if len(caller_rows) >= limit:
                 caller_truncated = True
-        if callees and selected.begin <= instruction_rva < selected.end and target not in callee_seen:
+        if callees and selected.begin <= instruction_rva_val < selected.end and target not in callee_seen:
             callee_seen.add(target)
             target_function = functions.find(target)
             callee_rows.append({
                 "rva": _hex(target_function.begin if target_function is not None else target),
                 "context": {
-                    "kind": "direct_callee", "call_rva": _hex(instruction_rva),
+                    "kind": "direct_callee", "call_rva": _hex(instruction_rva_val),
                     "instruction": rendered, "target_rva": _hex(target),
                     "function": _function_public(target_function),
                 },

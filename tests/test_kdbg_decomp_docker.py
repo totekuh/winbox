@@ -39,11 +39,11 @@ def test_container_name_is_stable_and_scoped_to_state_root(tmp_path):
 
 
 def test_worker_runtime_namespace_changes_with_protocol_api(monkeypatch, tmp_path):
-    import winbox.kdbg.decomp.client as client_module
+    import winbox.kdbg.decomp.client_paths as client_paths_module
 
     cfg = Config(winbox_dir=tmp_path)
     current = (socket_path(cfg), lock_path(cfg), session_path(cfg))
-    monkeypatch.setattr(client_module, "WORKER_API", "999")
+    monkeypatch.setattr(client_paths_module, "WORKER_API", "999")
     newer = (socket_path(cfg), lock_path(cfg), session_path(cfg))
     assert current != newer
     assert all("api999" in str(path) for path in newer)

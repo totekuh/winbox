@@ -417,7 +417,7 @@ class TestErrorTypesDistinguishLaunchFromTransport:
 
         ga = GuestAgent(Config())
         monkeypatch.setattr(
-            "winbox.vm.guest.subprocess.run",
+            "winbox.vm.guest_transport.subprocess.run",
             lambda *a, **kw: subprocess.CompletedProcess(
                 args=[], returncode=1, stdout="", stderr=stderr
             ),

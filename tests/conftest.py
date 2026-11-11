@@ -104,7 +104,7 @@ def mock_env(cfg):
         stack.enter_context(patch("winbox.cli.GuestAgent", return_value=ga))
         stack.enter_context(patch("winbox.cli.VM", return_value=vm))
 
-        stack.enter_context(patch("winbox.cli.network.VMState", VMState))
+        stack.enter_context(patch("winbox.cli.network_net.VMState", VMState))
         stack.enter_context(patch("winbox.cli.setup.VM", return_value=vm))
         stack.enter_context(patch("winbox.cli.Config.load", return_value=cfg))
 

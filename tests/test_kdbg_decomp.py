@@ -122,7 +122,7 @@ def test_pyghidra_discovery_preserves_venv_python_symlink(monkeypatch, tmp_path)
     launcher.write_text(f"#!{venv_python}\n", encoding="utf-8")
     launcher.chmod(0o755)
     monkeypatch.delenv("WINBOX_PYGHIDRA_PYTHON", raising=False)
-    monkeypatch.setattr("winbox.kdbg.decomp.client.shutil.which", lambda _: str(launcher))
+    monkeypatch.setattr("winbox.kdbg.decomp.client_paths.shutil.which", lambda _: str(launcher))
     assert discover_pyghidra_python() == venv_python.absolute()
     assert discover_pyghidra_python() != system_python.resolve()
 

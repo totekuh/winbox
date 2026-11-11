@@ -13,7 +13,7 @@ from winbox.vm.guest import ExecResult
 @pytest.fixture
 def mock_nwfilter():
     """Patch nwfilter in both cli.network and netstatus with sensible defaults."""
-    with patch("winbox.cli.network.nwfilter") as m, \
+    with patch("winbox.cli.network_net.nwfilter") as m, \
          patch("winbox.netstatus.nwfilter", m):
         m.FILTER_NAME = "winbox-isolate"
         m.ensure_filter_defined.return_value = None
@@ -364,7 +364,7 @@ class TestDnsSync:
         mock_env.exec_powershell.return_value = ExecResult(
             exitcode=0, stdout="", stderr=""
         )
-        with patch("winbox.cli.network.Path") as mock_path:
+        with patch("winbox.cli.network_dns_hosts.Path") as mock_path:
             mock_path.side_effect = lambda p: resolv if p == "/etc/resolv.conf" else Path(p)
             mock_path.return_value.exists.return_value = True
             result = runner.invoke(cli, ["dns", "sync"])
@@ -376,7 +376,7 @@ class TestDnsSync:
         assert "Set-DnsClientServerAddress" in script
 
     def test_sync_no_resolv(self, runner, mock_env):
-        with patch("winbox.cli.network.Path") as mock_path:
+        with patch("winbox.cli.network_dns_hosts.Path") as mock_path:
             mock_path.return_value.exists.return_value = False
             result = runner.invoke(cli, ["dns", "sync"])
         assert result.exit_code != 0
@@ -388,7 +388,7 @@ class TestDnsSync:
         mock_env.exec_powershell.return_value = ExecResult(
             exitcode=0, stdout="", stderr=""
         )
-        with patch("winbox.cli.network.Path") as mock_path:
+        with patch("winbox.cli.network_dns_hosts.Path") as mock_path:
             mock_path.side_effect = lambda p: resolv if p == "/etc/resolv.conf" else Path(p)
             mock_path.return_value.exists.return_value = True
             result = runner.invoke(cli, ["dns", "sync"])

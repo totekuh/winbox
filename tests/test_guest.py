@@ -524,7 +524,7 @@ class TestPingIsChannelFirst:
 
         ga = GuestAgent(Config())
         monkeypatch.setattr(
-            "winbox.vm.guest.agent_channel_connected", lambda vm_name: connected
+            "winbox.vm.guest_transport.agent_channel_connected", lambda vm_name: connected
         )
         calls = []
 
@@ -566,7 +566,7 @@ class TestPingIsChannelFirst:
         ga = GuestAgent(Config())
         states = iter([False, False, True])
         monkeypatch.setattr(
-            "winbox.vm.guest.agent_channel_connected", lambda vm_name: next(states)
+            "winbox.vm.guest_transport.agent_channel_connected", lambda vm_name: next(states)
         )
         monkeypatch.setattr(ga, "_raw_command", lambda p, **kw: {"return": {}})
         monkeypatch.setattr("time.sleep", lambda *_: None)
@@ -591,7 +591,7 @@ class TestStartGuestExecLaunchRetry:
     @pytest.fixture(autouse=True)
     def _no_launch_sleep(self, monkeypatch):
         # Don't actually sleep between launch retries.
-        monkeypatch.setattr("winbox.vm.guest.time.sleep", lambda *_: None)
+        monkeypatch.setattr("winbox.vm.guest_transport.time.sleep", lambda *_: None)
 
     def test_retries_unreachable_launch_then_succeeds(self, monkeypatch):
         from winbox.vm.guest import GuestAgentUnreachable
