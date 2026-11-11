@@ -10,7 +10,10 @@ import pytest
 
 from winbox.kdbg.debugger.child_lifecycle import (
     ChildStartupError,
+    _read_startup_line,
+    reap_in_background,
     supervise_startup,
+    terminate_and_reap,
 )
 
 pytestmark = pytest.mark.filterwarnings(
@@ -125,3 +128,41 @@ def test_repeated_successful_children_leave_no_zombies():
         )
     for pid in pids:
         _assert_reaped(pid)
+
+
+def test_read_startup_line_empty_pipe():
+    r, w = os.pipe()
+    os.close(w)
+    with pytest.raises(ChildStartupError, match="exited before publishing"):
+        _read_startup_line(r, timeout=1, max_bytes=1024, label="empty")
+    os.close(r)
+
+
+def test_read_startup_line_partial_then_close():
+    r, w = os.pipe()
+    os.write(w, b"partial")
+    os.close(w)
+    with pytest.raises(ChildStartupError, match="ended before newline"):
+        _read_startup_line(r, timeout=1, max_bytes=1024, label="partial")
+    os.close(r)
+
+
+def test_terminate_and_reap_kills_real_child():
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(60)
+        os._exit(0)
+    terminate_and_reap(pid, grace=0.05)
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)
+
+
+def test_reap_in_background_collects_exited_child():
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    time.sleep(0.05)
+    reap_in_background(pid, label="test")
+    time.sleep(0.3)
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)
