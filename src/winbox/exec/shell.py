@@ -244,16 +244,243 @@ def _relay(sock: socket.socket) -> None:
         console.print("\n[blue][*][/] Shell closed")
 
 
+class LineEditor:
+    """Pure state-machine line editor for pipe-mode shell. No I/O."""
+
+    def __init__(self, term_cols: int = 80):
+        self.buf = bytearray()
+        self.pos = 0
+        self.history: list[bytes] = []
+        self.hist_idx = -1
+        self.saved = bytearray()
+        self.term_cols = max(1, term_cols)
+        self.start_col = 0
+
+    def screen(self, bpos: int) -> tuple[int, int]:
+        return divmod(self.start_col + bpos, self.term_cols)
+
+    def move(self, from_bpos: int, to_bpos: int) -> bytes:
+        if from_bpos == to_bpos:
+            return b""
+        fl, fc = self.screen(from_bpos)
+        tl, tc = self.screen(to_bpos)
+        seq = b""
+        if tl < fl:
+            seq += b"\x1b[%dA" % (fl - tl)
+        elif tl > fl:
+            seq += b"\x1b[%dB" % (tl - fl)
+        if tc != fc:
+            seq += b"\r"
+            if tc > 0:
+                seq += b"\x1b[%dC" % tc
+        return seq
+
+    def redraw(self, cursor_at: int) -> bytes:
+        out = self.move(cursor_at, 0)
+        out += b"\x1b[J"
+        if self.buf:
+            out += bytes(self.buf)
+            if self.pos < len(self.buf):
+                out += self.move(len(self.buf), self.pos)
+        return out
+
+    def track_col(self, data: bytes) -> None:
+        i = 0
+        while i < len(data):
+            b = data[i]
+            if b == 0x1B and i + 1 < len(data) and data[i + 1] == 0x5B:
+                i += 2
+                while i < len(data) and not (0x40 <= data[i] <= 0x7E):
+                    i += 1
+                if i < len(data):
+                    i += 1
+            elif b == 0x0D:
+                self.start_col = 0
+                i += 1
+            elif b == 0x0A:
+                self.start_col = 0
+                i += 1
+            elif b == 0x08:
+                if self.start_col > 0:
+                    self.start_col -= 1
+                i += 1
+            elif b >= 0x20:
+                self.start_col += 1
+                if self.start_col >= self.term_cols:
+                    self.start_col = 0
+                i += 1
+            else:
+                i += 1
+
+    def resize(self, cols: int) -> bytes:
+        self.term_cols = max(1, cols)
+        if self.buf:
+            return self.redraw(self.pos)
+        return b""
+
+    def insert(self, data: bytes) -> bytes:
+        old = self.pos
+        self.buf[self.pos:self.pos] = data
+        self.pos += len(data)
+        if self.pos == len(self.buf):
+            return data
+        return self.redraw(old)
+
+    def enter(self) -> tuple[bytes, bytes]:
+        out = b""
+        if self.pos < len(self.buf):
+            out += self.move(self.pos, len(self.buf))
+        out += b"\r\n"
+        line = bytes(self.buf)
+        if line.strip():
+            self.history.append(line)
+        self.buf.clear()
+        self.pos = 0
+        self.hist_idx = -1
+        self.start_col = 0
+        return out, line + b"\n"
+
+    def backspace(self) -> bytes:
+        if self.pos <= 0:
+            return b""
+        old = self.pos
+        del self.buf[self.pos - 1]
+        self.pos -= 1
+        return self.redraw(old)
+
+    def delete(self) -> bytes:
+        if self.pos >= len(self.buf):
+            return b""
+        del self.buf[self.pos]
+        return self.redraw(self.pos)
+
+    def cursor_left(self) -> bytes:
+        if self.pos <= 0:
+            return b""
+        old = self.pos
+        self.pos -= 1
+        return self.move(old, self.pos)
+
+    def cursor_right(self) -> bytes:
+        if self.pos >= len(self.buf):
+            return b""
+        old = self.pos
+        self.pos += 1
+        return self.move(old, self.pos)
+
+    def word_left(self) -> bytes:
+        if self.pos <= 0:
+            return b""
+        old = self.pos
+        while self.pos > 0 and self.buf[self.pos - 1 : self.pos] == b" ":
+            self.pos -= 1
+        while self.pos > 0 and self.buf[self.pos - 1 : self.pos] != b" ":
+            self.pos -= 1
+        if self.pos == old:
+            return b""
+        return self.move(old, self.pos)
+
+    def word_right(self) -> bytes:
+        if self.pos >= len(self.buf):
+            return b""
+        old = self.pos
+        while self.pos < len(self.buf) and self.buf[self.pos : self.pos + 1] == b" ":
+            self.pos += 1
+        while self.pos < len(self.buf) and self.buf[self.pos : self.pos + 1] != b" ":
+            self.pos += 1
+        if self.pos == old:
+            return b""
+        return self.move(old, self.pos)
+
+    def home(self) -> bytes:
+        if self.pos <= 0:
+            return b""
+        old = self.pos
+        self.pos = 0
+        return self.move(old, self.pos)
+
+    def end(self) -> bytes:
+        if self.pos >= len(self.buf):
+            return b""
+        old = self.pos
+        self.pos = len(self.buf)
+        return self.move(old, self.pos)
+
+    def history_up(self) -> bytes:
+        if not self.history or self.hist_idx >= len(self.history) - 1:
+            return b""
+        old = self.pos
+        if self.hist_idx == -1:
+            self.saved[:] = self.buf[:]
+        self.hist_idx += 1
+        self.buf[:] = bytearray(self.history[-(self.hist_idx + 1)])
+        self.pos = len(self.buf)
+        return self.redraw(old)
+
+    def history_down(self) -> bytes:
+        if self.hist_idx <= -1:
+            return b""
+        old = self.pos
+        if self.hist_idx > 0:
+            self.hist_idx -= 1
+            self.buf[:] = bytearray(self.history[-(self.hist_idx + 1)])
+        else:
+            self.hist_idx = -1
+            self.buf[:] = self.saved[:]
+        self.pos = len(self.buf)
+        return self.redraw(old)
+
+    def ctrl_c(self) -> tuple[bytes, bytes]:
+        out = b""
+        if self.pos < len(self.buf):
+            out += self.move(self.pos, len(self.buf))
+        out += b"^C\r\n"
+        self.buf.clear()
+        self.pos = 0
+        self.hist_idx = -1
+        self.start_col = 0
+        return out, b"\n"
+
+    def ctrl_k(self) -> bytes:
+        if self.pos >= len(self.buf):
+            return b""
+        del self.buf[self.pos :]
+        return self.redraw(self.pos)
+
+    def ctrl_u(self) -> bytes:
+        if self.pos <= 0:
+            return b""
+        old = self.pos
+        del self.buf[: self.pos]
+        self.pos = 0
+        return self.redraw(old)
+
+    def ctrl_w(self) -> bytes:
+        if self.pos <= 0:
+            return b""
+        old = self.pos
+        while self.pos > 0 and self.buf[self.pos - 1 : self.pos] == b" ":
+            self.pos -= 1
+        while self.pos > 0 and self.buf[self.pos - 1 : self.pos] != b" ":
+            self.pos -= 1
+        del self.buf[self.pos : old]
+        return self.redraw(old)
+
+    def clear_screen(self) -> bytes:
+        out = b"\x1b[2J\x1b[H"
+        self.start_col = 0
+        if self.buf:
+            out += bytes(self.buf)
+            if self.pos < len(self.buf):
+                out += self.move(len(self.buf), self.pos)
+        return out
+
+    def tab(self) -> bytes:
+        return b"\x07"
+
+
 def _relay_pipe(sock: socket.socket) -> None:
-    """Line-buffered relay with client-side readline for pipe mode.
-
-    Provides local line editing (backspace, arrows, history) since the
-    remote shell has no terminal in pipe mode — std handles are kernel
-    pipe objects, not console pseudo-handles.
-
-    Handles multi-line wrapping by tracking terminal width and prompt
-    column, using cursor up/down + absolute column for line crossings.
-    """
+    """Line-buffered relay with client-side readline for pipe mode."""
     if not sys.stdin.isatty():
         console.print("[red][-][/] shell requires an interactive terminal")
         return
@@ -263,20 +490,13 @@ def _relay_pipe(sock: socket.socket) -> None:
     stdout_fd = sys.stdout.fileno()
     stdin_fd = sys.stdin.fileno()
 
-    buf = bytearray()       # current line being edited
-    pos = 0                 # cursor position within buf
-    history: list[bytes] = []
-    hist_idx = -1           # -1 = not browsing history
-    saved = bytearray()     # line saved when entering history browse
-    _inbuf = bytearray()    # input buffer for batching reads
-
     try:
-        term_cols = os.get_terminal_size().columns
+        cols = os.get_terminal_size().columns
     except OSError:
-        term_cols = 80
-    start_col = 0           # cursor column where user input starts (after prompt)
+        cols = 80
+    ed = LineEditor(term_cols=cols)
+    _inbuf = bytearray()
 
-    # SIGWINCH handling — keep term_cols accurate after terminal resize
     sig_r, sig_w = os.pipe()
     os.set_blocking(sig_r, False)
     os.set_blocking(sig_w, False)
@@ -284,76 +504,10 @@ def _relay_pipe(sock: socket.socket) -> None:
     old_sighandler = signal.signal(signal.SIGWINCH, lambda *_: None)
 
     def out(data: bytes) -> None:
-        os.write(stdout_fd, data)
-
-    def _screen(bpos: int) -> tuple[int, int]:
-        """Screen (line_offset, column) for a buffer position."""
-        return divmod(start_col + bpos, term_cols)
-
-    def _move(from_bpos: int, to_bpos: int) -> None:
-        """Move terminal cursor between two buffer positions (handles line wrapping)."""
-        if from_bpos == to_bpos:
-            return
-        fl, fc = _screen(from_bpos)
-        tl, tc = _screen(to_bpos)
-        seq = b''
-        if tl < fl:
-            seq += b'\x1b[%dA' % (fl - tl)
-        elif tl > fl:
-            seq += b'\x1b[%dB' % (tl - fl)
-        if tc != fc:
-            seq += b'\r'
-            if tc > 0:
-                seq += b'\x1b[%dC' % tc
-        out(seq)
-
-    def _redraw(cursor_at: int) -> None:
-        """Erase all user input and rewrite. cursor_at = where cursor physically is."""
-        nonlocal term_cols
-        try:
-            term_cols = os.get_terminal_size().columns
-        except OSError:
-            pass
-        _move(cursor_at, 0)
-        out(b'\x1b[J')  # clear from cursor to end of screen
-        if buf:
-            out(bytes(buf))
-            if pos < len(buf):
-                _move(len(buf), pos)
-
-    def _track_col(data: bytes) -> None:
-        """Update start_col by tracking cursor column through output data."""
-        nonlocal start_col
-        i = 0
-        while i < len(data):
-            b = data[i]
-            if b == 0x1b and i + 1 < len(data) and data[i + 1] == 0x5b:
-                # Skip CSI sequence: ESC[ ... final_byte
-                i += 2
-                while i < len(data) and not (0x40 <= data[i] <= 0x7e):
-                    i += 1
-                if i < len(data):
-                    i += 1
-            elif b == 0x0d:  # \r
-                start_col = 0
-                i += 1
-            elif b == 0x0a:  # \n
-                start_col = 0
-                i += 1
-            elif b == 0x08:  # \b
-                if start_col > 0:
-                    start_col -= 1
-                i += 1
-            elif b >= 0x20:  # printable
-                start_col += 1
-                if start_col >= term_cols:
-                    start_col = 0
-                i += 1
-            else:
-                i += 1
+        if data:
+            os.write(stdout_fd, data)
 
     def _fill(n=1, timeout=0.02):
-        """Ensure at least n bytes in _inbuf, reading from stdin if needed."""
         while len(_inbuf) < n:
             r, _, _ = select.select([sys.stdin], [], [], timeout)
             if r:
@@ -368,36 +522,32 @@ def _relay_pipe(sock: socket.socket) -> None:
 
     try:
         while True:
-            # Only block in select when input buffer is empty
             if not _inbuf:
                 readable, _, _ = select.select([sys.stdin, sock, sig_r], [], [])
 
                 if sig_r in readable:
                     try:
-                        os.read(sig_r, 4096)  # drain wakeup bytes
+                        os.read(sig_r, 4096)
                     except OSError:
                         pass
                     try:
-                        term_cols = os.get_terminal_size().columns
+                        out(ed.resize(os.get_terminal_size().columns))
                     except OSError:
                         pass
-                    if buf:
-                        _redraw(pos)
 
                 if sock in readable:
                     data = sock.recv(4096)
                     if not data:
                         break
-                    # Erase user's partial input, print output, then redraw
-                    if buf:
-                        _move(pos, 0)
-                        out(b'\x1b[J')
+                    if ed.buf:
+                        out(ed.move(ed.pos, 0))
+                        out(b"\x1b[J")
                     out(data)
-                    _track_col(data)
-                    if buf:
-                        out(bytes(buf))
-                        if pos < len(buf):
-                            _move(len(buf), pos)
+                    ed.track_col(data)
+                    if ed.buf:
+                        out(bytes(ed.buf))
+                        if ed.pos < len(ed.buf):
+                            out(ed.move(len(ed.buf), ed.pos))
 
                 if sys.stdin in readable:
                     raw = os.read(stdin_fd, 1024)
@@ -410,187 +560,80 @@ def _relay_pipe(sock: socket.socket) -> None:
 
             b = _inbuf[0]
 
-            # Batch-insert printable characters (fast paste support)
-            if b >= 0x20 and b != 0x7f:
+            if b >= 0x20 and b != 0x7F:
                 end = 1
-                while end < len(_inbuf) and _inbuf[end] >= 0x20 and _inbuf[end] != 0x7f:
+                while end < len(_inbuf) and _inbuf[end] >= 0x20 and _inbuf[end] != 0x7F:
                     end += 1
                 run = bytes(_inbuf[:end])
                 del _inbuf[:end]
-                old = pos
-                buf[pos:pos] = run
-                pos += len(run)
-                if pos == len(buf):
-                    out(run)
-                else:
-                    _redraw(old)
+                out(ed.insert(run))
                 continue
 
             del _inbuf[0]
 
-            if b == 0x0d:  # Enter
-                if pos < len(buf):
-                    _move(pos, len(buf))
-                out(b'\r\n')
-                line = bytes(buf)
-                sock.sendall(line + b'\n')
-                if line.strip():
-                    history.append(line)
-                buf.clear()
-                pos = 0
-                hist_idx = -1
-                start_col = 0
-
-            elif b in (0x7f, 0x08):  # Backspace
-                if pos > 0:
-                    old = pos
-                    del buf[pos - 1]
-                    pos -= 1
-                    _redraw(old)
-
-            elif b == 0x1b:  # Escape sequence start
+            if b == 0x0D:
+                stdout_bytes, sock_bytes = ed.enter()
+                out(stdout_bytes)
+                sock.sendall(sock_bytes)
+            elif b in (0x7F, 0x08):
+                out(ed.backspace())
+            elif b == 0x1B:
                 if not _fill(1):
                     continue
-                if _inbuf[0] != 0x5b:  # expect [
+                if _inbuf[0] != 0x5B:
                     continue
                 del _inbuf[0]
                 if not _fill(1):
                     continue
                 c = _inbuf[0]
                 del _inbuf[0]
-
-                if c == 0x41:  # Up — previous history
-                    if history and hist_idx < len(history) - 1:
-                        old = pos
-                        if hist_idx == -1:
-                            saved[:] = buf[:]
-                        hist_idx += 1
-                        buf[:] = bytearray(history[-(hist_idx + 1)])
-                        pos = len(buf)
-                        _redraw(old)
-
-                elif c == 0x42:  # Down — next history
-                    if hist_idx > 0:
-                        old = pos
-                        hist_idx -= 1
-                        buf[:] = bytearray(history[-(hist_idx + 1)])
-                        pos = len(buf)
-                        _redraw(old)
-                    elif hist_idx == 0:
-                        old = pos
-                        hist_idx = -1
-                        buf[:] = saved[:]
-                        pos = len(buf)
-                        _redraw(old)
-
-                elif c == 0x43 and pos < len(buf):  # Right
-                    old = pos
-                    pos += 1
-                    _move(old, pos)
-
-                elif c == 0x44 and pos > 0:  # Left
-                    old = pos
-                    pos -= 1
-                    _move(old, pos)
-
-                elif c == 0x31:  # ESC[1;5C / ESC[1;5D — Ctrl+Right/Left
+                if c == 0x41:
+                    out(ed.history_up())
+                elif c == 0x42:
+                    out(ed.history_down())
+                elif c == 0x43:
+                    out(ed.cursor_right())
+                elif c == 0x44:
+                    out(ed.cursor_left())
+                elif c == 0x31:
                     if _fill(3):
                         rest = bytes(_inbuf[:3])
                         del _inbuf[:3]
-                        if rest[0:2] == b';5':
-                            old = pos
-                            if rest[2:3] == b'C':  # Ctrl+Right
-                                while pos < len(buf) and buf[pos:pos+1] == b' ':
-                                    pos += 1
-                                while pos < len(buf) and buf[pos:pos+1] != b' ':
-                                    pos += 1
-                            elif rest[2:3] == b'D':  # Ctrl+Left
-                                while pos > 0 and buf[pos-1:pos] == b' ':
-                                    pos -= 1
-                                while pos > 0 and buf[pos-1:pos] != b' ':
-                                    pos -= 1
-                            if pos != old:
-                                _move(old, pos)
-
-                elif c == 0x48:  # Home
-                    if pos > 0:
-                        old = pos
-                        pos = 0
-                        _move(old, pos)
-
-                elif c == 0x46:  # End
-                    if pos < len(buf):
-                        old = pos
-                        pos = len(buf)
-                        _move(old, pos)
-
-                elif c == 0x33:  # Delete key (ESC[3~)
+                        if rest[0:2] == b";5":
+                            if rest[2:3] == b"C":
+                                out(ed.word_right())
+                            elif rest[2:3] == b"D":
+                                out(ed.word_left())
+                elif c == 0x48:
+                    out(ed.home())
+                elif c == 0x46:
+                    out(ed.end())
+                elif c == 0x33:
                     if _fill(1):
-                        del _inbuf[0]  # consume ~
-                    if pos < len(buf):
-                        del buf[pos]
-                        _redraw(pos)
-
-            elif b == 0x03:  # Ctrl+C
-                if pos < len(buf):
-                    _move(pos, len(buf))
-                out(b'^C\r\n')
-                buf.clear()
-                pos = 0
-                hist_idx = -1
-                start_col = 0
-                sock.sendall(b'\n')  # trigger fresh prompt
-
-            elif b == 0x04:  # Ctrl+D
+                        del _inbuf[0]
+                    out(ed.delete())
+            elif b == 0x03:
+                stdout_bytes, sock_bytes = ed.ctrl_c()
+                out(stdout_bytes)
+                sock.sendall(sock_bytes)
+            elif b == 0x04:
                 break
-
-            elif b == 0x09:  # Tab — no completion in pipe mode
-                out(b'\x07')  # bell
-
-            elif b == 0x1a:  # Ctrl+Z — pass through to remote
-                sock.sendall(b'\x1a')
-
-            elif b == 0x01:  # Ctrl+A — Home
-                if pos > 0:
-                    old = pos
-                    pos = 0
-                    _move(old, pos)
-
-            elif b == 0x05:  # Ctrl+E — End
-                if pos < len(buf):
-                    old = pos
-                    pos = len(buf)
-                    _move(old, pos)
-
-            elif b == 0x0b:  # Ctrl+K — kill to end of line
-                if pos < len(buf):
-                    del buf[pos:]
-                    _redraw(pos)
-
-            elif b == 0x15:  # Ctrl+U — kill to start of line
-                if pos > 0:
-                    old = pos
-                    del buf[:pos]
-                    pos = 0
-                    _redraw(old)
-
-            elif b == 0x17:  # Ctrl+W — delete word backward
-                if pos > 0:
-                    old = pos
-                    while pos > 0 and buf[pos-1:pos] == b' ':
-                        pos -= 1
-                    while pos > 0 and buf[pos-1:pos] != b' ':
-                        pos -= 1
-                    del buf[pos:old]
-                    _redraw(old)
-
-            elif b == 0x0c:  # Ctrl+L — clear screen
-                out(b'\x1b[2J\x1b[H')  # clear + cursor home
-                start_col = 0
-                if buf:
-                    out(bytes(buf))
-                    if pos < len(buf):
-                        _move(len(buf), pos)
+            elif b == 0x09:
+                out(ed.tab())
+            elif b == 0x1A:
+                sock.sendall(b"\x1a")
+            elif b == 0x01:
+                out(ed.home())
+            elif b == 0x05:
+                out(ed.end())
+            elif b == 0x0B:
+                out(ed.ctrl_k())
+            elif b == 0x15:
+                out(ed.ctrl_u())
+            elif b == 0x17:
+                out(ed.ctrl_w())
+            elif b == 0x0C:
+                out(ed.clear_screen())
 
     except (ConnectionResetError, BrokenPipeError, OSError):
         pass

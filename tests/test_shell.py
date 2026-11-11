@@ -330,3 +330,286 @@ class TestRelayGuards:
         sock = MagicMock()
         _relay_pipe(sock)
         sock.close.assert_not_called()
+
+
+# ─── LineEditor ────────────────────────────────────────────────────────────────
+
+
+from winbox.exec.shell import LineEditor
+
+
+class TestLineEditor:
+
+    def _ed(self, cols=80):
+        return LineEditor(term_cols=cols)
+
+    # -- construction --
+
+    def test_default_state(self):
+        ed = self._ed()
+        assert ed.buf == bytearray()
+        assert ed.pos == 0
+        assert ed.history == []
+        assert ed.hist_idx == -1
+        assert ed.start_col == 0
+        assert ed.term_cols == 80
+
+    # -- screen geometry --
+
+    def test_screen_geometry(self):
+        ed = self._ed()
+        ed.start_col = 3
+        assert ed.screen(5) == (0, 8)
+
+    def test_screen_wraps(self):
+        ed = self._ed()
+        ed.start_col = 3
+        assert ed.screen(78)[0] == 1
+
+    # -- insert --
+
+    def test_insert_at_end(self):
+        ed = self._ed()
+        ed.insert(b"abc")
+        assert ed.buf == bytearray(b"abc")
+        assert ed.pos == 3
+
+    def test_insert_in_middle(self):
+        ed = self._ed()
+        ed.insert(b"ac")
+        ed.pos = 1
+        ed.insert(b"b")
+        assert ed.buf == bytearray(b"abc")
+        assert ed.pos == 2
+
+    # -- backspace / delete --
+
+    def test_backspace(self):
+        ed = self._ed()
+        ed.insert(b"abc")
+        ed.backspace()
+        assert ed.buf == bytearray(b"ab")
+        assert ed.pos == 2
+
+    def test_backspace_at_start(self):
+        ed = self._ed()
+        assert ed.backspace() == b""
+
+    def test_delete(self):
+        ed = self._ed()
+        ed.insert(b"abc")
+        ed.pos = 1
+        ed.delete()
+        assert ed.buf == bytearray(b"ac")
+
+    def test_delete_at_end(self):
+        ed = self._ed()
+        ed.insert(b"abc")
+        assert ed.delete() == b""
+
+    # -- cursor movement --
+
+    def test_cursor_left(self):
+        ed = self._ed()
+        ed.insert(b"abc")
+        ed.cursor_left()
+        assert ed.pos == 2
+
+    def test_cursor_right(self):
+        ed = self._ed()
+        ed.insert(b"abc")
+        ed.pos = 1
+        ed.cursor_right()
+        assert ed.pos == 2
+
+    def test_cursor_left_at_start(self):
+        ed = self._ed()
+        assert ed.cursor_left() == b""
+        assert ed.pos == 0
+
+    def test_cursor_right_at_end(self):
+        ed = self._ed()
+        ed.insert(b"abc")
+        assert ed.cursor_right() == b""
+        assert ed.pos == 3
+
+    def test_home(self):
+        ed = self._ed()
+        ed.insert(b"abc")
+        ed.home()
+        assert ed.pos == 0
+
+    def test_end(self):
+        ed = self._ed()
+        ed.insert(b"abc")
+        ed.home()
+        ed.end()
+        assert ed.pos == 3
+
+    # -- word movement --
+
+    def test_word_left(self):
+        ed = self._ed()
+        ed.insert(b"hello world")
+        ed.word_left()
+        assert ed.pos == 6
+
+    def test_word_right(self):
+        ed = self._ed()
+        ed.insert(b"hello world")
+        ed.pos = 0
+        ed.word_right()
+        assert ed.pos == 5
+
+    # -- kill commands --
+
+    def test_ctrl_k(self):
+        ed = self._ed()
+        ed.insert(b"abcdef")
+        ed.pos = 3
+        ed.ctrl_k()
+        assert ed.buf == bytearray(b"abc")
+
+    def test_ctrl_u(self):
+        ed = self._ed()
+        ed.insert(b"abcdef")
+        ed.pos = 3
+        ed.ctrl_u()
+        assert ed.buf == bytearray(b"def")
+        assert ed.pos == 0
+
+    def test_ctrl_w(self):
+        ed = self._ed()
+        ed.insert(b"hello world")
+        ed.ctrl_w()
+        assert ed.buf == bytearray(b"hello ")
+
+    # -- history --
+
+    def test_history_up(self):
+        ed = self._ed()
+        ed.insert(b"first")
+        ed.enter()
+        ed.insert(b"second")
+        ed.enter()
+        ed.history_up()
+        assert ed.buf == bytearray(b"second")
+
+    def test_history_down(self):
+        ed = self._ed()
+        ed.insert(b"first")
+        ed.enter()
+        ed.insert(b"second")
+        ed.enter()
+        ed.history_up()
+        ed.history_up()
+        ed.history_down()
+        assert ed.buf == bytearray(b"second")
+
+    def test_history_down_restores_saved(self):
+        ed = self._ed()
+        ed.insert(b"done")
+        ed.enter()
+        ed.insert(b"partial")
+        ed.history_up()
+        assert ed.buf == bytearray(b"done")
+        ed.history_down()
+        assert ed.buf == bytearray(b"partial")
+
+    def test_history_up_at_top(self):
+        ed = self._ed()
+        ed.insert(b"only")
+        ed.enter()
+        ed.history_up()
+        buf_before = bytes(ed.buf)
+        ed.history_up()
+        assert bytes(ed.buf) == buf_before
+
+    # -- enter / special --
+
+    def test_enter(self):
+        ed = self._ed()
+        ed.insert(b"ls")
+        stdout, sock = ed.enter()
+        assert b"\r\n" in stdout
+        assert sock == b"ls\n"
+        assert ed.buf == bytearray()
+        assert ed.pos == 0
+
+    def test_enter_adds_to_history(self):
+        ed = self._ed()
+        ed.insert(b"cmd")
+        ed.enter()
+        assert ed.history == [b"cmd"]
+
+    def test_enter_skips_blank_history(self):
+        ed = self._ed()
+        ed.insert(b"   ")
+        ed.enter()
+        assert ed.history == []
+
+    def test_ctrl_c(self):
+        ed = self._ed()
+        ed.insert(b"partial")
+        stdout, sock = ed.ctrl_c()
+        assert b"^C" in stdout
+        assert sock == b"\n"
+        assert ed.buf == bytearray()
+
+    def test_clear_screen(self):
+        ed = self._ed()
+        ed.insert(b"text")
+        out = ed.clear_screen()
+        assert b"\x1b[2J" in out
+        assert b"\x1b[H" in out
+        assert ed.start_col == 0
+
+    def test_tab(self):
+        ed = self._ed()
+        assert ed.tab() == b"\x07"
+
+    # -- track_col --
+
+    def test_track_col_printable(self):
+        ed = self._ed()
+        ed.track_col(b"abc")
+        assert ed.start_col == 3
+
+    def test_track_col_newline(self):
+        ed = self._ed()
+        ed.track_col(b"x\n")
+        assert ed.start_col == 0
+
+    def test_track_col_carriage_return(self):
+        ed = self._ed()
+        ed.track_col(b"x\r")
+        assert ed.start_col == 0
+
+    def test_track_col_backspace(self):
+        ed = self._ed()
+        ed.start_col = 5
+        ed.track_col(b"\x08")
+        assert ed.start_col == 4
+
+    def test_track_col_wraps(self):
+        ed = self._ed(cols=10)
+        ed.track_col(b"x" * 12)
+        assert ed.start_col == 2
+
+    def test_track_col_skips_csi(self):
+        ed = self._ed()
+        ed.track_col(b"\x1b[32mhi")
+        assert ed.start_col == 2
+
+    # -- resize --
+
+    def test_resize_updates_term_cols(self):
+        ed = self._ed()
+        ed.resize(120)
+        assert ed.term_cols == 120
+
+    def test_resize_redraws_when_buf_nonempty(self):
+        ed = self._ed()
+        ed.insert(b"text")
+        out = ed.resize(120)
+        assert len(out) > 0
