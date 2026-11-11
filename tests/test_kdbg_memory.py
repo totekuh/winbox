@@ -15,8 +15,13 @@ from winbox.kdbg.hmp import parse_idt, parse_registers
 from winbox.kdbg.memory import (
     WalkCache,
     parse_hex_dump,
+    read_cstr,
     read_phys,
+    read_u32,
+    read_u64,
+    read_unicode_string,
     read_virt_cr3,
+    read_virt_current,
     virt_to_phys,
 )
 
@@ -460,3 +465,90 @@ def test_config_kdbg_pagewalk_persist_roundtrip(tmp_path):
     cfg.persist("KDBG_PAGEWALK", "1")
     cfg2 = Config._apply_overrides(Config(), config_file)
     assert cfg2.kdbg_pagewalk is True
+
+
+# ── Typed read helpers and edge cases ──────────────────────────────────
+
+
+_VA = 0x7FF600001000
+_VA2 = 0x7FF600002000
+_PAGE = 0x3A0000
+_PAGE2 = 0x3B0000
+_CR3 = 0x200000
+
+
+def test_read_virt_current_happy_path(fake_mem):
+    _populate_4k_mapping(fake_mem, cr3=_CR3, va=_VA, page_phys=_PAGE)
+    fake_mem.write_bytes(_PAGE, b"\x01\x02\x03\x04")
+    assert read_virt_current("vm", _VA, 4) == b"\x01\x02\x03\x04"
+
+
+def test_read_virt_current_chunking(fake_mem):
+    _populate_4k_mapping(fake_mem, cr3=_CR3, va=_VA, page_phys=_PAGE)
+    _populate_4k_mapping(fake_mem, cr3=_CR3, va=_VA + 0x1000, page_phys=_PAGE2)
+    payload = bytes(range(256)) * 32  # 8192 bytes
+    fake_mem.write_bytes(_PAGE, payload[:4096])
+    fake_mem.write_bytes(_PAGE2, payload[4096:])
+    assert read_virt_current("vm", _VA, 8192, chunk=4096) == payload
+
+
+def test_read_virt_current_zero_length(fake_mem):
+    assert read_virt_current("vm", _VA, 0) == b""
+
+
+def test_read_phys_zero_length(fake_mem):
+    assert read_phys("vm", 0x1000, 0) == b""
+
+
+def test_read_u64(fake_mem):
+    import struct
+    _populate_4k_mapping(fake_mem, cr3=_CR3, va=_VA, page_phys=_PAGE)
+    fake_mem.write_bytes(_PAGE, struct.pack("<Q", 0xDEADBEEFCAFEBABE))
+    assert read_u64("vm", _CR3, _VA) == 0xDEADBEEFCAFEBABE
+
+
+def test_read_u32(fake_mem):
+    import struct
+    _populate_4k_mapping(fake_mem, cr3=_CR3, va=_VA, page_phys=_PAGE)
+    fake_mem.write_bytes(_PAGE, struct.pack("<I", 0x12345678))
+    assert read_u32("vm", _CR3, _VA) == 0x12345678
+
+
+def test_read_cstr_stops_at_nul(fake_mem):
+    _populate_4k_mapping(fake_mem, cr3=_CR3, va=_VA, page_phys=_PAGE)
+    fake_mem.write_bytes(_PAGE, b"hello\x00world")
+    assert read_cstr("vm", _CR3, _VA, 11) == "hello"
+
+
+def test_read_cstr_all_nul(fake_mem):
+    _populate_4k_mapping(fake_mem, cr3=_CR3, va=_VA, page_phys=_PAGE)
+    fake_mem.write_bytes(_PAGE, b"\x00\x00\x00")
+    assert read_cstr("vm", _CR3, _VA, 3) == ""
+
+
+def test_read_unicode_string_happy_path(fake_mem):
+    import struct
+    _populate_4k_mapping(fake_mem, cr3=_CR3, va=_VA, page_phys=_PAGE)
+    _populate_4k_mapping(fake_mem, cr3=_CR3, va=_VA2, page_phys=_PAGE2)
+    text = "Hello"
+    encoded = text.encode("utf-16-le")
+    # _UNICODE_STRING layout: USHORT Length at offset 0, PWSTR Buffer at offset 8
+    fake_mem.write_bytes(_PAGE, struct.pack("<H", len(encoded)))
+    fake_mem.write_bytes(_PAGE + 8, struct.pack("<Q", _VA2))
+    fake_mem.write_bytes(_PAGE2, encoded)
+    assert read_unicode_string("vm", _CR3, _VA, length_off=0, buffer_off=8) == "Hello"
+
+
+def test_read_unicode_string_zero_length(fake_mem):
+    import struct
+    _populate_4k_mapping(fake_mem, cr3=_CR3, va=_VA, page_phys=_PAGE)
+    fake_mem.write_bytes(_PAGE, struct.pack("<H", 0))
+    assert read_unicode_string("vm", _CR3, _VA, length_off=0, buffer_off=8) == ""
+
+
+def test_read_unicode_string_zero_buffer(fake_mem):
+    import struct
+    _populate_4k_mapping(fake_mem, cr3=_CR3, va=_VA, page_phys=_PAGE)
+    fake_mem.write_bytes(_PAGE, struct.pack("<H", 10))
+    fake_mem.write_bytes(_PAGE + 8, struct.pack("<Q", 0))
+    assert read_unicode_string("vm", _CR3, _VA, length_off=0, buffer_off=8) == ""

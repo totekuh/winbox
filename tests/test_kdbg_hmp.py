@@ -132,3 +132,228 @@ def test_unparseable_listener_row_is_not_a_wildcard_match(monkeypatch):
     monkeypatch.setattr("builtins.open", opened)
     assert hmp_module._listening_sockets() == set()
     assert hmp_module.probe_port("127.0.0.1", 1234) is False
+
+
+# ── QMP connection protocol tests ──────────────────────────────────────
+
+import json
+import socket
+import threading
+
+from winbox.kdbg.hmp import _QmpConnection, _QmpCommandError, _QmpUnavailable
+
+
+def _socketpair():
+    server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    return server, client
+
+
+def _qmp_server_thread(server_sock, response_bytes):
+    """Read one request, write one response."""
+    try:
+        server_sock.recv(4096)
+        server_sock.sendall(response_bytes)
+    finally:
+        server_sock.close()
+
+
+class TestQmpConnection:
+
+    # ── _read_message ──────────────────────────────────────────────────
+
+    def test_read_message_valid_json(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            server.sendall(b'{"QMP": {"version": {}}}\n')
+            msg = conn._read_message()
+            assert msg == {"QMP": {"version": {}}}
+        finally:
+            server.close()
+            conn.close()
+
+    def test_read_message_invalid_json(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            server.sendall(b'not json\n')
+            with pytest.raises(_QmpUnavailable, match="invalid JSON"):
+                conn._read_message()
+        finally:
+            server.close()
+            conn.close()
+
+    def test_read_message_non_dict(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            server.sendall(b'[1,2]\n')
+            with pytest.raises(_QmpUnavailable, match="unexpected QMP message"):
+                conn._read_message()
+        finally:
+            server.close()
+            conn.close()
+
+    def test_read_message_socket_closed(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        server.close()
+        try:
+            with pytest.raises(_QmpUnavailable, match="closed"):
+                conn._read_message()
+        finally:
+            conn.close()
+
+    def test_read_message_skips_empty_lines(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            server.sendall(b'\n\n{"ok":true}\n')
+            msg = conn._read_message()
+            assert msg == {"ok": True}
+        finally:
+            server.close()
+            conn.close()
+
+    # ── _execute ───────────────────────────────────────────────────────
+
+    def test_execute_happy_path(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            t = threading.Thread(
+                target=_qmp_server_thread,
+                args=(server, b'{"return":"result","id":1}\n'),
+            )
+            t.start()
+            result = conn._execute("test-cmd")
+            t.join(timeout=2)
+            assert result == "result"
+        finally:
+            conn.close()
+
+    def test_execute_error_response(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            t = threading.Thread(
+                target=_qmp_server_thread,
+                args=(server, b'{"error":{"class":"GenericError","desc":"oops"},"id":1}\n'),
+            )
+            t.start()
+            with pytest.raises(_QmpCommandError, match="oops"):
+                conn._execute("test-cmd")
+            t.join(timeout=2)
+        finally:
+            conn.close()
+
+    def test_execute_mismatched_id(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            t = threading.Thread(
+                target=_qmp_server_thread,
+                args=(server, b'{"return":"x","id":999}\n'),
+            )
+            t.start()
+            with pytest.raises(_QmpUnavailable, match="mismatched"):
+                conn._execute("test-cmd")
+            t.join(timeout=2)
+        finally:
+            conn.close()
+
+    def test_execute_event_skipped(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            t = threading.Thread(
+                target=_qmp_server_thread,
+                args=(server, b'{"event":"STOP"}\n{"return":"ok","id":1}\n'),
+            )
+            t.start()
+            result = conn._execute("test-cmd")
+            t.join(timeout=2)
+            assert result == "ok"
+        finally:
+            conn.close()
+
+    def test_execute_send_failure(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        server.close()
+        try:
+            with pytest.raises(_QmpUnavailable, match="send failed|receive failed|closed"):
+                conn._execute("test-cmd")
+        finally:
+            conn.close()
+
+    # ── negotiate ──────────────────────────────────────────────────────
+
+    def test_negotiate_happy_path(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            def play_server():
+                server.sendall(b'{"QMP":{"version":{"qemu":{}}}}\n')
+                server.recv(4096)
+                server.sendall(b'{"return":{},"id":1}\n')
+                server.close()
+            t = threading.Thread(target=play_server)
+            t.start()
+            conn.negotiate()
+            t.join(timeout=2)
+        finally:
+            conn.close()
+
+    def test_negotiate_missing_greeting(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            server.sendall(b'{"something":"else"}\n')
+            with pytest.raises(_QmpUnavailable, match="missing QMP greeting"):
+                conn.negotiate()
+        finally:
+            server.close()
+            conn.close()
+
+    # ── hmp ────────────────────────────────────────────────────────────
+
+    def test_hmp_happy_path(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            def play_server():
+                server.sendall(b'{"QMP":{"version":{"qemu":{}}}}\n')
+                server.recv(4096)
+                server.sendall(b'{"return":{},"id":1}\n')
+                server.recv(4096)
+                server.sendall(b'{"return":"VM status: running","id":2}\n')
+                server.close()
+            t = threading.Thread(target=play_server)
+            t.start()
+            conn.negotiate()
+            result = conn.hmp("info status", timeout=5)
+            t.join(timeout=2)
+            assert result == "VM status: running"
+        finally:
+            conn.close()
+
+    def test_hmp_non_string_response(self):
+        server, client = _socketpair()
+        conn = _QmpConnection(client, "test")
+        try:
+            def play_server():
+                server.sendall(b'{"QMP":{"version":{"qemu":{}}}}\n')
+                server.recv(4096)
+                server.sendall(b'{"return":{},"id":1}\n')
+                server.recv(4096)
+                server.sendall(b'{"return":42,"id":2}\n')
+                server.close()
+            t = threading.Thread(target=play_server)
+            t.start()
+            conn.negotiate()
+            with pytest.raises(_QmpUnavailable, match="non-text"):
+                conn.hmp("info status", timeout=5)
+            t.join(timeout=2)
+        finally:
+            conn.close()
