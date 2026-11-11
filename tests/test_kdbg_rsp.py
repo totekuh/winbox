@@ -296,6 +296,12 @@ def test_write_memory_emits_M_with_hex_payload():
     assert b"$M2000,2:cc90#" in sent
 
 
+def test_write_memory_raises_on_error_reply():
+    cli, sock = _client([b"+", _frame(b"E22")])
+    with pytest.raises(RspError, match=r"M failed at 0x2000.*E22"):
+        cli.write_memory(0x2000, b"\xcc")
+
+
 def test_write_registers_emits_G_and_returns_raw_reply():
     cli, sock = _client([b"+", _frame(b"OK")])
     blob = bytes(range(32))

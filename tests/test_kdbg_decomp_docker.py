@@ -104,6 +104,8 @@ def test_start_uses_private_hardened_current_uid_container(monkeypatch, tmp_path
     assert result["started"] is True
     command = calls[0]
     assert command[:2] == ("run", "--detach")
+
+    # --- isolation flags ---
     assert command[command.index("--network") + 1] == "none"
     assert "--read-only" in command
     assert ("--cap-drop", "ALL") == command[
@@ -111,8 +113,38 @@ def test_start_uses_private_hardened_current_uid_container(monkeypatch, tmp_path
     ]
     assert "no-new-privileges" in command
     assert not any(value.startswith("--publish") or value == "-p" for value in command)
+
+    # --- resource limits ---
+    assert command[command.index("--pids-limit") + 1] == "512"
+    mem_index = command.index("--memory")
+    assert command[mem_index + 1] == command[command.index("--memory-swap") + 1]
+    assert command[command.index("--stop-timeout") + 1] == "30"
+
+    # --- least privilege ---
+    import os
+    uid, gid = os.getuid(), os.getgid()
+    assert command[command.index("--user") + 1] == f"{uid}:{gid}"
+
+    # --- tmpfs hardening ---
+    tmpfs_index = command.index("--tmpfs")
+    tmpfs_value = command[tmpfs_index + 1]
+    assert tmpfs_value.startswith("/tmp:")
+    for restriction in ("noexec", "nosuid", "nodev"):
+        assert restriction in tmpfs_value
+
+    # --- log rotation ---
+    log_opts = [command[i + 1] for i, v in enumerate(command) if v == "--log-opt"]
+    assert "max-size=10m" in log_opts
+    assert "max-file=3" in log_opts
+
+    # --- ownership labels ---
+    label_values = [command[i + 1] for i, v in enumerate(command) if v == "--label"]
+    assert f"io.winbox.owner-uid={uid}" in label_values
+    assert f"io.winbox.worker-api={WORKER_API}" in label_values
+    assert any(v.startswith("io.winbox.state=") for v in label_values)
+    assert "io.winbox.component=pyghidra" in label_values
+
     assert f"/run/winbox/decomp-{protocol_family()}.sock" in command
-    assert f"io.winbox.worker-api={WORKER_API}" in command
 
 
 def test_lifecycle_lock_serializes_concurrent_first_starts(monkeypatch, tmp_path):
@@ -239,6 +271,97 @@ def test_stale_worker_api_is_refused_without_shutdown(monkeypatch, tmp_path):
     with pytest.raises(DecompError, match="refusing automatic shutdown"):
         client.call("status")
     assert migrations == []
+
+
+def test_resource_limits_validates_memory_format(monkeypatch):
+    from winbox.kdbg.decomp.docker import DockerError, resource_limits
+
+    for bad in ("abc", "0g", "-1m", "g", ""):
+        monkeypatch.setenv("WINBOX_GHIDRA_MEMORY", bad)
+        monkeypatch.setenv("WINBOX_GHIDRA_CPUS", "2.0")
+        with pytest.raises(DockerError, match="WINBOX_GHIDRA_MEMORY"):
+            resource_limits()
+
+
+def test_resource_limits_validates_cpu_range(monkeypatch):
+    from winbox.kdbg.decomp.docker import DockerError, resource_limits
+
+    monkeypatch.setenv("WINBOX_GHIDRA_MEMORY", "4g")
+    for bad in ("0.1", "100", "abc"):
+        monkeypatch.setenv("WINBOX_GHIDRA_CPUS", bad)
+        with pytest.raises(DockerError):
+            resource_limits()
+
+
+def test_resource_limits_accepts_valid_values(monkeypatch):
+    from winbox.kdbg.decomp.docker import resource_limits
+
+    monkeypatch.setenv("WINBOX_GHIDRA_MEMORY", "2g")
+    monkeypatch.setenv("WINBOX_GHIDRA_CPUS", "1.5")
+    assert resource_limits() == ("2g", "1.5")
+
+
+def test_docker_wrapper_raises_on_timeout(monkeypatch, tmp_path):
+    manager = DockerManager(Config(winbox_dir=tmp_path / "state"))
+    monkeypatch.setattr(
+        "shutil.which", lambda _name: "/usr/bin/docker",
+    )
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(cmd="docker", timeout=60),
+        ),
+    )
+    with pytest.raises(DockerError, match="timed out"):
+        manager._docker("info")
+
+
+def test_docker_wrapper_raises_on_os_error(monkeypatch, tmp_path):
+    manager = DockerManager(Config(winbox_dir=tmp_path / "state"))
+    monkeypatch.setattr(
+        "shutil.which", lambda _name: "/usr/bin/docker",
+    )
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("exec format error")),
+    )
+    with pytest.raises(DockerError, match="could not run"):
+        manager._docker("info")
+
+
+def test_docker_wrapper_raises_on_nonzero_exit(monkeypatch, tmp_path):
+    manager = DockerManager(Config(winbox_dir=tmp_path / "state"))
+    monkeypatch.setattr(
+        "shutil.which", lambda _name: "/usr/bin/docker",
+    )
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: _completed(returncode=1, stderr="permission denied"),
+    )
+    with pytest.raises(DockerError, match="permission denied"):
+        manager._docker("info")
+
+
+def test_stop_removes_container_and_stale_socket(monkeypatch, tmp_path):
+    cfg = Config(winbox_dir=tmp_path / "state")
+    manager = DockerManager(cfg)
+    monkeypatch.setattr(
+        manager, "container_info",
+        lambda: {"running": True, "status": "running", "image": IMAGE},
+    )
+    calls = []
+    monkeypatch.setattr(manager, "_docker", lambda *a, **k: calls.append(a) or _completed())
+    result = manager._stop()
+    assert result["stopped"] is True
+    assert any("stop" in c for c in calls)
+    assert any("rm" in c for c in calls)
+
+
+def test_stop_already_stopped(monkeypatch, tmp_path):
+    manager = DockerManager(Config(winbox_dir=tmp_path / "state"))
+    monkeypatch.setattr(manager, "container_info", lambda: None)
+    result = manager._stop()
+    assert result == {"stopped": False, "already_stopped": True}
 
 
 def test_mcp_lifecycle_serializes_results_and_errors(monkeypatch, tmp_path):
