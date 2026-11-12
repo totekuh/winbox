@@ -303,7 +303,7 @@ def _discover_and_register() -> None:
 
     package_path = __path__  # type: ignore[name-defined]
     for finder, mod_name, ispkg in pkgutil.iter_modules(package_path):
-        if ispkg or mod_name.startswith("_"):
+        if mod_name.startswith("_"):
             continue
         module = importlib.import_module(f"{__name__}.{mod_name}")
         register = getattr(module, "REGISTER", None)

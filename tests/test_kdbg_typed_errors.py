@@ -161,7 +161,7 @@ def test_cli_renders_stable_typed_error_code(monkeypatch, tmp_path):
             )
 
     monkeypatch.setattr("winbox.cli.Config.load", lambda: Config(winbox_dir=tmp_path))
-    monkeypatch.setattr("winbox.cli.kdbg._client", lambda _cfg: RefusingClient())
+    monkeypatch.setattr("winbox.cli.kdbg.execution._client", lambda _cfg: RefusingClient())
     result = CliRunner().invoke(cli, ["kdbg", "regs"])
     assert result.exit_code == 1
     assert "state_conflict: safe halt required" in result.output

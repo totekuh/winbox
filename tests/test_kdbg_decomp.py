@@ -1317,7 +1317,7 @@ def test_cli_context_emits_machine_safe_json(monkeypatch, tmp_path):
     import json
     from click.testing import CliRunner
     from winbox.cli import cli
-    import winbox.cli.kdbg as cli_kdbg
+    import winbox.cli.kdbg.session as cli_kdbg_session
 
     cfg = Config(winbox_dir=tmp_path)
     captured = {}
@@ -1328,7 +1328,7 @@ def test_cli_context_emits_machine_safe_json(monkeypatch, tmp_path):
             return {"schema": "winbox.kdbg-context/1", "value": "x" * 500}
 
     monkeypatch.setattr("winbox.cli.Config.load", lambda: cfg)
-    monkeypatch.setattr(cli_kdbg, "_client", lambda _cfg: Client())
+    monkeypatch.setattr(cli_kdbg_session, "_client", lambda _cfg: Client())
     result = CliRunner().invoke(cli, [
         "kdbg", "context", "--disasm-count", "3",
         "--stack-qwords", "4", "--bt-depth", "2",

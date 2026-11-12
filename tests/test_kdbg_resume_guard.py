@@ -228,9 +228,9 @@ class TestResumeIsSafeOnARunningVm:
         from winbox.vm import VMState
 
         with (
-            patch("winbox.cli.kdbg.VM") as vm_cls,
-            patch("winbox.cli.kdbg.probe_port") as probe,
-            patch("winbox.cli.kdbg.RspClient") as rsp,
+            patch("winbox.cli.kdbg.session.VM") as vm_cls,
+            patch("winbox.cli.kdbg.session.probe_port") as probe,
+            patch("winbox.cli.kdbg.session.RspClient") as rsp,
         ):
             vm_cls.return_value.state.return_value = state
             result = CliRunner().invoke(cli, ["kdbg", "resume"])

@@ -21,19 +21,28 @@ def kdbg_env(cfg):
     The HMP subprocess call lives in ``winbox.kdbg.hmp`` — the CLI module
     imports a thin wrapper around it — so that's where we patch.
     """
+    from contextlib import ExitStack
+
     vm = MagicMock()
     vm.state.return_value = VMState.RUNNING
+    vm_cls = MagicMock(return_value=vm)
+    mock_probe = MagicMock(return_value=False)
 
-    with patch("winbox.cli.kdbg.VM", return_value=vm), \
-         patch("winbox.cli.Config.load", return_value=cfg), \
-         patch("winbox.kdbg.hmp_qmp._qmp_socket_paths", return_value=[]), \
-         patch(
-             "winbox.kdbg.hmp_qmp._libvirt_hmp",
-             side_effect=hmp_module._QmpUnavailable("disabled for subprocess tests"),
-         ), \
-         patch("winbox.kdbg.hmp.subprocess.run") as mock_run, \
-         patch("winbox.cli.kdbg.probe_port", return_value=False) as mock_probe:
-        # Default: virsh succeeds and the HMP output looks like a real start
+    with ExitStack() as stack:
+        for mod in (
+            "lifecycle", "inspect", "evidence", "threads", "triage",
+            "snapshots", "debugger", "user", "session",
+        ):
+            stack.enter_context(patch(f"winbox.cli.kdbg.{mod}.VM", vm_cls))
+        for mod in ("lifecycle", "debugger", "user", "session"):
+            stack.enter_context(patch(f"winbox.cli.kdbg.{mod}.probe_port", mock_probe))
+        stack.enter_context(patch("winbox.cli.Config.load", return_value=cfg))
+        stack.enter_context(patch("winbox.kdbg.hmp_qmp._qmp_socket_paths", return_value=[]))
+        stack.enter_context(patch(
+            "winbox.kdbg.hmp_qmp._libvirt_hmp",
+            side_effect=hmp_module._QmpUnavailable("disabled for subprocess tests"),
+        ))
+        mock_run = stack.enter_context(patch("winbox.kdbg.hmp.subprocess.run"))
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout="Waiting for gdb connection on device 'tcp:127.0.0.1:1234'",
@@ -94,7 +103,7 @@ class TestKdbgStart:
 
     def test_refuses_when_persistent_reader_owns_stub(self, runner, kdbg_env):
         from winbox.cli import cli
-        with patch("winbox.cli.kdbg.reader_info", return_value={"port": 4321}):
+        with patch("winbox.cli.kdbg.lifecycle.reader_info", return_value={"port": 4321}):
             result = runner.invoke(cli, ["kdbg", "start"])
         assert result.exit_code == 1
         assert "reader already owns" in result.output
@@ -151,12 +160,12 @@ class TestKdbgAttachPolicies:
             "schema": "winbox.kdbg-staging-preflight/1",
             "staging_policy": "cached-only", "dry_run": True,
         }
-        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
+        with patch("winbox.cli.kdbg.debugger.DaemonClient", return_value=daemon), \
              patch(
                  "winbox.kdbg.staging.preflight_user_module_staging",
                  return_value=plan,
              ) as preflight, \
-             patch("winbox.cli.kdbg.fork_daemon") as fork:
+             patch("winbox.cli.kdbg.debugger.fork_daemon") as fork:
             result = runner.invoke(cli, [
                 "kdbg", "attach", "4584", "--staging-policy", "cached-only",
                 "--preflight", "--prewarm",
@@ -185,7 +194,7 @@ class TestKdbgAttachPolicies:
         BreakpointIntentStore(cfg).add("mpengine+0x40")
         daemon = MagicMock()
         daemon.session_alive.return_value = False
-        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
+        with patch("winbox.cli.kdbg.debugger.DaemonClient", return_value=daemon), \
              patch(
                  "winbox.kdbg.staging.preflight_user_module_staging",
                  return_value={"schema": "preflight", "dry_run": True},
@@ -262,10 +271,10 @@ class TestKdbgThreads:
         from winbox.cli import cli
 
         target, walked = self._target_and_threads()
-        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
-             patch("winbox.cli.kdbg._get_store"), \
-             patch("winbox.cli.kdbg.find_process", return_value=target), \
-             patch("winbox.cli.kdbg.list_threads", return_value=walked):
+        with patch("winbox.cli.kdbg.threads.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg.threads._get_store"), \
+             patch("winbox.cli.kdbg.threads.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.threads.list_threads", return_value=walked):
             result = runner.invoke(cli, ["kdbg", "threads", "4712"])
 
         assert result.exit_code == 0, result.output
@@ -281,10 +290,10 @@ class TestKdbgThreads:
         from winbox.cli import cli
 
         target, walked = self._target_and_threads()
-        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
-             patch("winbox.cli.kdbg._get_store"), \
-             patch("winbox.cli.kdbg.find_process", return_value=target), \
-             patch("winbox.cli.kdbg.list_threads", return_value=walked):
+        with patch("winbox.cli.kdbg.threads.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg.threads._get_store"), \
+             patch("winbox.cli.kdbg.threads.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.threads.list_threads", return_value=walked):
             result = runner.invoke(cli, ["kdbg", "threads", "4712", "--json"])
 
         assert result.exit_code == 0, result.output
@@ -307,10 +316,10 @@ class TestKdbgThreads:
         from winbox.cli import cli
 
         target, walked = self._target_and_threads()
-        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
-             patch("winbox.cli.kdbg._get_store"), \
-             patch("winbox.cli.kdbg.find_process", return_value=target), \
-             patch("winbox.cli.kdbg.list_threads", return_value=walked):
+        with patch("winbox.cli.kdbg.threads.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg.threads._get_store"), \
+             patch("winbox.cli.kdbg.threads.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.threads.list_threads", return_value=walked):
             result = runner.invoke(cli, [
                 "kdbg", "threads", "4712", "--json", "--require-complete",
             ])
@@ -355,12 +364,12 @@ class TestKdbgThreads:
             eprocess=target.eprocess, pid=target.pid, process_name=target.name,
             tid=thread.tid, in_target_process=True,
         )
-        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
-             patch("winbox.cli.kdbg._get_store"), \
-             patch("winbox.cli.kdbg.find_process", return_value=target), \
-             patch("winbox.cli.kdbg.list_threads", return_value=walked), \
-             patch("winbox.cli.kdbg.resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
-             patch("winbox.cli.kdbg.list_current_vcpu_threads", return_value=[current]):
+        with patch("winbox.cli.kdbg.threads.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg.threads._get_store"), \
+             patch("winbox.cli.kdbg.threads.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.threads.list_threads", return_value=walked), \
+             patch("winbox.cli.kdbg.threads.resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
+             patch("winbox.cli.kdbg.threads.list_current_vcpu_threads", return_value=[current]):
             result = runner.invoke(cli, [
                 "kdbg", "threads", "4712", "--json", "--resolve",
                 "--state", "Waiting", "--limit", "1",
@@ -399,13 +408,13 @@ class TestKdbgThreads:
                 },
             },
         }
-        with patch("winbox.cli.kdbg.ensure_types_loaded") as ensure, \
-             patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
-             patch("winbox.cli.kdbg._get_store"), \
-             patch("winbox.cli.kdbg.find_process", return_value=target), \
-             patch("winbox.cli.kdbg.list_threads", return_value=walked), \
-             patch("winbox.cli.kdbg.resolve_thread_wait_objects", return_value=wait) as resolved, \
-             patch("winbox.cli.kdbg.list_current_vcpu_threads", return_value=[]):
+        with patch("winbox.cli.kdbg.threads.ensure_types_loaded") as ensure, \
+             patch("winbox.cli.kdbg.threads.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg.threads._get_store"), \
+             patch("winbox.cli.kdbg.threads.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.threads.list_threads", return_value=walked), \
+             patch("winbox.cli.kdbg.threads.resolve_thread_wait_objects", return_value=wait) as resolved, \
+             patch("winbox.cli.kdbg.threads.list_current_vcpu_threads", return_value=[]):
             result = runner.invoke(cli, [
                 "kdbg", "threads", "4712", "--json", "--wait-objects",
                 "--wait-object-limit", "1", "--wait-owner-depth", "2",
@@ -422,8 +431,8 @@ class TestKdbgThreads:
     def test_wait_objects_refuse_summary_before_touching_the_vm(self, runner, kdbg_env):
         from winbox.cli import cli
 
-        with patch("winbox.cli.kdbg.ensure_types_loaded") as ensure, \
-             patch("winbox.cli.kdbg.debug_snapshot") as snapshot:
+        with patch("winbox.cli.kdbg.threads.ensure_types_loaded") as ensure, \
+             patch("winbox.cli.kdbg.threads.debug_snapshot") as snapshot:
             result = runner.invoke(cli, [
                 "kdbg", "threads", "4712", "--detail", "summary", "--wait-objects",
             ])
@@ -438,11 +447,11 @@ class TestKdbgThreads:
         from winbox.cli import cli
 
         target, walked = self._target_and_threads()
-        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
-             patch("winbox.cli.kdbg._get_store"), \
-             patch("winbox.cli.kdbg.find_process", return_value=target), \
-             patch("winbox.cli.kdbg.list_threads", return_value=walked), \
-             patch("winbox.cli.kdbg.list_current_vcpu_threads", return_value=[]):
+        with patch("winbox.cli.kdbg.threads.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg.threads._get_store"), \
+             patch("winbox.cli.kdbg.threads.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.threads.list_threads", return_value=walked), \
+             patch("winbox.cli.kdbg.threads.list_current_vcpu_threads", return_value=[]):
             result = runner.invoke(cli, ["kdbg", "threads", "4712", "--json", "--detail", "summary"])
 
         assert result.exit_code == 0, result.output
@@ -476,9 +485,9 @@ class TestKdbgGlobalThreadTriage:
         from winbox.cli import cli
 
         result = self._result(complete=True)
-        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
-             patch("winbox.cli.kdbg._get_store"), \
-             patch("winbox.cli.kdbg.triage_all_process_threads", return_value=result) as triage:
+        with patch("winbox.cli.kdbg.triage.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg.triage._get_store"), \
+             patch("winbox.cli.kdbg.triage.triage_all_process_threads", return_value=result) as triage:
             invoked = runner.invoke(cli, [
                 "kdbg", "thread-triage", "--json", "--process-cap", "7",
                 "--total-thread-cap", "99", "--sample-per-process", "3", "--limit", "5",
@@ -498,9 +507,9 @@ class TestKdbgGlobalThreadTriage:
         from winbox.cli import cli
 
         result = self._result(complete=False)
-        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
-             patch("winbox.cli.kdbg._get_store"), \
-             patch("winbox.cli.kdbg.triage_all_process_threads", return_value=result):
+        with patch("winbox.cli.kdbg.triage.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg.triage._get_store"), \
+             patch("winbox.cli.kdbg.triage.triage_all_process_threads", return_value=result):
             invoked = runner.invoke(cli, [
                 "kdbg", "thread-triage", "--json", "--require-complete",
             ])
@@ -514,10 +523,10 @@ class TestKdbgGlobalThreadTriage:
     def test_missing_pid_never_walks_threads(self, runner, kdbg_env):
         from winbox.cli import cli
 
-        with patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
-             patch("winbox.cli.kdbg._get_store"), \
-             patch("winbox.cli.kdbg.find_process", return_value=None), \
-             patch("winbox.cli.kdbg.list_threads") as listed:
+        with patch("winbox.cli.kdbg.threads.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg.threads._get_store"), \
+             patch("winbox.cli.kdbg.threads.find_process", return_value=None), \
+             patch("winbox.cli.kdbg.threads.list_threads") as listed:
             result = runner.invoke(cli, ["kdbg", "threads", "9999"])
 
         assert result.exit_code == 1
@@ -549,15 +558,15 @@ class TestKdbgGlobalThreadTriage:
             tid=thread.tid, in_target_process=True,
         )
         snapshot = MagicMock(return_value=nullcontext())
-        with patch("winbox.cli.kdbg.debug_snapshot", snapshot), \
-             patch("winbox.cli.kdbg._get_store"), \
-             patch("winbox.cli.kdbg.find_process", return_value=target), \
-             patch("winbox.cli.kdbg.list_threads", return_value=walked), \
-             patch("winbox.cli.kdbg.list_modules", return_value=[ModuleRecord("ntoskrnl.exe", 0xfffff80010000000, 0x4000, 0)]), \
-             patch("winbox.cli.kdbg.ensure_types_loaded"), \
-             patch("winbox.cli.kdbg.list_user_modules", return_value=[UserModuleRecord("target.exe", 0x7ff740000000, 0x4000, "C:\\target.exe", 0)]), \
-             patch("winbox.cli.kdbg.resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
-             patch("winbox.cli.kdbg.list_current_vcpu_threads", return_value=[current]):
+        with patch("winbox.cli.kdbg.triage.debug_snapshot", snapshot), \
+             patch("winbox.cli.kdbg.triage._get_store"), \
+             patch("winbox.cli.kdbg.triage.find_process", return_value=target), \
+             patch("winbox.cli.kdbg.triage.list_threads", return_value=walked), \
+             patch("winbox.cli.kdbg.triage.list_modules", return_value=[ModuleRecord("ntoskrnl.exe", 0xfffff80010000000, 0x4000, 0)]), \
+             patch("winbox.cli.kdbg.triage.ensure_types_loaded"), \
+             patch("winbox.cli.kdbg.triage.list_user_modules", return_value=[UserModuleRecord("target.exe", 0x7ff740000000, 0x4000, "C:\\target.exe", 0)]), \
+             patch("winbox.cli.kdbg.triage.resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
+             patch("winbox.cli.kdbg.triage.list_current_vcpu_threads", return_value=[current]):
             result = runner.invoke(cli, ["kdbg", "triage", "4712", "--json", "--thread-limit", "1"])
 
         assert result.exit_code == 0, result.output
@@ -592,7 +601,7 @@ class TestKdbgDoctor:
             "mcp": {"version": "test", "catalog_revision": "test", "tool_count": 85},
             "notes": [],
         }
-        with patch("winbox.cli.kdbg.collect_doctor", return_value=report) as doctor:
+        with patch("winbox.cli.kdbg.lifecycle.collect_doctor", return_value=report) as doctor:
             result = runner.invoke(cli, ["kdbg", "doctor", "--json"])
 
         assert result.exit_code == 0, result.output
@@ -615,9 +624,9 @@ class TestKdbgVadExtract:
             "name": "private-rwx", "manifest_path": "/evidence/private-rwx.json",
             "blob_path": "/evidence/private-rwx.bin",
         }
-        with patch("winbox.cli.kdbg._get_store") as symbols, \
-             patch("winbox.cli.kdbg.extract_vad_live", return_value=extraction) as extract, \
-             patch("winbox.cli.kdbg.VadExtractStore", return_value=artifacts):
+        with patch("winbox.cli.kdbg.evidence._get_store") as symbols, \
+             patch("winbox.cli.kdbg.evidence.extract_vad_live", return_value=extraction) as extract, \
+             patch("winbox.cli.kdbg.evidence.VadExtractStore", return_value=artifacts):
             result = runner.invoke(cli, [
                 "kdbg", "vad-extract", "4712", "0x40000000", "--length", "4096",
                 "--name", "private-rwx", "--json",
@@ -636,7 +645,7 @@ class TestKdbgVadExtract:
     def test_extract_rejects_out_of_budget_length_before_opening_snapshot(self, runner, kdbg_env):
         from winbox.cli import cli
 
-        with patch("winbox.cli.kdbg.extract_vad_live") as extract:
+        with patch("winbox.cli.kdbg.evidence.extract_vad_live") as extract:
             result = runner.invoke(cli, [
                 "kdbg", "vad-extract", "4712", "0x40000000", "--length", str(8 * 1024 * 1024 + 1),
                 "--name", "private-rwx",
@@ -652,8 +661,8 @@ class TestKdbgVadExtract:
 
         artifacts = MagicMock()
         artifacts.ensure_available.side_effect = VadExtractError("artifact 'case' already exists and is immutable")
-        with patch("winbox.cli.kdbg.VadExtractStore", return_value=artifacts), \
-             patch("winbox.cli.kdbg.extract_vad_live") as extract:
+        with patch("winbox.cli.kdbg.evidence.VadExtractStore", return_value=artifacts), \
+             patch("winbox.cli.kdbg.evidence.extract_vad_live") as extract:
             result = runner.invoke(cli, [
                 "kdbg", "vad-extract", "4712", "0x40000000", "--name", "case",
             ])
@@ -674,10 +683,10 @@ class TestKdbgThreadBaseline:
             "name": "case", "captured_at": "2026-08-27T00:00:00Z",
             "process": {"pid": 4712, "name": "target.exe"}, "thread_count": 1,
         }
-        with patch("winbox.cli.kdbg.ThreadBaselineStore", return_value=baseline), \
-             patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()) as snapshot, \
-             patch("winbox.cli.kdbg._get_store"), \
-             patch("winbox.cli.kdbg.capture_thread_baseline", return_value=capture):
+        with patch("winbox.cli.kdbg.snapshots.ThreadBaselineStore", return_value=baseline), \
+             patch("winbox.cli.kdbg.snapshots.debug_snapshot", return_value=nullcontext()) as snapshot, \
+             patch("winbox.cli.kdbg.snapshots._get_store"), \
+             patch("winbox.cli.kdbg.snapshots.capture_thread_baseline", return_value=capture):
             result = runner.invoke(cli, [
                 "kdbg", "thread-baseline", "4712", "--name", "case", "--json",
             ])
@@ -694,8 +703,8 @@ class TestKdbgThreadBaseline:
 
         baseline = MagicMock()
         baseline.load.side_effect = BaselineNotFoundError("baseline 'case' was not found")
-        with patch("winbox.cli.kdbg.ThreadBaselineStore", return_value=baseline), \
-             patch("winbox.cli.kdbg.debug_snapshot") as snapshot:
+        with patch("winbox.cli.kdbg.snapshots.ThreadBaselineStore", return_value=baseline), \
+             patch("winbox.cli.kdbg.snapshots.debug_snapshot") as snapshot:
             result = runner.invoke(cli, ["kdbg", "thread-diff", "4712", "--name", "case"])
 
         assert result.exit_code == 1
@@ -711,7 +720,7 @@ class TestKdbgTargetStatus:
         daemon.call.return_value = {
             "state": "gone", "reason": "pid_reused", "advisory": True,
         }
-        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon):
+        with patch("winbox.cli.kdbg.debugger.DaemonClient", return_value=daemon):
             result = runner.invoke(cli, ["kdbg", "target-status"])
         assert result.exit_code == 0, result.output
         assert json.loads(result.output)["state"] == "gone"
@@ -797,7 +806,7 @@ class TestKdbgStatus:
 
     def test_status_reports_connected_reader_without_probe(self, runner, kdbg_env):
         from winbox.cli import cli
-        with patch("winbox.cli.kdbg.reader_info", return_value={"port": 1234}):
+        with patch("winbox.cli.kdbg.lifecycle.reader_info", return_value={"port": 1234}):
             result = runner.invoke(cli, ["kdbg", "status"])
         assert result.exit_code == 0
         assert "persistent reader owns it" in result.output
@@ -812,7 +821,7 @@ class TestKdbgCetSafety:
         with patch("winbox.cli.VM", return_value=kdbg_env["vm"]), patch(
             "winbox.cli.GuestAgent",
         ), patch("winbox.cli.ensure_running"), patch(
-            "winbox.cli.kdbg.query_cet_status",
+            "winbox.cli.kdbg.lifecycle.query_cet_status",
             return_value=SimpleNamespace(
                 safe_for_debug=True, user_shadow_stack="OFF", strict_mode="OFF",
                 enabled_processes=(), unqueryable_processes=(),
@@ -829,7 +838,7 @@ class TestKdbgCetSafety:
         with patch("winbox.cli.VM", return_value=kdbg_env["vm"]), patch(
             "winbox.cli.GuestAgent",
         ), patch("winbox.cli.ensure_running"), patch(
-            "winbox.cli.kdbg.prepare_cet",
+            "winbox.cli.kdbg.lifecycle.prepare_cet",
         ) as prepare:
             result = runner.invoke(cli, ["kdbg", "prepare"])
         assert result.exit_code == 1
@@ -843,9 +852,9 @@ class TestKdbgCetSafety:
         with patch("winbox.cli.VM", return_value=kdbg_env["vm"]), patch(
             "winbox.cli.GuestAgent",
         ), patch("winbox.cli.ensure_running"), patch(
-            "winbox.cli.kdbg.stop_reader",
+            "winbox.cli.kdbg.lifecycle.stop_reader",
         ) as stop, patch(
-            "winbox.cli.kdbg.prepare_cet", return_value=backup,
+            "winbox.cli.kdbg.lifecycle.prepare_cet", return_value=backup,
         ):
             result = runner.invoke(cli, ["kdbg", "prepare", "--confirm"])
         assert result.exit_code == 0
@@ -860,7 +869,7 @@ class TestKdbgCetSafety:
         with patch("winbox.cli.VM", return_value=kdbg_env["vm"]), patch(
             "winbox.cli.GuestAgent",
         ), patch("winbox.cli.ensure_running"), patch(
-            "winbox.cli.kdbg.restore_cet_policy",
+            "winbox.cli.kdbg.lifecycle.restore_cet_policy",
         ) as restore:
             result = runner.invoke(cli, ["kdbg", "restore-cet"])
         assert result.exit_code == 1
@@ -879,15 +888,15 @@ class TestKdbgUserBreakpointOwnership:
         )
         rsp = MagicMock()
         events = []
-        with patch("winbox.cli.kdbg.reader_info", return_value={"port": 1234}), \
-             patch("winbox.cli.kdbg.debug_snapshot", return_value=nullcontext()), \
-             patch("winbox.cli.kdbg._get_store", return_value=cfg_store), \
-             patch("winbox.cli.kdbg.find_process", return_value=target), \
+        with patch("winbox.cli.kdbg.user.reader_info", return_value={"port": 1234}), \
+             patch("winbox.cli.kdbg.user.debug_snapshot", return_value=nullcontext()), \
+             patch("winbox.cli.kdbg.user._get_store", return_value=cfg_store), \
+             patch("winbox.cli.kdbg.user.find_process", return_value=target), \
              patch(
-                 "winbox.cli.kdbg.stop_reader",
+                 "winbox.cli.kdbg.user.stop_reader",
                  side_effect=lambda cfg: events.append("stop"),
-             ), patch("winbox.cli.kdbg.RspClient") as rsp_cls, patch(
-                 "winbox.cli.kdbg.install_user_breakpoint",
+             ), patch("winbox.cli.kdbg.user.RspClient") as rsp_cls, patch(
+                 "winbox.cli.kdbg.user.install_user_breakpoint",
                  return_value=SimpleNamespace(elapsed=0.001, target_dtb=0x123000),
              ):
             rsp_cls.connect.side_effect = lambda *a, **kw: events.append("connect") or rsp
@@ -914,7 +923,7 @@ class TestKdbgBreakpointCliParity:
             "condition": "rcx == 4", "actions": ["rax", "bytes(rdx,16)"],
             "elapsed_ms": 1.25,
         }
-        with patch("winbox.cli.kdbg._client", return_value=client):
+        with patch("winbox.cli.kdbg.breakpoints._client", return_value=client):
             result = runner.invoke(cli, [
                 "kdbg", "bp", "0x1000", "--watch", "access", "--size", "8",
                 "--condition", "rcx == 4", "--action", "rax",
@@ -936,7 +945,7 @@ class TestKdbgBreakpointCliParity:
         from winbox.cli import cli
 
         client = MagicMock()
-        with patch("winbox.cli.kdbg._client", return_value=client):
+        with patch("winbox.cli.kdbg.breakpoints._client", return_value=client):
             result = runner.invoke(cli, [
                 "kdbg", "bp", "0x1000", "--watch", "write", "--size", size,
             ])
@@ -951,7 +960,7 @@ class TestKdbgBreakpointCliParity:
             "id": 1, "va": "0x1000", "user_mode": False, "hw": True,
             "condition": None, "elapsed_ms": 1.0,
         }
-        with patch("winbox.cli.kdbg._client", return_value=client):
+        with patch("winbox.cli.kdbg.breakpoints._client", return_value=client):
             result = runner.invoke(cli, ["kdbg", "bp", "0x1000", "--size", "8"])
         assert result.exit_code == 0, result.output
         client.call.assert_called_once_with(
@@ -972,7 +981,7 @@ class TestKdbgBreakpointCliParity:
             "total": 100, "returned": 1, "truncated": True, "next_hit": 41,
             "summary": {"rax": {"distinct": 1}},
         }
-        with patch("winbox.cli.kdbg._client", return_value=client):
+        with patch("winbox.cli.kdbg.execution._client", return_value=client):
             result = runner.invoke(cli, [
                 "kdbg", "bp-trace", "3", "--from-hit", "40", "--limit", "50",
                 "--expression", "rax", "--value", "34", "--errors-only",
@@ -999,7 +1008,7 @@ class TestKdbgBreakpointCliParity:
         }
         client = MagicMock()
         client.call.return_value = payload
-        with patch("winbox.cli.kdbg._client", return_value=client):
+        with patch("winbox.cli.kdbg.execution._client", return_value=client):
             result = runner.invoke(cli, ["kdbg", "bp-trace", "1", "--json"])
 
         assert result.exit_code == 0, result.output
@@ -1018,7 +1027,7 @@ class TestKdbgBreakpointCliParity:
         from winbox.cli import cli
 
         client = MagicMock()
-        with patch("winbox.cli.kdbg._client", return_value=client):
+        with patch("winbox.cli.kdbg.breakpoints._client", return_value=client):
             result = runner.invoke(cli, ["kdbg", "bp-trace", "1", *arguments])
         assert result.exit_code == 2
         client.call.assert_not_called()
@@ -1031,7 +1040,7 @@ class TestKdbgBreakpointCliParity:
             "id": 1, "va": "0x1000", "hw": True, "wp_type": "write",
             "wp_size": 4, "hits": 2, "age_s": 1.0, "target": "buffer",
         }]}
-        with patch("winbox.cli.kdbg._client", return_value=client):
+        with patch("winbox.cli.kdbg.breakpoints._client", return_value=client):
             result = runner.invoke(cli, ["kdbg", "bps"])
         assert result.exit_code == 0, result.output
         assert "write/4" in result.output
@@ -1045,7 +1054,7 @@ class TestKdbgBreakpointCliParity:
             "hits": 0, "age_s": 1.0, "target": "MPENGINE+0xB52C40",
             "target_pretty": "MpEngine.dll+0xb52c40",
         }]}
-        with patch("winbox.cli.kdbg._client", return_value=client):
+        with patch("winbox.cli.kdbg.breakpoints._client", return_value=client):
             result = runner.invoke(cli, ["kdbg", "bps"])
         assert result.exit_code == 0, result.output
         assert "MpEngine.dll+0xb52c40" in result.output
@@ -1102,12 +1111,12 @@ class TestKdbgDetach:
             "resume_safe": True,
             "cr3_poisoned": False,
         }
-        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
+        with patch("winbox.cli.kdbg.session._client", return_value=daemon), \
              patch(
                  "winbox.kdbg.debugger.continue_job.poll_continue",
                  return_value={"state": "idle"},
              ), \
-             patch("winbox.cli.kdbg.ensure_not_paused", return_value=None) as guard:
+             patch("winbox.cli.kdbg.session.ensure_not_paused", return_value=None) as guard:
             result = runner.invoke(cli, ["kdbg", "detach"])
 
         assert result.exit_code == 0, result.output
@@ -1127,12 +1136,12 @@ class TestKdbgDetach:
             "cr3_poisoned": True,
             "recovery": "restore snapshot before resuming",
         }
-        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
+        with patch("winbox.cli.kdbg.session._client", return_value=daemon), \
              patch(
                  "winbox.kdbg.debugger.continue_job.poll_continue",
                  return_value={"state": "idle"},
              ), \
-             patch("winbox.cli.kdbg.ensure_not_paused") as guard:
+             patch("winbox.cli.kdbg.session.ensure_not_paused") as guard:
             result = runner.invoke(cli, ["kdbg", "detach"])
 
         assert result.exit_code == 0, result.output
@@ -1173,7 +1182,7 @@ class TestKdbgResume:
         kdbg_env["probe"].return_value = True
         daemon = MagicMock()
         daemon.session_alive.return_value = True
-        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon):
+        with patch("winbox.cli.kdbg.session.DaemonClient", return_value=daemon):
             result = runner.invoke(cli, ["kdbg", "resume"])
         assert result.exit_code == 1
         assert "kdbg detach" in result.output
@@ -1190,8 +1199,8 @@ class TestKdbgResume:
         daemon = MagicMock()
         daemon.session_alive.return_value = False
         rsp_client = MagicMock()
-        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
-             patch("winbox.cli.kdbg.RspClient") as rsp_cls, \
+        with patch("winbox.cli.kdbg.session.DaemonClient", return_value=daemon), \
+             patch("winbox.cli.kdbg.session.RspClient") as rsp_cls, \
              patch("time.sleep"):
             rsp_cls.connect.return_value = rsp_client
             result = runner.invoke(cli, ["kdbg", "resume"])
@@ -1208,8 +1217,8 @@ class TestKdbgResume:
         daemon = MagicMock()
         daemon.session_alive.return_value = False
         rsp_client = MagicMock()
-        with patch("winbox.cli.kdbg.DaemonClient", return_value=daemon), \
-             patch("winbox.cli.kdbg.RspClient") as rsp_cls, \
+        with patch("winbox.cli.kdbg.session.DaemonClient", return_value=daemon), \
+             patch("winbox.cli.kdbg.session.RspClient") as rsp_cls, \
              patch("time.sleep"):
             rsp_cls.connect.return_value = rsp_client
             result = runner.invoke(cli, ["kdbg", "resume"])
