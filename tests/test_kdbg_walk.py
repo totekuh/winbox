@@ -15,6 +15,12 @@ from typing import Any
 import pytest
 
 from winbox.kdbg import walk
+from winbox.kdbg.walk import _layout as _walk_layout
+from winbox.kdbg.walk import _processes as _walk_processes
+from winbox.kdbg.walk import _modules as _walk_modules
+from winbox.kdbg.walk import _threads as _walk_threads
+from winbox.kdbg.walk import _wait as _walk_wait
+from winbox.kdbg.walk import _attribution as _walk_attribution
 from winbox.kdbg.store import SymbolStoreError
 from winbox.kdbg.walk import (
     ProcessRecord,
@@ -82,9 +88,9 @@ def _stub_reads(monkeypatch, backing: _Backing) -> None:
             raise AssertionError(f"unexpected unicode read at 0x{va:x}")
         return backing.strings[va]
 
-    monkeypatch.setattr(walk, "_read_u64", fake_u64)
-    monkeypatch.setattr(walk, "_read_u32", fake_u32)
-    monkeypatch.setattr(walk, "_read_unicode_string", fake_unicode)
+    monkeypatch.setattr(_walk_layout, "_read_u64", fake_u64)
+    monkeypatch.setattr(_walk_layout, "_read_u32", fake_u32)
+    monkeypatch.setattr(_walk_layout, "_read_unicode_string", fake_unicode)
 
 
 # Shared offsets across tests — chosen to look like real Windows layout
@@ -298,8 +304,8 @@ def _list_proc_with_user_dtb(monkeypatch, raw_user_dtb_value: int):
         HEAD: flink,            # head -> first entry's flink
     }
 
-    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3_candidates", lambda vm: [0x999000])
-    monkeypatch.setattr("winbox.kdbg.walk._read_u64",
+    monkeypatch.setattr("winbox.kdbg.walk._layout._cpu_cr3_candidates", lambda vm: [0x999000])
+    monkeypatch.setattr("winbox.kdbg.walk._layout._read_u64",
                         lambda vm, cr3, va, cache: qwords[va])
 
     class S:
@@ -325,7 +331,7 @@ def _list_proc_with_user_dtb(monkeypatch, raw_user_dtb_value: int):
             raw[start:start + 8] = b"test.exe"
         return bytes(raw)
 
-    monkeypatch.setattr(walk, "read_virt_cr3", read_span)
+    monkeypatch.setattr(_walk_processes, "read_virt_cr3", read_span)
 
     procs = list_processes("vm", S())
     assert len(procs) == 1
@@ -392,7 +398,7 @@ def test_process_entry_coalesces_adjacent_fields_without_sparse_overread(monkeyp
             raw[name_start:name_start + 15] = b"worker.exe\x00\x00\x00\x00\x00"
         return bytes(raw)
 
-    monkeypatch.setattr(walk, "read_virt_cr3", read_span)
+    monkeypatch.setattr(_walk_processes, "read_virt_cr3", read_span)
     cache = walk.WalkCache()
     record, flink = walk._read_process_entry(
         "vm", 0x999000, eprocess, layout, cache,
@@ -499,7 +505,7 @@ def test_process_entry_preserves_create_and_exit_identity_fields(monkeypatch):
             raw[name_start:name_start + 8] = b"live.exe"
         return bytes(raw)
 
-    monkeypatch.setattr(walk, "read_virt_cr3", read_span)
+    monkeypatch.setattr(_walk_processes, "read_virt_cr3", read_span)
     record, _ = walk._read_process_entry(
         "vm", 0x999000, eprocess, layout, walk.WalkCache(),
     )
@@ -514,7 +520,7 @@ def test_process_entry_rejects_short_coalesced_read(monkeypatch):
 
     layout = walk._process_layout(S())
     monkeypatch.setattr(
-        walk,
+        _walk_processes,
         "read_virt_cr3",
         lambda vm, cr3, va, length, *, cache: b"\x00" * (length - 1),
     )
@@ -541,9 +547,9 @@ def test_find_process_stops_reading_immediately_after_match(monkeypatch):
         def struct(self, type_name, field=None, *, module="nt"):
             return _PROC_TYPES[type_name]
 
-    monkeypatch.setattr(walk, "_cpu_cr3_candidates", lambda vm: [0x999000])
+    monkeypatch.setattr(_walk_layout, "_cpu_cr3_candidates", lambda vm: [0x999000])
     monkeypatch.setattr(
-        walk, "_read_u64",
+        _walk_layout, "_read_u64",
         lambda vm, cr3, va, cache: system + apl_off,
     )
 
@@ -555,7 +561,7 @@ def test_find_process_stops_reading_immediately_after_match(monkeypatch):
             return ProcessRecord(828, "lsass.exe", target, 0x172643000, 0), tail + apl_off
         pytest.fail("early-exit lookup read past the matching process")
 
-    monkeypatch.setattr(walk, "_read_process_entry", read_entry)
+    monkeypatch.setattr(_walk_processes, "_read_process_entry", read_entry)
     result = find_process("vm", S(), pid=828)
 
     assert result is not None and result.name == "lsass.exe"
@@ -568,7 +574,7 @@ def test_cpu_cr3_comes_from_active_rsp_snapshot(monkeypatch):
     from types import SimpleNamespace
 
     snapshot = SimpleNamespace(current_cr3=0x1AA000)
-    monkeypatch.setattr(walk, "current_snapshot", lambda vm: snapshot)
+    monkeypatch.setattr(_walk_layout, "current_snapshot", lambda vm: snapshot)
     assert _cpu_cr3("winbox") == 0x1AA000
 
 
@@ -576,7 +582,7 @@ def test_cpu_cr3_requires_active_rsp_snapshot(monkeypatch):
     from winbox.kdbg.hmp import HmpError
     from winbox.kdbg.walk import _cpu_cr3
 
-    monkeypatch.setattr(walk, "current_snapshot", lambda vm: None)
+    monkeypatch.setattr(_walk_layout, "current_snapshot", lambda vm: None)
     with pytest.raises(HmpError, match="no active RSP snapshot"):
         _cpu_cr3("winbox")
 
@@ -584,7 +590,7 @@ def test_cpu_cr3_requires_active_rsp_snapshot(monkeypatch):
 def test_cpu_cr3_candidates_reads_every_vcpu_and_deduplicates(monkeypatch):
     from types import SimpleNamespace
     snapshot = SimpleNamespace(cr3_candidates=(0x100000, 0x200000))
-    monkeypatch.setattr(walk, "current_snapshot", lambda vm: snapshot)
+    monkeypatch.setattr(_walk_layout, "current_snapshot", lambda vm: snapshot)
     assert walk._cpu_cr3_candidates("vm") == [0x100000, 0x200000]
 
 
@@ -597,7 +603,7 @@ def test_cached_kernel_cr3_avoids_volatile_vcpu_sampling(monkeypatch):
         lambda vm: pytest.fail("cached fast path must not sample vCPU CR3"),
     )
     monkeypatch.setattr(
-        walk, "_read_u64",
+        _walk_layout, "_read_u64",
         lambda vm, cr3, va, cache: 0xFFFFE000_DEADBEE8 if cr3 == stable else 0,
     )
     cr3, flink, _ = walk._read_kernel_list_head("vm", head, None)
@@ -613,7 +619,7 @@ def test_stale_cached_cr3_is_invalidated_then_all_vcpus_are_tried(monkeypatch):
     working_kernel_half = working_user_half ^ 0x1000
     walk._remember_kernel_cr3("vm", stale)
     monkeypatch.setattr(
-        walk, "_cpu_cr3_candidates", lambda vm: [0x770000, working_user_half]
+        _walk_layout, "_cpu_cr3_candidates", lambda vm: [0x770000, working_user_half]
     )
     attempted = []
 
@@ -623,7 +629,7 @@ def test_stale_cached_cr3_is_invalidated_then_all_vcpus_are_tried(monkeypatch):
             return 0xFFFFE000_00001238
         raise PageWalkError(f"0x{cr3:x} does not map head")
 
-    monkeypatch.setattr(walk, "_read_u64", read)
+    monkeypatch.setattr(_walk_layout, "_read_u64", read)
     cr3, flink, _ = walk._read_kernel_list_head("vm", head, None)
     assert (cr3, flink) == (working_kernel_half, 0xFFFFE000_00001238)
     assert attempted == [
@@ -639,14 +645,14 @@ def test_reboot_poison_pointer_is_rejected_as_a_cr3_candidate(monkeypatch):
     poisoned = 0x1AE000
     working = 0x2BE000
     walk._remember_kernel_cr3("vm", poisoned)
-    monkeypatch.setattr(walk, "_cpu_cr3_candidates", lambda vm: [working])
+    monkeypatch.setattr(_walk_layout, "_cpu_cr3_candidates", lambda vm: [working])
 
     def read(vm, cr3, va, cache):
         if cr3 in (poisoned, poisoned ^ 0x1000):
             return 0x000FAFAFAFAFA0B0
         return 0xFFFFE000_00100448
 
-    monkeypatch.setattr(walk, "_read_u64", read)
+    monkeypatch.setattr(_walk_layout, "_read_u64", read)
     cr3, flink, _ = walk._read_kernel_list_head("vm", head, None)
     assert (cr3, flink) == (working, 0xFFFFE000_00100448)
     assert walk._cached_kernel_cr3("vm") is None
@@ -657,9 +663,9 @@ def test_impossible_empty_kernel_list_is_rejected(monkeypatch):
     stale = 0x1AE000
     working = 0x2BE000
     walk._remember_kernel_cr3("vm", stale)
-    monkeypatch.setattr(walk, "_cpu_cr3_candidates", lambda vm: [working])
+    monkeypatch.setattr(_walk_layout, "_cpu_cr3_candidates", lambda vm: [working])
     monkeypatch.setattr(
-        walk, "_read_u64",
+        _walk_layout, "_read_u64",
         lambda vm, cr3, va, cache: (
             head if cr3 in (stale, stale ^ 0x1000) else 0xFFFFE000_00100448
         ),
@@ -681,7 +687,7 @@ def test_explicit_cr3_ignores_cache_and_live_vcpus(monkeypatch):
         seen.append(cr3)
         return 0xFFFFE000_00004320
 
-    monkeypatch.setattr(walk, "_read_u64", read)
+    monkeypatch.setattr(_walk_layout, "_read_u64", read)
     cr3, flink, _ = walk._read_kernel_list_head("vm", head, 0x990000)
     assert (cr3, flink) == (0x990000, 0xFFFFE000_00004320)
     assert seen == [0x990000]
@@ -707,7 +713,7 @@ def test_find_process_matches_name_longer_than_15_chars(monkeypatch):
         pid=1234, name=truncated, eprocess=0x1000,
         directory_table_base=0x2000, user_directory_table_base=0,
     )
-    monkeypatch.setattr(walk, "_iter_processes", lambda *a, **k: iter([rec]))
+    monkeypatch.setattr(_walk_processes, "_iter_processes", lambda *a, **k: iter([rec]))
 
     assert find_process("winbox", None, name="SecurityHealthService.exe") is rec
     # A different long name that truncates differently must NOT match.
@@ -741,8 +747,8 @@ def test_list_processes_switches_to_system_dtb(monkeypatch):
         cr3s_used.append(cr3)
         return qwords[va]
 
-    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3_candidates", lambda vm: [CPU_CR3])
-    monkeypatch.setattr("winbox.kdbg.walk._read_u64", tracking_read_u64)
+    monkeypatch.setattr("winbox.kdbg.walk._layout._cpu_cr3_candidates", lambda vm: [CPU_CR3])
+    monkeypatch.setattr("winbox.kdbg.walk._layout._read_u64", tracking_read_u64)
 
     def read_entry(vm, cr3, eproc, layout, cache):
         cr3s_used.append(cr3)
@@ -751,7 +757,7 @@ def test_list_processes_switches_to_system_dtb(monkeypatch):
         assert eproc == PROC2
         return ProcessRecord(1234, "proc2.exe", PROC2, 0x5678000, 0), HEAD
 
-    monkeypatch.setattr(walk, "_read_process_entry", read_entry)
+    monkeypatch.setattr(_walk_processes, "_read_process_entry", read_entry)
 
     class S:
         def resolve(self, name):
@@ -793,10 +799,10 @@ def test_list_processes_no_switch_when_system_dtb_matches(monkeypatch):
         cr3s_used.append(cr3)
         return qwords[va]
 
-    monkeypatch.setattr("winbox.kdbg.walk._cpu_cr3_candidates", lambda vm: [DTB])
-    monkeypatch.setattr("winbox.kdbg.walk._read_u64", tracking_read_u64)
+    monkeypatch.setattr("winbox.kdbg.walk._layout._cpu_cr3_candidates", lambda vm: [DTB])
+    monkeypatch.setattr("winbox.kdbg.walk._layout._read_u64", tracking_read_u64)
     monkeypatch.setattr(
-        walk,
+        _walk_processes,
         "_read_process_entry",
         lambda vm, cr3, eproc, layout, cache: (
             ProcessRecord(4, "System", SYSTEM, DTB, 0), HEAD,
@@ -895,13 +901,14 @@ def _thread_backing(monkeypatch, target: ProcessRecord):
         calls.append((vm, cr3, va, length, cache))
         return bytes(memory.get(va + i, 0) for i in range(length))
 
-    monkeypatch.setattr(walk, "read_virt_cr3", read_span)
+    monkeypatch.setattr(_walk_processes, "read_virt_cr3", read_span)
+    monkeypatch.setattr(_walk_threads, "read_virt_cr3", read_span)
     monkeypatch.setattr(
-        walk, "_read_kernel_list_head",
+        _walk_layout, "_read_kernel_list_head",
         lambda *_args: (0x1AE000, 0xFFFFE001_00000000, walk.WalkCache()),
     )
     monkeypatch.setattr(
-        walk, "_read_u64",
+        _walk_layout, "_read_u64",
         lambda _vm, _cr3, va, _cache: qwords[va],
     )
 
@@ -1039,7 +1046,7 @@ def test_list_threads_reports_cap_as_partial_result(monkeypatch):
     qwords[head] = first + layout.thread_list_entry
     add(first, second + layout.thread_list_entry, 4816)
     add(second, head, 4820)
-    monkeypatch.setattr(walk, "MAX_THREADS_PER_PROCESS", 1)
+    monkeypatch.setattr(_walk_threads, "MAX_THREADS_PER_PROCESS", 1)
 
     result = list_threads("vm", _thread_store(), target)
 
@@ -1115,9 +1122,9 @@ def _install_wait_reads(monkeypatch, values: dict[int, tuple[int, int]]) -> None
         value, width = values[address]
         assert width == length
         return value.to_bytes(width, "little")
-    monkeypatch.setattr(walk, "read_virt_cr3", read)
+    monkeypatch.setattr(_walk_wait, "read_virt_cr3", read)
     monkeypatch.setattr(
-        walk, "_read_kernel_list_head",
+        _walk_layout, "_read_kernel_list_head",
         lambda *_args: (0x1AE000, 0xFFFFE001_00000000, walk.WalkCache()),
     )
 
@@ -1133,7 +1140,7 @@ def test_wait_object_evidence_returns_only_proven_mutant_owner_chain(monkeypatch
     owner = 0xFFFFE001_00300000
     mutant = 0xFFFFE001_00400000
     layout = _wait_layout_for_test()
-    monkeypatch.setattr(walk, "_wait_layout", lambda _store: layout)
+    monkeypatch.setattr(_walk_layout, "_wait_layout", lambda _store: layout)
     values = {
         thread.ethread + 0xD0: (thread.ethread + 0x140, 8),
         thread.ethread + 0x140 + 0x18: (thread.ethread, 8),
@@ -1169,7 +1176,7 @@ def test_wait_object_evidence_refuses_external_blocks_and_owner_cycles(monkeypat
         start_address=0, win32_start_address=0, create_time=1, exit_status=259,
     )
     layout = _wait_layout_for_test()
-    monkeypatch.setattr(walk, "_wait_layout", lambda _store: layout)
+    monkeypatch.setattr(_walk_layout, "_wait_layout", lambda _store: layout)
     _install_wait_reads(monkeypatch, {
         thread.ethread + 0xD0: (0xFFFFE001_00BAD000, 8),
     })
@@ -1335,8 +1342,8 @@ def test_resolve_thread_start_addresses_uses_live_module_bases_and_local_symbols
                 ),
             }
 
-    monkeypatch.setattr(walk, "list_modules", lambda *_a, **_k: [kernel])
-    monkeypatch.setattr(walk, "list_user_modules", lambda *_a, **_k: [user])
+    monkeypatch.setattr(_walk_modules, "list_modules", lambda *_a, **_k: [kernel])
+    monkeypatch.setattr(_walk_modules, "list_user_modules", lambda *_a, **_k: [user])
 
     resolved, warnings = resolve_thread_start_addresses(
         "vm", SymbolFake(), target, [thread], cache=walk.WalkCache(),
@@ -1362,8 +1369,8 @@ def test_resolve_thread_start_addresses_does_not_guess_private_or_jit(monkeypatc
         start_address=0x00007FF7_50000000, win32_start_address=0, create_time=1,
         exit_status=259,
     )
-    monkeypatch.setattr(walk, "list_modules", lambda *_a, **_k: [])
-    monkeypatch.setattr(walk, "list_user_modules", lambda *_a, **_k: [])
+    monkeypatch.setattr(_walk_modules, "list_modules", lambda *_a, **_k: [])
+    monkeypatch.setattr(_walk_modules, "list_user_modules", lambda *_a, **_k: [])
 
     resolved, warnings = resolve_thread_start_addresses(
         "vm", FakeStore(_THREAD_TYPES), target, [thread], cache=walk.WalkCache(),
@@ -1384,8 +1391,8 @@ def test_resolve_thread_start_addresses_adds_validated_vad_without_rewriting_loa
         start_address=0x00007FF7_50000000, win32_start_address=0, create_time=1,
         exit_status=259,
     )
-    monkeypatch.setattr(walk, "list_modules", lambda *_a, **_k: [])
-    monkeypatch.setattr(walk, "list_user_modules", lambda *_a, **_k: [])
+    monkeypatch.setattr(_walk_modules, "list_modules", lambda *_a, **_k: [])
+    monkeypatch.setattr(_walk_modules, "list_user_modules", lambda *_a, **_k: [])
     import winbox.kdbg.vad as vad
 
     record = SimpleNamespace(public=lambda: {
@@ -1442,19 +1449,19 @@ def test_list_current_vcpu_threads_validates_kpcr_prcb_and_ethread(monkeypatch):
         idle_prcb + 0x8: idle_ethread,
         idle_ethread + 0x220: idle_owner,
     }
-    monkeypatch.setattr(
-        walk, "current_snapshot",
-        lambda _vm: SimpleNamespace(
-            vcpu_kernel_gs_bases=((0, (0xDEAD, kpcr)), (1, (0xBEEF,)), (2, (idle_kpcr,))),
-        ),
+    vcpu_snapshot = SimpleNamespace(
+        vcpu_kernel_gs_bases=((0, (0xDEAD, kpcr)), (1, (0xBEEF,)), (2, (idle_kpcr,))),
     )
-    monkeypatch.setattr(walk, "_current_vcpu_layout", lambda _store: current_layout)
-    monkeypatch.setattr(walk, "_thread_layout", lambda _store: thread_layout)
-    monkeypatch.setattr(walk, "_process_layout", lambda _store: object())
-    monkeypatch.setattr(walk, "_read_kernel_list_head", lambda *_args: (0x1AE000, 0, walk.WalkCache()))
-    monkeypatch.setattr(walk, "_read_u64", lambda _vm, _cr3, va, _cache: values[va])
+    monkeypatch.setattr(_walk_layout, "current_snapshot", lambda _vm: vcpu_snapshot)
+    monkeypatch.setattr(_walk_attribution, "current_snapshot", lambda _vm: vcpu_snapshot)
+    monkeypatch.setattr(_walk_attribution, "_current_vcpu_layout", lambda _store: current_layout)
+    monkeypatch.setattr(_walk_layout, "_thread_layout", lambda _store: thread_layout)
+    monkeypatch.setattr(_walk_attribution, "_layout", _walk_layout)
+    monkeypatch.setattr(_walk_processes, "_process_layout", lambda _store: object())
+    monkeypatch.setattr(_walk_layout, "_read_kernel_list_head", lambda *_args: (0x1AE000, 0, walk.WalkCache()))
+    monkeypatch.setattr(_walk_layout, "_read_u64", lambda _vm, _cr3, va, _cache: values[va])
     monkeypatch.setattr(
-        walk, "_read_process_entry",
+        _walk_processes, "_read_process_entry",
         lambda _vm, _cr3, eprocess, _layout, _cache: (
             ProcessRecord(
                 pid=0 if eprocess == idle_owner else target.pid,
@@ -1472,7 +1479,7 @@ def test_list_current_vcpu_threads_validates_kpcr_prcb_and_ethread(monkeypatch):
             return b"\x00" * 16
         return b""
     monkeypatch.setattr(
-        walk, "read_virt_cr3",
+        _walk_attribution, "read_virt_cr3",
         fake_cid,
     )
 
@@ -1518,7 +1525,7 @@ def test_is_wow64_true(monkeypatch):
         WOW64_PROCESS: PEB32,
     }
 
-    monkeypatch.setattr("winbox.kdbg.walk._read_u64",
+    monkeypatch.setattr("winbox.kdbg.walk._layout._read_u64",
                         lambda vm, cr3, va, cache: qwords.get(va, 0))
 
     class S:
@@ -1545,7 +1552,7 @@ def test_is_wow64_false(monkeypatch):
         target.eprocess + WOW64_OFF: 0,
     }
 
-    monkeypatch.setattr("winbox.kdbg.walk._read_u64",
+    monkeypatch.setattr("winbox.kdbg.walk._layout._read_u64",
                         lambda vm, cr3, va, cache: qwords.get(va, 0))
 
     class S:
@@ -1567,7 +1574,7 @@ def test_is_wow64_no_field(monkeypatch):
         directory_table_base=0x12345000, user_directory_table_base=0,
     )
 
-    monkeypatch.setattr("winbox.kdbg.walk._read_u64",
+    monkeypatch.setattr("winbox.kdbg.walk._layout._read_u64",
                         lambda vm, cr3, va, cache: 0x7FFE_0000_0000)
 
     class S:
@@ -1618,7 +1625,7 @@ def test_wow64_module_walk_returns_x86_loader_view(monkeypatch):
     }
     _stub_reads(monkeypatch, _Backing(qwords=qwords, dwords=dwords, strings={}))
     monkeypatch.setattr(
-        walk, "_read_unicode_string32",
+        _walk_modules, "_read_unicode_string32",
         lambda vm, cr3, va, cache: {
             entry32 + 0x24: "C:\\Windows\\SysWOW64\\legacy.exe",
             entry32 + 0x2C: "legacy.exe",
@@ -1656,7 +1663,7 @@ def test_wow64_duplicate_main_exe_prefers_x86_record(monkeypatch):
         "cmd.exe", 0x7C0000, 0x5D000, r"C:\Windows\SysWOW64\cmd.exe",
         0x77002000, "x86",
     )
-    monkeypatch.setattr(walk, "_list_wow64_modules", lambda *a, **k: [x86])
+    monkeypatch.setattr(_walk_modules, "_list_wow64_modules", lambda *a, **k: [x86])
     mods = list_user_modules("vm", store=FakeStore(_TYPES), target=target)
     assert mods == [x86]
 
@@ -1671,5 +1678,5 @@ def test_wow64_rejects_peb_above_32bit(monkeypatch):
         target.eprocess + 0x580: 0xFFFFE00100200000,
         0xFFFFE00100200000: 0x1_00000000,
     }
-    monkeypatch.setattr(walk, "_read_u64", lambda vm, cr3, va, cache: values[va])
+    monkeypatch.setattr(_walk_layout, "_read_u64", lambda vm, cr3, va, cache: values[va])
     assert is_wow64("vm", store, target) is False

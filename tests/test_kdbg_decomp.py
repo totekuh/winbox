@@ -962,9 +962,9 @@ def test_source_mapping_rejects_start_beyond_function():
 
 
 def test_oversized_full_code_is_bounded_without_changing_mapping_input(monkeypatch):
-    import winbox.kdbg.decomp.worker as worker_module
+    import winbox.kdbg.decomp.worker._mapping as mapping_module
 
-    monkeypatch.setattr(worker_module, "MAX_CODE", 16)
+    monkeypatch.setattr(mapping_module, "MAX_CODE", 16)
     complete = "one\ntwo\nthree\nfour\nfive\n"
     returned, stats = _bounded_code_payload(complete, full=True)
     mapping = _map_source(
@@ -1054,9 +1054,9 @@ def test_mapped_assembly_groups_shared_instructions_and_unmapped_lines():
 
 
 def test_mapped_assembly_enforces_association_cap(monkeypatch):
-    import winbox.kdbg.decomp.worker as worker_module
+    import winbox.kdbg.decomp.worker._mapping as mapping_module
 
-    monkeypatch.setattr(worker_module, "MAX_MAPPED_INSTRUCTION_ASSOCIATIONS", 1)
+    monkeypatch.setattr(mapping_module, "MAX_MAPPED_INSTRUCTION_ASSOCIATIONS", 1)
     instructions = [
         _FakeInstruction(0x1000, b"\x90", "NOP"),
         _FakeInstruction(0x1001, b"\x90", "NOP"),
@@ -1079,9 +1079,9 @@ def test_mapped_assembly_enforces_association_cap(monkeypatch):
 
 
 def test_mapped_assembly_marks_every_later_addressed_line_incomplete(monkeypatch):
-    import winbox.kdbg.decomp.worker as worker_module
+    import winbox.kdbg.decomp.worker._mapping as mapping_module
 
-    monkeypatch.setattr(worker_module, "MAX_MAPPED_INSTRUCTION_ASSOCIATIONS", 1)
+    monkeypatch.setattr(mapping_module, "MAX_MAPPED_INSTRUCTION_ASSOCIATIONS", 1)
     instructions = [
         _FakeInstruction(0x1000, b"\x90", "NOP"),
         _FakeInstruction(0x1001, b"\x90", "NOP"),

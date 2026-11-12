@@ -178,7 +178,9 @@ def test_install_builds_only_bundled_assets_and_verifies_image(monkeypatch, tmp_
     def docker(*args, **kwargs):
         context = Path(args[-1])
         observed["dockerfile"] = (context / "Dockerfile").read_text(encoding="utf-8")
-        observed["worker"] = (context / "worker.py").read_text(encoding="utf-8")
+        observed["worker_dir"] = (context / "worker").is_dir()
+        observed["worker_common"] = (context / "worker" / "_common.py").read_text(encoding="utf-8")
+        observed["worker_init"] = (context / "worker" / "__init__.py").read_text(encoding="utf-8")
         return _completed(stdout="built")
 
     monkeypatch.setattr(manager, "_docker", docker)
@@ -191,8 +193,8 @@ def test_install_builds_only_bundled_assets_and_verifies_image(monkeypatch, tmp_
     assert "GHIDRA_SHA256=" in observed["dockerfile"]
     assert "PYGHIDRA_SHA256=" in observed["dockerfile"]
     assert f'io.winbox.worker-api="{WORKER_API}"' in observed["dockerfile"]
-    assert f'WORKER_API = "{WORKER_API}"' in observed["worker"]
-    assert "Persistent, serialized PyGhidra worker" in observed["worker"]
+    assert f'WORKER_API = "{WORKER_API}"' in observed["worker_common"]
+    assert "Persistent, serialized PyGhidra worker" in observed["worker_init"]
 
 
 def test_binary_staging_is_content_addressed_atomic_and_container_relative(tmp_path):

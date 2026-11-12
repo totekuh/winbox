@@ -638,7 +638,7 @@ def test_corrupt_project_partial_reset_failure_is_typed(monkeypatch, tmp_path):
         worker, "_enter_project", lambda *_a: (_ for _ in ()).throw(RuntimeError("corrupt")),
     )
     monkeypatch.setattr(
-        "winbox.kdbg.decomp.worker.shutil.rmtree",
+        "winbox.kdbg.decomp.worker._worker.shutil.rmtree",
         lambda *_a, **_k: (_ for _ in ()).throw(OSError("denied")),
     )
     with pytest.raises(WorkerError) as captured:
@@ -772,7 +772,7 @@ class TestLoadEnrichment:
         digest = "b" * 64
         _valid_sidecar(enrichment, digest)
         monkeypatch.setattr(
-            "winbox.kdbg.decomp.worker.MAX_ENRICHMENT_BYTES", 10,
+            "winbox.kdbg.decomp.worker._enrichment.MAX_ENRICHMENT_BYTES", 10,
         )
         with pytest.raises(WorkerError, match="exceeds"):
             worker._load_enrichment(str(enrichment / f"{digest}.json"), digest)

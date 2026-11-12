@@ -45,8 +45,8 @@ RUN apt-get update \
     && find /opt/ghidra -type d -name __pycache__ -prune -exec rm -rf '{}' + \
     && find /opt/ghidra -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
-COPY worker.py /opt/winbox/worker.py
+COPY worker/ /opt/winbox/worker/
 
 WORKDIR /opt/winbox
 
-ENTRYPOINT ["/opt/venv/bin/python", "/opt/winbox/worker.py"]
+ENTRYPOINT ["/opt/venv/bin/python", "/opt/winbox/worker/__main__.py"]

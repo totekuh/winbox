@@ -57,7 +57,7 @@ class _DecompLifecycleMixin:
         root.mkdir(parents=True, exist_ok=True)
         os.chmod(root, 0o700)
         interpreter = discover_pyghidra_python()
-        worker = Path(__file__).with_name("worker.py").resolve()
+        worker = (Path(__file__).with_name("worker") / "__main__.py").resolve()
         command = [
             str(interpreter), str(worker),
             "--socket", str(socket_path(self.cfg)),

@@ -205,8 +205,8 @@ class DockerManager:
 
     def _install(self, *, pull: bool) -> dict[str, Any]:
         dockerfile = Path(__file__).with_name("container") / "Dockerfile"
-        worker = Path(__file__).with_name("worker.py")
-        if not dockerfile.is_file() or not worker.is_file():
+        worker_dir = Path(__file__).with_name("worker")
+        if not dockerfile.is_file() or not worker_dir.is_dir():
             raise DockerError("installed winbox package is missing its Docker build assets")
         root = _state_root(self.cfg)
         root.mkdir(parents=True, exist_ok=True)
@@ -214,7 +214,7 @@ class DockerManager:
         with tempfile.TemporaryDirectory(prefix="winbox-ghidra-build-") as temporary:
             context = Path(temporary)
             shutil.copyfile(dockerfile, context / "Dockerfile")
-            shutil.copyfile(worker, context / "worker.py")
+            shutil.copytree(worker_dir, context / "worker")
             command = ["build"]
             if pull:
                 command.append("--pull")

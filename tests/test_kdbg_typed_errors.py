@@ -173,8 +173,9 @@ def test_real_worker_publishes_heartbeat_and_typed_wire_error(monkeypatch, tmp_p
     monkeypatch.setenv("WINBOX_DECOMP_BACKEND", "host")
     monkeypatch.setenv("WINBOX_GHIDRA_PROJECT_DIR", str(tmp_path / "projects"))
     cfg = Config(winbox_dir=tmp_path / "state")
+    worker_entry = Path(worker_module.__file__).resolve().parent / "__main__.py"
     command = [
-        sys.executable, str(Path(worker_module.__file__).resolve()),
+        sys.executable, str(worker_entry),
         "--socket", str(socket_path(cfg)), "--lock", str(lock_path(cfg)),
         "--session", str(session_path(cfg)), "--cache", str(cache_dir(cfg)),
         "--projects", str(project_dir()), "--max-open-programs", "2",
@@ -254,8 +255,9 @@ def test_status_is_nonblocking_during_serialized_worker_phase(monkeypatch, tmp_p
     cfg = Config(winbox_dir=tmp_path / "state")
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(fake_modules) + os.pathsep + environment.get("PYTHONPATH", "")
+    worker_entry = Path(worker_module.__file__).resolve().parent / "__main__.py"
     command = [
-        sys.executable, str(Path(worker_module.__file__).resolve()),
+        sys.executable, str(worker_entry),
         "--socket", str(socket_path(cfg)), "--lock", str(lock_path(cfg)),
         "--session", str(session_path(cfg)), "--cache", str(cache_dir(cfg)),
         "--projects", str(projects), "--max-open-programs", "2",
