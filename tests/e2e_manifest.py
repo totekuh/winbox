@@ -60,6 +60,7 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
 
     # Execute
     "exec": (LIVE, ""),
+    "powershell": (LIVE, ""),
     "shell": (EXCLUDED, "interactive ConPTY session; needs a TTY"),
     "ssh": (EXCLUDED, "interactive SSH session; needs a TTY"),
     "eventlogs": (LIVE, ""),
