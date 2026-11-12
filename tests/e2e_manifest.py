@@ -293,6 +293,20 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "user_delete": (LIVE, "confirmation guard"),
     "user_list": (LIVE, ""),
 
+    # Share / user
+    "share_create": (LIVE, ""),
+    "share_delete": (LIVE, "including purge confirmation guard"),
+    "share_list": (LIVE, ""),
+    "share_grant": (LIVE, ""),
+    "share_revoke": (LIVE, ""),
+    "share_ls": (LIVE, ""),
+    "share_mkdir": (LIVE, ""),
+    "share_write": (LIVE, "both inline content and source upload"),
+    "share_rm": (LIVE, "confirmation guard"),
+    "user_create": (LIVE, ""),
+    "user_delete": (LIVE, "confirmation guard"),
+    "user_list": (LIVE, ""),
+
     # Named-pipe broker
     "pipe_list": (LIVE, ""),
     "pipe_info": (LIVE, ""),
