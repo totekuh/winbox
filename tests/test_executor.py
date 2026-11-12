@@ -108,28 +108,31 @@ class TestResolveExe:
 
 
 class TestRunCommandQuoting:
-    """cmd.exe re-splits any unquoted whitespace into extra arguments, so a
-    spacey exe path or argument must be wrapped in double quotes before it
-    reaches ga.exec — otherwise `winbox exec tool.exe --path "C:\\Program
-    Files\\Target"` arrives in the guest as four arguments instead of two."""
+    """The QEMU guest agent applies MSVC C-runtime escaping when building the
+    CreateProcess command line.  Any double-quotes we add get escaped to ``\\"``,
+    producing ``'\\\"token\\\"'`` errors on the guest.  _quote_cmd_arg is
+    therefore identity — tokens pass through unmodified, and the GA's own
+    outer wrapping keeps the single-arg contract with cmd.exe /c intact."""
 
     def _ga(self):
         ga = MagicMock()
         ga.exec.return_value = ExecResult(exitcode=0, stdout="", stderr="")
         return ga
 
-    def test_spacey_argument_is_quoted(self, cfg):
+    def test_spacey_argument_passes_through_unquoted(self, cfg):
         ga = self._ga()
         run_command(cfg, ga, "whoami.exe", ("C:\\Program Files\\Target",), timeout=60)
         full_cmd = ga.exec.call_args[0][0]
-        assert '"C:\\Program Files\\Target"' in full_cmd
+        assert "C:\\Program Files\\Target" in full_cmd
+        assert '\\"' not in full_cmd
 
-    def test_spacey_resolved_exe_path_is_quoted(self, cfg):
+    def test_spacey_resolved_exe_path_passes_through_unquoted(self, cfg):
         (cfg.tools_dir / "PsExec (v2).exe").touch()
         ga = self._ga()
         run_command(cfg, ga, "PsExec (v2).exe", (), timeout=60)
         full_cmd = ga.exec.call_args[0][0]
-        assert '"Z:\\tools\\PsExec (v2).exe"' in full_cmd
+        assert "PsExec (v2).exe" in full_cmd
+        assert '\\"' not in full_cmd
 
     def test_argument_without_whitespace_is_not_quoted(self, cfg):
         ga = self._ga()
@@ -137,12 +140,13 @@ class TestRunCommandQuoting:
         full_cmd = ga.exec.call_args[0][0]
         assert full_cmd.endswith("whoami.exe /priv")
 
-    def test_bg_spacey_argument_is_quoted(self, cfg):
+    def test_bg_spacey_argument_passes_through_unquoted(self, cfg):
         ga = MagicMock()
         ga.exec_background.return_value = 1234
         run_command_bg(cfg, ga, "whoami.exe", ("C:\\Program Files\\Target",))
         full_cmd = ga.exec_background.call_args[0][0]
-        assert '"C:\\Program Files\\Target"' in full_cmd
+        assert "C:\\Program Files\\Target" in full_cmd
+        assert '\\"' not in full_cmd
 
 
 class TestRunCommandRetryPolicy:
@@ -265,6 +269,100 @@ class TestCredentialedExecCli:
         assert result.exit_code == 0
         assert run.call_args.kwargs["user"] == "alice"
         assert run.call_args.kwargs["password"] == "secret"
+
+
+class TestPowershellCli:
+    def test_powershell_runs_a_script(self, runner, mock_env):
+        from winbox.cli import cli
+
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="hello\n", stderr="",
+        )
+        result = runner.invoke(cli, ["powershell", "Write-Output hello"])
+        assert result.exit_code == 0
+        assert "hello" in result.output
+        mock_env.exec_powershell.assert_called_once()
+        assert mock_env.exec_powershell.call_args[0][0] == "Write-Output hello"
+
+    def test_powershell_propagates_exit_code(self, runner, mock_env):
+        from winbox.cli import cli
+
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=3, stdout="", stderr="",
+        )
+        result = runner.invoke(cli, ["powershell", "exit 3"])
+        assert result.exit_code == 3
+
+    def test_powershell_shows_stderr(self, runner, mock_env):
+        from winbox.cli import cli
+
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="", stderr="warning text",
+        )
+        result = runner.invoke(cli, ["powershell", "something"])
+        assert "warning text" in result.output
+
+    def test_powershell_forwards_user_and_password(self, runner, mock_env):
+        from winbox.cli import cli
+
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="", stderr="",
+        )
+        result = runner.invoke(
+            cli,
+            ["powershell", "--user", "alice", "--password", "secret", "whoami"],
+        )
+        assert result.exit_code == 0
+        assert mock_env.exec_powershell.call_args.kwargs["user"] == "alice"
+        assert mock_env.exec_powershell.call_args.kwargs["password"] == "secret"
+
+    @pytest.mark.parametrize(
+        "options", [["--user", "alice"], ["--password", "secret"]],
+    )
+    def test_powershell_requires_both_user_options(self, runner, mock_env, options):
+        from winbox.cli import cli
+
+        result = runner.invoke(cli, ["powershell", *options, "whoami"])
+        assert result.exit_code != 0
+        assert "must be supplied together" in result.output
+
+    def test_powershell_bg_returns_job_id(self, runner, mock_env):
+        from winbox.cli import cli
+
+        mock_env.exec_powershell_background.return_value = 5678
+        result = runner.invoke(cli, ["powershell", "--bg", "Start-Sleep 60"])
+        assert result.exit_code == 0
+        assert "Job" in result.output
+        assert "started" in result.output
+
+    def test_powershell_file_reads_and_executes(self, runner, mock_env, tmp_path):
+        from winbox.cli import cli
+
+        ps1 = tmp_path / "test.ps1"
+        ps1.write_text("Write-Output 'from-file'\n")
+        mock_env.exec_powershell.return_value = ExecResult(
+            exitcode=0, stdout="from-file\n", stderr="",
+        )
+        result = runner.invoke(cli, ["powershell", "-f", str(ps1)])
+        assert result.exit_code == 0
+        assert "from-file" in result.output
+        sent_script = mock_env.exec_powershell.call_args[0][0]
+        assert "from-file" in sent_script
+
+    def test_powershell_file_and_inline_are_exclusive(self, runner, mock_env, tmp_path):
+        from winbox.cli import cli
+
+        ps1 = tmp_path / "test.ps1"
+        ps1.write_text("x\n")
+        result = runner.invoke(cli, ["powershell", "-f", str(ps1), "inline code"])
+        assert result.exit_code != 0
+        assert "not both" in result.output
+
+    def test_powershell_requires_script_or_file(self, runner, mock_env):
+        from winbox.cli import cli
+
+        result = runner.invoke(cli, ["powershell"])
+        assert result.exit_code != 0
 
 
 class TestCredentialedShellCli:

@@ -1,8 +1,8 @@
 # winbox — install / dev / test helpers
 #
-# Quick start (end user):
-#   make apt          # system dependencies (needs sudo)
-#   make install      # install the `winbox` CLI globally via pipx
+# Quick start:
+#   make apt       # system dependencies (needs sudo)
+#   make install   # install everything via pipx (force-reinstalls)
 #
 # Developer:
 #   make apt install-dev
@@ -10,7 +10,7 @@
 #
 # `make` or `make help` lists every target.
 
-SHELL := bash
+SHELL := bash -euo pipefail
 .DEFAULT_GOAL := help
 
 # --- package sets -----------------------------------------------------------
@@ -60,31 +60,18 @@ help: ## Show this help
 # --- system dependencies (apt) ----------------------------------------------
 
 .PHONY: apt
-apt: ## Install required system packages (sudo)
+apt: ## Install required + optional system packages (sudo)
 	$(APT) update
-	$(APT) install -y $(APT_REQUIRED)
-
-.PHONY: apt-optional
-apt-optional: ## Install optional system packages: vnc, demangling, capture, inetsim (sudo)
-	$(APT) update
-	$(APT) install -y $(APT_OPTIONAL)
-
-.PHONY: apt-all
-apt-all: apt apt-optional ## Install both required and optional system packages (sudo)
-
-# --- pipx bootstrap ---------------------------------------------------------
-
-.PHONY: pipx
-pipx: ## Ensure pipx is installed and on PATH
-	@command -v $(PIPX) >/dev/null 2>&1 || { \
-		echo ">> pipx not found, installing via apt"; \
-		$(APT) update && $(APT) install -y pipx; }
-	$(PIPX) ensurepath
+	$(APT) install -y $(APT_REQUIRED) $(APT_OPTIONAL)
 
 # --- install ----------------------------------------------------------------
 
 .PHONY: install
-install: pipx ## Install the winbox CLI globally via pipx (isolated venv)
+install: ## Force-(re)install the winbox CLI via pipx with all dependencies
+	command -v $(PIPX) >/dev/null 2>&1 || { \
+		echo ">> pipx not found, installing via apt"; \
+		$(APT) update && $(APT) install -y pipx; }
+	$(PIPX) ensurepath
 	$(PIPX) install --force '.$(PKG_EXTRAS)'
 	@echo ">> installed. If 'winbox' isn't found, open a new shell (pipx ensurepath)."
 
@@ -95,13 +82,9 @@ install-dev: ## Editable dev install into a local .venv with dev + mcp extras
 	.venv/bin/pip install -e '.[dev,mcp]'
 	@echo ">> dev env ready. Activate with: source .venv/bin/activate"
 
-.PHONY: reinstall
-reinstall: ## Force-reinstall the pipx CLI (after pulling changes)
-	$(PIPX) install --force '.$(PKG_EXTRAS)'
-
 .PHONY: uninstall
 uninstall: ## Remove the pipx-installed winbox CLI
-	-$(PIPX) uninstall winbox
+	$(PIPX) uninstall winbox
 
 # --- test -------------------------------------------------------------------
 

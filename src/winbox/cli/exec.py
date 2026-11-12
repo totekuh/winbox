@@ -131,4 +131,83 @@ def ssh(cfg: Config, vm: VM, ga: GuestAgent) -> None:
         os.execvp("ssh", ssh_args)
 
 
-REGISTER = ("Execute", [exec_cmd, shell, ssh])
+@click.command("powershell")
+@click.argument("script", required=False)
+@click.option("-f", "--file", "script_file", type=click.Path(exists=True, dir_okay=False),
+              help="Read script from a .ps1 file instead of an inline argument.")
+@click.option("--timeout", default=600, show_default=True, help="Execution timeout in seconds.")
+@click.option("--bg", is_flag=True, help="Run in background, return immediately.")
+@click.option("--user", help="Run as this local Windows user.")
+@click.option("--password", help="Password for --user.")
+@needs_vm()
+def powershell_cmd(
+    cfg: Config, vm: VM, ga: GuestAgent,
+    script: str | None, script_file: str | None, timeout: int, bg: bool,
+    user: str | None, password: str | None,
+) -> None:
+    """Execute a PowerShell script in the Windows VM.
+
+    Provide SCRIPT as an inline argument, or use -f to read from a .ps1
+    file on the host. Both are sent via -EncodedCommand, so backslash
+    paths and quotes pass through verbatim — no nested escaping needed.
+
+    Examples::
+
+        winbox powershell 'Get-Process | Select -First 5'
+        winbox powershell -f ./recon.ps1
+        winbox powershell --bg 'Start-Sleep 60'
+    """
+    if script is not None and script_file is not None:
+        raise click.UsageError("provide SCRIPT or --file, not both")
+    if script is None and script_file is None:
+        raise click.UsageError("provide a SCRIPT argument or --file")
+    if script_file is not None:
+        from pathlib import Path
+        script = Path(script_file).read_text(encoding="utf-8-sig")
+    if (user is None) != (password is None):
+        raise click.UsageError("--user and --password must be supplied together")
+
+    kwargs = {}
+    if user is not None:
+        kwargs.update(user=user, password=password)
+
+    if bg:
+        import uuid
+        from winbox.jobs import Job, JobMode, JobStore
+
+        store = JobStore(cfg)
+        nonce = f"__wbx{uuid.uuid4().hex[:16]}__"
+
+        def _spawn(job_id: int) -> Job:
+            pid = ga.exec_powershell_background(script, **kwargs)
+            return Job(
+                id=job_id, pid=pid,
+                command=f"powershell: {script[:80]}",
+                mode=JobMode.BUFFERED, nonce=nonce,
+            )
+
+        job = store.claim(_spawn)
+        console.print(f"[green][+][/] Job {job.id} started (PID {job.pid})")
+        console.print(f"    Retrieve output: winbox jobs output {job.id}")
+        return
+
+    try:
+        result = ga.exec_powershell(script, timeout=timeout, **kwargs)
+    except GuestAgentError as e:
+        console.print("[red][-][/] Guest agent disconnected mid-execution:")
+        console.print(f"    {e}", markup=False, highlight=False)
+        state = vm.state()
+        if state != VMState.RUNNING:
+            console.print(f"    VM state: [yellow]{state.value}[/] — try [bold]winbox up[/] and re-run")
+        else:
+            console.print("    VM is still running but GA is unreachable — try [bold]winbox up --reboot[/]")
+        raise SystemExit(1)
+
+    if result.stdout:
+        console.print(result.stdout, end="", markup=False, highlight=False)
+    if result.stderr:
+        console.print(result.stderr, end="", markup=False, style="red", highlight=False)
+    raise SystemExit(result.exitcode)
+
+
+REGISTER = ("Execute", [exec_cmd, powershell_cmd, shell, ssh])

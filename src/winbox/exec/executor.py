@@ -50,9 +50,22 @@ def resolve_exe(exe: str, tools_dir: Path) -> str:
 
 
 def _quote_cmd_arg(s: str) -> str:
-    """Wrap a token in double quotes if it has whitespace, so cmd.exe's own
-    parser doesn't re-split it into multiple arguments."""
-    return f'"{s}"' if any(c.isspace() for c in s) else s
+    """Identity — no quoting.
+
+    The QEMU guest agent applies MSVC C-runtime escaping when building
+    the CreateProcess command line for ``cmd.exe /c``.  Any double-quotes
+    we add here get escaped to ``\\"``, producing ``'\\\"token\\\"'``
+    errors on the guest.  Since the entire command string is already
+    passed as a single ``arg`` element to ``guest-exec``, the GA wraps
+    it in outer quotes automatically — individual tokens do not need
+    quoting on our side.
+
+    If an argument contains spaces and must stay together, the caller
+    should include the quotes in the original command (they pass through
+    the GA correctly when they're part of the content, not added on
+    top of it).
+    """
+    return s
 
 
 def run_command(

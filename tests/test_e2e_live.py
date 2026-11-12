@@ -228,6 +228,49 @@ class TestExec:
         result = ga.exec(command, timeout=60)
         assert expected in result.stdout
 
+    @pytest.mark.parametrize(
+        "command,expected",
+        [
+            ("dir C:", "Volume"),
+            (r"dir C:\Windows", "System32"),
+            ("cmd.exe /c echo hello world", "hello world"),
+            ("whoami", "system"),
+            ("echo %USERNAME%", "WINBOX"),
+            ("echo a & echo b", "b"),
+            ("echo line1 && echo line2", "line2"),
+            ("echo pipe | findstr pipe", "pipe"),
+            (r"dir C:\Progra~1", "Progra~1"),
+        ],
+    )
+    def test_exec_quoting_does_not_double_escape(self, ga, command, expected):
+        """The GA transport applies MSVC C-runtime escaping to each arg.
+        Any double-quotes we add would get escaped to ``\\"``, so the
+        command string must pass through without extra quoting."""
+        result = ga.exec(command, timeout=60)
+        assert expected.lower() in (result.stdout + result.stderr).lower(), (
+            f"command {command!r} → stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+
+    def test_exec_nonexistent_binary_returns_nonzero(self, ga):
+        result = ga.exec("nonexistent_binary_xyz.exe", timeout=60)
+        assert result.exitcode != 0
+        assert "not recognized" in result.stderr
+
+    def test_exec_exit_code_propagation(self, ga):
+        assert ga.exec("exit /b 0", timeout=60).exitcode == 0
+        assert ga.exec("exit /b 42", timeout=60).exitcode == 42
+        assert ga.exec("exit /b 1", timeout=60).exitcode == 1
+
+    def test_exec_embedded_quotes_work_via_powershell(self, ga):
+        """cmd.exe /c mangles embedded double-quotes through the GA transport;
+        PowerShell handles them correctly — this is the recommended path for
+        paths with spaces."""
+        result = ga.exec_powershell(
+            r'Test-Path "C:\Program Files"', timeout=60,
+        )
+        assert result.exitcode == 0
+        assert "True" in result.stdout
+
     def test_nonce_never_leaks_into_stdout(self, ga):
         assert "__wbx" not in ga.exec("echo clean", timeout=60).stdout
 
@@ -280,6 +323,45 @@ class TestExec:
         """The authoritative readiness signal agrees with a real round-trip."""
         assert vm.agent_connected() is True
         assert ga.ping() is True
+
+
+class TestPowershellCli:
+    def test_powershell_runs_a_script(self, run):
+        result = run("powershell", "Write-Output 'ps-cli-ok'")
+        assert "ps-cli-ok" in result.output
+
+    def test_powershell_propagates_nonzero_exit(self, run):
+        result = run("powershell", "exit 3", expect_ok=False)
+        assert result.exit_code == 3
+
+    def test_powershell_captures_stderr(self, run):
+        result = run("powershell", "Write-Error 'boom' -ErrorAction Continue; exit 0")
+        assert "boom" in result.output
+
+    def test_powershell_handles_windows_paths(self, run):
+        result = run("powershell", r'Test-Path C:\Windows\System32\cmd.exe')
+        assert "True" in result.output
+
+    def test_powershell_handles_quoted_paths_with_spaces(self, run):
+        result = run("powershell", r'Test-Path "C:\Program Files"')
+        assert "True" in result.output
+
+    def test_powershell_env_variable_access(self, run):
+        result = run("powershell", "$env:COMPUTERNAME")
+        assert result.output.strip()
+
+    def test_powershell_multiline_pipeline(self, run):
+        result = run("powershell", "Get-Process | Select-Object -First 1 | Format-Table Name -HideTableHeaders")
+        assert result.output.strip()
+
+    def test_powershell_file_flag(self, run, cfg):
+        ps1 = cfg.tools_dir / "e2e_ps_cli.ps1"
+        ps1.write_text("Write-Output 'e2e-ps-file-ok'\n")
+        try:
+            result = run("powershell", "-f", str(ps1))
+            assert "e2e-ps-file-ok" in result.output
+        finally:
+            ps1.unlink(missing_ok=True)
 
 
 class TestCredentialedExec:
