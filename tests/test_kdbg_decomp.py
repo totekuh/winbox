@@ -1299,8 +1299,9 @@ def test_mcp_context_forwards_bounded_evidence_options(monkeypatch, tmp_path):
             captured.update(op=op, **kwargs)
             return {"schema": "winbox.kdbg-context/1"}
 
-    monkeypatch.setattr(mcp_module, "_kdbg_cfg_only", lambda: cfg)
-    monkeypatch.setattr(mcp_module, "_kdbg_client", lambda _cfg: Client())
+    import winbox.mcp._kdbg_inspect as _inspect_mod
+    monkeypatch.setattr(_inspect_mod, "_kdbg_cfg_only", lambda: cfg)
+    monkeypatch.setattr(_inspect_mod, "_kdbg_client", lambda _cfg: Client())
     reply = mcp_module.kdbg_context(
         disasm_count=4, stack_qwords=5, bt_depth=2,
         memory=[{"va": "0x1000", "length": 8}],

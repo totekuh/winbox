@@ -104,7 +104,11 @@ def mock_mcp(cfg):
     shared dir, which became unreliable after _exec_python started
     cleaning up its temp files in a finally block.
     """
-    import winbox.mcp as mcp_mod
+    import winbox.mcp._common as _common
+    import winbox.mcp._kdbg_walk as _kdbg_walk_mod
+    import winbox.mcp._kdbg_threads as _kdbg_threads_mod
+    import winbox.mcp._kdbg_triage as _kdbg_triage_mod
+    import winbox.mcp._kdbg_user as _kdbg_user_mod
     import winbox.kdbg.staging as staging_mod
 
     ga = MagicMock()
@@ -115,27 +119,31 @@ def mock_mcp(cfg):
     vm = MagicMock()
     vm.state.return_value = VMState.RUNNING
 
-    mcp_mod._cfg = cfg
-    mcp_mod._vm = vm
-    mcp_mod._ga = ga
-    # State is injected directly, so mark init complete: _get_state now keys
-    # its fast path on _initialized rather than on _cfg being non-None.
-    mcp_mod._initialized = True
+    _common._cfg = cfg
+    _common._vm = vm
+    _common._ga = ga
+    _common._initialized = True
 
-    original_exec_python = mcp_mod._exec_python
-    original_debug_snapshot = mcp_mod._kdbg_debug_snapshot
+    original_exec_python = _common._exec_python
+    original_debug_snapshots = {
+        "_kdbg_walk": _kdbg_walk_mod._kdbg_debug_snapshot,
+        "_kdbg_threads": _kdbg_threads_mod._kdbg_debug_snapshot,
+        "_kdbg_triage": _kdbg_triage_mod._kdbg_debug_snapshot,
+        "_kdbg_user": _kdbg_user_mod._kdbg_debug_snapshot,
+    }
     original_prepare_manifest = staging_mod.prepare_user_module_manifest
 
-    def capturing_exec_python(code, timeout=300, args=None):
+    def capturing_exec_python(code, timeout=300, args=None, **kwargs):
         ga.captured_code = code
         ga.captured_args_dict = args
-        return original_exec_python(code, timeout=timeout, args=args)
+        return original_exec_python(code, timeout=timeout, args=args, **kwargs)
 
-    mcp_mod._exec_python = capturing_exec_python
-    # Unit tests must never touch a real VM monitor. Transaction behavior has
-    # dedicated tests in test_kdbg_snapshot.py; individual MCP tests can
-    # override this stub when asserting the operation boundary.
-    mcp_mod._kdbg_debug_snapshot = lambda *_args, **_kwargs: nullcontext()
+    _common._exec_python = capturing_exec_python
+    _snapshot_stub = lambda *_args, **_kwargs: nullcontext()
+    _kdbg_walk_mod._kdbg_debug_snapshot = _snapshot_stub
+    _kdbg_threads_mod._kdbg_debug_snapshot = _snapshot_stub
+    _kdbg_triage_mod._kdbg_debug_snapshot = _snapshot_stub
+    _kdbg_user_mod._kdbg_debug_snapshot = _snapshot_stub
     staging_mod.prepare_user_module_manifest = lambda _cfg, _ga, _store, pid, **_kw: SimpleNamespace(
         pid=pid,
         summary=lambda: {
@@ -149,13 +157,16 @@ def mock_mcp(cfg):
 
     yield ga, vm, cfg
 
-    mcp_mod._exec_python = original_exec_python
-    mcp_mod._kdbg_debug_snapshot = original_debug_snapshot
+    _common._exec_python = original_exec_python
+    _kdbg_walk_mod._kdbg_debug_snapshot = original_debug_snapshots["_kdbg_walk"]
+    _kdbg_threads_mod._kdbg_debug_snapshot = original_debug_snapshots["_kdbg_threads"]
+    _kdbg_triage_mod._kdbg_debug_snapshot = original_debug_snapshots["_kdbg_triage"]
+    _kdbg_user_mod._kdbg_debug_snapshot = original_debug_snapshots["_kdbg_user"]
     staging_mod.prepare_user_module_manifest = original_prepare_manifest
-    mcp_mod._cfg = None
-    mcp_mod._vm = None
-    mcp_mod._ga = None
-    mcp_mod._initialized = False
+    _common._cfg = None
+    _common._vm = None
+    _common._ga = None
+    _common._initialized = False
 
 
 @pytest.fixture
@@ -221,8 +232,8 @@ class TestEnsureVmReady:
         vm.state.return_value = VMState.PAUSED
 
         from winbox.mcp import kdbg_ps
-        with patch("winbox.mcp._kdbg_get_store") as mock_store, \
-             patch("winbox.mcp._kdbg_list_processes", return_value=[]):
+        with patch("winbox.mcp._kdbg_walk._kdbg_get_store") as mock_store, \
+             patch("winbox.mcp._kdbg_walk._kdbg_list_processes", return_value=[]):
             mock_store.return_value = MagicMock()
             result = kdbg_ps()
         payload = _mcp_result(result)
@@ -435,7 +446,7 @@ class TestPythonTool:
     def test_credentials_are_forwarded(self, mock_mcp):
         from winbox.mcp import python
 
-        with patch("winbox.mcp._exec_python") as execute:
+        with patch("winbox.mcp._common._exec_python") as execute:
             execute.return_value = {
                 "stdout": "ok", "stderr": "", "exitcode": 0,
             }
@@ -2049,11 +2060,11 @@ class TestPipeSession:
         ga.exec.return_value = ExecResult(exitcode=0, stdout="pid:1234\n", stderr="")
 
         # Intercept _exec_python to write status.json immediately
-        import winbox.mcp as mcp_mod
-        real_exec = mcp_mod._exec_python
+        import winbox.mcp._common as _common
+        real_exec = _common._exec_python
 
-        def _fake_exec(code, timeout=300, args=None):
-            result = real_exec(code, timeout=timeout, args=args)
+        def _fake_exec(code, timeout=300, args=None, **kwargs):
+            result = real_exec(code, timeout=timeout, args=args, **kwargs)
             # Find the session dir that was just created and write status.json
             pipes_dir = cfg.shared_dir / ".mcp" / "pipes"
             for d in pipes_dir.iterdir():
@@ -2062,7 +2073,7 @@ class TestPipeSession:
                     sfile.write_text('{"status": "ready"}')
             return result
 
-        with patch.object(mcp_mod, '_exec_python', side_effect=_fake_exec):
+        with patch.object(_common, '_exec_python', side_effect=_fake_exec):
             session_id = pipe_open(name="srvsvc")
 
         assert len(session_id) == 12
@@ -2086,13 +2097,13 @@ class TestPipeSession:
         assert "spawner failed" in result
 
     def test_open_broker_error(self, mock_mcp):
-        import winbox.mcp as mcp_mod
+        import winbox.mcp._common as _common
         from unittest.mock import patch
         from winbox.mcp import pipe_open
         ga, vm, cfg = mock_mcp
         ga.exec.return_value = ExecResult(exitcode=0, stdout="pid:1234\n", stderr="")
 
-        def _fake_exec(code, timeout=300, args=None):
+        def _fake_exec(code, timeout=300, args=None, **kwargs):
             pipes_dir = cfg.shared_dir / ".mcp" / "pipes"
             if pipes_dir.exists():
                 for d in pipes_dir.iterdir():
@@ -2101,7 +2112,7 @@ class TestPipeSession:
                         sfile.write_text('{"status": "error", "error": "ACCESS_DENIED"}')
             return {"exitcode": 0, "stdout": "pid:1234\n", "stderr": ""}
 
-        with patch.object(mcp_mod, '_exec_python', side_effect=_fake_exec):
+        with patch.object(_common, '_exec_python', side_effect=_fake_exec):
             result = pipe_open(name="lsass")
 
         assert "ACCESS_DENIED" in result
@@ -2128,7 +2139,7 @@ class TestPipeSession:
             exitcode=0, stdout="4242 python.exe", stderr=""
         )
         ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
-        with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
+        with patch.object(mcp_mod._common, "_exec_python", side_effect=_fake_exec):
             pipe_open(name="lsass")
 
         taskkill_calls = [
@@ -2156,7 +2167,7 @@ class TestPipeSession:
             exitcode=0, stdout="7777 python.exe", stderr=""
         )
         ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
-        with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
+        with patch.object(mcp_mod._common, "_exec_python", side_effect=_fake_exec):
             result = pipe_open(name="srvsvc", timeout=0)  # instant timeout
 
         assert "timeout" in result
@@ -2192,7 +2203,7 @@ class TestPipeSession:
             exitcode=0, stdout="9191 python.exe", stderr=""
         )
         ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
-        with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
+        with patch.object(mcp_mod._common, "_exec_python", side_effect=_fake_exec):
             result = pipe_open(name="srvsvc", timeout=0)
 
         assert "timeout" in result
@@ -2221,7 +2232,7 @@ class TestPipeSession:
                         sfile.write_text('{"status": "ready"}')
             return {"exitcode": 0, "stdout": "pid:5555\n", "stderr": ""}
 
-        with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
+        with patch.object(mcp_mod._common, "_exec_python", side_effect=_fake_exec):
             session_id = pipe_open(name="srvsvc")
 
         assert len(session_id) == 12
@@ -2755,7 +2766,7 @@ class TestPipeBrokerOwnershipCheck:
             exitcode=0, stdout="INFO: No tasks", stderr=""
         )
         ga.exec_argv.return_value = ExecResult(exitcode=0, stdout="", stderr="")
-        with patch.object(mcp_mod, "_exec_python", side_effect=_fake_exec):
+        with patch.object(mcp_mod._common, "_exec_python", side_effect=_fake_exec):
             result = pipe_open(name="srvsvc", timeout=0)  # instant timeout
 
         assert "timeout" in result
@@ -2786,8 +2797,8 @@ class TestKdbgTools:
         ga, vm, cfg = mock_mcp
         cfg.vm_name = "winbox"
 
-        with patch("winbox.mcp._kdbg_hmp", return_value=self._stub_hmp_start()) as hmp, \
-             patch("winbox.mcp._kdbg_probe", return_value=False):
+        with patch("winbox.mcp._kdbg_infra._kdbg_hmp", return_value=self._stub_hmp_start()) as hmp, \
+             patch("winbox.mcp._kdbg_infra._kdbg_probe", return_value=False):
             result = kdbg_start()
 
         out = _mcp_result(result)
@@ -2802,9 +2813,9 @@ class TestKdbgTools:
         cfg = mock_mcp[2]
         cfg.vm_name = "winbox"
 
-        with patch("winbox.mcp._kdbg_hmp",
+        with patch("winbox.mcp._kdbg_infra._kdbg_hmp",
                    return_value=self._stub_hmp_start(port=9999)) as hmp, \
-             patch("winbox.mcp._kdbg_probe", return_value=False):
+             patch("winbox.mcp._kdbg_infra._kdbg_probe", return_value=False):
             result = kdbg_start(port=9999)
 
         assert _mcp_result(result)["port"] == 9999
@@ -2815,9 +2826,9 @@ class TestKdbgTools:
         cfg = mock_mcp[2]
         cfg.vm_name = "winbox"
 
-        with patch("winbox.mcp._kdbg_hmp",
+        with patch("winbox.mcp._kdbg_infra._kdbg_hmp",
                    return_value=self._stub_hmp_start(bind="0.0.0.0")) as hmp, \
-             patch("winbox.mcp._kdbg_probe", return_value=False):
+             patch("winbox.mcp._kdbg_infra._kdbg_probe", return_value=False):
             result = kdbg_start(any_interface=True)
 
         out = _mcp_result(result)
@@ -2830,8 +2841,8 @@ class TestKdbgTools:
         cfg = mock_mcp[2]
         cfg.vm_name = "winbox"
 
-        with patch("winbox.mcp._kdbg_hmp") as hmp, \
-             patch("winbox.mcp._kdbg_probe", return_value=True):
+        with patch("winbox.mcp._kdbg_infra._kdbg_hmp") as hmp, \
+             patch("winbox.mcp._kdbg_infra._kdbg_probe", return_value=True):
             result = kdbg_start()
 
         assert "already listening" in _mcp_error(result)["message"]
@@ -2839,8 +2850,8 @@ class TestKdbgTools:
 
     def test_start_refuses_when_persistent_reader_owns_stub(self, mock_mcp):
         from winbox.mcp import kdbg_start
-        with patch("winbox.mcp._kdbg_reader_info", return_value={"port": 4321}), \
-             patch("winbox.mcp._kdbg_hmp") as hmp:
+        with patch("winbox.mcp._kdbg_infra._kdbg_reader_info", return_value={"port": 4321}), \
+             patch("winbox.mcp._kdbg_infra._kdbg_hmp") as hmp:
             result = kdbg_start()
         error = _mcp_error(result)
         assert "reader already owns" in error["message"]
@@ -2852,7 +2863,7 @@ class TestKdbgTools:
         ga, vm, cfg = mock_mcp
         vm.state.return_value = VMState.SHUTOFF
 
-        with patch("winbox.mcp._kdbg_hmp") as hmp:
+        with patch("winbox.mcp._kdbg_infra._kdbg_hmp") as hmp:
             result = kdbg_start()
 
         assert "not running" in _mcp_error(result)["message"].lower()
@@ -2863,9 +2874,9 @@ class TestKdbgTools:
         cfg = mock_mcp[2]
         cfg.vm_name = "winbox"
 
-        with patch("winbox.mcp._kdbg_hmp",
+        with patch("winbox.mcp._kdbg_infra._kdbg_hmp",
                    return_value=(1, "", "qemu agent not connected")), \
-             patch("winbox.mcp._kdbg_probe", return_value=False):
+             patch("winbox.mcp._kdbg_infra._kdbg_probe", return_value=False):
             result = kdbg_start()
 
         error = _mcp_error(result)
@@ -2878,8 +2889,8 @@ class TestKdbgTools:
         cfg = mock_mcp[2]
         cfg.vm_name = "winbox"
 
-        with patch("winbox.mcp._kdbg_hmp", return_value=(0, "Unknown command", "")), \
-             patch("winbox.mcp._kdbg_probe", return_value=False):
+        with patch("winbox.mcp._kdbg_infra._kdbg_hmp", return_value=(0, "Unknown command", "")), \
+             patch("winbox.mcp._kdbg_infra._kdbg_probe", return_value=False):
             result = kdbg_start()
 
         assert "Unexpected HMP response" in _mcp_error(result)["message"]
@@ -2889,7 +2900,7 @@ class TestKdbgTools:
         cfg = mock_mcp[2]
         cfg.vm_name = "winbox"
 
-        with patch("winbox.mcp._kdbg_hmp",
+        with patch("winbox.mcp._kdbg_infra._kdbg_hmp",
                    return_value=(0, "Disabled gdbserver", "")) as hmp:
             result = kdbg_stop()
 
@@ -2901,7 +2912,7 @@ class TestKdbgTools:
         ga, vm, cfg = mock_mcp
         vm.state.return_value = VMState.SHUTOFF
 
-        with patch("winbox.mcp._kdbg_hmp") as hmp:
+        with patch("winbox.mcp._kdbg_infra._kdbg_hmp") as hmp:
             result = kdbg_stop()
 
         assert "not running" in _mcp_error(result)["message"].lower()
@@ -2912,7 +2923,7 @@ class TestKdbgTools:
         cfg = mock_mcp[2]
         cfg.vm_name = "winbox"
 
-        with patch("winbox.mcp._kdbg_hmp", return_value=(1, "", "monitor error")):
+        with patch("winbox.mcp._kdbg_infra._kdbg_hmp", return_value=(1, "", "monitor error")):
             result = kdbg_stop()
 
         assert "Failed to stop" in _mcp_error(result)["message"]
@@ -2920,7 +2931,7 @@ class TestKdbgTools:
     def test_status_listening(self, mock_mcp):
         from winbox.mcp import kdbg_status
 
-        with patch("winbox.mcp._kdbg_probe", return_value=True):
+        with patch("winbox.mcp._kdbg_infra._kdbg_probe", return_value=True):
             result = kdbg_status()
 
         out = _mcp_result(result)
@@ -2930,7 +2941,7 @@ class TestKdbgTools:
     def test_status_not_running(self, mock_mcp):
         from winbox.mcp import kdbg_status
 
-        with patch("winbox.mcp._kdbg_probe", return_value=False):
+        with patch("winbox.mcp._kdbg_infra._kdbg_probe", return_value=False):
             result = kdbg_status()
 
         assert _mcp_result(result)["state"] == "stopped"
@@ -2938,7 +2949,7 @@ class TestKdbgTools:
     def test_status_custom_port(self, mock_mcp):
         from winbox.mcp import kdbg_status
 
-        with patch("winbox.mcp._kdbg_probe", return_value=True) as probe:
+        with patch("winbox.mcp._kdbg_infra._kdbg_probe", return_value=True) as probe:
             result = kdbg_status(port=4321)
 
         out = _mcp_result(result)
@@ -2950,7 +2961,7 @@ class TestKdbgTools:
         ga, vm, cfg = mock_mcp
         vm.state.return_value = VMState.SHUTOFF
 
-        with patch("winbox.mcp._kdbg_probe") as probe:
+        with patch("winbox.mcp._kdbg_infra._kdbg_probe") as probe:
             result = kdbg_status()
 
         assert _mcp_result(result)["state"] == "vm_not_running"
@@ -2958,8 +2969,8 @@ class TestKdbgTools:
 
     def test_status_reports_connected_reader_without_probe(self, mock_mcp):
         from winbox.mcp import kdbg_status
-        with patch("winbox.mcp._kdbg_reader_info", return_value={"port": 1234}), \
-             patch("winbox.mcp._kdbg_probe") as probe:
+        with patch("winbox.mcp._kdbg_infra._kdbg_reader_info", return_value={"port": 1234}), \
+             patch("winbox.mcp._kdbg_infra._kdbg_probe") as probe:
             result = kdbg_status()
         out = _mcp_result(result)
         assert out["state"] == "connected"
@@ -2993,7 +3004,7 @@ class TestKdbgCetTools:
             safe_for_debug=True, user_shadow_stack="OFF", strict_mode="OFF",
             enabled_processes=(), unqueryable_processes=(),
         )
-        with patch("winbox.mcp._kdbg_query_cet_status", return_value=status):
+        with patch("winbox.mcp._kdbg_infra._kdbg_query_cet_status", return_value=status):
             result = kdbg_cet_status()
         out = _mcp_result(result)
         assert out["safe_for_debug"] is True
@@ -3012,7 +3023,7 @@ class TestKdbgCetTools:
             enabled_processes=("svchost[404]",),
             unqueryable_processes=(),
         )
-        with patch("winbox.mcp._kdbg_query_cet_status", return_value=status):
+        with patch("winbox.mcp._kdbg_infra._kdbg_query_cet_status", return_value=status):
             result = kdbg_cet_status()
         out = _mcp_result(result)
         assert out["safe_for_debug"] is False
@@ -3024,7 +3035,7 @@ class TestKdbgCetTools:
     def test_prepare_refuses_without_confirmation(self, mock_mcp):
         from winbox.mcp import kdbg_prepare
 
-        with patch("winbox.mcp._kdbg_prepare_cet") as prepare:
+        with patch("winbox.mcp._kdbg_infra._kdbg_prepare_cet") as prepare:
             result = kdbg_prepare()
         assert _mcp_error(result)["message"].startswith("refused:")
         prepare.assert_not_called()
@@ -3033,8 +3044,8 @@ class TestKdbgCetTools:
         from winbox.mcp import kdbg_prepare
 
         backup = tmp_path / "kdbg-cet-backup.json"
-        with patch("winbox.mcp._kdbg_stop_reader") as stop, patch(
-            "winbox.mcp._kdbg_prepare_cet", return_value=backup,
+        with patch("winbox.mcp._kdbg_infra._kdbg_stop_reader") as stop, patch(
+            "winbox.mcp._kdbg_infra._kdbg_prepare_cet", return_value=backup,
         ):
             result = kdbg_prepare(confirm=True)
         out = _mcp_result(result)
@@ -3045,7 +3056,7 @@ class TestKdbgCetTools:
     def test_restore_refuses_without_confirmation(self, mock_mcp):
         from winbox.mcp import kdbg_restore_cet
 
-        with patch("winbox.mcp._kdbg_restore_cet_policy") as restore:
+        with patch("winbox.mcp._kdbg_infra._kdbg_restore_cet_policy") as restore:
             result = kdbg_restore_cet()
         assert _mcp_error(result)["message"].startswith("refused:")
         restore.assert_not_called()
@@ -3071,8 +3082,8 @@ class TestKdbgListTools:
                           directory_table_base=0x7fa000),
         ]
 
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_list_processes", return_value=procs):
+        with patch("winbox.mcp._kdbg_walk._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_walk._kdbg_list_processes", return_value=procs):
             result = kdbg_ps()
 
         parsed = _mcp_result(result)["processes"]
@@ -3115,9 +3126,9 @@ class TestKdbgListTools:
             truncated_reason="cycle detected at ETHREAD list entry 0xffffae0012345578",
         )
 
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_find_process", return_value=target), \
-             patch("winbox.mcp._kdbg_list_threads", return_value=walked):
+        with patch("winbox.mcp._kdbg_threads._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_threads._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_threads._kdbg_list_threads", return_value=walked):
             result = _mcp_result(kdbg_threads(1234))
 
         assert result["pid"] == 1234
@@ -3172,9 +3183,9 @@ class TestKdbgListTools:
         walked = ThreadWalkResult(
             threads=[], complete=False, truncated_reason="ThreadListHead contained a null link",
         )
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_find_process", return_value=target), \
-             patch("winbox.mcp._kdbg_list_threads", return_value=walked):
+        with patch("winbox.mcp._kdbg_threads._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_threads._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_threads._kdbg_list_threads", return_value=walked):
             result = kdbg_threads(1234, require_complete=True)
 
         assert result["ok"] is False
@@ -3190,8 +3201,8 @@ class TestKdbgListTools:
             "scope": {"complete": True, "reasons": []},
             "rankings": {},
         }
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_triage_all_process_threads", return_value=expected) as triage:
+        with patch("winbox.mcp._kdbg_threads._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_triage._kdbg_triage_all_process_threads", return_value=expected) as triage:
             result = _mcp_result(kdbg_thread_triage(
                 process_cap=7, total_thread_cap=99, sample_per_process=3,
                 result_limit=5, resolve=False,
@@ -3211,8 +3222,8 @@ class TestKdbgListTools:
             "scope": {"complete": False, "reasons": ["process cap"]},
             "rankings": {},
         }
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_triage_all_process_threads", return_value=expected):
+        with patch("winbox.mcp._kdbg_triage._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_triage._kdbg_triage_all_process_threads", return_value=expected):
             result = kdbg_thread_triage(require_complete=True)
 
         assert result["ok"] is False
@@ -3225,9 +3236,9 @@ class TestKdbgListTools:
 
         _, _, cfg = mock_mcp
         cfg.vm_name = "winbox"
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_find_process", return_value=None), \
-             patch("winbox.mcp._kdbg_list_threads") as listed:
+        with patch("winbox.mcp._kdbg_threads._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_threads._kdbg_find_process", return_value=None), \
+             patch("winbox.mcp._kdbg_threads._kdbg_list_threads") as listed:
             error = _mcp_error(kdbg_threads(9999))
 
         assert error["message"] == "pid 9999 not found"
@@ -3276,11 +3287,11 @@ class TestKdbgListTools:
             eprocess=target.eprocess, pid=target.pid, process_name=target.name,
             tid=thread.tid, in_target_process=True,
         )
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_find_process", return_value=target), \
-             patch("winbox.mcp._kdbg_list_threads", return_value=ThreadWalkResult([thread], True)), \
-             patch("winbox.mcp._kdbg_resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
-             patch("winbox.mcp._kdbg_list_current_vcpu_threads", return_value=[current]):
+        with patch("winbox.mcp._kdbg_threads._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_threads._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_threads._kdbg_list_threads", return_value=ThreadWalkResult([thread], True)), \
+             patch("winbox.mcp._kdbg_threads._kdbg_resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
+             patch("winbox.mcp._kdbg_threads._kdbg_list_current_vcpu_threads", return_value=[current]):
             result = _mcp_result(kdbg_threads(1234, resolve=True))
 
         assert (result["count"], result["total_count"], result["matched_count"], result["returned"]) == (1, 1, 1, 1)
@@ -3318,12 +3329,12 @@ class TestKdbgListTools:
             },
             "records": {thread.ethread: {"complete": True, "owner_chain": []}},
         }
-        with patch("winbox.mcp._kdbg_get_store") as store, \
-             patch("winbox.mcp._kdbg_ensure_types_loaded") as ensure, \
-             patch("winbox.mcp._kdbg_find_process", return_value=target), \
-             patch("winbox.mcp._kdbg_list_threads", return_value=ThreadWalkResult([thread], True)), \
-             patch("winbox.mcp._kdbg_resolve_thread_wait_objects", return_value=evidence) as resolved, \
-             patch("winbox.mcp._kdbg_list_current_vcpu_threads", return_value=[]):
+        with patch("winbox.mcp._kdbg_threads._kdbg_get_store") as store, \
+             patch("winbox.mcp._kdbg_threads._kdbg_ensure_types_loaded") as ensure, \
+             patch("winbox.mcp._kdbg_threads._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_threads._kdbg_list_threads", return_value=ThreadWalkResult([thread], True)), \
+             patch("winbox.mcp._kdbg_threads._kdbg_resolve_thread_wait_objects", return_value=evidence) as resolved, \
+             patch("winbox.mcp._kdbg_threads._kdbg_list_current_vcpu_threads", return_value=[]):
             result = _mcp_result(kdbg_threads(
                 1234, wait_objects=True, wait_object_limit=1, wait_owner_depth=2,
             ))
@@ -3340,8 +3351,8 @@ class TestKdbgListTools:
     def test_kdbg_threads_wait_objects_refuse_summary_before_snapshot(self, mock_mcp):
         from winbox.mcp import kdbg_threads
 
-        with patch("winbox.mcp._kdbg_debug_snapshot") as snapshot, \
-             patch("winbox.mcp._kdbg_ensure_types_loaded") as ensure:
+        with patch("winbox.mcp._kdbg_threads._kdbg_debug_snapshot") as snapshot, \
+             patch("winbox.mcp._kdbg_threads._kdbg_ensure_types_loaded") as ensure:
             error = _mcp_error(kdbg_threads(1234, detail="summary", wait_objects=True))
 
         assert error["code"] == "invalid_argument"
@@ -3352,7 +3363,7 @@ class TestKdbgListTools:
     def test_kdbg_threads_wait_object_bounds_refuse_before_snapshot(self, mock_mcp):
         from winbox.mcp import kdbg_threads
 
-        with patch("winbox.mcp._kdbg_debug_snapshot") as snapshot:
+        with patch("winbox.mcp._kdbg_threads._kdbg_debug_snapshot") as snapshot:
             error = _mcp_error(kdbg_threads(1234, wait_object_limit=0))
 
         assert error["code"] == "invalid_argument"
@@ -3369,9 +3380,9 @@ class TestKdbgListTools:
             pid=1234, name="target.exe", eprocess=0xffffae00abcdef00,
             directory_table_base=0x7fa000,
         )
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_find_process", return_value=target), \
-             patch("winbox.mcp._kdbg_list_threads", return_value=ThreadWalkResult([], True)):
+        with patch("winbox.mcp._kdbg_threads._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_threads._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_threads._kdbg_list_threads", return_value=ThreadWalkResult([], True)):
             error = _mcp_error(kdbg_threads(1234, state="invented"))
 
         assert error["code"] == "invalid_argument"
@@ -3391,7 +3402,7 @@ class TestKdbgListTools:
             "mcp": {"catalog_revision": "test", "tool_count": 85},
             "notes": [],
         }
-        with patch("winbox.mcp._kdbg_collect_doctor", return_value=report) as doctor:
+        with patch("winbox.mcp._kdbg_infra._kdbg_collect_doctor", return_value=report) as doctor:
             result = _mcp_result(kdbg_doctor())
 
         assert result is report
@@ -3433,15 +3444,15 @@ class TestKdbgListTools:
             pid=target.pid, process_name=target.name, tid=thread.tid, in_target_process=True,
         )
         snapshot = MagicMock(return_value=nullcontext())
-        with patch("winbox.mcp._kdbg_debug_snapshot", snapshot), \
-             patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_find_process", return_value=target), \
-             patch("winbox.mcp._kdbg_list_threads", return_value=ThreadWalkResult([thread], True)), \
-             patch("winbox.mcp._kdbg_list_modules", return_value=[ModuleRecord("ntoskrnl.exe", 0xfffff80010000000, 0x4000, 0)]), \
-             patch("winbox.mcp._kdbg_ensure_types_loaded"), \
-             patch("winbox.mcp._kdbg_list_user_modules", return_value=[UserModuleRecord("target.exe", 0x7ff740000000, 0x4000, "C:\\target.exe", 0)]), \
-             patch("winbox.mcp._kdbg_resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
-             patch("winbox.mcp._kdbg_list_current_vcpu_threads", return_value=[current]):
+        with patch("winbox.mcp._kdbg_triage._kdbg_debug_snapshot", snapshot), \
+             patch("winbox.mcp._kdbg_triage._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_triage._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_triage._kdbg_list_threads", return_value=ThreadWalkResult([thread], True)), \
+             patch("winbox.mcp._kdbg_triage._kdbg_list_modules", return_value=[ModuleRecord("ntoskrnl.exe", 0xfffff80010000000, 0x4000, 0)]), \
+             patch("winbox.mcp._kdbg_triage._kdbg_ensure_types_loaded"), \
+             patch("winbox.mcp._kdbg_triage._kdbg_list_user_modules", return_value=[UserModuleRecord("target.exe", 0x7ff740000000, 0x4000, "C:\\target.exe", 0)]), \
+             patch("winbox.mcp._kdbg_triage._kdbg_resolve_thread_start_addresses", return_value=({thread.ethread: attribution}, ())), \
+             patch("winbox.mcp._kdbg_triage._kdbg_list_current_vcpu_threads", return_value=[current]):
             result = _mcp_result(kdbg_triage(1234, thread_limit=1))
 
         assert snapshot.call_count == 1
@@ -3470,9 +3481,9 @@ class TestKdbgListTools:
         baseline = MagicMock()
         capture = object()
         baseline.save.return_value = {"name": "case", "thread_count": 3}
-        with patch("winbox.mcp._KdbgThreadBaselineStore", return_value=baseline), \
-             patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_capture_thread_baseline", return_value=capture) as collected:
+        with patch("winbox.mcp._kdbg_threads._KdbgThreadBaselineStore", return_value=baseline), \
+             patch("winbox.mcp._kdbg_triage._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_threads._kdbg_capture_thread_baseline", return_value=capture) as collected:
             result = _mcp_result(kdbg_thread_baseline(1234, name="case"))
 
         assert result["name"] == "case"
@@ -3488,9 +3499,9 @@ class TestKdbgListTools:
 
         baseline = MagicMock()
         baseline.load.side_effect = BaselineNotFoundError("baseline 'case' was not found")
-        with patch("winbox.mcp._KdbgThreadBaselineStore", return_value=baseline), \
-             patch("winbox.mcp._kdbg_debug_snapshot") as snapshot, \
-             patch("winbox.mcp._kdbg_capture_thread_baseline") as collected:
+        with patch("winbox.mcp._kdbg_threads._KdbgThreadBaselineStore", return_value=baseline), \
+             patch("winbox.mcp._kdbg_threads._kdbg_debug_snapshot") as snapshot, \
+             patch("winbox.mcp._kdbg_threads._kdbg_capture_thread_baseline") as collected:
             error = _mcp_error(kdbg_thread_diff(1234, name="case"))
 
         assert error["code"] == "baseline_not_found"
@@ -3505,9 +3516,9 @@ class TestKdbgListTools:
         baseline = MagicMock()
         capture = object()
         baseline.diff.return_value = {"created_count": 0, "exited_count": 0, "changed_count": 1}
-        with patch("winbox.mcp._KdbgThreadBaselineStore", return_value=baseline), \
-             patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_capture_thread_baseline", return_value=capture):
+        with patch("winbox.mcp._kdbg_threads._KdbgThreadBaselineStore", return_value=baseline), \
+             patch("winbox.mcp._kdbg_threads._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_threads._kdbg_capture_thread_baseline", return_value=capture):
             result = _mcp_result(kdbg_thread_diff(1234, name="case", limit=8))
 
         assert result["changed_count"] == 1
@@ -3529,8 +3540,8 @@ class TestKdbgListTools:
                          size=0x00080000, entry=0xffffae0011120000),
         ]
 
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_list_modules", return_value=mods):
+        with patch("winbox.mcp._kdbg_walk._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_walk._kdbg_list_modules", return_value=mods):
             result = kdbg_lm()
 
         parsed = _mcp_result(result)["modules"]
@@ -3560,8 +3571,8 @@ class TestKdbgListTools:
                                eprocess=0xffffae0012345000,
                                directory_table_base=0x1ad000)]
 
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_list_processes", return_value=procs):
+        with patch("winbox.mcp._kdbg_walk._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_walk._kdbg_list_processes", return_value=procs):
             result = kdbg_ps()
 
         vm.resume.assert_not_called()
@@ -3582,9 +3593,9 @@ class TestKdbgListTools:
                                directory_table_base=0x7fa000)
         payload = b"\xde\xad\xbe\xef"
 
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_find_process", return_value=target), \
-             patch("winbox.mcp._kdbg_read_virt_cr3", return_value=payload):
+        with patch("winbox.mcp._kdbg_walk._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_user._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_user._kdbg_read_virt_cr3", return_value=payload):
             result = kdbg_read_va(pid=1234, address="0x7ff600001000", length=4)
 
         vm.resume.assert_not_called()
@@ -3618,9 +3629,9 @@ class TestKdbgListTools:
             events.append("walk")
             return [ProcessRecord(4, "System", 0x1000, 0x2000)]
 
-        with patch("winbox.mcp._kdbg_debug_snapshot", snapshot), \
-             patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_list_processes", side_effect=walk):
+        with patch("winbox.mcp._kdbg_walk._kdbg_debug_snapshot", snapshot), \
+             patch("winbox.mcp._kdbg_walk._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_walk._kdbg_list_processes", side_effect=walk):
             kdbg_ps()
 
         assert events == ["enter", "walk", "exit"]
@@ -3655,10 +3666,10 @@ class TestKdbgListTools:
             events.append("read")
             return b"OK"
 
-        with patch("winbox.mcp._kdbg_debug_snapshot", snapshot), \
-             patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_find_process", side_effect=find), \
-             patch("winbox.mcp._kdbg_read_virt_cr3", side_effect=read):
+        with patch("winbox.mcp._kdbg_user._kdbg_debug_snapshot", snapshot), \
+             patch("winbox.mcp._kdbg_user._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_user._kdbg_find_process", side_effect=find), \
+             patch("winbox.mcp._kdbg_user._kdbg_read_virt_cr3", side_effect=read):
             result = kdbg_read_va(1234, "0x1000", 2)
 
         assert _mcp_result(result)["bytes"] == "4f4b"
@@ -3689,14 +3700,14 @@ class TestKdbgEvidenceTools:
         handles = {"handle_table": {"address": "0xffff800000223000"}, "enumeration": {"available": False}}
         header = SimpleNamespace(public=lambda: {"body": "0xffff800000123450", "type_index": 5})
 
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_ensure_vad_layouts"), \
-             patch("winbox.mcp._kdbg_ensure_object_layouts"), \
-             patch("winbox.mcp._kdbg_find_process", return_value=target), \
-             patch("winbox.mcp._kdbg_list_vads", return_value=walked) as listed, \
-             patch("winbox.mcp._kdbg_token_evidence", return_value=token), \
-             patch("winbox.mcp._kdbg_handle_table_status", return_value=handles), \
-             patch("winbox.mcp._kdbg_object_header", return_value=header):
+        with patch("winbox.mcp._kdbg_walk._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_walk._kdbg_ensure_vad_layouts"), \
+             patch("winbox.mcp._kdbg_walk._kdbg_ensure_object_layouts"), \
+             patch("winbox.mcp._kdbg_walk._kdbg_find_process", return_value=target), \
+             patch("winbox.mcp._kdbg_walk._kdbg_list_vads", return_value=walked) as listed, \
+             patch("winbox.mcp._kdbg_walk._kdbg_token_evidence", return_value=token), \
+             patch("winbox.mcp._kdbg_walk._kdbg_handle_table_status", return_value=handles), \
+             patch("winbox.mcp._kdbg_walk._kdbg_object_header", return_value=header):
             vad = _mcp_result(kdbg_vad(1234, executable=True, limit=1))
             primary = _mcp_result(kdbg_token(1234))
             table = _mcp_result(kdbg_handles(1234))
@@ -3715,8 +3726,8 @@ class TestKdbgEvidenceTools:
             "snapshot_metadata": {"phases_ms": {"capture": 1.0}},
         }
         expected_diff = {"schema": "winbox.kdbg-capture-diff/1", "profile": "process", "identity_match": True}
-        with patch("winbox.mcp._kdbg_get_store"), \
-             patch("winbox.mcp._kdbg_capture_live", return_value=capture) as live:
+        with patch("winbox.mcp._kdbg_walk._kdbg_get_store"), \
+             patch("winbox.mcp._kdbg_walk._kdbg_capture_live", return_value=capture) as live:
             result = _mcp_result(kdbg_capture(profile="process", pid=1234))
         assert result == {"capture": capture, "saved": None}
         assert live.call_args.kwargs == {
@@ -3725,8 +3736,8 @@ class TestKdbgEvidenceTools:
 
         capture_store = MagicMock()
         capture_store.load.side_effect = [{"schema": "left"}, {"schema": "right"}]
-        with patch("winbox.mcp._KdbgCaptureStore", return_value=capture_store), \
-             patch("winbox.mcp._kdbg_diff_captures", return_value=expected_diff) as diff:
+        with patch("winbox.mcp._kdbg_walk._KdbgCaptureStore", return_value=capture_store), \
+             patch("winbox.mcp._kdbg_walk._kdbg_diff_captures", return_value=expected_diff) as diff:
             result = _mcp_result(kdbg_capture_diff("left", "right", limit=8))
         assert result == expected_diff
         diff.assert_called_once_with(
@@ -3747,9 +3758,9 @@ class TestKdbgEvidenceTools:
             "name": "private-rwx", "blob_path": "/evidence/private-rwx.bin",
             "manifest_path": "/evidence/private-rwx.json",
         }
-        with patch("winbox.mcp._kdbg_get_store") as symbols, \
-             patch("winbox.mcp._kdbg_extract_vad_live", return_value=extraction) as extract, \
-             patch("winbox.mcp._KdbgVadExtractStore", return_value=artifacts):
+        with patch("winbox.mcp._kdbg_walk._kdbg_get_store") as symbols, \
+             patch("winbox.mcp._kdbg_walk._kdbg_extract_vad_live", return_value=extraction) as extract, \
+             patch("winbox.mcp._kdbg_walk._KdbgVadExtractStore", return_value=artifacts):
             result = _mcp_result(kdbg_vad_extract(
                 1234, "0x40000000", "private-rwx", length=4096,
             ))
@@ -3766,7 +3777,7 @@ class TestKdbgEvidenceTools:
     def test_vad_extract_rejects_invalid_length_before_touching_vm(self, mock_mcp):
         from winbox.mcp import kdbg_vad_extract
 
-        with patch("winbox.mcp._kdbg_extract_vad_live") as extract:
+        with patch("winbox.mcp._kdbg_walk._kdbg_extract_vad_live") as extract:
             error = _mcp_error(kdbg_vad_extract(1234, "0x40000000", "case", length=True))
         assert error["code"] == "invalid_argument"
         extract.assert_not_called()
@@ -3777,8 +3788,8 @@ class TestKdbgEvidenceTools:
 
         artifacts = MagicMock()
         artifacts.validate_name.side_effect = VadExtractError("artifact name must match safe pattern")
-        with patch("winbox.mcp._KdbgVadExtractStore", return_value=artifacts), \
-             patch("winbox.mcp._kdbg_extract_vad_live") as extract:
+        with patch("winbox.mcp._kdbg_walk._KdbgVadExtractStore", return_value=artifacts), \
+             patch("winbox.mcp._kdbg_walk._kdbg_extract_vad_live") as extract:
             error = _mcp_error(kdbg_vad_extract(1234, "0x40000000", "../../escape"))
         assert error["code"] == "vad_extract_error"
         extract.assert_not_called()
@@ -3789,8 +3800,8 @@ class TestKdbgEvidenceTools:
 
         artifacts = MagicMock()
         artifacts.ensure_available.side_effect = VadExtractError("artifact already exists and is immutable")
-        with patch("winbox.mcp._KdbgVadExtractStore", return_value=artifacts), \
-             patch("winbox.mcp._kdbg_extract_vad_live") as extract:
+        with patch("winbox.mcp._kdbg_walk._KdbgVadExtractStore", return_value=artifacts), \
+             patch("winbox.mcp._kdbg_walk._kdbg_extract_vad_live") as extract:
             error = _mcp_error(kdbg_vad_extract(1234, "0x40000000", "case"))
         assert error["code"] == "vad_extract_error"
         extract.assert_not_called()
@@ -3845,9 +3856,9 @@ class TestKdbgDaemonTools:
             "target_name": "notepad.exe", "daemon_pid": 1234,
             "gdbstub_port": 1234,
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
              patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
-             patch("winbox.mcp._fork_daemon", return_value=1234) as ff:
+             patch("winbox.mcp._kdbg_session._fork_daemon", return_value=1234) as ff:
             result = kdbg_attach(4584)
 
         ff.assert_called_once()
@@ -3870,10 +3881,10 @@ class TestKdbgDaemonTools:
                 "staging_policy": kwargs["policy"], "staged": 1,
             })
 
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
              patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
              patch.object(staging_module, "prepare_user_module_manifest", prepare), \
-             patch("winbox.mcp._fork_daemon", return_value=1234):
+             patch("winbox.mcp._kdbg_session._fork_daemon", return_value=1234):
             result = kdbg_attach(4584, staging_policy="binaries")
         assert result["ok"] is True
         assert captured["policy"] == "binaries"
@@ -3884,13 +3895,13 @@ class TestKdbgDaemonTools:
         import winbox.kdbg.staging as staging_module
 
         client = self._client_with(alive=False)
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
              patch.object(
                  staging_module, "preflight_user_module_staging",
                  return_value={"schema": "winbox.kdbg-staging-preflight/1", "dry_run": True},
              ) as preflight, \
              patch("winbox.kdbg.hmp.gdbstub_has_client") as probe, \
-             patch("winbox.mcp._fork_daemon") as fork:
+             patch("winbox.mcp._kdbg_session._fork_daemon") as fork:
             result = kdbg_attach(4584, staging_policy="cached-only", preflight=True)
         assert _mcp_result(result)["dry_run"] is True
         preflight.assert_called_once()
@@ -3906,13 +3917,13 @@ class TestKdbgDaemonTools:
         _ga, _vm, cfg = mock_mcp
         BreakpointIntentStore(cfg).add("mpengine+0x40")
         client = self._client_with(alive=False)
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
              patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
              patch.object(
                  staging_module, "prepare_user_module_manifest",
                  wraps=staging_module.prepare_user_module_manifest,
              ), \
-             patch("winbox.mcp._fork_daemon", return_value=1234) as fork:
+             patch("winbox.mcp._kdbg_session._fork_daemon", return_value=1234) as fork:
             kdbg_attach(4584)
             assert fork.call_args.kwargs["breakpoint_intents"] is None
             kdbg_attach(4584, apply_intents=True)
@@ -3937,13 +3948,13 @@ class TestKdbgDaemonTools:
             ),
         )
         manifest = UserModuleManifest(pid=4584, modules=modules)
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
              patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
              patch.object(
                  staging_module, "prepare_user_module_manifest",
                  return_value=manifest,
              ), \
-             patch("winbox.mcp._fork_daemon", return_value=1234), \
+             patch("winbox.mcp._kdbg_session._fork_daemon", return_value=1234), \
              patch(
                  "winbox.kdbg.decomp.start_prepare_background",
                  return_value={"token": "c" * 32, "state": "starting"},
@@ -3957,12 +3968,12 @@ class TestKdbgDaemonTools:
         from winbox.kdbg.staging import StagingError
 
         client = self._client_with(alive=False)
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
              patch(
                  "winbox.kdbg.staging.prepare_user_module_manifest",
                  side_effect=StagingError("loader inventory corrupt"),
              ), \
-             patch("winbox.mcp._fork_daemon") as ff:
+             patch("winbox.mcp._kdbg_session._fork_daemon") as ff:
             result = kdbg_attach(4584)
         ff.assert_not_called()
         assert "loader inventory corrupt" in _mcp_error(result)["message"]
@@ -3970,8 +3981,8 @@ class TestKdbgDaemonTools:
     def test_attach_refuses_when_session_already_alive(self, mock_mcp):
         from winbox.mcp import kdbg_attach
         client = self._client_with(alive=True)
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
-             patch("winbox.mcp._fork_daemon") as ff:
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
+             patch("winbox.mcp._kdbg_session._fork_daemon") as ff:
             result = kdbg_attach(4584)
 
         ff.assert_not_called()
@@ -3982,9 +3993,9 @@ class TestKdbgDaemonTools:
     def test_attach_refuses_when_gdb_client_connected(self, mock_mcp):
         from winbox.mcp import kdbg_attach
         client = self._client_with(alive=False)
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
              patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=True), \
-             patch("winbox.mcp._fork_daemon") as ff:
+             patch("winbox.mcp._kdbg_session._fork_daemon") as ff:
             result = kdbg_attach(4584)
         ff.assert_not_called()
         assert "another gdb client" in _mcp_error(result)["message"]
@@ -3994,9 +4005,9 @@ class TestKdbgDaemonTools:
         client = self._client_with(alive=False)
         client.session_info.return_value = {"target_pid": 4584, "target_name": "test.exe",
                                             "target_dtb": "0x1ae000", "gdbstub_port": 1234}
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
              patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
-             patch("winbox.mcp._fork_daemon", return_value=12345):
+             patch("winbox.mcp._kdbg_session._fork_daemon", return_value=12345):
             result = kdbg_attach(4584)
         assert "daemon_pid" in _mcp_result(result)
 
@@ -4006,11 +4017,11 @@ class TestKdbgDaemonTools:
         proc = self._fake_proc(pid=99999)
         client = self._client_with(alive=False)
         fake_store = MagicMock()
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
-             patch("winbox.mcp._kdbg_get_store", return_value=fake_store), \
-             patch("winbox.mcp._kdbg_list_processes", return_value=[proc]), \
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
+             patch("winbox.mcp._kdbg_session._kdbg_get_store", return_value=fake_store), \
+             patch("winbox.mcp._kdbg_walk._kdbg_list_processes", return_value=[proc]), \
              patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
-             patch("winbox.mcp._fork_daemon", side_effect=DaemonError("gdbstub refused")):
+             patch("winbox.mcp._kdbg_session._fork_daemon", side_effect=DaemonError("gdbstub refused")):
             result = kdbg_attach(99999)
         assert _mcp_error(result)["message"] == "gdbstub refused"
 
@@ -4025,11 +4036,11 @@ class TestKdbgDaemonTools:
         })
         fake_store = MagicMock()
         hvci_on = HvciStatus(vbs_enabled=True, hvci_enabled=True, hypervisor_off=False)
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
-             patch("winbox.mcp._kdbg_get_store", return_value=fake_store), \
-             patch("winbox.mcp._kdbg_list_processes", return_value=[proc]), \
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
+             patch("winbox.mcp._kdbg_session._kdbg_get_store", return_value=fake_store), \
+             patch("winbox.mcp._kdbg_walk._kdbg_list_processes", return_value=[proc]), \
              patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
-             patch("winbox.mcp._fork_daemon", return_value=1234), \
+             patch("winbox.mcp._kdbg_session._fork_daemon", return_value=1234), \
              patch("winbox.hvci.status", return_value=hvci_on):
             result = kdbg_attach(4584)
         out = _mcp_result(result)
@@ -4047,11 +4058,11 @@ class TestKdbgDaemonTools:
         })
         fake_store = MagicMock()
         hvci_off = HvciStatus(vbs_enabled=False, hvci_enabled=False, hypervisor_off=True)
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
-             patch("winbox.mcp._kdbg_get_store", return_value=fake_store), \
-             patch("winbox.mcp._kdbg_list_processes", return_value=[proc]), \
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client), \
+             patch("winbox.mcp._kdbg_session._kdbg_get_store", return_value=fake_store), \
+             patch("winbox.mcp._kdbg_walk._kdbg_list_processes", return_value=[proc]), \
              patch("winbox.kdbg.hmp.gdbstub_has_client", return_value=False), \
-             patch("winbox.mcp._fork_daemon", return_value=1234), \
+             patch("winbox.mcp._kdbg_session._fork_daemon", return_value=1234), \
              patch("winbox.hvci.status", return_value=hvci_off):
             result = kdbg_attach(4584)
         out = _mcp_result(result)
@@ -4062,7 +4073,7 @@ class TestKdbgDaemonTools:
     def test_session_when_not_attached(self, mock_mcp):
         from winbox.mcp import kdbg_session
         client = self._client_with(alive=False)
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             result = kdbg_session()
         assert _mcp_result(result) == {"attached": False, "pagewalk": False}
 
@@ -4072,7 +4083,7 @@ class TestKdbgDaemonTools:
             "target": {"pid": 4584, "dtb": "0x4d6bb000", "name": "notepad.exe"},
             "bps": 1, "halted": True, "uptime_s": 12.3, "daemon_pid": 1234,
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             result = kdbg_session()
         out = _mcp_result(result)
         assert out["attached"] is True
@@ -4084,7 +4095,7 @@ class TestKdbgDaemonTools:
         client = self._client_with(call_result={
             "state": "gone", "reason": "pid_reused", "advisory": True,
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             result = kdbg_target_status()
         assert _mcp_result(result)["state"] == "gone"
         client.call.assert_called_once_with("target_status")
@@ -4097,7 +4108,7 @@ class TestKdbgDaemonTools:
             "id": 0, "va": "0x7ff7b04eeabc",
             "user_mode": True, "hw": True, "elapsed_ms": 3.7,
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             result = kdbg_bp("notepad!Save")
         # Default mode is "hw" — verify it's forwarded
         client.call.assert_called_once_with(
@@ -4113,7 +4124,7 @@ class TestKdbgDaemonTools:
             "id": 0, "va": "0x7ff7b04eeabc",
             "user_mode": True, "hw": False, "elapsed_ms": 4.2,
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             kdbg_bp("notepad!Save", mode="soft")
         client.call.assert_called_once_with(
             "bp_add", target="notepad!Save", mode="soft", condition=None,
@@ -4123,7 +4134,7 @@ class TestKdbgDaemonTools:
         from winbox.mcp import kdbg_bp
         from winbox.kdbg.debugger.client import ClientError
         client = self._client_with(call_raises=ClientError("Z0 failed: E22"))
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             result = kdbg_bp("notepad!Cold")
         assert _mcp_error(result)["message"] == "Z0 failed: E22"
 
@@ -4133,7 +4144,7 @@ class TestKdbgDaemonTools:
             "id": 1, "va": "0xfffff806123456", "user_mode": False,
             "hw": True, "condition": "rcx == 0xdeadbeef", "elapsed_ms": 2.1,
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             kdbg_bp("nt!NtClose", condition="rcx == 0xdeadbeef")
         client.call.assert_called_once_with(
             "bp_add", target="nt!NtClose", mode="hw",
@@ -4146,7 +4157,7 @@ class TestKdbgDaemonTools:
             "id": 0, "va": "0x1", "user_mode": False, "hw": True,
             "condition": None, "elapsed_ms": 1.0,
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             kdbg_bp("nt!Foo", condition="   ")
         client.call.assert_called_once_with(
             "bp_add", target="nt!Foo", mode="hw", condition=None,
@@ -4156,7 +4167,7 @@ class TestKdbgDaemonTools:
         from winbox.mcp import kdbg_bp
         client = self._client_with(call_result={"id": 0})
         actions = ["byte(rcx)", "bytes(rdx,16)"]
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             kdbg_bp("nt!Foo", actions=actions)
         client.call.assert_called_once_with(
             "bp_add", target="nt!Foo", mode="hw", condition=None,
@@ -4171,7 +4182,7 @@ class TestKdbgDaemonTools:
             "bps": [{"id": 0, "va": "0x...", "target": "x", "user_mode": True,
                      "hits": 5, "age_s": 1.2}]
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             result = kdbg_bps()
         out = _mcp_result(result)
         assert len(out["bps"]) == 1
@@ -4183,7 +4194,7 @@ class TestKdbgDaemonTools:
             "id": 3, "entries": [], "total": 100, "returned": 0,
             "truncated": False,
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             result = kdbg_bp_trace(
                 3,
                 from_hit=40,
@@ -4215,7 +4226,7 @@ class TestKdbgDaemonTools:
             "id": 1, "entries": [], "total": 0, "returned": 0,
             "truncated": False,
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             kdbg_bp_trace(1)
 
         client.call.assert_called_once_with(
@@ -4226,7 +4237,7 @@ class TestKdbgDaemonTools:
     def test_rm_passes_id(self, mock_mcp):
         from winbox.mcp import kdbg_rm
         client = self._client_with(call_result={"removed": 0, "va": "0x123"})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_session._kdbg_client", return_value=client):
             kdbg_rm(0)
         client.call.assert_called_once_with("bp_remove", id=0)
 
@@ -4237,7 +4248,7 @@ class TestKdbgDaemonTools:
         client-side socket timeout. They MUST NOT collide."""
         from winbox.mcp import kdbg_cont
         client = self._client_with(call_result={"reason": "bp"})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_run._kdbg_client", return_value=client):
             kdbg_cont(timeout=15.0)
         # Call must be call("cont", sock_timeout=25.0, timeout=15.0)
         args, kwargs = client.call.call_args
@@ -4252,7 +4263,7 @@ class TestKdbgDaemonTools:
             "cr3": "0x4d6bb000", "in_target": True,
             "bp_id": 0, "bp_target": "notepad!SaveFile",
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_run._kdbg_client", return_value=client):
             result = kdbg_cont()
         out = _mcp_result(result)
         assert out["reason"] == "bp"
@@ -4313,14 +4324,14 @@ class TestKdbgDaemonTools:
     def test_step_calls_daemon(self, mock_mcp):
         from winbox.mcp import kdbg_step
         client = self._client_with(call_result={"reason": "step", "rip": "0x..."})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_run._kdbg_client", return_value=client):
             kdbg_step()
         client.call.assert_called_once_with("step")
 
     def test_interrupt_calls_daemon(self, mock_mcp):
         from winbox.mcp import kdbg_interrupt
         client = self._client_with(call_result={"queued": True})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_run._kdbg_client", return_value=client):
             kdbg_interrupt()
         client.call.assert_called_once_with("interrupt")
 
@@ -4331,7 +4342,7 @@ class TestKdbgDaemonTools:
         client = self._client_with(call_result={
             "rip": "0x123", "rsp": "0x456", "cr3": "0x789",
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_run._kdbg_client", return_value=client):
             out = _mcp_result(kdbg_regs())
         assert out["rip"] == "0x123"
         assert out["cr3"] == "0x789"
@@ -4339,14 +4350,14 @@ class TestKdbgDaemonTools:
     def test_mem_passes_va_and_length(self, mock_mcp):
         from winbox.mcp import kdbg_mem
         client = self._client_with(call_result={"va": "0x1000", "bytes": "deadbeef"})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             kdbg_mem("0x1000", length=4)
         client.call.assert_called_once_with("mem", va="0x1000", length=4)
 
     def test_write_mem_passes_va_and_data(self, mock_mcp):
         from winbox.mcp import kdbg_write_mem
         client = self._client_with(call_result={"va": "0x1000", "length": 4})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             result = kdbg_write_mem("0x1000", "deadbeef")
         client.call.assert_called_once_with("write_mem", va="0x1000", data="deadbeef")
         out = _mcp_result(result)
@@ -4356,7 +4367,7 @@ class TestKdbgDaemonTools:
         from winbox.mcp import kdbg_write_mem
         from winbox.kdbg.debugger.client import ClientError
         client = self._client_with(call_raises=ClientError("M failed: E22"))
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             result = kdbg_write_mem("0x1000", "ff")
         assert _mcp_error(result)["message"] == "M failed: E22"
 
@@ -4364,7 +4375,7 @@ class TestKdbgDaemonTools:
         from winbox.mcp import kdbg_mem
         # "abc" in UTF-16LE = 61 00 62 00 63 00
         client = self._client_with(call_result={"va": "0x1000", "bytes": "610062006300"})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             result = kdbg_mem("0x1000", length=6, decode="utf-16le")
         out = _mcp_result(result)
         assert out["decoded"] == "abc"
@@ -4373,7 +4384,7 @@ class TestKdbgDaemonTools:
         from winbox.mcp import kdbg_mem
         # "hello" in UTF-8 = 68 65 6c 6c 6f
         client = self._client_with(call_result={"va": "0x1000", "bytes": "68656c6c6f"})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             result = kdbg_mem("0x1000", length=5, decode="utf-8")
         out = _mcp_result(result)
         assert out["decoded"] == "hello"
@@ -4382,7 +4393,7 @@ class TestKdbgDaemonTools:
         from winbox.mcp import kdbg_mem
         # bytes: 41 42 01 7f 43 (A B ctrl-A DEL C)
         client = self._client_with(call_result={"va": "0x1", "bytes": "41420143"})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             result = kdbg_mem("0x1", length=4, decode="ascii")
         out = _mcp_result(result)
         assert out["decoded"] == "AB.C"
@@ -4393,7 +4404,7 @@ class TestKdbgDaemonTools:
         client = self._client_with(call_result={
             "va": "0x1", "bytes": "68656c6c6f00" + "7461696c"
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             result = kdbg_mem("0x1", length=10, decode="cstr")
         out = _mcp_result(result)
         assert out["decoded"] == "hello"
@@ -4401,7 +4412,7 @@ class TestKdbgDaemonTools:
     def test_mem_decode_hex_default_no_decode_field(self, mock_mcp):
         from winbox.mcp import kdbg_mem
         client = self._client_with(call_result={"va": "0x1", "bytes": "deadbeef"})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             result = kdbg_mem("0x1", length=4)
         out = _mcp_result(result)
         assert "decoded" not in out  # default hex mode keeps raw
@@ -4409,7 +4420,7 @@ class TestKdbgDaemonTools:
     def test_mem_decode_unknown_mode_surfaces_in_decoded(self, mock_mcp):
         from winbox.mcp import kdbg_mem
         client = self._client_with(call_result={"va": "0x1", "bytes": "00"})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             result = kdbg_mem("0x1", length=1, decode="bogus")
         out = _mcp_result(result)
         assert "unknown decode" in out["decoded"]
@@ -4425,7 +4436,7 @@ class TestKdbgDaemonTools:
             {"rip": "0x401000", "rsp": "0x0", "cr3": "0x0"},  # regs reply
             {"va": "0x401000", "bytes": "9090c3"},            # mem reply
         ]
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_run._kdbg_client", return_value=client):
             result = kdbg_disasm(addr="", count=4)
         out = _mcp_result(result)
         assert out["base"] == "0x401000"
@@ -4440,7 +4451,7 @@ class TestKdbgDaemonTools:
 
         client = MagicMock()
         client.call.return_value = {"va": "0x500000", "bytes": "90"}
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_run._kdbg_client", return_value=client):
             out = _mcp_result(kdbg_disasm(
                 addr="0x500000", count=1, instruction_bytes=True,
             ))
@@ -4451,7 +4462,7 @@ class TestKdbgDaemonTools:
         client = MagicMock()
         # Only mem call expected (no regs since addr was given)
         client.call.return_value = {"va": "0x500000", "bytes": "488d0500000000"}
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_run._kdbg_client", return_value=client):
             result = kdbg_disasm(addr="0x500000", count=1)
         # Only mem should be called once.
         assert client.call.call_count == 1
@@ -4462,7 +4473,7 @@ class TestKdbgDaemonTools:
 
     def test_disasm_invalid_addr_returns_error(self, mock_mcp):
         from winbox.mcp import kdbg_disasm
-        with patch("winbox.mcp._kdbg_client", return_value=MagicMock()):
+        with patch("winbox.mcp._kdbg_run._kdbg_client", return_value=MagicMock()):
             result = kdbg_disasm(addr="not_a_number", count=1)
         error = _mcp_error(result)
         assert error["code"] == "invalid_argument"
@@ -4474,7 +4485,7 @@ class TestKdbgDaemonTools:
             "rsp": "0x100",
             "qwords": [{"offset": "rsp+0x00", "va": "0x100", "value": "0x0000000000000001"}],
         })
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             kdbg_stack(n=8)
         client.call.assert_called_once_with("stack", n=8)
 
@@ -4486,7 +4497,7 @@ class TestKdbgDaemonTools:
             {"offset": "rsp+0x08", "va": "0x1008", "value": "0x00000000cafebabe"},
         ]
         client = self._client_with(call_result={"rsp": "0x1000", "qwords": qwords})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             result = kdbg_stack(n=2)
         parsed = _mcp_result(result)
         assert parsed["rsp"] == "0x1000"
@@ -4500,7 +4511,7 @@ class TestKdbgDaemonTools:
         import json as _json
         raw_hex = "efbeadde00000000" + "bebafeca00000000"
         client = self._client_with(call_result={"va": "0x1000", "bytes": raw_hex})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             result = kdbg_mem(va="0x1000", length=16, decode="qwords")
         parsed = _mcp_result(result)
         assert parsed["decoded"] == [
@@ -4511,7 +4522,7 @@ class TestKdbgDaemonTools:
     def test_bt_passes_depth(self, mock_mcp):
         from winbox.mcp import kdbg_bt
         client = self._client_with(call_result={"rsp": "0x100", "frames": []})
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_inspect._kdbg_client", return_value=client):
             kdbg_bt(depth=12)
         client.call.assert_called_once_with("bt", depth=12)
 
@@ -4520,7 +4531,7 @@ class TestKdbgDaemonTools:
     def test_detach_no_session_is_noop(self, mock_mcp):
         from winbox.mcp import kdbg_detach
         client = self._client_with(alive=False)
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_recovery._kdbg_client", return_value=client):
             result = kdbg_detach()
         assert _mcp_result(result) == {
             "detached": False, "already_detached": True,
@@ -4537,7 +4548,7 @@ class TestKdbgDaemonTools:
             "resume_safe": True,
             "cr3_poisoned": False,
         }
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_recovery._kdbg_client", return_value=client), \
              patch("winbox.kdbg.hmp.ensure_not_paused", return_value=None) as guard:
             result = kdbg_detach()
         client.call.assert_called_once_with("detach")
@@ -4557,7 +4568,7 @@ class TestKdbgDaemonTools:
             "cr3_poisoned": True,
             "recovery": "restore snapshot before resuming",
         }
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_recovery._kdbg_client", return_value=client), \
              patch("winbox.kdbg.hmp.ensure_not_paused") as guard:
             result = kdbg_detach()
 
@@ -4574,7 +4585,7 @@ class TestKdbgDaemonTools:
         client = MagicMock()
         client.session_alive.side_effect = [True, False]
         client.call.side_effect = ClientError("connection closed")
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_recovery._kdbg_client", return_value=client), \
              patch("winbox.kdbg.hmp.ensure_not_paused") as guard:
             result = kdbg_detach()
 
@@ -4588,19 +4599,19 @@ class TestKdbgDaemonTools:
 
     def test_resume_refuses_when_session_active(self, mock_mcp):
         from winbox.mcp import kdbg_resume
-        import winbox.mcp as mcp_mod
-        mcp_mod._vm.state.return_value = VMState.PAUSED
+        import winbox.mcp._common as _common
+        _common._vm.state.return_value = VMState.PAUSED
         client = self._client_with(alive=True)
-        with patch("winbox.mcp._kdbg_client", return_value=client):
+        with patch("winbox.mcp._kdbg_recovery._kdbg_client", return_value=client):
             result = kdbg_resume()
         assert "kdbg_detach instead" in _mcp_error(result)["message"]
 
     def test_resume_errors_when_no_gdbstub(self, mock_mcp):
         from winbox.mcp import kdbg_resume
-        import winbox.mcp as mcp_mod
-        mcp_mod._vm.state.return_value = VMState.PAUSED
+        import winbox.mcp._common as _common
+        _common._vm.state.return_value = VMState.PAUSED
         client = self._client_with(alive=False)
-        with patch("winbox.mcp._kdbg_client", return_value=client), \
+        with patch("winbox.mcp._kdbg_recovery._kdbg_client", return_value=client), \
              patch("winbox.kdbg.hmp.probe_port", return_value=False):
             result = kdbg_resume()
         assert "gdbstub not listening" in _mcp_error(result)["message"]
@@ -4609,11 +4620,11 @@ class TestKdbgDaemonTools:
         """Docstring promises 'No-op if VM is already running' — it must
         not connect to the gdbstub, which would halt a healthy VM."""
         from winbox.mcp import kdbg_resume
-        import winbox.mcp as mcp_mod
-        mcp_mod._vm.state.return_value = VMState.RUNNING
+        import winbox.mcp._common as _common
+        _common._vm.state.return_value = VMState.RUNNING
         client = self._client_with(alive=False)
-        with patch("winbox.mcp._kdbg_client", return_value=client) as kc, \
-             patch("winbox.mcp._RspClient") as rsp:
+        with patch("winbox.mcp._kdbg_recovery._kdbg_client", return_value=client) as kc, \
+             patch("winbox.mcp._kdbg_recovery._RspClient") as rsp:
             result = kdbg_resume()
         assert _mcp_result(result) == {"resumed": False, "already_running": True}
         kc.assert_not_called()
@@ -4624,15 +4635,15 @@ class TestKdbgDaemonTools:
         race QEMU and leave the VM paused instead of running. kdbg_resume
         must not claim success it did not verify."""
         from winbox.mcp import kdbg_resume
-        import winbox.mcp as mcp_mod
+        import winbox.mcp._common as _common
         # Not running yet (proceeds past the no-op check); running by the
         # time the post-release check happens.
-        mcp_mod._vm.state.side_effect = [VMState.PAUSED, VMState.RUNNING]
+        _common._vm.state.side_effect = [VMState.PAUSED, VMState.RUNNING]
         daemon_client = self._client_with(alive=False)
         rsp_client = MagicMock()
-        with patch("winbox.mcp._kdbg_client", return_value=daemon_client), \
+        with patch("winbox.mcp._kdbg_recovery._kdbg_client", return_value=daemon_client), \
              patch("winbox.kdbg.hmp.probe_port", return_value=True), \
-             patch("winbox.mcp._RspClient") as rsp_cls, \
+             patch("winbox.mcp._kdbg_recovery._RspClient") as rsp_cls, \
              patch("time.sleep"):
             rsp_cls.connect.return_value = rsp_client
             result = kdbg_resume()
@@ -4642,13 +4653,13 @@ class TestKdbgDaemonTools:
 
     def test_resume_reports_the_real_state_when_release_leaves_it_paused(self, mock_mcp):
         from winbox.mcp import kdbg_resume
-        import winbox.mcp as mcp_mod
-        mcp_mod._vm.state.side_effect = [VMState.PAUSED, VMState.PAUSED]
+        import winbox.mcp._common as _common
+        _common._vm.state.side_effect = [VMState.PAUSED, VMState.PAUSED]
         daemon_client = self._client_with(alive=False)
         rsp_client = MagicMock()
-        with patch("winbox.mcp._kdbg_client", return_value=daemon_client), \
+        with patch("winbox.mcp._kdbg_recovery._kdbg_client", return_value=daemon_client), \
              patch("winbox.kdbg.hmp.probe_port", return_value=True), \
-             patch("winbox.mcp._RspClient") as rsp_cls, \
+             patch("winbox.mcp._kdbg_recovery._RspClient") as rsp_cls, \
              patch("time.sleep"):
             rsp_cls.connect.return_value = rsp_client
             result = kdbg_resume()
@@ -4787,15 +4798,16 @@ class TestRegSetTypeLeniency:
 
     def _script_for(self, value_type):
         import winbox.mcp as m
+        import winbox.mcp._common as _common
 
         captured = {}
 
-        def fake_exec_python(script, timeout=30):
+        def fake_exec_python(script, timeout=30, **kwargs):
             captured["script"] = script
             return {"stdout": "", "stderr": "", "exitcode": 0}
 
         fn = m.reg_set.fn if hasattr(m.reg_set, "fn") else m.reg_set
-        with patch.object(m, "_exec_python", fake_exec_python):
+        with patch.object(_common, "_exec_python", fake_exec_python):
             fn(r"HKLM\SOFTWARE\X", "V", "1", value_type)
         return captured["script"]
 

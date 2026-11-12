@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import winbox.mcp as mcp_mod
+import winbox.mcp._common as _common
 from winbox.vm import (
     VMState,
     GuestAgentUnreachable,
@@ -25,7 +26,7 @@ class TestGuestErrorMessage:
     def test_running_vm_abandoned_gets_unreachable_hint(self):
         vm = MagicMock()
         vm.state.return_value = VMState.RUNNING
-        msg = mcp_mod._guest_error_message(
+        msg = _common._guest_error_message(
             GuestExecAbandoned("lost contact on PID 42", pid=42), vm
         )
         assert "lost contact" in msg
@@ -34,7 +35,7 @@ class TestGuestErrorMessage:
     def test_running_vm_unreachable_gets_unreachable_hint(self):
         vm = MagicMock()
         vm.state.return_value = VMState.RUNNING
-        msg = mcp_mod._guest_error_message(
+        msg = _common._guest_error_message(
             GuestAgentUnreachable("agent not responding"), vm
         )
         assert "unreachable" in msg.lower()
@@ -43,7 +44,7 @@ class TestGuestErrorMessage:
         # A timeout ran for its full window; no reboot hint, just the message.
         vm = MagicMock()
         vm.state.return_value = VMState.RUNNING
-        msg = mcp_mod._guest_error_message(
+        msg = _common._guest_error_message(
             GuestExecTimeout("Command timed out after 300s", pid=9), vm
         )
         assert "timed out" in msg
@@ -52,7 +53,7 @@ class TestGuestErrorMessage:
     def test_non_running_vm_gets_state_hint(self):
         vm = MagicMock()
         vm.state.return_value = VMState.PAUSED
-        msg = mcp_mod._guest_error_message(
+        msg = _common._guest_error_message(
             GuestExecAbandoned("lost contact", pid=1), vm
         )
         assert "paused" in msg
@@ -61,7 +62,7 @@ class TestGuestErrorMessage:
     def test_state_probe_failure_does_not_mask_original(self):
         vm = MagicMock()
         vm.state.side_effect = RuntimeError("virsh blew up")
-        msg = mcp_mod._guest_error_message(
+        msg = _common._guest_error_message(
             GuestAgentUnreachable("original problem"), vm
         )
         assert "original problem" in msg
@@ -72,18 +73,18 @@ class TestGuestErrorsContextManager:
         vm = MagicMock()
         vm.state.return_value = VMState.RUNNING
         with pytest.raises(RuntimeError, match="unreachable"):
-            with mcp_mod._guest_errors(vm):
+            with _common._guest_errors(vm):
                 raise GuestExecAbandoned("lost contact", pid=3)
 
     def test_passes_through_non_guest_errors(self):
         vm = MagicMock()
         with pytest.raises(ValueError, match="not a GA error"):
-            with mcp_mod._guest_errors(vm):
+            with _common._guest_errors(vm):
                 raise ValueError("not a GA error")
 
     def test_no_error_is_transparent(self):
         vm = MagicMock()
-        with mcp_mod._guest_errors(vm):
+        with _common._guest_errors(vm):
             pass  # must not raise
 
 
@@ -94,14 +95,16 @@ def mcp_env(cfg):
     ga = MagicMock()
     vm = MagicMock()
     vm.state.return_value = VMState.RUNNING
-    mcp_mod._cfg = cfg
-    mcp_mod._vm = vm
-    mcp_mod._ga = ga
-    with patch.object(mcp_mod, "_ensure_vm_ready", return_value=(cfg, vm, ga)):
+    _common._cfg = cfg
+    _common._vm = vm
+    _common._ga = ga
+    _common._initialized = True
+    with patch.object(_common, "_ensure_vm_ready", return_value=(cfg, vm, ga)):
         yield cfg, vm, ga
-    mcp_mod._cfg = None
-    mcp_mod._vm = None
-    mcp_mod._ga = None
+    _common._cfg = None
+    _common._vm = None
+    _common._ga = None
+    _common._initialized = False
 
 
 class TestExecPythonErrorTranslation:
@@ -109,20 +112,20 @@ class TestExecPythonErrorTranslation:
         cfg, vm, ga = mcp_env
         ga.exec.side_effect = GuestExecAbandoned("lost contact on PID 7", pid=7)
         with pytest.raises(RuntimeError, match="winbox up --reboot"):
-            mcp_mod._exec_python("print('hi')")
+            _common._exec_python("print('hi')")
 
     def test_timeout_becomes_runtime_error(self, mcp_env):
         cfg, vm, ga = mcp_env
         ga.exec.side_effect = GuestExecTimeout("timed out after 300s", pid=8)
         with pytest.raises(RuntimeError, match="timed out"):
-            mcp_mod._exec_python("print('hi')")
+            _common._exec_python("print('hi')")
 
     def test_call_dir_is_cleaned_up_on_failure(self, mcp_env):
         cfg, vm, ga = mcp_env
         ga.exec.side_effect = GuestAgentUnreachable("gone")
         mcp_dir = cfg.shared_dir / ".mcp"
         with pytest.raises(RuntimeError):
-            mcp_mod._exec_python("print('hi')")
+            _common._exec_python("print('hi')")
         # The per-call subdir must not be left behind.
         leftovers = list(mcp_dir.iterdir()) if mcp_dir.exists() else []
         assert leftovers == []
@@ -130,7 +133,7 @@ class TestExecPythonErrorTranslation:
     def test_completed_nonzero_still_returns_normally(self, mcp_env):
         cfg, vm, ga = mcp_env
         ga.exec.return_value = ExecResult(exitcode=1, stdout="", stderr="boom")
-        result = mcp_mod._exec_python("raise SystemExit(1)")
+        result = _common._exec_python("raise SystemExit(1)")
         assert result["exitcode"] == 1
         assert result["stderr"] == "boom"
 

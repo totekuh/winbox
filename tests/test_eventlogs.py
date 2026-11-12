@@ -709,20 +709,22 @@ class TestEventlogsGroupBackwardsCompat:
 @pytest.fixture
 def mock_mcp_eventlogs(cfg):
     """Minimal MCP fixture for eventlogs - mocks _ensure_vm_ready."""
-    import winbox.mcp as mcp_mod
+    import winbox.mcp._common as _common
 
     ga = MagicMock()
     vm = MagicMock()
-    mcp_mod._cfg = cfg
-    mcp_mod._vm = vm
-    mcp_mod._ga = ga
+    _common._cfg = cfg
+    _common._vm = vm
+    _common._ga = ga
+    _common._initialized = True
 
-    with patch.object(mcp_mod, "_ensure_vm_ready", return_value=(cfg, vm, ga)):
+    with patch.object(_common, "_ensure_vm_ready", return_value=(cfg, vm, ga)):
         yield ga
 
-    mcp_mod._cfg = None
-    mcp_mod._vm = None
-    mcp_mod._ga = None
+    _common._cfg = None
+    _common._vm = None
+    _common._ga = None
+    _common._initialized = False
 
 
 class TestMcpEventlogs:
