@@ -901,7 +901,7 @@ def test_bp_add_soft_user_va_uses_cr3_masquerade(monkeypatch):
     """mode='soft' on a user VA still routes through install_user_breakpoint."""
     user_va = 0x7ff6e289a760
 
-    from winbox.kdbg.debugger import daemon as daemon_mod
+    from winbox.kdbg.debugger.daemon import _breakpoints as _bp_mod
     from winbox.kdbg.debugger.install import InstallReport
 
     captured = {}
@@ -911,7 +911,7 @@ def test_bp_add_soft_user_va_uses_cr3_masquerade(monkeypatch):
         captured["user_va"] = user_va
         return InstallReport(user_va=user_va, target_dtb=cr3_candidates[0], elapsed=0.005)
 
-    monkeypatch.setattr(daemon_mod, "install_user_breakpoint", fake_install)
+    monkeypatch.setattr(_bp_mod, "install_user_breakpoint", fake_install)
 
     rsp = FakeRsp()
     store = FakeStore({"notepad!NPWndProc": user_va})
@@ -953,12 +953,12 @@ def test_bp_add_default_mode_is_hw():
 def test_bp_add_hw_user_skips_install_user_breakpoint(monkeypatch):
     """mode=hw user VA must NOT invoke install_user_breakpoint
     (Z1 doesn't need CR3 masquerade)."""
-    from winbox.kdbg.debugger import daemon as daemon_mod
+    from winbox.kdbg.debugger.daemon import _breakpoints as _bp_mod
     captured = {"called": False}
     def fake_install(*a, **kw):
         captured["called"] = True
         raise AssertionError("install_user_breakpoint should NOT be called for hw bps")
-    monkeypatch.setattr(daemon_mod, "install_user_breakpoint", fake_install)
+    monkeypatch.setattr(_bp_mod, "install_user_breakpoint", fake_install)
 
     rsp = FakeRsp()
     store = FakeStore({"notepad!Bar": 0x7ff6_e289_b000})
@@ -1158,17 +1158,17 @@ def test_bp_list_includes_demangled_pretty_target():
         target=TargetInfo(pid=4584, dtb=0x4d6bb000, name="notepad.exe"),
     )
     # Stub install to skip the actual gdbstub dance for user-mode bp.
-    from winbox.kdbg.debugger import daemon as daemon_mod
+    from winbox.kdbg.debugger.daemon import _breakpoints as _bp_mod
     from winbox.kdbg.debugger.install import InstallReport
-    original = daemon_mod.install_user_breakpoint
-    daemon_mod.install_user_breakpoint = lambda *a, **kw: InstallReport(
+    original = _bp_mod.install_user_breakpoint
+    _bp_mod.install_user_breakpoint = lambda *a, **kw: InstallReport(
         user_va=kw["user_va"], target_dtb=kw["cr3_candidates"][0], elapsed=0.001,
     )
     try:
         session.handle_op("bp_add", {"target": f"notepad!{mangled}"})
         reply = session.handle_op("bp_list", {})
     finally:
-        daemon_mod.install_user_breakpoint = original
+        _bp_mod.install_user_breakpoint = original
 
     bp = reply["result"]["bps"][0]
     assert bp["target"] == f"notepad!{mangled}"
@@ -1324,7 +1324,7 @@ def test_bp_list_includes_hw_field():
 def test_bp_add_user_soft_stores_installed_cr3(monkeypatch):
     """op_bp_add must persist the CR3 that install_user_breakpoint
     actually used so removal can skip candidate iteration."""
-    from winbox.kdbg.debugger import daemon as _daemon_mod
+    from winbox.kdbg.debugger.daemon import _breakpoints as _bp_mod
     from winbox.kdbg.debugger.install import InstallReport
 
     rsp = FakeRsp()
@@ -1337,7 +1337,7 @@ def test_bp_add_user_soft_stores_installed_cr3(monkeypatch):
         elapsed=0.001,
     )
     monkeypatch.setattr(
-        _daemon_mod, "install_user_breakpoint",
+        _bp_mod, "install_user_breakpoint",
         lambda *a, **kw: fake_report,
     )
 
@@ -1895,7 +1895,7 @@ def test_op_cont_silent_continues_unrelated_cr3():
 
 def test_filtered_cr3_timeout_captures_the_received_stop(monkeypatch):
     """Budget expiry after CR3 filtering must not leave a lying running state."""
-    import winbox.kdbg.debugger.daemon as daemon_mod
+    from winbox.kdbg.debugger.daemon import _execution as daemon_mod
 
     class _Clock:
         values = iter((0.0, 0.0, 0.6, 0.6))
@@ -1927,7 +1927,7 @@ def test_filtered_cr3_timeout_captures_the_received_stop(monkeypatch):
 
 def test_deadline_expires_after_filter_check_before_next_resume(monkeypatch):
     """No gap may exist between filter accounting and the loop deadline."""
-    import winbox.kdbg.debugger.daemon as daemon_mod
+    from winbox.kdbg.debugger.daemon import _execution as daemon_mod
 
     class _Clock:
         # start, first-loop budget, post-filter check (still inside), next
@@ -2240,10 +2240,10 @@ def _patch_validator(monkeypatch, loaded_modules):
     """Stub list_user_modules + ensure_types_loaded so _validate_module_bases
     sees ``loaded_modules`` as the target's PEB.Ldr contents.
     """
-    from winbox.kdbg.debugger import daemon as daemon_mod
+    from winbox.kdbg.debugger.daemon import _validation as _val_mod
     monkeypatch.setattr(
-        daemon_mod, "_validate_module_bases",
-        daemon_mod._validate_module_bases,  # keep real impl
+        _val_mod, "_validate_module_bases",
+        _val_mod._validate_module_bases,  # keep real impl
     )
     # Patch the inner imports
     import winbox.kdbg as kdbg_mod
@@ -2481,7 +2481,7 @@ def test_validate_no_candidates_skips_peb_walk(monkeypatch):
     """If the store has no user-mode modules with bases, skip the
     PEB.Ldr walk entirely (it's an HMP-heavy operation we don't want
     to trigger if there's nothing to validate)."""
-    from winbox.kdbg.debugger import daemon as daemon_mod
+    from winbox.kdbg.debugger.daemon import _validation as _val_mod
     walked = {"called": False}
     def tracking_walk(*a, **kw):
         walked["called"] = True
@@ -2492,7 +2492,7 @@ def test_validate_no_candidates_skips_peb_walk(monkeypatch):
     store = _StoreForValidation({
         "nt": {"base": 0xfffff80608628000},  # kernel-only, gets skipped
     })
-    daemon_mod._validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
+    _val_mod._validate_module_bases(FakeCfg(), MagicMock(), _FakeTarget(), store)
     assert walked["called"] is False
 
 
@@ -2758,7 +2758,7 @@ def test_op_cont_predicate_skip_then_halt():
 
 
 def test_predicate_skip_at_deadline_captures_stop(monkeypatch):
-    import winbox.kdbg.debugger.daemon as daemon_mod
+    from winbox.kdbg.debugger.daemon import _execution as daemon_mod
 
     class _Clock:
         values = iter((0.0, 0.0, 0.6, 0.6))
@@ -2783,7 +2783,7 @@ def test_predicate_skip_at_deadline_captures_stop(monkeypatch):
 
 
 def test_action_autocont_at_deadline_captures_stop(monkeypatch, tmp_path):
-    import winbox.kdbg.debugger.daemon as daemon_mod
+    from winbox.kdbg.debugger.daemon import _execution as daemon_mod
 
     class _Clock:
         values = iter((0.0, 0.0, 0.6, 0.6))
@@ -4571,9 +4571,9 @@ class TestBpActions:
     def test_capture_trace_budget_stops_future_reads_explicitly(
         self, tmp_path, monkeypatch,
     ):
-        import winbox.kdbg.debugger.daemon as daemon_module
+        from winbox.kdbg.debugger.daemon import _actions as _actions_mod
 
-        monkeypatch.setattr(daemon_module, "MAX_CAPTURE_BYTES_PER_TRACE", 8)
+        monkeypatch.setattr(_actions_mod, "MAX_CAPTURE_BYTES_PER_TRACE", 8)
         cfg = FakeCfg()
         cfg.root_dir = tmp_path
         rsp = FakeRsp()

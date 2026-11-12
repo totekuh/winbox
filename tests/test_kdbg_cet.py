@@ -405,13 +405,14 @@ def test_reader_gate_failure_prevents_fork(monkeypatch, tmp_path):
 
 def test_daemon_gate_failure_is_actionable_and_prevents_fork(monkeypatch, tmp_path):
     import winbox.kdbg.debugger.daemon as daemon
+    from winbox.kdbg.debugger.daemon import _fork as _fork_mod
 
     cfg = Config(winbox_dir=tmp_path)
     monkeypatch.setattr(
         cet, "require_safe", lambda cfg: (_ for _ in ()).throw(CetSafetyError("unsafe")),
     )
     monkeypatch.setattr(
-        daemon.os, "pipe", lambda: pytest.fail("must gate before creating daemon pipe"),
+        _fork_mod.os, "pipe", lambda: pytest.fail("must gate before creating daemon pipe"),
     )
     with pytest.raises(daemon.DaemonError, match="unsafe"):
         daemon.fork_daemon(cfg, 4)
