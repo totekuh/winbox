@@ -21,7 +21,7 @@ class Config:
 
     vm_name: str = "winbox"
     vm_os: str = DEFAULT_OS
-    kdbg_pagewalk: bool = False
+    kdbg_pagewalk: bool = True
     # VM display stack. "vnc" (default) is plain VNC + the libvirt-default
     # video model. "spice" switches to SPICE + QXL + spice-guest-tools
     # (vdagent) for dynamic resolution and host<->guest clipboard. NOTE:

@@ -171,7 +171,7 @@ def _fresh_setup() -> None:
 
 
 def clean_stale_kdbg() -> None:
-    """Stop leftover reader and clear stale nt base so tests get fresh symbols."""
+    """Stop leftover reader, clear stale nt base, reset pagewalk override."""
     try:
         cfg = Config.load()
     except Exception:
@@ -187,6 +187,16 @@ def clean_stale_kdbg() -> None:
             if data.get("base") is not None:
                 store.set_base("nt", 0)
                 _log("cleared stale nt base from symbol store")
+    except Exception:
+        pass
+    try:
+        config_path = cfg.winbox_dir / "config"
+        if config_path.exists():
+            lines = config_path.read_text().splitlines()
+            cleaned = [l for l in lines if not l.startswith("KDBG_PAGEWALK=")]
+            if len(cleaned) != len(lines):
+                config_path.write_text("\n".join(cleaned) + "\n" if cleaned else "")
+                _log("removed stale KDBG_PAGEWALK override from config")
     except Exception:
         pass
 
