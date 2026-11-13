@@ -428,10 +428,10 @@ def test_pagewalk_2mb_large_page():
 # ── Config pagewalk tests ──────────────────────────────────────────────
 
 
-def test_config_kdbg_pagewalk_default_false():
+def test_config_kdbg_pagewalk_default_true():
     from winbox.config import Config
     cfg = Config()
-    assert cfg.kdbg_pagewalk is False
+    assert cfg.kdbg_pagewalk is True
 
 
 def test_config_kdbg_pagewalk_from_file(tmp_path):
