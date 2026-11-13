@@ -1433,11 +1433,12 @@ class TestKdbg:
     def test_symbols_and_lookups(self, run, tool):
         run("kdbg", "start")
         try:
+            symbols = self._result(tool, "kdbg_symbols_load")
+            assert symbols["module"] == "nt" and symbols["symbol_count"] > 0
             pid = self._target_pid(tool)
             self._result(tool, "kdbg_attach", pid)
             try:
-                symbols = self._result(tool, "kdbg_symbols_load")
-                assert symbols["module"] == "nt" and symbols["symbol_count"] > 0
+                self._result(tool, "kdbg_base_refresh")
                 match = self._result(
                     tool, "kdbg_sym", "nt!PsInitialSystemProcess"
                 )["matches"]
@@ -1450,7 +1451,6 @@ class TestKdbg:
                 assert any(m["name"].lower() == "ntoskrnl.exe" for m in modules)
                 procs = self._result(tool, "kdbg_ps")["processes"]
                 assert any(p["name"] == "System" for p in procs)
-                self._result(tool, "kdbg_base_refresh")
             finally:
                 self._result(tool, "kdbg_detach")
         finally:
