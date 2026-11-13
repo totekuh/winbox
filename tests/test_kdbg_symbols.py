@@ -70,17 +70,17 @@ class TestResolveNtBaseMzGuard:
         })()
         monkeypatch.setattr(symbols, "debug_snapshot", lambda cfg: nullcontext(snapshot))
 
-        def fake_read(vm, read_cr3, va, size, **kwargs):
-            assert read_cr3 in (cr3, cr3 ^ 0x1000)
+        def fake_pw(snap, pw_cr3, va, length):
+            assert pw_cr3 in (cr3, cr3 ^ 0x1000)
             if va == kpcr + 0x38:
                 return idt_base.to_bytes(8, "little")
             if va == idt_base:
                 return self._idt_entry_for(handler)
             if va == self.BASE:
                 return mz
-            raise AssertionError(f"unexpected read at 0x{va:x}")
+            raise SymbolLoadError(f"unmapped VA 0x{va:x}")
 
-        monkeypatch.setattr(symbols, "read_virt_cr3", fake_read)
+        monkeypatch.setattr(symbols, "_pagewalk_read", fake_pw)
 
     def test_valid_mz_returns_base(self, monkeypatch, tmp_path):
         from winbox.kdbg.symbols import resolve_nt_base
@@ -94,9 +94,179 @@ class TestResolveNtBaseMzGuard:
         # Simulates the KPTI case: the page-aligned/canonical checks pass but
         # the base doesn't point at ntoskrnl.
         self._patch(monkeypatch, tmp_path, mz=b"\x00\x00")
-        with pytest.raises(SymbolLoadError, match="header"):
+        with pytest.raises(SymbolLoadError, match="did not resolve"):
             resolve_nt_base(
                 self._cfg(tmp_path), {"KiDivideErrorFault": self.RVA},
+            )
+
+
+class TestResolveNtBaseKvasShadowFallback:
+    """On KVAS, IDT[0] points to KiDivideErrorFault (non-shadow handler).
+    resolve_nt_base must try both Shadow and non-shadow RVAs so it
+    succeeds regardless of which handler the kernel IDT uses."""
+
+    SHADOW_RVA = 0xA89100
+    PLAIN_RVA = 0x421A00
+    BASE = 0xFFFFF80353600000
+
+    def _cfg(self, tmp_path):
+        return SimpleNamespace(vm_name="winbox", symbols_dir=tmp_path)
+
+    def _idt_entry_for(self, handler: int) -> bytes:
+        entry = bytearray(16)
+        entry[0:2] = (handler & 0xFFFF).to_bytes(2, "little")
+        entry[6:8] = ((handler >> 16) & 0xFFFF).to_bytes(2, "little")
+        entry[8:12] = ((handler >> 32) & 0xFFFFFFFF).to_bytes(4, "little")
+        return bytes(entry)
+
+    def _patch(self, monkeypatch, tmp_path, *, handler_rva: int):
+        handler = self.BASE + handler_rva
+        idt_base = 0xFFFFF78000000000
+        kpcr = 0xFFFFF78000100000
+        cr3 = 0x12345000
+        store = SymbolStore(tmp_path)
+        store.save(
+            module="nt", build="TEST", image="nt.pdb",
+            symbols={
+                "KiDivideErrorFaultShadow": self.SHADOW_RVA,
+                "KiDivideErrorFault": self.PLAIN_RVA,
+            },
+            types={"_KPCR": {
+                "size": 0x200,
+                "fields": {"IdtBase": {"off": 0x38, "type": "void*"}},
+            }},
+            base=self.BASE,
+        )
+        snapshot = type("Snapshot", (), {
+            "cr3_candidates": (cr3,), "kernel_gs_bases": (kpcr,),
+        })()
+        monkeypatch.setattr(symbols, "debug_snapshot", lambda cfg: nullcontext(snapshot))
+
+        def fake_pw(snap, pw_cr3, va, length):
+            if va == kpcr + 0x38:
+                return idt_base.to_bytes(8, "little")
+            if va == idt_base:
+                return self._idt_entry_for(handler)
+            if va == self.BASE:
+                return b"MZ"
+            raise SymbolLoadError(f"unmapped VA 0x{va:x}")
+
+        monkeypatch.setattr(symbols, "_pagewalk_read", fake_pw)
+
+    def test_shadow_handler_resolves(self, monkeypatch, tmp_path):
+        """IDT[0] points to KiDivideErrorFaultShadow — shadow RVA hits first."""
+        from winbox.kdbg.symbols import resolve_nt_base
+        self._patch(monkeypatch, tmp_path, handler_rva=self.SHADOW_RVA)
+        assert resolve_nt_base(
+            self._cfg(tmp_path),
+            {"KiDivideErrorFaultShadow": self.SHADOW_RVA,
+             "KiDivideErrorFault": self.PLAIN_RVA},
+        ) == self.BASE
+
+    def test_plain_handler_resolves_via_fallback(self, monkeypatch, tmp_path):
+        """IDT[0] points to KiDivideErrorFault (KVAS non-shadow IDT).
+        Shadow RVA gives non-page-aligned base; plain RVA succeeds."""
+        from winbox.kdbg.symbols import resolve_nt_base
+        self._patch(monkeypatch, tmp_path, handler_rva=self.PLAIN_RVA)
+        assert resolve_nt_base(
+            self._cfg(tmp_path),
+            {"KiDivideErrorFaultShadow": self.SHADOW_RVA,
+             "KiDivideErrorFault": self.PLAIN_RVA},
+        ) == self.BASE
+
+    def test_plain_only_works(self, monkeypatch, tmp_path):
+        """PDB has only KiDivideErrorFault (no shadow symbol)."""
+        from winbox.kdbg.symbols import resolve_nt_base
+        self._patch(monkeypatch, tmp_path, handler_rva=self.PLAIN_RVA)
+        assert resolve_nt_base(
+            self._cfg(tmp_path),
+            {"KiDivideErrorFault": self.PLAIN_RVA},
+        ) == self.BASE
+
+
+class TestResolveNtBaseEfaultSkipsToNextKpcr:
+    """When one KPCR/CR3 combo EFAULTs (KVAS user CR3 doesn't map that
+    kernel PML4 entry), resolve_nt_base must skip it and succeed via
+    another KPCR that IS reachable."""
+
+    RVA = 0x100000
+    BASE = 0xFFFFF80000000000
+
+    def _cfg(self, tmp_path):
+        return SimpleNamespace(vm_name="winbox", symbols_dir=tmp_path)
+
+    def _idt_entry_for(self, handler: int) -> bytes:
+        entry = bytearray(16)
+        entry[0:2] = (handler & 0xFFFF).to_bytes(2, "little")
+        entry[6:8] = ((handler >> 16) & 0xFFFF).to_bytes(2, "little")
+        entry[8:12] = ((handler >> 32) & 0xFFFFFFFF).to_bytes(4, "little")
+        return bytes(entry)
+
+    def test_efault_on_first_kpcr_still_resolves(self, monkeypatch, tmp_path):
+        from winbox.kdbg.symbols import resolve_nt_base
+
+        handler = self.BASE + self.RVA
+        idt_base = 0xFFFFF78000000000
+        bad_kpcr = 0xFFFF800100000000
+        good_kpcr = 0xFFFFF80000100000
+        cr3 = 0x1AE000
+
+        store = SymbolStore(tmp_path)
+        store.save(
+            module="nt", build="TEST", image="nt.pdb",
+            symbols={"KiDivideErrorFault": self.RVA},
+            types={"_KPCR": {
+                "size": 0x200,
+                "fields": {"IdtBase": {"off": 0x38, "type": "void*"}},
+            }},
+            base=self.BASE,
+        )
+        snapshot = type("Snapshot", (), {
+            "cr3_candidates": (cr3,),
+            "kernel_gs_bases": (bad_kpcr, good_kpcr),
+        })()
+        monkeypatch.setattr(symbols, "debug_snapshot", lambda cfg: nullcontext(snapshot))
+
+        def fake_pw(snap, pw_cr3, va, length):
+            if (va & ~0xFFF) == (bad_kpcr & ~0xFFF):
+                raise SymbolLoadError("PML4E not present")
+            if va == good_kpcr + 0x38:
+                return idt_base.to_bytes(8, "little")
+            if va == idt_base:
+                return self._idt_entry_for(handler)
+            if va == self.BASE:
+                return b"MZ"
+            raise SymbolLoadError(f"unmapped VA 0x{va:x}")
+
+        monkeypatch.setattr(symbols, "_pagewalk_read", fake_pw)
+        assert resolve_nt_base(
+            self._cfg(tmp_path), {"KiDivideErrorFault": self.RVA},
+        ) == self.BASE
+
+    def test_all_kpcrs_unmapped_raises(self, monkeypatch, tmp_path):
+        from winbox.kdbg.symbols import resolve_nt_base
+
+        cr3 = 0x1AE000
+        store = SymbolStore(tmp_path)
+        store.save(
+            module="nt", build="TEST", image="nt.pdb",
+            symbols={"KiDivideErrorFault": 0x100000},
+            types={"_KPCR": {
+                "size": 0x200,
+                "fields": {"IdtBase": {"off": 0x38, "type": "void*"}},
+            }},
+            base=None,
+        )
+        snapshot = type("Snapshot", (), {
+            "cr3_candidates": (cr3,),
+            "kernel_gs_bases": (0xFFFF800100000000, 0xFFFF800200000000),
+        })()
+        monkeypatch.setattr(symbols, "debug_snapshot", lambda cfg: nullcontext(snapshot))
+        monkeypatch.setattr(symbols, "_pagewalk_read",
+            lambda *a, **kw: (_ for _ in ()).throw(SymbolLoadError("PML4E not present")))
+        with pytest.raises(SymbolLoadError, match="could not resolve"):
+            resolve_nt_base(
+                self._cfg(tmp_path), {"KiDivideErrorFault": 0x100000},
             )
 
 

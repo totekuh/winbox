@@ -108,8 +108,10 @@ def vm_status() -> str:
 
     disk_mb = None
     try:
-        disk_mb = round(vm.disk_usage() / (1024 * 1024))
-    except (OSError, AttributeError):
+        raw = vm.disk_usage()
+        if raw is not None:
+            disk_mb = round(raw / (1024 * 1024))
+    except OSError:
         pass
 
     tools_count = 0

@@ -12,12 +12,12 @@ Run:   pytest -m integration -k install_integration
 from __future__ import annotations
 
 import struct
-import subprocess
 
 import pytest
 
 from winbox.config import Config
 from winbox.kdbg import SymbolStore
+from winbox.vm import VM
 from winbox.kdbg.debugger import (
     RspClient,
     install_user_breakpoint,
@@ -31,8 +31,13 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")
-def cfg():
+def cfg(bootstrapped_vm):
     return Config.load()
+
+
+@pytest.fixture(scope="module")
+def vm(cfg):
+    return VM(cfg)
 
 
 @pytest.fixture(scope="module")
@@ -41,7 +46,7 @@ def store(cfg):
 
 
 @pytest.fixture
-def cli_conn(cfg):
+def cli_conn(cfg, vm):
     if not probe_port("127.0.0.1", 1234):
         pytest.skip("gdbstub not listening — run `winbox kdbg start`")
     c = RspClient.connect("127.0.0.1", 1234, timeout=5)
@@ -51,10 +56,7 @@ def cli_conn(cfg):
         c.close()
     except Exception:
         pass
-    subprocess.run(
-        ["virsh", "-c", "qemu:///system", "resume", "winbox"],
-        capture_output=True,
-    )
+    vm.resume()
 
 
 def _find_notepad(cfg, store):

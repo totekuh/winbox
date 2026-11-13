@@ -21,6 +21,11 @@ from winbox.vm import GuestAgent
 pytestmark = pytest.mark.integration
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _ensure_vm(bootstrapped_vm):
+    pass
+
+
 def test_live_attach_manifest_and_mixed_wow64_transition_trace():
     cfg = Config.load()
     ga = GuestAgent(cfg)

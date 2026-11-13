@@ -185,8 +185,9 @@ def status(ctx: click.Context) -> None:
         console.print(f"  Agent:   {agent_status}")
 
     disk = vm.disk_usage()
-    if disk:
-        console.print(f"  Disk:    {disk}")
+    if disk is not None:
+        from winbox.utils import human_size
+        console.print(f"  Disk:    {human_size(disk)}")
 
     if cfg.tools_dir.exists():
         tool_count = sum(1 for f in cfg.tools_dir.iterdir() if f.is_file() and not f.name.startswith("."))

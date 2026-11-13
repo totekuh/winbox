@@ -560,10 +560,10 @@ class TestDiskUsage:
     def test_none_when_disk_is_absent(self, vm):
         assert vm.disk_usage() is None
 
-    def test_human_readable_size(self, vm):
+    def test_returns_raw_bytes(self, vm):
         vm.cfg.winbox_dir.mkdir(parents=True, exist_ok=True)
         vm.cfg.disk_path.write_bytes(b"\x00" * 2048)
-        assert "KB" in vm.disk_usage() or "B" in vm.disk_usage()
+        assert vm.disk_usage() == 2048
 
 
 class TestDestroy:

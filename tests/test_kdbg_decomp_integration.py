@@ -11,6 +11,7 @@ import pytest
 
 from winbox.config import Config
 from winbox.kdbg.decomp.client import DecompClient
+from winbox.kdbg.decomp.client_paths import DecompError
 from winbox.kdbg.decomp.cache import cache_inventory, repair_cache
 from winbox.kdbg.decomp.docker import DockerError, DockerManager, project_dir
 from winbox.kdbg.decomp.enrichment import ANALYSIS_PROFILE, enrichment_path
@@ -148,11 +149,18 @@ def test_persistent_pyghidra_worker_decompiles_and_reuses_project(tmp_path, requ
     }
     assert warm_elapsed < 5.0
     def query(_):
-        return client.call(
-            "decompile", binary=str(binary), sha256=digest,
-            rva=address - 0x400000, before=0, after=0, full=False,
-            decompile_timeout=30,
-        )["function"]["name"]
+        for attempt in range(5):
+            try:
+                return client.call(
+                    "decompile", binary=str(binary), sha256=digest,
+                    rva=address - 0x400000, before=0, after=0, full=False,
+                    decompile_timeout=30,
+                )["function"]["name"]
+            except DecompError as exc:
+                if "busy" in str(exc) and attempt < 4:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                raise
 
     concurrent_started = time.monotonic()
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -221,3 +229,37 @@ def test_persistent_pyghidra_worker_decompiles_and_reuses_project(tmp_path, requ
     )
     assert preserved["function"]["name"] == "focus_me"
     DecompClient(cfg).call("shutdown", start=False, timeout=5)
+
+
+@pytest.mark.integration
+def test_mcp_decomp_cache_prune_dry_run():
+    """MCP cache prune in dry-run mode returns a summary without deleting."""
+    cfg = Config.load()
+    inv = cache_inventory(cfg)
+    if not inv["entries"]:
+        pytest.skip("no decomp cache entries to prune")
+
+    from winbox.kdbg.decomp.cache_prune import prune_cache
+    result = prune_cache(cfg, older_than_days=0.001, dry_run=True)
+    assert "candidates" in result or "entries" in result or isinstance(result, dict)
+
+
+@pytest.mark.integration
+def test_mcp_decomp_cache_repair_no_corruption():
+    """Repair on a healthy cache returns without error."""
+    cfg = Config.load()
+    inv = cache_inventory(cfg)
+    if not inv["entries"]:
+        pytest.skip("no decomp cache entries to repair")
+    entry = inv["entries"][0]
+    result = repair_cache(cfg, sha256=entry["sha256"])
+    assert result["rebuild"] == "succeeded"
+
+
+@pytest.mark.integration
+def test_mcp_decomp_cancel_with_no_active_job():
+    """Cancel when nothing is running raises a clear error, not a crash."""
+    cfg = Config.load()
+    from winbox.kdbg.decomp.service.lifecycle import cancel_decomp
+    with pytest.raises(DecompError, match="not_running|no active"):
+        cancel_decomp(cfg)

@@ -10,6 +10,47 @@ from winbox.config import Config
 from winbox.vm import VMState
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--no-bootstrap", action="store_true", default=False,
+        help="Skip VM bootstrap, assume VM is ready",
+    )
+
+
+@pytest.fixture(scope="session")
+def bootstrapped_vm(request):
+    """Ensure a prepared VM exists before integration tests.
+
+    On first run: destroys any existing VM, runs ``winbox setup``, disables
+    CET, reboots, and snapshots as ``integration-ready``.  On subsequent runs
+    restores that snapshot (~2 min).
+
+    Skipped entirely for unit-test-only runs (no integration tests collected)
+    and when ``--no-bootstrap`` is passed.
+    """
+    if request.config.getoption("--no-bootstrap", default=False):
+        yield
+        return
+    has_integration = any(
+        item.get_closest_marker("integration") for item in request.session.items
+    )
+    if not has_integration:
+        yield
+        return
+    from tests.bootstrap import BootstrapError, bootstrap, clean_stale_kdbg
+    clean_stale_kdbg()
+    try:
+        bootstrap()
+    except BootstrapError as exc:
+        pytest.exit(f"VM bootstrap failed at '{exc.stage}': {exc}", returncode=1)
+    yield
+    try:
+        from tests.bootstrap import SNAPSHOT_READY, restore_snapshot
+        restore_snapshot(SNAPSHOT_READY)
+    except Exception:
+        pass
+
+
 @pytest.fixture
 def runner():
     return CliRunner()
@@ -79,7 +120,7 @@ def mock_env(cfg):
     vm.agent_connected.return_value = True
     vm.ip.return_value = "192.168.122.203"
     vm.exists.return_value = True
-    vm.disk_usage.return_value = "6.5 GB"
+    vm.disk_usage.return_value = 6_979_321_856
     vm.snapshot_list.return_value = ["clean"]
 
     import importlib

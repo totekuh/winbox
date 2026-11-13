@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import time
 from datetime import timedelta
@@ -35,6 +34,7 @@ from winbox.cli import cli
 from winbox.cli import capture as capture_mod
 from winbox.config import Config
 from winbox.vm import VM, GuestAgent, VMState
+from winbox.vm.virsh import virsh_run
 
 pytestmark = pytest.mark.integration
 
@@ -43,7 +43,7 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="session")
-def cfg() -> Config:
+def cfg(bootstrapped_vm) -> Config:
     return Config.load()
 
 
@@ -155,10 +155,8 @@ def _accept_not_halted(result) -> None:
 
 
 def _domstate(vm_name: str) -> str:
-    return subprocess.run(
-        ["virsh", "-c", "qemu:///system", "domstate", vm_name],
-        capture_output=True, text=True, check=False,
-    ).stdout.strip()
+    result = virsh_run("domstate", vm_name, check=False)
+    return result.stdout.strip()
 
 
 # ─── identity: the config and the guest must agree ──────────────────────────
@@ -1212,6 +1210,27 @@ class TestDefender:
                 CliRunner().invoke(cli, ["av", "disable"])
 
 
+    def test_mcp_av_disable(self, tool, ga, profile):
+        """MCP av_disable: succeeds on Server, refuses on Win11 client."""
+        original = tool("av_status")()
+        tool("av_enable")()
+        try:
+            out = tool("av_disable")(confirm=True)
+            status = tool("av_status")()
+            if "error" in out.lower() or "tamper" in out.lower():
+                assert profile.client_sku, (
+                    f"av_disable refused on non-client SKU: {out}"
+                )
+            else:
+                assert "Defender: ON" not in status, (
+                    f"av_disable claimed success but Defender still on: {status}"
+                )
+            assert "alive" in ga.exec("echo alive", timeout=90).stdout
+        finally:
+            if "Defender: ON" in original:
+                tool("av_enable")()
+
+
 class TestHvci:
     """HVCI / VBS detection and toggle."""
 
@@ -1235,6 +1254,22 @@ class TestHvci:
         status = run("hvci", "status").output
         # Re-enable may or may not activate without Secure Boot
         assert "VBS:" in status
+
+    def test_mcp_hvci_disable(self, tool):
+        """MCP hvci_disable toggles HVCI off and status confirms."""
+        tool("hvci_enable")()
+        out = tool("hvci_disable")()
+        assert "error" not in out.lower(), out
+        status = tool("hvci_status")()
+        assert "off" in status.lower() or "disabled" in status.lower()
+
+    def test_mcp_hvci_enable(self, tool):
+        """MCP hvci_enable restores HVCI and status confirms."""
+        tool("hvci_disable")()
+        out = tool("hvci_enable")()
+        assert "error" not in out.lower(), out
+        status = tool("hvci_status")()
+        assert '"hvci":' in status
 
 
 class TestMalwareAnalysis:
@@ -2157,6 +2192,88 @@ class TestKdbg:
     def test_user_bp_rejects_a_bad_target(self, run):
         run("kdbg", "user-bp", "999999", "nosuch!symbol", expect_ok=False)
 
+    def test_mcp_step_advances_rip(self, run, tool):
+        """Single-step via MCP moves RIP forward."""
+        run("kdbg", "start")
+        try:
+            pid = self._target_pid(tool)
+            self._result(tool, "kdbg_attach", pid)
+            try:
+                regs_before = self._result(tool, "kdbg_regs")
+                rip_before = int(regs_before["rip"], 0)
+                self._result(tool, "kdbg_step")
+                regs_after = self._result(tool, "kdbg_regs")
+                rip_after = int(regs_after["rip"], 0)
+                assert rip_after != rip_before, (
+                    f"RIP did not advance: 0x{rip_before:x}"
+                )
+            finally:
+                self._result(tool, "kdbg_detach")
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+
+    def test_mcp_interrupt_on_halted_target(self, run, tool):
+        """Interrupt on an already-halted target succeeds or says so."""
+        run("kdbg", "start")
+        try:
+            pid = self._target_pid(tool)
+            self._result(tool, "kdbg_attach", pid)
+            try:
+                result = self._result(tool, "kdbg_interrupt")
+                assert result is not None
+            finally:
+                self._result(tool, "kdbg_detach")
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+
+    def test_mcp_write_mem_roundtrip(self, run, tool):
+        """Write 8 bytes to the target's kernel stack, read back, restore."""
+        run("kdbg", "start")
+        try:
+            pid = self._target_pid(tool)
+            self._result(tool, "kdbg_attach", pid)
+            try:
+                regs = self._result(tool, "kdbg_regs")
+                rsp = regs["rsp"]
+                original = self._result(
+                    tool, "kdbg_read_va", pid, rsp, 8,
+                )
+                original_hex = original["bytes"]
+                pattern = "deadbeefcafebabe"
+                self._result(tool, "kdbg_write_mem", rsp, pattern)
+                readback = self._result(
+                    tool, "kdbg_read_va", pid, rsp, 8,
+                )
+                assert readback["bytes"] == pattern
+                self._result(tool, "kdbg_write_mem", rsp, original_hex)
+            finally:
+                self._result(tool, "kdbg_detach")
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+
+    def test_mcp_cont_hits_breakpoint(self, run, tool):
+        """Set bp on hot symbol, continue, verify we stop at it."""
+        run("kdbg", "start")
+        try:
+            pid = self._target_pid(tool)
+            self._result(tool, "kdbg_attach", pid)
+            try:
+                bp = self._result(
+                    tool, "kdbg_bp", "nt!NtCreateFile",
+                )
+                bp_id = bp["bp"]["id"]
+                try:
+                    result = tool("kdbg_cont")(timeout=10.0)
+                    if result.get("ok"):
+                        ctx = result["result"]
+                        assert "reason" in ctx
+                finally:
+                    self._result(tool, "kdbg_bp_intent_remove", bp_id)
+            finally:
+                tool("kdbg_detach")()
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+
 
 # ─── provisioning ───────────────────────────────────────────────────────────
 
@@ -2177,11 +2294,7 @@ class TestLifecycleTeardown:
         # A snapshot left behind by an interrupted earlier run would make
         # creation fail with "domain moment already exists".
         if "e2e-snap" in vm.snapshot_list():
-            subprocess.run(
-                ["virsh", "-c", "qemu:///system", "snapshot-delete",
-                 vm.name, "e2e-snap"],
-                capture_output=True, check=False,
-            )
+            virsh_run("snapshot-delete", vm.name, "e2e-snap", check=False)
 
         run("snapshot", "e2e-snap")
         assert "e2e-snap" in run("snapshot").output

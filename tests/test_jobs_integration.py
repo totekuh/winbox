@@ -23,7 +23,7 @@ from winbox.vm import VM, VMState, GuestAgent, GuestAgentError
 
 
 @pytest.fixture(scope="session")
-def live_cfg():
+def live_cfg(bootstrapped_vm):
     return Config.load()
 
 

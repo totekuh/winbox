@@ -53,10 +53,77 @@ class LoadedModule:
     type_count: int
 
 
+def _pagewalk_read(snapshot, cr3: int, va: int, length: int) -> bytes:
+    """4-level x86-64 page table walk via physical reads."""
+    def _pte(table_pa: int, index: int) -> int:
+        raw = snapshot.read_physical(table_pa + index * 8, 8)
+        return int.from_bytes(raw, "little")
+
+    pml4_pa = cr3 & 0x000FFFFFFFFFF000
+    pml4e = _pte(pml4_pa, (va >> 39) & 0x1FF)
+    if not (pml4e & 1):
+        raise SymbolLoadError(f"PML4E not present for VA 0x{va:x}")
+    pdpt_pa = pml4e & 0x000FFFFFFFFFF000
+    pdpte = _pte(pdpt_pa, (va >> 30) & 0x1FF)
+    if not (pdpte & 1):
+        raise SymbolLoadError(f"PDPTE not present for VA 0x{va:x}")
+    if pdpte & 0x80:
+        pa = (pdpte & 0x000FFFFFC0000000) | (va & 0x3FFFFFFF)
+        return snapshot.read_physical(pa, length)
+    pd_pa = pdpte & 0x000FFFFFFFFFF000
+    pde = _pte(pd_pa, (va >> 21) & 0x1FF)
+    if not (pde & 1):
+        raise SymbolLoadError(f"PDE not present for VA 0x{va:x}")
+    if pde & 0x80:
+        pa = (pde & 0x000FFFFFFFE00000) | (va & 0x1FFFFF)
+        return snapshot.read_physical(pa, length)
+    pt_pa = pde & 0x000FFFFFFFFFF000
+    pte = _pte(pt_pa, (va >> 12) & 0x1FF)
+    if not (pte & 1):
+        raise SymbolLoadError(f"PTE not present for VA 0x{va:x}")
+    pa = (pte & 0x000FFFFFFFFFF000) | (va & 0xFFF)
+    return snapshot.read_physical(pa, length)
+
+
+def _find_kernel_cr3(snapshot, store: SymbolStore, cr3s, kpcrs) -> int | None:
+    """Walk KPCR → KPRCB → KTHREAD → KPROCESS → DirectoryTableBase.
+
+    Uses the first reachable KPCR to extract the kernel CR3, which maps
+    the full kernel address space (unlike the user CR3 on KVAS builds).
+    """
+    try:
+        prcb_off = int(store.struct("_KPCR", "CurrentPrcb")["off"])
+        thread_off = int(store.struct("_KPRCB", "CurrentThread")["off"])
+        proc_off = int(store.struct("_KTHREAD", "Process")["off"])
+        dtb_off = int(store.struct("_KPROCESS", "DirectoryTableBase")["off"])
+    except (KeyError, TypeError, SymbolStoreError):
+        return None
+
+    def _u64(cr3: int, va: int) -> int:
+        return int.from_bytes(_pagewalk_read(snapshot, cr3, va, 8), "little")
+
+    for kpcr in kpcrs:
+        for cr3 in cr3s:
+            try:
+                prcb = _u64(cr3, kpcr + prcb_off)
+                thread = _u64(cr3, prcb + thread_off)
+                process = _u64(cr3, thread + proc_off)
+                dtb = _u64(cr3, process + dtb_off)
+                if dtb and (dtb & 0xFFF) == 0:
+                    return dtb
+            except (HmpError, SymbolLoadError):
+                continue
+    return None
+
+
 def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
     """Derive ntoskrnl's load base using RSP registers and memory only."""
-    rva = nt_syms.get("KiDivideErrorFaultShadow") or nt_syms.get("KiDivideErrorFault")
-    if rva is None:
+    rvas: list[int] = []
+    for name in ("KiDivideErrorFaultShadow", "KiDivideErrorFault"):
+        v = nt_syms.get(name)
+        if v is not None and v not in rvas:
+            rvas.append(v)
+    if not rvas:
         raise SymbolLoadError(
             "KiDivideErrorFault[Shadow] missing from PDB publics — "
             "this PDB may not be ntkrnlmp"
@@ -77,16 +144,20 @@ def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
             for candidate in (sampled, sampled ^ 0x1000):
                 if candidate not in cr3s:
                     cr3s.append(candidate)
-        for kpcr in snapshot.kernel_gs_bases:
+        kpcrs = snapshot.kernel_gs_bases
+
+        kernel_cr3 = _find_kernel_cr3(snapshot, store, cr3s, kpcrs)
+        if kernel_cr3 is not None and kernel_cr3 not in cr3s:
+            cr3s.insert(0, kernel_cr3)
+
+        for kpcr in kpcrs:
             for cr3 in cr3s:
                 try:
-                    idt_raw = read_virt_cr3(
-                        cfg.vm_name, cr3, kpcr + idt_off, 8,
-                    )
+                    idt_raw = _pagewalk_read(snapshot, cr3, kpcr + idt_off, 8)
                     idt_base = int.from_bytes(idt_raw, "little")
                     if idt_base >> 47 != 0x1FFFF or idt_base & 0xF:
                         raise SymbolLoadError(f"invalid IDT base 0x{idt_base:x}")
-                    entry = read_virt_cr3(cfg.vm_name, cr3, idt_base, 16)
+                    entry = _pagewalk_read(snapshot, cr3, idt_base, 16)
                     if len(entry) != 16:
                         raise SymbolLoadError(
                             f"short IDT read at 0x{idt_base:x}: {len(entry)}"
@@ -96,23 +167,27 @@ def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
                         | (int.from_bytes(entry[6:8], "little") << 16)
                         | (int.from_bytes(entry[8:12], "little") << 32)
                     )
-                    base = handler - rva
-                    if base & 0xFFF or base >> 47 != 0x1FFFF:
-                        raise SymbolLoadError(
-                            f"invalid nt base candidate 0x{base:x}"
-                        )
-                    head = read_virt_cr3(cfg.vm_name, cr3, base, 2)
-                    if head != b"MZ":
-                        raise SymbolLoadError(
-                            f"nt base candidate 0x{base:x} has header {head!r}"
-                        )
-                    return base
+                    for rva in rvas:
+                        base = handler - rva
+                        if base & 0xFFF or base >> 47 != 0x1FFFF:
+                            continue
+                        head = _pagewalk_read(snapshot, cr3, base, 2)
+                        if head == b"MZ":
+                            return base
+                    raise SymbolLoadError(
+                        f"handler 0x{handler:x} did not resolve to a "
+                        f"valid nt base with any known RVA"
+                    )
                 except (HmpError, SymbolLoadError) as exc:
                     failures.append(
                         f"KPCR=0x{kpcr:x}/CR3=0x{cr3:x}: {exc}"
                     )
-    detail = failures[-1] if failures else "no canonical KPCR candidates from RSP"
-    raise SymbolLoadError(f"could not resolve nt base through KPCR/IDT: {detail}")
+    if not failures:
+        raise SymbolLoadError("could not resolve nt base: no KPCR candidates from RSP")
+    summary = "; ".join(failures[:4])
+    if len(failures) > 4:
+        summary += f" (+{len(failures) - 4} more)"
+    raise SymbolLoadError(f"could not resolve nt base through KPCR/IDT: {summary}")
 
 
 def load_module(

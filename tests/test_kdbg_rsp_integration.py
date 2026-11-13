@@ -34,7 +34,7 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")
-def cfg():
+def cfg(bootstrapped_vm):
     config = Config.load()
     try:
         require_safe(config, GuestAgent(config))

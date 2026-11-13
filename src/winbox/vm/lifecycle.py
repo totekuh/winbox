@@ -173,8 +173,8 @@ class VM(VMNetMixin):
             time.sleep(poll)
         return True
 
-    def disk_usage(self) -> str | None:
+    def disk_usage(self) -> int | None:
+        """Return disk image size in bytes, or None if the image doesn't exist."""
         if not self.cfg.disk_path.exists():
             return None
-        from winbox.utils import human_size
-        return human_size(self.cfg.disk_path.stat().st_size)
+        return self.cfg.disk_path.stat().st_size
