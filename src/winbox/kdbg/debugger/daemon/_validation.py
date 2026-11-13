@@ -54,7 +54,9 @@ def _validate_module_bases(
             from winbox.kdbg.hmp import HmpError
             from winbox.kdbg.symbols import SymbolLoadError, resolve_nt_base
             try:
-                live_nt_base = resolve_nt_base(cfg, nt_syms)
+                live_nt_base = resolve_nt_base(
+                    cfg, nt_syms, kernel_cr3=target.dtb,
+                )
             except (HmpError, SymbolLoadError, OSError) as e:
                 print(
                     f"warning: could not validate nt base "

@@ -134,7 +134,7 @@ def _find_kernel_cr3(snapshot, store: SymbolStore, cr3s, kpcrs) -> int | None:
     return None
 
 
-def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
+def resolve_nt_base(cfg: Config, nt_syms: dict[str, int], *, kernel_cr3: int | None = None) -> int:
     """Derive ntoskrnl's load base using RSP registers and memory only."""
     rvas: list[int] = []
     for name in ("KiDivideErrorFaultShadow", "KiDivideErrorFault"):
@@ -158,6 +158,8 @@ def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
     failures: list[str] = []
     with debug_snapshot(cfg) as snapshot:
         cr3s: list[int] = []
+        if kernel_cr3 is not None and kernel_cr3 not in cr3s:
+            cr3s.append(kernel_cr3)
         from winbox.kdbg.walk._layout import _cached_kernel_cr3
         cached = _cached_kernel_cr3(cfg.vm_name)
         if cached is not None and cached not in cr3s:
