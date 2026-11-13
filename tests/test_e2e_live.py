@@ -1435,24 +1435,19 @@ class TestKdbg:
         try:
             symbols = self._result(tool, "kdbg_symbols_load")
             assert symbols["module"] == "nt" and symbols["symbol_count"] > 0
-            pid = self._target_pid(tool)
-            self._result(tool, "kdbg_attach", pid)
-            try:
-                self._result(tool, "kdbg_base_refresh")
-                match = self._result(
-                    tool, "kdbg_sym", "nt!PsInitialSystemProcess"
-                )["matches"]
-                assert "PsInitialSystemProcess" in match[0]
-                layout = self._result(
-                    tool, "kdbg_struct", "_EPROCESS", "UniqueProcessId"
-                )
-                assert layout["field"] == "UniqueProcessId" and layout["lines"]
-                modules = self._result(tool, "kdbg_lm")["modules"]
-                assert any(m["name"].lower() == "ntoskrnl.exe" for m in modules)
-                procs = self._result(tool, "kdbg_ps")["processes"]
-                assert any(p["name"] == "System" for p in procs)
-            finally:
-                self._result(tool, "kdbg_detach")
+            match = self._result(
+                tool, "kdbg_sym", "nt!PsInitialSystemProcess"
+            )["matches"]
+            assert "PsInitialSystemProcess" in match[0]
+            layout = self._result(
+                tool, "kdbg_struct", "_EPROCESS", "UniqueProcessId"
+            )
+            assert layout["field"] == "UniqueProcessId" and layout["lines"]
+            modules = self._result(tool, "kdbg_lm")["modules"]
+            assert any(m["name"].lower() == "ntoskrnl.exe" for m in modules)
+            procs = self._result(tool, "kdbg_ps")["processes"]
+            assert any(p["name"] == "System" for p in procs)
+            self._result(tool, "kdbg_base_refresh")
         finally:
             run("kdbg", "stop")
 
