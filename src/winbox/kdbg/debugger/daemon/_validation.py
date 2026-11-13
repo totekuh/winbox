@@ -50,7 +50,7 @@ def _validate_module_bases(
             nt_data = None
         cached_nt_base = (nt_data or {}).get("base")
         nt_syms = (nt_data or {}).get("symbols") or {}
-        if cached_nt_base and nt_syms:
+        if nt_syms:
             from winbox.kdbg.hmp import HmpError
             from winbox.kdbg.symbols import SymbolLoadError, resolve_nt_base
             try:
@@ -66,12 +66,13 @@ def _validate_module_bases(
             else:
                 if live_nt_base != cached_nt_base:
                     store.set_base("nt", live_nt_base)
-                    print(
-                        f"note: nt base moved 0x{cached_nt_base:x} -> "
-                        f"0x{live_nt_base:x} (ASLR, typically a VM reboot); "
-                        f"refreshed automatically",
-                        file=sys.stderr,
-                    )
+                    if cached_nt_base:
+                        print(
+                            f"note: nt base moved 0x{cached_nt_base:x} -> "
+                            f"0x{live_nt_base:x} (ASLR, typically a VM reboot); "
+                            f"refreshed automatically",
+                            file=sys.stderr,
+                        )
 
     candidates: list[tuple[str, int, tuple[str, str]]] = []
     for mod_name in modules:
