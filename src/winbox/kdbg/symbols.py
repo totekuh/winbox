@@ -85,6 +85,24 @@ def _pagewalk_read(snapshot, cr3: int, va: int, length: int) -> bytes:
     return snapshot.read_physical(pa, length)
 
 
+def _discover_kernel_cr3_via_eprocess(cfg, store: SymbolStore) -> int | None:
+    """Walk PsActiveProcessHead to find System (PID 4) and its kernel CR3.
+
+    The EPROCESS walk succeeds even with user-mode CR3s because
+    PsActiveProcessHead is at a VA the user PML4 maps correctly.
+    The System process's DirectoryTableBase is the kernel CR3.
+    """
+    try:
+        from winbox.kdbg.walk import list_processes
+        walked = list_processes(cfg.vm_name, store, pid=4)
+        for proc in walked.processes:
+            if proc.pid == 4 and proc.directory_table_base:
+                return proc.directory_table_base
+    except Exception:
+        pass
+    return None
+
+
 def _find_kernel_cr3(snapshot, store: SymbolStore, cr3s, kpcrs) -> int | None:
     """Walk KPCR → KPRCB → KTHREAD → KPROCESS → DirectoryTableBase.
 
@@ -140,6 +158,10 @@ def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
     failures: list[str] = []
     with debug_snapshot(cfg) as snapshot:
         cr3s: list[int] = []
+        from winbox.kdbg.walk._layout import _cached_kernel_cr3
+        cached = _cached_kernel_cr3(cfg.vm_name)
+        if cached is not None and cached not in cr3s:
+            cr3s.append(cached)
         for sampled in snapshot.cr3_candidates:
             for candidate in (sampled, sampled ^ 0x1000):
                 if candidate not in cr3s:
@@ -147,6 +169,8 @@ def resolve_nt_base(cfg: Config, nt_syms: dict[str, int]) -> int:
         kpcrs = snapshot.kernel_gs_bases
 
         kernel_cr3 = _find_kernel_cr3(snapshot, store, cr3s, kpcrs)
+        if kernel_cr3 is None:
+            kernel_cr3 = _discover_kernel_cr3_via_eprocess(cfg, store)
         if kernel_cr3 is not None and kernel_cr3 not in cr3s:
             cr3s.insert(0, kernel_cr3)
 
