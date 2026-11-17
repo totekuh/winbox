@@ -73,7 +73,12 @@ def ensure_types_loaded(
 
 
 def ensure_nt_base_current(cfg: Config, store: SymbolStore) -> bool:
-    """Re-point the store's nt base at the running kernel if ASLR moved it."""
+    """Point the store's nt base at the running kernel.
+
+    Establishes the base when none is cached (cold store, or one whose
+    base was cleared) and re-points it when ASLR moved it across a reboot.
+    A no-op when the cached base already matches the live kernel.
+    """
     from winbox.kdbg.symbols import resolve_nt_base
 
     try:
@@ -83,7 +88,7 @@ def ensure_nt_base_current(cfg: Config, store: SymbolStore) -> bool:
 
     cached = data.get("base")
     syms = data.get("symbols") or {}
-    if not cached or not syms:
+    if not syms:
         return False
 
     try:
@@ -99,8 +104,11 @@ def ensure_nt_base_current(cfg: Config, store: SymbolStore) -> bool:
         return False
 
     store.set_base("nt", live)
-    logger.info(
-        "nt base moved 0x%x -> 0x%x (ASLR, typically a VM reboot); refreshed",
-        cached, live,
-    )
+    if cached:
+        logger.info(
+            "nt base moved 0x%x -> 0x%x (ASLR, typically a VM reboot); refreshed",
+            cached, live,
+        )
+    else:
+        logger.info("nt base established at 0x%x (no cached base)", live)
     return True
