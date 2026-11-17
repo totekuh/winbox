@@ -73,9 +73,24 @@ def _identity(process: ProcessRecord) -> dict[str, Any]:
 
 
 def _thread_key(thread: ThreadRecord) -> str:
-    if thread.create_time <= 0:
+    # create_time is the anti-aliasing discriminator: when an ETHREAD pool
+    # slot is recycled, the pointer repeats but create_time differs, so a
+    # recycled slot never aliases to the old thread's key.
+    #
+    # create_time == 0 is legitimate for System's phase-0 boot threads
+    # (tid 12/16/20/24 et al.), created before the system clock was live.
+    # Those threads never exit, so their ETHREAD is never recycled, and a
+    # genuinely new thread always carries a non-zero create_time — so a
+    # zero-create_time slot cannot alias with a real one. Key such threads
+    # by ETHREAD alone. Worst case a diff over-reports (never hides a
+    # thread swap), which is the safe direction for an evidence tool.
+    #
+    # A negative create_time is garbage (bad read / corrupt field), not a
+    # boot thread, and is still refused.
+    if thread.create_time < 0:
         raise ThreadBaselineError(
-            f"tid {thread.tid} has no ETHREAD.CreateTime; refusing an unsafe baseline"
+            f"tid {thread.tid} has a negative ETHREAD.CreateTime "
+            f"({thread.create_time}); refusing an unsafe baseline"
         )
     return f"{thread.ethread:016x}:{thread.create_time:016x}"
 
