@@ -88,7 +88,12 @@ class _RspTransport:
         if not self._noack:
             self._read_ack(strict=True)
 
-    def _read_byte(self, timeout: float | None = None) -> int:
+    def _read_byte(self, timeout: float | None = _DEFAULT_TIMEOUT) -> int:
+        if timeout is None:
+            # An unbounded recv can wedge the single-threaded daemon forever
+            # (the gdbstub going silent is not an error the socket surfaces).
+            # Forbid it outright rather than let a missing argument hang us.
+            raise RspError("refusing an unbounded RSP read (timeout=None)")
         self._sock.settimeout(timeout)
         if not self._inbuf:
             try:
@@ -170,5 +175,5 @@ class _RspTransport:
     def interrupt(self) -> None:
         raise NotImplementedError
 
-    def wait_for_stop(self, *, timeout: float | None = None) -> object:
+    def wait_for_stop(self, *, timeout: float | None = _DEFAULT_TIMEOUT) -> object:
         raise NotImplementedError

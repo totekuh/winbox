@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import time
+from contextlib import suppress
 from datetime import timedelta
 
 import pytest
@@ -157,6 +158,34 @@ def _accept_not_halted(result) -> None:
 def _domstate(vm_name: str) -> str:
     result = virsh_run("domstate", vm_name, check=False)
     return result.stdout.strip()
+
+
+def _force_reset_kdbg(cfg: Config) -> None:
+    """Guarantee a clean-slate kdbg state: no session daemon, no reader, VM running.
+
+    This is the load-bearing teardown for TestKdbg — a test that raises before
+    its own ``kdbg_detach`` would otherwise leak the session daemon holding
+    ``kdbg.lock`` and cascade into every later attach failing. Graceful-first,
+    escalates to SIGKILL, so it is cheap when already clean.
+    """
+    from winbox.kdbg.debugger.daemon import force_stop_daemon
+    from winbox.kdbg.debugger.reader import stop_reader
+    from winbox.kdbg.hmp import ensure_not_paused, hmp
+
+    # Release whoever owns the gdbstub's single RSP client first...
+    with suppress(Exception):
+        force_stop_daemon(cfg)
+    with suppress(Exception):
+        stop_reader(cfg)
+    # ...then remove the QEMU gdbstub itself, so the next test's `kdbg start`
+    # sees a free :1234 (removing the stub also lets QEMU resume the guest).
+    # The reader path self-starts the stub on demand, so walk tests still work.
+    with suppress(Exception):
+        hmp(cfg.vm_name, "gdbserver none", mode="tuple")
+    # A SIGKILL skips QEMU's clean cont, which can leave the VM paused; resume it
+    # so the next test and the guest_is_healthy gate see a running guest.
+    with suppress(Exception):
+        ensure_not_paused(cfg.vm_name)
 
 
 # ─── identity: the config and the guest must agree ──────────────────────────
@@ -1400,6 +1429,18 @@ class TestJobs:
 
 
 class TestKdbg:
+    @pytest.fixture(autouse=True)
+    def _kdbg_clean_slate(self, cfg):
+        """Force-reset kdbg daemons before and after every test in this class.
+
+        The after-reset is the one that breaks the cascade: a test that raises
+        before reaching its own kdbg_detach still has its leaked session daemon
+        reaped here, so the next test starts clean.
+        """
+        _force_reset_kdbg(cfg)
+        yield
+        _force_reset_kdbg(cfg)
+
     @staticmethod
     def _result(tool, tool_name, *args, **kwargs):
         """Unwrap and validate the common structured KDBG MCP envelope."""

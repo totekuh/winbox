@@ -181,6 +181,11 @@ def clean_stale_kdbg() -> None:
     except Exception:
         pass
     try:
+        from winbox.kdbg.debugger.daemon import force_stop_daemon
+        force_stop_daemon(cfg)
+    except Exception:
+        pass
+    try:
         store = SymbolStore(cfg.symbols_dir)
         if "nt" in store.list_modules():
             data = store.load("nt")

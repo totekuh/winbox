@@ -49,5 +49,6 @@ from winbox.kdbg.debugger.daemon._fork import (  # noqa: F401
     _detach_to_log,
     _install_signal_handlers,
     _write_session_file,
+    force_stop_daemon,
     fork_daemon,
 )

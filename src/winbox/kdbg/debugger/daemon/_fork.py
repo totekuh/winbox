@@ -299,3 +299,74 @@ def _install_signal_handlers(session) -> None:
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
     signal.signal(signal.SIGUSR1, on_usr1)
+
+
+def force_stop_daemon(
+    cfg: Config,
+    *,
+    timeout: float = 5.0,
+    term_grace: float = 2.0,
+    kill_grace: float = 2.0,
+) -> bool:
+    """Guarantee the interactive session daemon is gone, cleanly if possible.
+
+    Graceful-first: preempt any in-flight ``cont`` (lightweight ``interrupt``
+    op + SIGUSR1), then a clean ``detach`` (restores CR3, resumes the guest,
+    exits). If the daemon does not exit, escalate SIGTERM -> SIGKILL, verifying
+    death via the flock probe (never ``waitpid`` — the daemon is setsid-detached
+    and not our child).
+
+    Returns ``True`` when a daemon existed and is now confirmed dead, ``False``
+    when none was alive. Raises ``DaemonError`` if a daemon survives SIGKILL.
+    The production clean-detach path is untouched; SIGKILL only fires when the
+    graceful detach already failed to make the daemon exit.
+    """
+    from winbox.kdbg.debugger.child_lifecycle import kill_pid_until_dead
+    from winbox.kdbg.debugger.client import ClientError, DaemonClient
+    from winbox.kdbg.debugger.continue_job import cancel_continue
+
+    client = DaemonClient(cfg)
+    if not client.session_alive():
+        with suppress(OSError):
+            sock_path(cfg).unlink()
+        with suppress(OSError):
+            session_path(cfg).unlink()
+        return False
+
+    pid: int | None = None
+    info = client.session_info()
+    if info is not None:
+        with suppress(ValueError, TypeError, KeyError):
+            pid = int(info["daemon_pid"])
+
+    # Preempt a busy cont so the graceful detach is serviceable.
+    with suppress(Exception):
+        cancel_continue(cfg)
+    if pid is not None and pid > 0:
+        with suppress(ProcessLookupError, OSError):
+            os.kill(pid, signal.SIGUSR1)
+
+    # Graceful detach: clean CR3 restore + resume + shutdown.
+    with suppress(ClientError, OSError):
+        client.call("detach", sock_timeout=timeout)
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and client.session_alive():
+        time.sleep(0.02)
+
+    if client.session_alive():
+        if not kill_pid_until_dead(
+            pid,
+            lambda: client.session_alive(),
+            term_grace=term_grace,
+            kill_grace=kill_grace,
+        ):
+            raise DaemonError(
+                f"kdbg daemon pid={pid} survived SIGKILL; gdbstub may be stuck"
+            )
+
+    with suppress(OSError):
+        sock_path(cfg).unlink()
+    with suppress(OSError):
+        session_path(cfg).unlink()
+    return True

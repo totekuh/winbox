@@ -7,6 +7,7 @@ import select
 import signal
 import threading
 import time
+from contextlib import suppress
 
 
 class ChildStartupError(RuntimeError):
@@ -64,6 +65,44 @@ def reap_in_background(pid: int, *, label: str) -> None:
         name=f"winbox-{label}-reaper-{pid}",
         daemon=True,
     ).start()
+
+
+def kill_pid_until_dead(
+    pid: int | None,
+    is_alive,
+    *,
+    term_grace: float = 2.0,
+    kill_grace: float = 2.0,
+) -> bool:
+    """Force a process dead, verifying via a caller-supplied liveness probe.
+
+    Unlike ``terminate_and_reap``, this never calls ``waitpid`` — the target
+    may be a ``setsid``-detached daemon that has been reparented to init and is
+    NOT our child, so ``waitpid`` would raise ``ChildProcessError`` and falsely
+    report death. The only trustworthy oracle across processes is ``is_alive``
+    (a flock probe). Escalates SIGTERM -> grace -> SIGKILL -> grace.
+
+    Returns ``not is_alive()`` after the ladder. A ``True`` return means the
+    probe confirms the process is gone; callers should raise on ``False``.
+    """
+    def _poll(deadline: float) -> bool:
+        while time.monotonic() < deadline:
+            if not is_alive():
+                return True
+            time.sleep(0.02)
+        return not is_alive()
+
+    if pid is not None and pid > 0:
+        with suppress(ProcessLookupError, OSError):
+            os.kill(pid, signal.SIGTERM)
+        if _poll(time.monotonic() + max(0.0, term_grace)):
+            return True
+        with suppress(ProcessLookupError, OSError):
+            os.kill(pid, signal.SIGKILL)
+        if _poll(time.monotonic() + max(0.1, kill_grace)):
+            return True
+
+    return not is_alive()
 
 
 def _read_startup_line(

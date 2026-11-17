@@ -12,6 +12,7 @@ from contextlib import contextmanager, suppress
 from typing import Iterator
 
 from winbox.config import Config
+from winbox.kdbg.debugger.child_lifecycle import kill_pid_until_dead
 from winbox.kdbg.debugger.rsp import RspClient
 from winbox.kdbg.hmp import gdbstub_has_client, hmp, probe_port
 from winbox.kdbg.debugger.reader.types import (
@@ -213,8 +214,20 @@ def ensure_reader(cfg: Config, *, port: int = _DEFAULT_PORT) -> None:
     raise ReaderError("RSP reader started but its Unix socket did not appear")
 
 
-def stop_reader(cfg: Config, *, timeout: float = 5.0) -> bool:
-    """Stop the persistent reader if present. Returns whether one existed."""
+def stop_reader(
+    cfg: Config,
+    *,
+    timeout: float = 5.0,
+    term_grace: float = 2.0,
+    kill_grace: float = 2.0,
+) -> bool:
+    """Stop the persistent reader if present.
+
+    Graceful-first (unix-socket ``shutdown``), then verify death and escalate
+    SIGTERM -> SIGKILL if it did not exit. Returns ``True`` only when a reader
+    existed AND is now confirmed dead; raises ``ReaderError`` if a reader
+    survives SIGKILL. Returns ``False`` when no reader was alive.
+    """
     if not _reader_alive(cfg):
         return False
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -223,16 +236,37 @@ def stop_reader(cfg: Config, *, timeout: float = 5.0) -> bool:
         sock.connect(str(sock_path(cfg)))
         _request(sock, "shutdown")
     except (OSError, ReaderError):
-        try:
-            info = json.loads(session_path(cfg).read_text(encoding="utf-8"))
-            os.kill(int(info["pid"]), signal.SIGTERM)
-        except (OSError, ValueError, KeyError, json.JSONDecodeError):
-            pass
+        pass
     finally:
         sock.close()
+
+    # Give the graceful shutdown a chance to land.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and _reader_alive(cfg):
         time.sleep(0.02)
+
+    # Still alive -> force it dead, verifying via the flock probe (never waitpid:
+    # the reader is setsid-detached and not our child).
+    if _reader_alive(cfg):
+        pid: int | None = None
+        with suppress(OSError, ValueError, KeyError, json.JSONDecodeError):
+            info = json.loads(session_path(cfg).read_text(encoding="utf-8"))
+            pid = int(info["pid"])
+        if not kill_pid_until_dead(
+            pid,
+            lambda: _reader_alive(cfg),
+            term_grace=term_grace,
+            kill_grace=kill_grace,
+        ):
+            raise ReaderError(
+                f"reader daemon pid={pid} survived SIGKILL; gdbstub may be stuck"
+            )
+
+    # Confirmed dead. Tidy stale runtime files (self-heals anyway; lock untouched).
+    with suppress(OSError):
+        sock_path(cfg).unlink()
+    with suppress(OSError):
+        session_path(cfg).unlink()
     return True
 
 

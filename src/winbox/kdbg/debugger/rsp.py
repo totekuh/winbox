@@ -34,6 +34,9 @@ from winbox.kdbg.debugger.rsp_types import (  # noqa: F401 — re-exported
     _unescape,
 )
 from winbox.kdbg.debugger.rsp_protocol import _RspProtocol
+from winbox.kdbg.debugger.rsp_transport import _RspTransport
+
+_DEFAULT_TIMEOUT = _RspTransport._DEFAULT_TIMEOUT
 
 
 class RspClient(_RspProtocol):
@@ -180,7 +183,7 @@ class RspClient(_RspProtocol):
         """Send a raw Ctrl-C (0x03) to halt a running target."""
         self._send_raw(b"\x03")
 
-    def wait_for_stop(self, *, timeout: float | None = None) -> StopReply:
+    def wait_for_stop(self, *, timeout: float | None = _DEFAULT_TIMEOUT) -> StopReply:
         """Block until the next stop reply, return parsed StopReply."""
         while True:
             resp = self._read_packet(timeout=timeout)
