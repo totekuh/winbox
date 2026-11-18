@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import select
 import socket
 import time
 from contextlib import suppress
@@ -116,10 +117,26 @@ class _ReaderBroker:
                 ],
             })))
             while True:
+                # Notice a shutdown (SIGTERM sets this) promptly even while a
+                # client holds the snapshot open and idle. Returning here runs
+                # the finally below, which restores registers and conts the VM
+                # — so a stop_reader that escalates to SIGTERM gets a clean,
+                # resumed guest instead of a SIGKILL that leaves it paused.
+                if self.shutdown_requested:
+                    return
                 remaining = (budget.max_duration_ms / 1000) - (time.monotonic() - started)
                 if remaining <= 0:
                     conn.sendall(encode(_reply_err(budget_error("duration"))))
                     return
+                # Poll with select so the shutdown/budget checks run on a short
+                # cadence without interrupting read_line mid-line (a recv
+                # timeout there would drop its partial buffer and desync).
+                try:
+                    ready, _, _ = select.select([conn], [], [], min(0.5, remaining))
+                except (OSError, InterruptedError):
+                    return
+                if not ready:
+                    continue
                 conn.settimeout(min(30.0, max(0.001, remaining)))
                 try:
                     request = decode(read_line(conn))
