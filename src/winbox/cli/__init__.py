@@ -88,11 +88,17 @@ def needs_vm(*, auto_start: bool = True):
                 ensure_running(vm, ga, cfg)
             else:
                 state = vm.state()
-                if state != VMState.RUNNING:
-                    # auto_start=False is for diagnostic commands like kdbg
-                    # and net status. The VM being off isn't a problem we
-                    # caused — it's just a precondition the user has to
-                    # meet — so red[-] (genuine error blocking the action).
+                # PAUSED is accepted, not only RUNNING: a kdbg attach freezes
+                # the vcpus (libvirt reports "paused"), and the read-only
+                # diagnostic commands behind auto_start=False read that frozen
+                # guest fine. The MCP mirrors (kdbg_user_lm, kdbg_read_va) and
+                # the other CLI readers (inspect, threads, snapshots) already
+                # allow paused; this gate was the lone holdout and locked those
+                # commands out of the exact state they exist to inspect.
+                if state not in (VMState.RUNNING, VMState.PAUSED):
+                    # The VM being off isn't a problem we caused — it's just a
+                    # precondition the user has to meet — so red[-] (genuine
+                    # error blocking the action).
                     console.print(
                         f"[red][-][/] VM is not running (state: {state.value}). "
                         "Run [bold]winbox up[/] first."

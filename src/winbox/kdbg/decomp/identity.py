@@ -28,6 +28,18 @@ MAX_PE_HEADERS = 1 << 20
 MAX_DEBUG_DIRECTORY = 4096
 MAX_CODEVIEW = 4096
 
+# gdbstub read-failure codes for guest memory that is not resident while the
+# target is halted (paged out, or never faulted in).  A debug directory or
+# CodeView record sitting in such a page is a benign reason to skip the live
+# GUID and fall back to the PE-header identity, exactly as a stripped module
+# with no CodeView does -- not a fatal identity failure.
+_UNMAPPED_READ_SIGNS = ("E14", "E0E", "E08")
+
+
+def _is_unmapped_read(exc: BaseException) -> bool:
+    message = str(exc)
+    return any(sign in message for sign in _UNMAPPED_READ_SIGNS)
+
 
 @dataclass(frozen=True)
 class SectionIdentity:
@@ -205,7 +217,12 @@ def _read_live_pdb_key(
     if debug_rva >= image_size:
         raise IdentityError("debug directory lies outside mapped image")
     size = min(debug_size, MAX_DEBUG_DIRECTORY, image_size - debug_rva)
-    directory = _read_exact(read, base + debug_rva, size, "debug directory")
+    try:
+        directory = _read_exact(read, base + debug_rva, size, "debug directory")
+    except IdentityError as exc:
+        if _is_unmapped_read(exc):
+            return None
+        raise
     # IMAGE_DEBUG_DIRECTORY is 28 bytes. Ignore a partial trailing entry.
     for offset in range(0, len(directory) - 27, 28):
         kind = _u32(directory, offset + 12, "debug type")
@@ -217,7 +234,14 @@ def _read_live_pdb_key(
             continue
         if data_rva >= image_size or data_size > image_size - data_rva:
             continue
-        codeview = _read_exact(read, base + data_rva, data_size, "CodeView record")
+        try:
+            codeview = _read_exact(
+                read, base + data_rva, data_size, "CodeView record"
+            )
+        except IdentityError as exc:
+            if _is_unmapped_read(exc):
+                return None
+            raise
         if codeview[:4] != b"RSDS":
             continue
         guid = uuid.UUID(bytes_le=bytes(codeview[4:20])).hex.upper()
