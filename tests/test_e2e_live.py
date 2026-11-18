@@ -1263,6 +1263,16 @@ class TestDefender:
 class TestHvci:
     """HVCI / VBS detection and toggle."""
 
+    @pytest.fixture(scope="class", autouse=True)
+    def _restore_snapshot_after_class(self):
+        """HVCI toggles reboot the guest and leave VBS/HVCI on. The suite
+        shares one guest, so every later kdbg test would fail to resolve the
+        nt base. Revert to the ready snapshot once the class is done."""
+        yield
+        from tests.bootstrap import SNAPSHOT_READY, clean_stale_kdbg, restore_snapshot
+        clean_stale_kdbg()
+        restore_snapshot(SNAPSHOT_READY)
+
     def test_hvci_status(self, run, tool):
         """CLI and MCP status both succeed and report a consistent view."""
         out = run("hvci", "status").output
