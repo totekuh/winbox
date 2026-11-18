@@ -263,7 +263,7 @@ def cancel_continue(cfg: Config, *, token: str = "") -> dict[str, Any]:
         record["state"] = "cancel_requested"
         _write(root, record)
     try:
-        result = DaemonClient(cfg).call("interrupt", sock_timeout=5.0)
+        result = DaemonClient(cfg).call("interrupt", sock_timeout=5.0, arm=True)
     except ClientError as exc:
         with _locked(root):
             record = _read(root)
@@ -328,7 +328,13 @@ def _run_worker(root: Path, token: str, timeout: float, session_id: str) -> int:
         record = _read(root)
         if record is None or record.get("token") != token:
             return 2
-        record.update(state="running", worker_pid=os.getpid())
+        # A cancel can land while the job is still "starting" (the detached
+        # worker had not yet promoted it to "running"). Preserve that
+        # cancel_requested so the terminal result is labelled "cancelled";
+        # only a still-"starting" job advances to "running" here.
+        record["worker_pid"] = os.getpid()
+        if record.get("state") == "starting":
+            record["state"] = "running"
         _write(root, record)
 
     try:

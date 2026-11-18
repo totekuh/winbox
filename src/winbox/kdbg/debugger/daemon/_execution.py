@@ -20,6 +20,18 @@ class _ExecutionMixin:
         accepted_cr3s = self.target.cr3_set
         _cont_start = time.monotonic()
         deadline = _cont_start + max(0.5, float(timeout))
+        # An async continue-job cancel (an armed interrupt, see op_interrupt)
+        # may have reached the daemon in the window between the worker
+        # reporting "running" and this op starting, while the VM was still
+        # halted from the attach. The VM was never resumed, so honor the
+        # interrupt against the current stop instead of resuming and running
+        # to the full timeout — otherwise the job never cancels.
+        if (self._interrupt_pending
+                and self.run_state == "halted" and self.stop is not None):
+            self._interrupt_pending = False
+            result = {"reason": "interrupt", **self._stop_summary()}
+            result.update(self._unfired_hw_bp_warnings(0.0))
+            return result
         self._interrupt_pending = False
         while True:
             if self._interrupt_pending:
@@ -334,12 +346,23 @@ class _ExecutionMixin:
         return self._run_to(ret_addr, timeout=timeout,
                             reason="step_out", label="")
 
-    def op_interrupt(self) -> dict[str, Any]:
-        """Halt a running VM via raw ``\\x03`` on the RSP socket."""
+    def op_interrupt(self, arm: bool = False) -> dict[str, Any]:
+        """Halt a running VM via raw ``\\x03`` on the RSP socket.
+
+        ``arm`` marks an async continue-job cancellation. Such a cancel can
+        reach the daemon while the VM is still halted — in the window between
+        the cont worker reporting "running" and its ``cont`` op actually
+        starting. Clearing ``_interrupt_pending`` there would let the imminent
+        ``cont`` resume and run to its full timeout, so the job would never
+        cancel. With ``arm`` we leave the flag set instead; ``op_cont`` honors
+        it the moment it starts (its pre-resume check) and returns a prompt
+        ``interrupt`` stop. Interactive ``interrupt`` (``arm=False``) keeps the
+        plain already-halted behavior.
+        """
         if self.run_state == "halted" and self.stop is not None:
-            self._interrupt_pending = False
+            self._interrupt_pending = bool(arm)
             return {
-                "queued": False,
+                "queued": bool(arm),
                 "already_halted": True,
                 **self._stop_summary(),
             }
