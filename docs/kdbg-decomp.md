@@ -21,8 +21,14 @@ and often between processes; the RVA remains the invariant. A filename is not
 treated as identity. The bridge refuses concrete machine, `SizeOfImage`, PE
 timestamp, or CodeView GUID+age disagreements before Ghidra is queried. When
 both live and static CodeView records exist, the response reports
-`verified.identity_method = "pdb-guid-age"`; stripped binaries can use the weaker
-`"pe-headers"` fallback only when their timestamp is nonzero.
+`verified.identity_method = "pdb-guid-age"`; otherwise it uses the weaker
+`"pe-headers"` fallback (machine + `SizeOfImage` + nonzero timestamp). The
+fallback covers two cases: a stripped binary with no CodeView record, and a
+binary whose live CodeView page is simply not readable — in a halted guest the
+debug-info `.rdata` page is often paged out, so the GUID cannot be confirmed
+live even though the on-disk PE carries it. An unreadable CodeView page is
+treated like a missing one (degrade to `pe-headers`), not a verification
+failure; only a concrete disagreement fails closed.
 
 ## Setup and lifecycle
 
