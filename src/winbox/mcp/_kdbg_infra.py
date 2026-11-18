@@ -216,9 +216,12 @@ def kdbg_prepare(confirm: bool = False) -> dict[str, Any]:
     host and can be restored with ``kdbg_restore_cet``.
     """
     if not confirm:
+        # Phrased as a bad-argument refusal so _research_error classifies it
+        # as invalid_argument (a missing required confirm is bad input, not an
+        # operation that ran and failed).
         return _research_error(
-            "refused: this disables Windows CET UserShadowStack and hides "
-            "the VM cet-ss CPU feature; "
+            "confirm must be true: this disables Windows CET UserShadowStack "
+            "and hides the VM cet-ss CPU feature; "
             "call again with confirm=true, then reboot the VM",
             operation="kdbg_prepare",
         )
@@ -239,8 +242,10 @@ def kdbg_prepare(confirm: bool = False) -> dict[str, Any]:
 def kdbg_restore_cet(confirm: bool = False) -> dict[str, Any]:
     """Restore the CET policy backed up by ``kdbg_prepare``; reboot required."""
     if not confirm:
+        # invalid_argument, as in kdbg_prepare: a missing required confirm.
         return _research_error(
-            "refused: call again with confirm=true to restore the CET policy",
+            "confirm must be true to restore the CET policy; "
+            "call again with confirm=true",
             operation="kdbg_restore_cet",
         )
     cfg, _, ga = _mcp_common._ensure_vm_ready()

@@ -1890,7 +1890,12 @@ class TestKdbg:
             assert decomp["schema"] == "winbox.kdbg-decomp/5"
             assert decomp["detail"] == "compact"
             assert decomp["target"]["name"]
-            assert decomp["verified"]["identity_method"] == "pdb-guid-age"
+            # ntdll's CodeView page is often paged out in the halted guest, so
+            # the live GUID may be unreadable and identity degrades to the
+            # PE-header match. Both are valid exact-binary verifications.
+            assert decomp["verified"]["identity_method"] in {
+                "pdb-guid-age", "pe-headers",
+            }
             assert decomp["rip_mapping"]["kind"] in {
                 "exact", "range", "nearest-forward", "nearest-backward",
                 "ambiguous", "unmapped",
@@ -1912,8 +1917,10 @@ class TestKdbg:
         run("kdbg", "start")
         try:
             pid = self._target_pid(tool)
-            self._result(tool, "kdbg_attach", pid)
+            # Kernel symbols load via a standalone walk, which an attached
+            # session's gdbstub ownership would refuse; do it before attach.
             self._result(tool, "kdbg_symbols_load")
+            self._result(tool, "kdbg_attach", pid)
             try:
                 # Which mechanism works depends on the image. Win11 runs
                 # HVCI by default, which protects kernel code pages, so a
@@ -1931,7 +1938,11 @@ class TestKdbg:
                 )
                 bps = self._result(tool, "kdbg_bps")["bps"]
                 assert bps, "breakpoint did not register"
-                self._result(tool, "kdbg_rm", bps[0]["id"])
+                # Both mechanisms may register (hw + soft each get an id), so
+                # remove every breakpoint, not just the first, before asserting
+                # the list is empty.
+                for b in bps:
+                    self._result(tool, "kdbg_rm", b["id"])
                 assert self._result(tool, "kdbg_bps")["bps"] == []
             finally:
                 self._result(tool, "kdbg_detach")
@@ -2112,12 +2123,22 @@ class TestKdbg:
             session = self._result(tool, "kdbg_attach", fresh_pid)
             assert session["target"]["pid"] == fresh_pid
             try:
-                procs = self._result(tool, "kdbg_ps")["processes"]
-                assert any(p["name"] == "System" for p in procs), (
-                    "walkers still using a stale nt base"
-                )
-                modules = self._result(tool, "kdbg_user_lm", fresh_pid)["modules"]
-                assert any(m["name"].lower() == "winlogon.exe" for m in modules)
+                # Verify the repair through the daemon's OWN in-session signals,
+                # not a standalone ps/user_lm (which the attached session's
+                # gdbstub ownership refuses). These prove the daemon resolved
+                # the post-reboot bases with no manual refresh:
+                #  - user-mode bases: the auto-stage manifest discovered modules
+                #    against the fresh boot (an in-session equivalent of user_lm,
+                #    and strictly better since it is the daemon's own walk);
+                staged = session["auto_stage"]["module_progress"]
+                assert any(
+                    m["name"].lower() == "winlogon.exe" for m in staged
+                ), "auto-stage did not discover winlogon against the fresh boot"
+                #  - kernel (nt) base: an in-session context resolve walks via
+                #    the nt base; a stale base would break it.
+                context = self._result(tool, "kdbg_context")
+                assert context["schema"] == "winbox.kdbg-context/1"
+                assert context["state"] == "halted"
             finally:
                 self._result(tool, "kdbg_detach")
         finally:
@@ -2136,14 +2157,13 @@ class TestKdbg:
         run("kdbg", "start")
         try:
             pid = self._target_pid(tool)
-            self._result(tool, "kdbg_attach", pid)
-            try:
-                out = self._result(
-                    tool, "kdbg_user_symbols_load", pid, "winlogon.exe"
-                )
-                assert out["module"] == "winlogon" and out["symbol_count"] > 0
-            finally:
-                self._result(tool, "kdbg_detach")
+            # kdbg_user_symbols_load pulls the binary and walks the PEB via a
+            # standalone gdbstub walk; it runs without an active session (an
+            # attached session owns the stub and correctly refuses).
+            out = self._result(
+                tool, "kdbg_user_symbols_load", pid, "winlogon.exe"
+            )
+            assert out["module"] == "winlogon" and out["symbol_count"] > 0
         finally:
             run("kdbg", "stop", expect_ok=False)
 
@@ -2287,15 +2307,13 @@ class TestKdbg:
             try:
                 regs = self._result(tool, "kdbg_regs")
                 rsp = regs["rsp"]
-                original = self._result(
-                    tool, "kdbg_read_va", pid, rsp, 8,
-                )
+                # Reads are in-session (the session owns the gdbstub), so use
+                # kdbg_mem, not the standalone kdbg_read_va.
+                original = self._result(tool, "kdbg_mem", rsp, 8)
                 original_hex = original["bytes"]
                 pattern = "deadbeefcafebabe"
                 self._result(tool, "kdbg_write_mem", rsp, pattern)
-                readback = self._result(
-                    tool, "kdbg_read_va", pid, rsp, 8,
-                )
+                readback = self._result(tool, "kdbg_mem", rsp, 8)
                 assert readback["bytes"] == pattern
                 self._result(tool, "kdbg_write_mem", rsp, original_hex)
             finally:
@@ -2313,14 +2331,18 @@ class TestKdbg:
                 bp = self._result(
                     tool, "kdbg_bp", "nt!NtCreateFile",
                 )
-                bp_id = bp["bp"]["id"]
+                # kdbg_bp returns a flat record: {"id", "va", "target", ...}.
+                bp_id = bp["id"]
                 try:
                     result = tool("kdbg_cont")(timeout=10.0)
                     if result.get("ok"):
                         ctx = result["result"]
                         assert "reason" in ctx
                 finally:
-                    self._result(tool, "kdbg_bp_intent_remove", bp_id)
+                    # kdbg_bp installs a live breakpoint; remove it with
+                    # kdbg_rm (kdbg_bp_intent_remove is for persisted intents,
+                    # which this path never created).
+                    self._result(tool, "kdbg_rm", bp_id)
             finally:
                 tool("kdbg_detach")()
         finally:
