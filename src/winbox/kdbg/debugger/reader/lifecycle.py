@@ -14,10 +14,11 @@ from typing import Iterator
 from winbox.config import Config
 from winbox.kdbg.debugger.child_lifecycle import kill_pid_until_dead
 from winbox.kdbg.debugger.rsp import RspClient
-from winbox.kdbg.hmp import gdbstub_has_client, hmp, probe_port
+from winbox.kdbg.hmp import HmpError, gdbstub_has_client, hmp, probe_port
 from winbox.kdbg.debugger.reader.types import (
     ReaderError,
     SnapshotBudget,
+    SnapshotBudgetError,
     _DEFAULT_PORT,
     _READER_STARTUP_TIMEOUT,
     _STARTUP_STATUS_MAX_BYTES,
@@ -332,11 +333,46 @@ def debug_snapshot_for_vm(vm_name: str) -> Iterator[DebugSnapshot]:
         yield snapshot
 
 
+_TRANSIENT_READ_SIGNS = (
+    "e14", "m failed", "not present", "pml4e", "pdpte", "pde not", "pte not",
+)
+_SNAPSHOT_OP_RETRIES = 3
+
+
+def _is_transient_read_error(exc: BaseException) -> bool:
+    """A read that missed a not-present page under this frozen stop.
+
+    PsActiveProcessHead and other kernel globals live on pageable sections; a
+    single halt can catch such a page transiently not-present (the gdbstub
+    answers ``E14``), which is frozen for the life of that stop. A fresh halt a
+    moment later re-samples the vCPU CR3s and usually finds the page faulted
+    back in. Budget and busy errors are real limits, not transients.
+    """
+    if getattr(exc, "code", None) in {"busy", SnapshotBudgetError.code}:
+        return False
+    message = str(exc).lower()
+    return any(sign in message for sign in _TRANSIENT_READ_SIGNS)
+
+
 def snapshot_operation(func):
-    """Wrap a public walker/memory operation in one coherent RSP snapshot."""
+    """Wrap a public walker/memory operation in one coherent RSP snapshot.
+
+    A transient not-present read (see ``_is_transient_read_error``) retries in a
+    fresh snapshot, so one paged-out kernel page does not fail the whole
+    operation. Only standalone calls retry; when a caller already owns the
+    active snapshot the read is part of their coherent stop and must surface.
+    """
     def wrapped(vm_name: str, *args, **kwargs):
-        with debug_snapshot_for_vm(vm_name):
-            return func(vm_name, *args, **kwargs)
+        for attempt in range(_SNAPSHOT_OP_RETRIES):
+            caller_owns_snapshot = current_snapshot(vm_name) is not None
+            try:
+                with debug_snapshot_for_vm(vm_name):
+                    return func(vm_name, *args, **kwargs)
+            except (ReaderError, HmpError) as exc:
+                last = attempt + 1 >= _SNAPSHOT_OP_RETRIES
+                if caller_owns_snapshot or last or not _is_transient_read_error(exc):
+                    raise
+                time.sleep(0.15 * (attempt + 1))
     wrapped.__name__ = func.__name__
     wrapped.__doc__ = func.__doc__
     wrapped.__module__ = func.__module__
