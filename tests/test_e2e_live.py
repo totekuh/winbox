@@ -2362,6 +2362,49 @@ class TestKdbg:
         finally:
             run("kdbg", "stop", expect_ok=False)
 
+    def test_bp_trace_records_action_values(self, run, tool):
+        """Set bp with actions, let it fire, query the trace log."""
+        run("kdbg", "start")
+        try:
+            pid = self._target_pid(tool)
+            self._result(tool, "kdbg_attach", pid)
+            try:
+                bp = self._result(
+                    tool, "kdbg_bp", "nt!NtCreateFile",
+                    actions=["rax", "rcx"],
+                )
+                bp_id = bp["id"]
+                try:
+                    started = self._result(tool, "kdbg_cont_start", 10)
+                    token = started["token"]
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline:
+                        polled = self._result(tool, "kdbg_cont_poll", token)
+                        if not polled["active"]:
+                            break
+                        time.sleep(0.2)
+                    if polled.get("active"):
+                        self._result(tool, "kdbg_cont_cancel", token)
+                        for _ in range(50):
+                            polled = self._result(tool, "kdbg_cont_poll", token)
+                            if not polled["active"]:
+                                break
+                            time.sleep(0.1)
+                    trace = self._result(tool, "kdbg_bp_trace", bp_id)
+                    assert isinstance(trace["total"], int)
+                    assert isinstance(trace["entries"], list)
+                    if trace["total"] > 0:
+                        entry = trace["entries"][0]
+                        assert "hit" in entry
+                        assert "rip" in entry
+                        assert isinstance(entry["values"], dict)
+                finally:
+                    self._result(tool, "kdbg_rm", bp_id)
+            finally:
+                tool("kdbg_detach")()
+        finally:
+            run("kdbg", "stop", expect_ok=False)
+
 
 # ─── provisioning ───────────────────────────────────────────────────────────
 

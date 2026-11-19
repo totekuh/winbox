@@ -39,7 +39,7 @@ try {
 # --- RunEx (credentialed execution helper) ---
 $runExSource = "$provDir\RunEx.exe"
 $runExTarget = "C:\Tools\RunEx.exe"
-$runExSha256 = "74a884a5395c47fc76caea449f3bf7ab0bf20187c3eccfc9bf80af3609cf39bb"
+$runExSha256 = "7fcef8419f3829e3dcab167d071203097db9ef7a2aff97360d15a2933956fa6b"
 try {
     if (-not (Test-Path $runExSource)) { throw "RunEx.exe is missing from provisioning payload" }
     if ((Get-FileHash $runExSource -Algorithm SHA256).Hash.ToLowerInvariant() -ne $runExSha256) {
