@@ -18,7 +18,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-## Available tools (116)
+## Available tools (117)
 
 ### VM lifecycle
 
