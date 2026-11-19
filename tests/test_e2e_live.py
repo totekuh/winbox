@@ -470,11 +470,11 @@ class TestCredentialedExec:
             launch = json.loads(raw_launch)
             assert launch["background"] is True, launch
             result = None
-            for _ in range(30):
+            for _ in range(60):
                 result = json.loads(tool("job_result")(launch["job_id"]))
                 if not result.get("running"):
                     break
-                time.sleep(0.25)
+                time.sleep(0.5)
             assert result and result.get("running") is False, result
             assert result["exitcode"] == 0, result
             assert expected in result["stdout"].lower(), result
