@@ -95,11 +95,15 @@ def test_live_parallel_walkers_get_visible_nonqueueing_admission():
 def test_live_pid4_lookup_exits_after_first_eprocess(cfg, monkeypatch):
     """A single-PID lookup must not materialize the live process table."""
     from winbox.kdbg import walk
+    from winbox.kdbg.walk import _processes
     from winbox.kdbg.debugger.reader import debug_snapshot
     from winbox.kdbg.store import SymbolStore
 
     store = SymbolStore(cfg.symbols_dir)
-    original = walk._read_process_entry
+    # Patch the name _iter_processes actually calls — the one bound in the
+    # _processes module globals. Patching the walk package re-export would not
+    # intercept the call and the counter would never advance.
+    original = _processes._read_process_entry
     reads = 0
 
     def counted(*args, **kwargs):
@@ -107,7 +111,7 @@ def test_live_pid4_lookup_exits_after_first_eprocess(cfg, monkeypatch):
         reads += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(walk, "_read_process_entry", counted)
+    monkeypatch.setattr(_processes, "_read_process_entry", counted)
     with debug_snapshot(cfg):
         system = walk.find_process(cfg.vm_name, store, pid=4)
 
