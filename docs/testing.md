@@ -15,6 +15,7 @@ The live suite spans several integration test files:
 - `tests/test_kdbg_args_integration.py` — argument validation (bad PIDs, invalid limits/addresses)
 - `tests/test_kdbg_stepping_integration.py` — real-binary debugging (step-over, step-out, interrupt during cont, disasm validation, kdbg_ps/lm/struct)
 - `tests/test_kdbg_coverage_integration.py` — remaining tool gaps (read_va, search, session/status assertions, capture+diff, CET, CLI round-trips)
+- `tests/test_kdbg_e2e_extras_integration.py` — breakpoint intents (CRUD + fire on cont), pipe/share negatives, resume recovery, sinkhole DNS resolution
 
 `tests/bootstrap.py` automates VM provisioning for CI: creates the VM, disables
 CET, reboots, resolves symbols, and snapshots as `integration-ready`.
