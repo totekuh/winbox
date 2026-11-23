@@ -2232,6 +2232,7 @@ class _FakeTarget:
     def __init__(self, pid=4584, dtb=0x4d6bb000, name="notepad.exe", eprocess=0xffffe000_00100000) -> None:
         self.pid = pid
         self.directory_table_base = dtb
+        self.dtb = dtb
         self.name = name
         self.eprocess = eprocess
 
@@ -2394,7 +2395,7 @@ def test_validate_nt_passes_when_live_base_matches(monkeypatch):
     import winbox.kdbg.symbols as sym_mod
     monkeypatch.setattr(
         sym_mod, "resolve_nt_base",
-        lambda cfg, syms: cached_nt_base,  # matches cached
+        lambda cfg, syms, **kw: cached_nt_base,  # matches cached
     )
 
     store = _StoreForValidation({
@@ -2420,7 +2421,7 @@ def test_validate_refreshes_a_stale_nt_base(monkeypatch, capsys):
     import winbox.kdbg.symbols as sym_mod
     monkeypatch.setattr(
         sym_mod, "resolve_nt_base",
-        lambda cfg, syms: live_nt_base,
+        lambda cfg, syms, **kw: live_nt_base,
     )
 
     store = _StoreForValidation({
@@ -2449,7 +2450,7 @@ def test_validate_nt_resolve_failure_warns_and_continues(monkeypatch, capsys):
     _patch_validator(monkeypatch, [])
 
     import winbox.kdbg.symbols as sym_mod
-    def boom(cfg, syms):
+    def boom(cfg, syms, **kw):
         raise HmpError("HMP socket transient")
     monkeypatch.setattr(sym_mod, "resolve_nt_base", boom)
 

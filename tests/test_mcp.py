@@ -3037,7 +3037,7 @@ class TestKdbgCetTools:
 
         with patch("winbox.mcp._kdbg_infra._kdbg_prepare_cet") as prepare:
             result = kdbg_prepare()
-        assert _mcp_error(result)["message"].startswith("refused:")
+        assert _mcp_error(result)["message"].startswith("confirm must be true")
         prepare.assert_not_called()
 
     def test_prepare_stops_reader_before_policy_change(self, mock_mcp, tmp_path):
@@ -3058,7 +3058,7 @@ class TestKdbgCetTools:
 
         with patch("winbox.mcp._kdbg_infra._kdbg_restore_cet_policy") as restore:
             result = kdbg_restore_cet()
-        assert _mcp_error(result)["message"].startswith("refused:")
+        assert _mcp_error(result)["message"].startswith("confirm must be true")
         restore.assert_not_called()
 
 

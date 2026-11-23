@@ -159,8 +159,8 @@ def test_baseline_expires_on_process_boot_or_symbol_identity_change(tmp_path, mu
 
 def test_baseline_rejects_zero_thread_create_time_and_missing_name(tmp_path):
     store = _store(tmp_path)
-    with pytest.raises(ThreadBaselineError, match="ETHREAD.CreateTime"):
-        store.save("case", _capture([_thread(1, 0xFFFFE001_00001000, create_time=0)]))
+    with pytest.raises(ThreadBaselineError, match="negative ETHREAD.CreateTime"):
+        store.save("case", _capture([_thread(1, 0xFFFFE001_00001000, create_time=-1)]))
     with pytest.raises(BaselineNotFoundError, match="not found"):
         store.load("absent")
     with pytest.raises(ThreadBaselineError, match="baseline name"):

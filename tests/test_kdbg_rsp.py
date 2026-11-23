@@ -261,16 +261,13 @@ def test_rsp_error_default_partial_is_empty_bytes():
     assert err.partial == b""
 
 
-def test_read_byte_with_none_timeout_calls_settimeout_none():
-    """Regression: ``_read_byte(timeout=None)`` used to leave the socket
-    timeout at whatever a prior call set, which silently broke
-    ``wait_for_stop(timeout=None)`` (caller asks to block forever; socket
-    still has a 10s timeout from a prior read). Verify settimeout(None)
-    is now issued explicitly."""
+def test_read_byte_with_none_timeout_raises():
+    """Unbounded reads are now forbidden to prevent daemon hangs when the
+    gdbstub goes silent. ``_read_byte(timeout=None)`` must raise immediately."""
+    from winbox.kdbg.debugger.rsp_types import RspError
     cli, sock = _client([b"X"])
-    sock.timeout = 10.0  # leftover from a hypothetical prior op
-    cli._read_byte(timeout=None)
-    assert sock.timeout is None
+    with pytest.raises(RspError, match="unbounded"):
+        cli._read_byte(timeout=None)
 
 
 def test_read_ack_uses_default_timeout_not_none():
