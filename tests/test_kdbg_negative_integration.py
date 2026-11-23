@@ -57,6 +57,19 @@ def _force_reset(cfg: Config) -> None:
         ensure_not_paused(cfg.vm_name)
 
 
+def _reset_session(cfg: Config) -> None:
+    """Kill daemon/reader and ensure VM running. Leave gdbstub intact."""
+    from winbox.kdbg.debugger.daemon import force_stop_daemon
+    from winbox.kdbg.debugger.reader import stop_reader
+    from winbox.kdbg.hmp import ensure_not_paused
+    with suppress(Exception):
+        force_stop_daemon(cfg)
+    with suppress(Exception):
+        stop_reader(cfg)
+    with suppress(Exception):
+        ensure_not_paused(cfg.vm_name)
+
+
 @pytest.fixture(scope="module")
 def cfg(bootstrapped_vm):
     return Config.load()
@@ -106,9 +119,9 @@ def _assert_ok(response):
 class TestNoSessionErrors:
     @pytest.fixture(autouse=True)
     def _ensure_clean(self, cfg):
-        _force_reset(cfg)
+        _reset_session(cfg)
         yield
-        _force_reset(cfg)
+        _reset_session(cfg)
 
     def test_cont_without_session(self):
         _assert_error(_tool("kdbg_cont")(timeout=1.0), "no_session")
@@ -159,30 +172,33 @@ class TestNoSessionErrors:
 
 
 class TestDoubleAttach:
-    @pytest.fixture(autouse=True)
-    def _clean(self, cfg):
+    @pytest.fixture(autouse=True, scope="class")
+    def _gdbstub(self, cfg):
         _force_reset(cfg)
+        _run("kdbg", "start")
         yield
         _force_reset(cfg)
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, cfg):
+        _reset_session(cfg)
+        yield
+        _reset_session(cfg)
 
     def test_second_attach_refuses(self):
         """Second attach refused — either envelope error or RuntimeError from
         _ensure_vm_ready seeing a paused VM with an active session."""
-        _run("kdbg", "start")
+        pid = json.loads(_tool("ps")("winlogon"))[0]["pid"]
+        first = _tool("kdbg_attach")(pid)
+        _assert_ok(first)
         try:
-            pid = json.loads(_tool("ps")("winlogon"))[0]["pid"]
-            first = _tool("kdbg_attach")(pid)
-            _assert_ok(first)
             try:
-                try:
-                    second = _tool("kdbg_attach")(pid)
-                    assert second["ok"] is False, f"double attach should refuse: {second}"
-                except RuntimeError as exc:
-                    assert "session" in str(exc).lower() or "halted" in str(exc).lower(), exc
-            finally:
-                _tool("kdbg_detach")()
+                second = _tool("kdbg_attach")(pid)
+                assert second["ok"] is False, f"double attach should refuse: {second}"
+            except RuntimeError as exc:
+                assert "session" in str(exc).lower() or "halted" in str(exc).lower(), exc
         finally:
-            _run("kdbg", "stop", expect_ok=False)
+            _tool("kdbg_detach")()
 
 
 # ─── Category C: wrong state ─────────────────────────────────────────────────
@@ -197,74 +213,73 @@ class TestWrongStateErrors:
     a background thread while probing from the main thread.
     """
 
-    @pytest.fixture(autouse=True)
-    def _clean(self, cfg):
+    @pytest.fixture(autouse=True, scope="class")
+    def _gdbstub(self, cfg):
         _force_reset(cfg)
+        _run("kdbg", "start")
         yield
         _force_reset(cfg)
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, cfg):
+        _reset_session(cfg)
+        yield
+        _reset_session(cfg)
 
     def test_step_refused_during_cont(self):
         """step is not lightweight — daemon returns BUSY during cont."""
         from winbox.kdbg.debugger.client import ClientError, DaemonClient
         import threading
 
-        _run("kdbg", "start")
+        pid = json.loads(_tool("ps")("winlogon"))[0]["pid"]
+        _assert_ok(_tool("kdbg_attach")(pid))
         try:
-            pid = json.loads(_tool("ps")("winlogon"))[0]["pid"]
-            _assert_ok(_tool("kdbg_attach")(pid))
+            client = DaemonClient(Config.load())
+
+            def bg_cont():
+                with suppress(Exception):
+                    client.call("cont", sock_timeout=15.0, timeout=10.0)
+
+            thread = threading.Thread(target=bg_cont)
+            thread.start()
+            time.sleep(1.0)
             try:
-                client = DaemonClient(Config.load())
-
-                def bg_cont():
-                    with suppress(Exception):
-                        client.call("cont", sock_timeout=15.0, timeout=10.0)
-
-                thread = threading.Thread(target=bg_cont)
-                thread.start()
-                time.sleep(1.0)
-                try:
-                    with pytest.raises(ClientError) as exc_info:
-                        client.call("step", sock_timeout=5.0)
-                    assert exc_info.value.code in ("busy", "state_conflict")
-                finally:
-                    with suppress(Exception):
-                        client.call("interrupt", sock_timeout=5.0)
-                    thread.join(timeout=15)
+                with pytest.raises(ClientError) as exc_info:
+                    client.call("step", sock_timeout=5.0)
+                assert exc_info.value.code in ("busy", "state_conflict")
             finally:
-                _tool("kdbg_detach")()
+                with suppress(Exception):
+                    client.call("interrupt", sock_timeout=5.0)
+                thread.join(timeout=15)
         finally:
-            _run("kdbg", "stop", expect_ok=False)
+            _tool("kdbg_detach")()
 
     def test_status_allowed_during_cont(self):
         """status is lightweight: daemon serves it even during cont."""
         from winbox.kdbg.debugger.client import DaemonClient
         import threading
 
-        _run("kdbg", "start")
+        pid = json.loads(_tool("ps")("winlogon"))[0]["pid"]
+        _assert_ok(_tool("kdbg_attach")(pid))
         try:
-            pid = json.loads(_tool("ps")("winlogon"))[0]["pid"]
-            _assert_ok(_tool("kdbg_attach")(pid))
+            client = DaemonClient(Config.load())
+
+            def bg_cont():
+                with suppress(Exception):
+                    client.call("cont", sock_timeout=15.0, timeout=10.0)
+
+            thread = threading.Thread(target=bg_cont)
+            thread.start()
+            time.sleep(1.0)
             try:
-                client = DaemonClient(Config.load())
-
-                def bg_cont():
-                    with suppress(Exception):
-                        client.call("cont", sock_timeout=15.0, timeout=10.0)
-
-                thread = threading.Thread(target=bg_cont)
-                thread.start()
-                time.sleep(1.0)
-                try:
-                    status = client.call("status", sock_timeout=5.0)
-                    assert status["state"] == "running"
-                finally:
-                    with suppress(Exception):
-                        client.call("interrupt", sock_timeout=5.0)
-                    thread.join(timeout=15)
+                status = client.call("status", sock_timeout=5.0)
+                assert status["state"] == "running"
             finally:
-                _tool("kdbg_detach")()
+                with suppress(Exception):
+                    client.call("interrupt", sock_timeout=5.0)
+                thread.join(timeout=15)
         finally:
-            _run("kdbg", "stop", expect_ok=False)
+            _tool("kdbg_detach")()
 
 
 # ─── Category D: detach edge cases ───────────────────────────────────────────
@@ -273,9 +288,9 @@ class TestWrongStateErrors:
 class TestDetachEdgeCases:
     @pytest.fixture(autouse=True)
     def _clean(self, cfg):
-        _force_reset(cfg)
+        _reset_session(cfg)
         yield
-        _force_reset(cfg)
+        _reset_session(cfg)
 
     def test_detach_when_not_attached(self):
         result = _tool("kdbg_detach")()
