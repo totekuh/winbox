@@ -341,8 +341,8 @@ def _discover_and_register() -> None:
     # `--help` output groups stay stable regardless of file-system traversal
     # order.
     section_order = [
-        "VM Lifecycle", "Execute", "Files", "Network", "Target",
-        "Malware Analysis", "Integrations",
+        "VM Lifecycle", "Execute", "Files", "Network", "Active Directory",
+        "Target", "Malware Analysis", "Integrations",
     ]
     GroupedCli.SECTIONS = [
         (s, sections[s]) for s in section_order if s in sections

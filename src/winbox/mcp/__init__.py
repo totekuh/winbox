@@ -50,6 +50,14 @@ from winbox.mcp import _shares  # noqa: E402, F401
 from winbox.mcp._shares import *  # noqa: E402, F401, F403
 from winbox.mcp import _shares_io  # noqa: E402, F401
 from winbox.mcp._shares_io import *  # noqa: E402, F401, F403
+from winbox.mcp import _ad  # noqa: E402, F401
+from winbox.mcp._ad import *  # noqa: E402, F401, F403
+from winbox.mcp import _ad_objects  # noqa: E402, F401
+from winbox.mcp._ad_objects import *  # noqa: E402, F401, F403
+from winbox.mcp import _ad_gpo  # noqa: E402, F401
+from winbox.mcp._ad_gpo import *  # noqa: E402, F401, F403
+from winbox.mcp import _ad_dfs  # noqa: E402, F401
+from winbox.mcp._ad_dfs import *  # noqa: E402, F401, F403
 from winbox.mcp import _pipes  # noqa: E402, F401
 from winbox.mcp._pipes import *  # noqa: E402, F401, F403
 from winbox.mcp._pipes import _next_seq, _is_broker_alive, _session_dir  # noqa: E402, F401

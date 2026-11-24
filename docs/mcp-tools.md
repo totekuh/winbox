@@ -18,7 +18,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-## Available tools (116)
+## Available tools (140)
 
 ### VM lifecycle
 
@@ -73,6 +73,35 @@ claude mcp add winbox -- winbox mcp
 | `user_create(username, password, full_name?, no_password_expire?)` | Create a local Windows user on the VM |
 | `user_delete(username, confirm)` | Delete a local user. `confirm=True` required. |
 | `user_list()` | List local users as JSON (name, enabled, lastLogon) |
+
+### Active Directory
+
+| Tool | Description |
+|------|-------------|
+| `ad_promote(domain, password, timeout?)` | Promote VM to domain controller (new forest). Installs AD DS, creates forest, reboots. |
+| `ad_demote(password, timeout?)` | Demote domain controller back to standalone server. |
+| `ad_status(timeout?)` | Report AD DS status — DC info, domain, forest, services, DFS feature. |
+| `ad_user_create(sam, password, upn?, ou?, timeout?)` | Create a domain user account. |
+| `ad_user_delete(sam, timeout?)` | Delete a domain user account. |
+| `ad_user_list(ou?, timeout?)` | List domain users as JSON. |
+| `ad_group_create(name, scope?, ou?, timeout?)` | Create an AD security group (Global/Universal/DomainLocal). |
+| `ad_group_delete(name, timeout?)` | Delete an AD group. |
+| `ad_group_list(timeout?)` | List AD groups (excluding builtins) as JSON. |
+| `ad_group_add_member(group, member, timeout?)` | Add a member to an AD group. |
+| `ad_group_remove_member(group, member, timeout?)` | Remove a member from an AD group. |
+| `ad_ou_create(name, path?, timeout?)` | Create an organizational unit. |
+| `ad_ou_delete(dn, timeout?)` | Delete an organizational unit. |
+| `ad_ou_list(timeout?)` | List organizational units as JSON. |
+| `ad_gpo_create(name, timeout?)` | Create a Group Policy object. |
+| `ad_gpo_edit(name, key, value_name, reg_type, value, timeout?)` | Set a registry-based GPO setting. |
+| `ad_gpo_remove(name, timeout?)` | Delete a Group Policy object. |
+| `ad_gpo_list(timeout?)` | List all GPOs as JSON. |
+| `ad_gpo_link(name, target, timeout?)` | Link a GPO to an organizational unit. |
+| `ad_dfs_create(namespace, target, timeout?)` | Create a domain-based DFS namespace (DomainV2). Installs DFS feature if needed. |
+| `ad_dfs_add_target(namespace, folder, target, timeout?)` | Add a folder target to an existing DFS namespace. |
+| `ad_dfs_delete(namespace, timeout?)` | Remove a DFS namespace. |
+| `ad_dfs_list(timeout?)` | List DFS namespaces and folder targets. |
+| `ad_computer_list(timeout?)` | List domain computer accounts as JSON. |
 
 ### Defender
 
