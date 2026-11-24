@@ -64,6 +64,26 @@ def vm_down(force: bool = False) -> str:
     if state in (VMState.SHUTOFF, VMState.NOT_FOUND):
         return f"VM is not running (state: {state.value})"
 
+    try:
+        from winbox.tunnel import proxy as _tun_proxy
+        if _tun_proxy.is_running(cfg):
+            from winbox.tunnel import api as _tun_api
+            try:
+                _tok = _tun_api.auth(cfg)
+                for _ag in _tun_api.agents(cfg, _tok):
+                    _aid = _ag.get("id") or _ag.get("ID")
+                    if _aid is not None and _ag.get("Running"):
+                        _tun_api.stop_tunnel(cfg, _tok, _aid)
+            except Exception:
+                pass
+            try:
+                ga.exec("taskkill /im ligolo-agent.exe /f 2>nul", timeout=10)
+            except GuestAgentError:
+                pass
+            _tun_proxy.stop(cfg)
+    except ImportError:
+        pass
+
     if force:
         vm.force_stop()
         return "VM powered off (forced)"

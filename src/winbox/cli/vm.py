@@ -98,6 +98,28 @@ def down(ctx: click.Context, force: bool) -> None:
         console.print(msg)
         return
 
+    try:
+        from winbox.tunnel import proxy as _tun_proxy
+        if _tun_proxy.is_running(cfg):
+            from winbox.tunnel import api as _tun_api
+            console.print("[blue][*][/] Tearing down tunnel...")
+            try:
+                _tok = _tun_api.auth(cfg)
+                for _ag in _tun_api.agents(cfg, _tok):
+                    _aid = _ag.get("id") or _ag.get("ID")
+                    if _aid is not None and _ag.get("Running"):
+                        _tun_api.stop_tunnel(cfg, _tok, _aid)
+            except Exception:
+                pass
+            try:
+                ga.exec("taskkill /im ligolo-agent.exe /f 2>nul", timeout=10)
+            except GuestAgentError:
+                pass
+            _tun_proxy.stop(cfg)
+            console.print("[green][+][/] Tunnel torn down")
+    except ImportError:
+        pass
+
     console.print("[blue][*][/] Shutting down VM...")
     _graceful_shutdown(vm, ga)
     console.print("[green][+][/] VM stopped")

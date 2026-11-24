@@ -35,7 +35,7 @@ PS C:\Windows\system32>
 
 ## Platform capabilities
 
-- **MCP server** — 140 tools form a bounded, AI-native research control plane
+- **MCP server** — 144 tools form a bounded, AI-native research control plane
   for autonomous agents, covering VM lifecycle, execution, memory, symbols,
   debugging, drivers, IPC, defenses, networking, event logs, and evidence
   collection.

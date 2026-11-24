@@ -84,3 +84,5 @@ from winbox.mcp import _kdbg_inspect  # noqa: E402, F401
 from winbox.mcp._kdbg_inspect import *  # noqa: E402, F401, F403
 from winbox.mcp import _kdbg_recovery  # noqa: E402, F401
 from winbox.mcp._kdbg_recovery import *  # noqa: E402, F401, F403
+from winbox.mcp import _tunnel  # noqa: E402, F401
+from winbox.mcp._tunnel import *  # noqa: E402, F401, F403

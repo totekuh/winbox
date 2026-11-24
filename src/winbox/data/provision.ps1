@@ -56,6 +56,25 @@ try {
     $script:ProvisionFailed = $true
 }
 
+# --- Ligolo agent (tunnel pivot) ---
+$ligoloSource = "$provDir\ligolo-agent.exe"
+$ligoloTarget = "C:\Tools\ligolo-agent.exe"
+$ligoloSha256 = "1c7581cb54dab15b61cc8b5fee944d12f8cf96510f993637b91ce57aecbacaa0"
+try {
+    if (-not (Test-Path $ligoloSource)) { throw "ligolo-agent.exe missing from payload (optional)" }
+    if ((Get-FileHash $ligoloSource -Algorithm SHA256).Hash.ToLowerInvariant() -ne $ligoloSha256) {
+        throw "ligolo-agent.exe payload failed SHA-256 verification"
+    }
+    New-Item -ItemType Directory -Path "C:\Tools" -Force | Out-Null
+    Copy-Item $ligoloSource $ligoloTarget -Force
+    if ((Get-FileHash $ligoloTarget -Algorithm SHA256).Hash.ToLowerInvariant() -ne $ligoloSha256) {
+        throw "installed ligolo-agent.exe failed SHA-256 verification"
+    }
+    Write-Host "[+] Ligolo agent installed at $ligoloTarget"
+} catch {
+    Write-Host "[!] Ligolo agent installation skipped: $_"
+}
+
 # --- Disable Firewall ---
 Write-Host "[*] Disabling firewall..."
 try {

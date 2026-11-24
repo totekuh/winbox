@@ -18,7 +18,7 @@ pip install -e '.[mcp]'
 claude mcp add winbox -- winbox mcp
 ```
 
-## Available tools (140)
+## Available tools (144)
 
 ### VM lifecycle
 
@@ -132,6 +132,15 @@ claude mcp add winbox -- winbox mcp
 | Tool | Description |
 |------|-------------|
 | `net_status()` | JSON: link state (live + next-boot), nwfilter status, internet reachability |
+
+### Tunnel (ligolo-ng)
+
+| Tool | Description |
+|------|-------------|
+| `tunnel_up(subnets, interface?)` | Start a ligolo-ng tunnel — route subnets through the VM's VPN/Zscaler |
+| `tunnel_down()` | Stop the tunnel, kill agent, clean up |
+| `tunnel_route(add?, remove?, interface?)` | Hot add/remove subnet routes on a running tunnel |
+| `tunnel_status()` | JSON: proxy state, agents, interfaces, routes |
 
 ### Named pipes
 

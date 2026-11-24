@@ -62,6 +62,14 @@ SPICE_TOOLS_URL = (
 SPICE_TOOLS_EXE = "spice-guest-tools.exe"
 SPICE_TOOLS_SHA256 = "b5be0754802bcd7f7fe0ccdb877f8a6224ba13a2af7d84eb087a89b3b0237da2"
 
+LIGOLO_AGENT_URL = (
+    "https://github.com/nicocha30/ligolo-ng/releases/download/v0.9.2/"
+    "ligolo-ng_agent_0.9.2_windows_amd64.zip"
+)
+LIGOLO_AGENT_ZIP = "ligolo-agent.zip"
+LIGOLO_AGENT_EXE = "ligolo-agent.exe"
+LIGOLO_AGENT_SHA256 = "1c7581cb54dab15b61cc8b5fee944d12f8cf96510f993637b91ce57aecbacaa0"
+
 # Arcname of virtiofs.exe inside provision.zip (what provision.ps1 expects).
 VIRTIOFS_EXE = "virtiofs.exe"
 
@@ -223,6 +231,48 @@ def download_spice_tools(cfg: Config) -> Path:
         part.unlink(missing_ok=True)
         raise
     console.print("[green][+][/] spice-guest-tools downloaded and verified")
+    return dest
+
+
+def download_ligolo_agent(cfg: Config) -> Path:
+    """Ensure the pinned, hash-verified ligolo-ng agent EXE is cached."""
+    dest = cfg.iso_dir / LIGOLO_AGENT_EXE
+    if dest.exists() and _sha256(dest) == LIGOLO_AGENT_SHA256:
+        console.print("[green][+][/] ligolo-agent cached")
+        return dest
+    dest.unlink(missing_ok=True)
+    zip_part = cfg.iso_dir / (LIGOLO_AGENT_ZIP + ".part")
+    zip_part.unlink(missing_ok=True)
+    console.print("[blue][*][/] Downloading ligolo-ng agent...")
+    try:
+        subprocess.run(
+            ["wget", "-q", "--show-progress", "-O", str(zip_part), LIGOLO_AGENT_URL],
+            check=True,
+        )
+        if not zip_part.exists():
+            raise RuntimeError("ligolo-agent download failed")
+        if not zipfile.is_zipfile(zip_part):
+            raise RuntimeError(
+                "ligolo-agent download is not a valid zip "
+                "(probably truncated or an HTML error page)"
+            )
+        with zipfile.ZipFile(zip_part) as zf:
+            for name in zf.namelist():
+                if name.endswith("agent.exe"):
+                    with zf.open(name) as src, open(str(dest), "wb") as dst:
+                        dst.write(src.read())
+                    break
+            else:
+                raise RuntimeError("agent.exe not found inside ligolo-agent zip")
+        if _sha256(dest) != LIGOLO_AGENT_SHA256:
+            dest.unlink(missing_ok=True)
+            raise RuntimeError("ligolo-agent.exe failed SHA-256 verification")
+        zip_part.unlink(missing_ok=True)
+    except Exception:
+        zip_part.unlink(missing_ok=True)
+        dest.unlink(missing_ok=True)
+        raise
+    console.print("[green][+][/] ligolo-agent downloaded and verified")
     return dest
 
 

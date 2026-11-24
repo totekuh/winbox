@@ -43,6 +43,8 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
     "kdbg": (GROUP, ""),
     "net": (GROUP, ""),
     "sinkhole": (GROUP, ""),
+    "tunnel": (GROUP, ""),
+    "tunnel route": (GROUP, ""),
     "tools": (GROUP, ""),
 
     # Lifecycle
@@ -167,6 +169,13 @@ CLI_COVERAGE: dict[str, tuple[str, str]] = {
                             "(needs root) when dumpcap isn't installed"),
     "capture stop": (LIVE, ""),
     "capture status": (LIVE, ""),
+    "tunnel up": (EXCLUDED, "requires ligolo-proxy on PATH, a running VM, "
+                            "and a reachable target network"),
+    "tunnel down": (EXCLUDED, "requires a running tunnel"),
+    "tunnel status": (EXCLUDED, "requires ligolo-proxy"),
+    "tunnel route add": (EXCLUDED, "requires a running tunnel"),
+    "tunnel route rm": (EXCLUDED, "requires a running tunnel"),
+
     "sinkhole start": (LIVE, "on an unprivileged high port; the default :53 "
                              "bind needs root or a lowered "
                              "ip_unprivileged_port_start, same idea as "
@@ -309,6 +318,11 @@ MCP_COVERAGE: dict[str, tuple[str, str]] = {
     "applocker_disable": (LIVE, "paired with enable; reboot is part of the test"),
     "net_isolate": (LIVE, ""),
     "net_connect": (LIVE, ""),
+    "tunnel_up": (EXCLUDED, "requires ligolo-proxy on PATH, a running VM, "
+                            "and a reachable target network"),
+    "tunnel_down": (EXCLUDED, "requires a running tunnel"),
+    "tunnel_route": (EXCLUDED, "requires a running tunnel"),
+    "tunnel_status": (EXCLUDED, "requires ligolo-proxy"),
     "net_unplug": (LIVE, "including the persistent (next-boot) write"),
     "net_status": (LIVE, ""),
 
@@ -514,6 +528,11 @@ CLI_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "kdbg ghidra prune": "tests/test_kdbg_decomp_hardening.py",
     "kdbg ghidra repair": "tests/test_kdbg_decomp_hardening.py",
     "kdbg ghidra cancel": "tests/test_kdbg_decomp_prepare.py",
+    "tunnel up": "tests/test_tunnel.py",
+    "tunnel down": "tests/test_tunnel.py",
+    "tunnel status": "tests/test_tunnel.py",
+    "tunnel route add": "tests/test_tunnel.py",
+    "tunnel route rm": "tests/test_tunnel.py",
 }
 
 MCP_EXCLUSION_UNIT_TESTS: dict[str, str] = {
@@ -554,4 +573,8 @@ MCP_EXCLUSION_UNIT_TESTS: dict[str, str] = {
     "ad_dfs_delete": "tests/test_ad_mcp.py",
     "ad_dfs_list": "tests/test_ad_mcp.py",
     "ad_computer_list": "tests/test_ad_mcp.py",
+    "tunnel_up": "tests/test_tunnel.py",
+    "tunnel_down": "tests/test_tunnel.py",
+    "tunnel_route": "tests/test_tunnel.py",
+    "tunnel_status": "tests/test_tunnel.py",
 }

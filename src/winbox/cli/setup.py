@@ -201,6 +201,7 @@ def _setup_inner(
         installer.download_python_embed(cfg)
         installer.download_runex(cfg)
         installer.download_x64dbg(cfg)
+        installer.download_ligolo_agent(cfg)
         if cfg.display == "spice":
             installer.download_spice_tools(cfg)
         installer.extract_virtiofs(cfg)

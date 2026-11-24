@@ -14,8 +14,9 @@ from rich.console import Console
 
 from winbox import data as _data
 from winbox.setup.installer.downloads import (
-    OPENSSH_ZIP, PYTHON_EMBED_ZIP, PYTHON_EXE, RUNEX_EXE, SPICE_TOOLS_EXE,
-    VIRTIOFS_EXE, WINFSP_MSI, X64DBG_ZIP, _virtiofs_cache_path,
+    LIGOLO_AGENT_EXE, OPENSSH_ZIP, PYTHON_EMBED_ZIP, PYTHON_EXE, RUNEX_EXE,
+    SPICE_TOOLS_EXE, VIRTIOFS_EXE, WINFSP_MSI, X64DBG_ZIP,
+    _virtiofs_cache_path,
 )
 from winbox.vm import VM, GuestAgent, GuestAgentError
 
@@ -107,6 +108,9 @@ def provision_vm_disk(cfg: Config) -> None:
             if x64dbg_zip.exists():
                 zf.write(x64dbg_zip, X64DBG_ZIP)
             zf.write(runex_exe, RUNEX_EXE)
+            ligolo_agent = cfg.iso_dir / LIGOLO_AGENT_EXE
+            if ligolo_agent.exists():
+                zf.write(ligolo_agent, LIGOLO_AGENT_EXE)
             # SPICE display only, and best-effort: provision.ps1 self-gates on
             # the file's presence. Not in missing_files — spice is not
             # load-bearing, so a missing/failed install must never fail setup.
