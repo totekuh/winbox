@@ -190,6 +190,29 @@ winbox user delete bob -y                          # delete user
 
 Local users work with `winbox exec --user` and `winbox shell --user` for privilege-separated testing.
 
+## Active Directory
+
+Promote a Server VM to a domain controller and manage AD objects:
+
+```bash
+winbox ad promote --domain TESTLAB.LOCAL --password SafeMode123!
+winbox ad status                                   # DC info, services, DFS
+winbox ad user create jdoe --password P@ssw0rd1!   # domain user
+winbox ad group create IT-Admins                   # security group
+winbox ad group add-member IT-Admins jdoe
+winbox ad ou create Servers --path DC=TESTLAB,DC=LOCAL
+winbox ad gpo create 'Disable Defender'            # Group Policy object
+winbox ad gpo edit 'Disable Defender' \
+    --key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender' \
+    --value-name DisableAntiSpyware --type DWord --value 1
+winbox ad gpo link 'Disable Defender' --target DC=TESTLAB,DC=LOCAL
+winbox ad dfs create lab-dfs --target '\\WINBOX\Data'  # DFS namespace
+winbox ad computer list                            # domain computers
+winbox ad demote --password WinboxP@ss123          # tear down
+```
+
+Server-only (server2022, server2025). Win10/Win11 can join with `winbox domain join` but cannot host the DC role. All 24 MCP tool equivalents are available (`ad_promote`, `ad_user_create`, etc.).
+
 ## AppLocker
 
 Test application whitelisting bypass techniques:

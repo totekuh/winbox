@@ -7,7 +7,7 @@ Windows 10) into
 an automation, instrumentation, and analysis environment controlled from
 Kali. Execute tools, drive a PDB-aware hypervisor debugger, inspect protected
 memory, exercise drivers and IPC, change security posture, contain malware,
-and collect evidence through one CLI and a 116-tool MCP surface.
+and collect evidence through one CLI and a 140-tool MCP surface.
 
 ## Quick Demo
 
@@ -58,6 +58,9 @@ PS C:\Windows\system32>
 - **Transparent execution** — run `.exe` files like native Kali commands,
   including background/logged jobs, one-shot uploads, MSI installation,
   ConPTY SYSTEM shells, SSH, and optional `binfmt_misc` dispatch.
+- **Active Directory** — promote to domain controller, manage domain users,
+  groups, OUs, GPOs, DFS namespaces, and computer accounts. Single-VM AD
+  lab for Kerberos, share auditing, and GPO research.
 - **Network and domain integration** — NAT through Kali, manage DNS/hosts,
   join Active Directory domains, or isolate the target without losing the
   guest-agent and VirtIO-FS control channels.
@@ -95,7 +98,7 @@ See [Guest OS Targets](docs/guest-os.md) for per-OS notes and display options.
 | Guide | Description |
 |-------|-------------|
 | [Usage](docs/usage.md) | CLI commands, shells, tools, network, snapshots, event logs |
-| [MCP Tools](docs/mcp-tools.md) | 116-tool AI agent surface — full reference |
+| [MCP Tools](docs/mcp-tools.md) | 140-tool AI agent surface — full reference |
 | [Guest OS Targets](docs/guest-os.md) | Server 2022/2025, Win11, Win10 notes; display stack |
 | [Malware Detonation](docs/malware-detonation.md) | Containment, preflight, capture, sinkhole |
 | [Architecture](docs/architecture.md) | Platform layers, control planes |
@@ -112,6 +115,7 @@ See [Guest OS Targets](docs/guest-os.md) for per-OS notes and display options.
 VM Lifecycle       setup  provision  up  down  suspend  destroy  status  snapshot  restore  vnc
 Execute            eventlogs  exec  shell  ssh  jobs  msi
 Files              tools  upload  iso
+Active Directory    ad (promote, demote, status, user, group, ou, gpo, dfs, computer)
 Network            net  dns  hosts  domain  share  user
 Target             applocker  autologin  av  hvci  (bidirectional — flip on to test bypass tools)
 Malware Analysis   capture  detonate  sinkhole     (detonation lab — capture C2, sinkhole DNS, preflight)
