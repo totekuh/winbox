@@ -8,8 +8,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from winbox.config import Config
 
-PROXY_PORT = 11601
-API_PORT = 8080
 API_USER = "ligolo"
 API_PASS = "ligolo"
 TUN_INTERFACE = "ligolo"

@@ -83,7 +83,7 @@ def tunnel_up(ctx: click.Context, subnets: tuple[str, ...], interface: str) -> N
     console.print("[blue][*][/] Starting agent on VM...")
     try:
         ga.exec_background(
-            f'"{AGENT_VM_PATH}" -connect {cfg.host_ip}:11601 -ignore-cert -retry',
+            f'"{AGENT_VM_PATH}" -connect {cfg.host_ip}:{cfg.tunnel_proxy_port} -ignore-cert -retry',
         )
     except GuestAgentError as e:
         console.print(f"[red][-][/] Failed to start agent: {e}")

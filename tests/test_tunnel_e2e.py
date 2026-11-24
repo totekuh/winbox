@@ -130,10 +130,10 @@ def _cleanup_after(cfg):
     time.sleep(0.5)
 
 
-def _start_agent() -> subprocess.Popen:
+def _start_agent(proxy_port: int = 11601) -> subprocess.Popen:
     """Start Linux agent connecting to local proxy."""
     proc = subprocess.Popen(
-        [str(_LINUX_AGENT), "-connect", "127.0.0.1:11601", "-ignore-cert"],
+        [str(_LINUX_AGENT), "-connect", f"127.0.0.1:{proxy_port}", "-ignore-cert"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -206,7 +206,7 @@ class TestAgentConnection:
         from winbox.tunnel import api, proxy
 
         proxy.start(cfg)
-        agent_proc = _start_agent()
+        agent_proc = _start_agent(cfg.tunnel_proxy_port)
         try:
             token = api.auth(cfg)
             agent_id = _wait_agent(cfg, token)
@@ -227,7 +227,7 @@ class TestAgentConnection:
         from winbox.tunnel import api, proxy
 
         proxy.start(cfg)
-        agent_proc = _start_agent()
+        agent_proc = _start_agent(cfg.tunnel_proxy_port)
         try:
             token = api.auth(cfg)
             _wait_agent(cfg, token)
@@ -250,7 +250,7 @@ class TestTunRouting:
         from winbox.tunnel import api, proxy
 
         proxy.start(cfg)
-        agent_proc = _start_agent()
+        agent_proc = _start_agent(cfg.tunnel_proxy_port)
         try:
             token = api.auth(cfg)
             agent_id = _wait_agent(cfg, token)
@@ -370,12 +370,12 @@ def _netns_teardown():
     subprocess.run(["sudo", "-n", "ip", "link", "del", "veth-host"], capture_output=True)
 
 
-def _netns_start_agent() -> subprocess.Popen:
+def _netns_start_agent(proxy_port: int = 11601) -> subprocess.Popen:
     """Start ligolo-agent inside the netns."""
     proc = subprocess.Popen(
         [
             "sudo", "-n", "ip", "netns", "exec", NETNS_NAME,
-            str(_LINUX_AGENT), "-connect", "198.51.100.1:11601", "-ignore-cert",
+            str(_LINUX_AGENT), "-connect", f"198.51.100.1:{proxy_port}", "-ignore-cert",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -453,7 +453,7 @@ class TestRealPacketRouting:
             agent_proc = subprocess.Popen(
                 [
                     "sudo", "-n", "ip", "netns", "exec", NETNS_NAME,
-                    str(_LINUX_AGENT), "-connect", f"{VETH_HOST_IP}:11601", "-ignore-cert",
+                    str(_LINUX_AGENT), "-connect", f"{VETH_HOST_IP}:{cfg.tunnel_proxy_port}", "-ignore-cert",
                 ],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
             )
@@ -549,7 +549,7 @@ class TestMcpTools:
         from winbox.mcp._tunnel import tunnel_status
 
         proxy.start(cfg)
-        agent_proc = _start_agent()
+        agent_proc = _start_agent(cfg.tunnel_proxy_port)
         try:
             token = api.auth(cfg)
             agent_id = _wait_agent(cfg, token, timeout=15)

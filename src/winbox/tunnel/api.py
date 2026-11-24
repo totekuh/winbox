@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING, Any
 
-from winbox.tunnel import API_PASS, API_PORT, API_USER
+from winbox.tunnel import API_PASS, API_USER
 
 if TYPE_CHECKING:
     from winbox.config import Config
@@ -18,7 +18,7 @@ class ApiError(RuntimeError):
 
 
 def _base(cfg: Config) -> str:
-    return f"http://127.0.0.1:{API_PORT}"
+    return f"http://127.0.0.1:{cfg.tunnel_api_port}"
 
 
 def _request(

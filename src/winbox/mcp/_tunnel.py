@@ -79,7 +79,7 @@ def tunnel_up(subnets: list[str], interface: str = TUN_INTERFACE) -> str:
 
     try:
         ga.exec_background(
-            f'"{AGENT_VM_PATH}" -connect {cfg.host_ip}:11601 -ignore-cert -retry',
+            f'"{AGENT_VM_PATH}" -connect {cfg.host_ip}:{cfg.tunnel_proxy_port} -ignore-cert -retry',
         )
     except GuestAgentError as e:
         return f"error: failed to start agent on VM: {e}"

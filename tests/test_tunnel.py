@@ -11,10 +11,8 @@ import pytest
 from winbox.config import Config
 from winbox.tunnel import (
     AGENT_VM_PATH,
-    API_PORT,
     API_USER,
     API_PASS,
-    PROXY_PORT,
     TUN_INTERFACE,
     pidfile_path,
     tunnel_dir,

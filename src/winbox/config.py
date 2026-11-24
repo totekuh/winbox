@@ -40,6 +40,8 @@ class Config:
     # intra-subnet traffic.
     vm_subnet: str = "192.168.122.0"
     vm_subnet_mask: int = 24
+    tunnel_proxy_port: int = 11601
+    tunnel_api_port: int = 11602
     winbox_dir: Path = field(default_factory=lambda: Path.home() / ".winbox")
     virtio_iso_url: str = (
         "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/"
@@ -190,8 +192,10 @@ class Config:
             "WINBOX_DIR": "winbox_dir",
             "VIRTIO_ISO_URL": "virtio_iso_url",
             "KDBG_PAGEWALK": "kdbg_pagewalk",
+            "TUNNEL_PROXY_PORT": "tunnel_proxy_port",
+            "TUNNEL_API_PORT": "tunnel_api_port",
         }
-        int_fields = {"vm_ram", "vm_cpus", "vm_disk"}
+        int_fields = {"vm_ram", "vm_cpus", "vm_disk", "tunnel_proxy_port", "tunnel_api_port"}
         bool_fields = {"kdbg_pagewalk"}
         path_fields = {"winbox_dir"}
 

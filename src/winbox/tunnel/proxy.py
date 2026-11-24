@@ -12,9 +12,7 @@ from typing import TYPE_CHECKING
 
 from winbox.tunnel import (
     API_PASS,
-    API_PORT,
     API_USER,
-    PROXY_PORT,
     config_path,
     pidfile_path,
     tunnel_dir,
@@ -96,20 +94,21 @@ def is_running(cfg: Config) -> int | None:
 
 def _write_config(cfg: Config) -> Path:
     """Generate a ligolo-ng.yaml for daemon mode."""
+    api_port = cfg.tunnel_api_port
     conf = config_path(cfg)
     conf.parent.mkdir(parents=True, exist_ok=True)
     conf.write_text(
         f"web:\n"
         f"  enabled: true\n"
         f"  enableui: false\n"
-        f"  listen: 127.0.0.1:{API_PORT}\n"
+        f"  listen: 127.0.0.1:{api_port}\n"
         f"  debug: false\n"
         f"  logfile: \"\"\n"
         f"  behindreverseproxy: false\n"
         f"  trustedproxies:\n"
         f"    - 127.0.0.1\n"
         f"  corsAllowedOrigin:\n"
-        f"    - http://127.0.0.1:{API_PORT}\n"
+        f"    - http://127.0.0.1:{api_port}\n"
         f"  users:\n"
         f"    {API_USER}: {API_PASS}\n"
         f"  tls:\n"
@@ -128,7 +127,7 @@ def _write_pidfile(cfg: Config, pid: int) -> None:
     pf.write_text(f"{pid}\n")
 
 
-def start(cfg: Config, *, port: int = PROXY_PORT) -> int:
+def start(cfg: Config) -> int:
     """Start ligolo-proxy in daemon mode. Returns PID."""
     existing = is_running(cfg)
     if existing:
@@ -144,7 +143,7 @@ def start(cfg: Config, *, port: int = PROXY_PORT) -> int:
             proxy_bin,
             "-daemon",
             "-selfcert",
-            "-laddr", f"0.0.0.0:{port}",
+            "-laddr", f"0.0.0.0:{cfg.tunnel_proxy_port}",
             "-config", str(conf),
         ],
         stdout=open(tdir / "proxy.log", "w"),
